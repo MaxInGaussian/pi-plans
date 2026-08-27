@@ -95,20 +95,19 @@ describe("execution loop", () => {
 		const workdir = freshWorkdir();
 		const { pi, ctx, recorded } = makeHarness(workdir);
 		startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001", "VC-002"));
-		assert.ok(recorded.widget);
-		assert.equal(recorded.widget?.key, "pi-plans-execution");
-		assert.deepEqual(recorded.widget?.options, { placement: "belowEditor" });
-		const widget = recorded.widget?.factory(
-			{} as any,
-			{ fg: (_color: string, text: string) => text, strikethrough: (text: string) => `~~${text}~~` },
-		);
-		assert.ok(widget);
-		const rendered = widget.render(80);
-		assert.match(rendered[0] ?? "", /alt\+o/);
-		assert.match(rendered[0] ?? "", /📋 plans 0\/2/);
+
+		// Collapsed by default: progress lives in the bottom status bar (same
+		// layer as the ⏸ indicator); no panel widget is registered yet.
+		assert.equal(recorded.widget, undefined);
+		assert.match(recorded.status ?? "", /📋 plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
+		assert.match(recorded.status ?? "", /in-toks/);
+		assert.match(recorded.status ?? "", /out-toks/);
+		assert.match(recorded.status ?? "", /\/plans-list details/);
 
 		toggleExecutionPanelView(pi, ctx);
 		assert.ok(recorded.widget);
+		assert.equal(recorded.widget?.key, "pi-plans-execution");
+		assert.deepEqual(recorded.widget?.options, { placement: "belowEditor" });
 		const expandedWidget = recorded.widget?.factory(
 			{} as any,
 			{ fg: (_color: string, text: string) => text, strikethrough: (text: string) => `~~${text}~~` },
@@ -116,6 +115,9 @@ describe("execution loop", () => {
 		assert.ok(expandedWidget);
 		const expandedLines = expandedWidget.render(80);
 		assert.match(expandedLines.join("\n"), /☐/);
+		// Detail view never repeats the count or the keyboard hint.
+		assert.doesNotMatch(expandedLines.join("\n"), /📋 plans/);
+		assert.doesNotMatch(expandedLines.join("\n"), /alt\+o/);
 
 		assert.ok(getExecution());
 		const rules = executionContextMessage()!;
@@ -217,13 +219,15 @@ describe("execution loop", () => {
 		const { pi, ctx, recorded } = makeHarness(workdir);
 		startExecution(pi, ctx, path.join(workdir, "PLAN_v2.md"), items("VC-001", "VC-002"));
 
-		// The below-editor panel owns progress; the status item must be cleared,
-		// never carrying a duplicate “📋 plans x/y” count (regression: double display).
-		assert.equal(recorded.status, undefined);
+		// Bottom status bar carries the count — the same layer as ⏸ — so both
+		// execution states read from one consistent place.
+		assert.match(recorded.status ?? "", /📋 plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
+		assert.match(recorded.status ?? "", /in-toks/);
+		assert.match(recorded.status ?? "", /\/plans-list details/);
 
 		const start = recorded.messages.find((message) => message.customType === "pi-plans-exec-start");
 		assert.ok(start);
-		assert.match(start.content, /Progress appears below the editor/);
+		assert.match(start.content, /Progress appears in the bottom status bar/);
 		assert.doesNotMatch(start.content, /footer/);
 
 		applyDoneMarkers("[DONE:VC-001]");
@@ -247,12 +251,12 @@ describe("execution loop", () => {
 		assert.equal(consumePendingPanelSync(), true, "expected a pending panel sync marker");
 		assert.equal(consumePendingPanelSync(), false, "marker should be consumed exactly once");
 
-		// Back to idle: the next toggle persists and syncs, but still reuses the
-		// already-registered factory (cache-drop instead of teardown).
+		// Back to idle: the next toggle persists and syncs. It flips the panel to
+		// expanded, which registers the detail widget exactly once (no teardown).
 		ctx.isIdle = () => true;
 		assert.equal(toggleExecutionPanelView(pi, ctx), false);
 		assert.ok(recorded.entries.length > entriesBefore, "idle toggle did not persist");
-		assert.equal(recorded.widgetCalls, factoriesBefore, "idle toggle replaced the widget factory");
+		assert.equal(recorded.widgetCalls, factoriesBefore + 1, "idle toggle churned the widget registration");
 
 		stopExecution(pi, ctx, "test-done");
 	});

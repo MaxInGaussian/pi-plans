@@ -151,7 +151,10 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			.join("\n");
 		const changedIds = applyDoneMarkers(text);
 		if (changedIds.length > 0) {
-			recordExecutionCompletion(pi, ctx, changedIds);
+			// Attribute this turn's token usage to the finished items.
+			const raw = (event.message as { usage?: { input?: number; output?: number } }).usage;
+			const usage = raw ? { input: raw.input ?? 0, output: raw.output ?? 0 } : undefined;
+			recordExecutionCompletion(pi, ctx, changedIds, usage);
 		}
 		if (getExecution() && isExecutionComplete()) {
 			completeExecution(pi, ctx);

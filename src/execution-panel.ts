@@ -396,19 +396,16 @@ function renderItemLines(item: CheckItem, summary: ItemDiffSummary | undefined, 
 }
 
 function renderPanelLines(execution: ExecutionPanelExecutionLike, theme: ThemeLike, width: number): string[] {
+	// Expanded detail view only: the count/hint live in the bottom status bar,
+	// so the panel below the editor never repeats them.
 	const panel = ensurePanelState(execution);
-	const done = execution.items.filter((item) => item.done).length;
-	const hint = panel.expanded ? "alt+o /plans-list hide" : "alt+o /plans-list details";
-	const header = truncateAnsi(theme.fg("accent", `📋 plans ${done}/${execution.items.length} · ${hint}`), width);
-	if (!panel.expanded) {
-		return [header];
-	}
-	const lines = [header];
+	if (!panel.expanded) return [""];
+	const lines: string[] = [];
 	for (const item of execution.items) {
 		const summary = panel.itemSummaries[item.id]?.summary;
 		lines.push(...renderItemLines(item, summary, theme, width));
 	}
-	return lines;
+	return lines.length ? lines : [""];
 }
 
 interface WidgetThemeSource {
@@ -454,6 +451,11 @@ let registeredUi: unknown = null;
 
 export function refreshExecutionPanel(ctx: ExtensionContext, execution: ExecutionPanelExecutionLike | null): void {
 	if (!execution || !execution.items.length) {
+		clearExecutionPanel(ctx);
+		return;
+	}
+	if (!execution.panel?.expanded) {
+		// Collapsed: the bottom status bar carries the count; no panel widget.
 		clearExecutionPanel(ctx);
 		return;
 	}

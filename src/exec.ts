@@ -28,6 +28,7 @@ import { scanDoneMarkers, type CheckItem } from "./plan.ts";
 export interface ExecState extends ExecutionPanelExecutionLike {
 	startedAt: string;
 	panel?: ExecutionPanelState;
+	usage: { inToks: number; outToks: number };
 }
 
 let execution: ExecState | null = null;
@@ -54,12 +55,27 @@ export function executionProgress(): { done: number; total: number } | null {
 	};
 }
 
+function formatElapsed(startedAt: string): string {
+	const total = Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000));
+	const h = String(Math.floor(total / 3600)).padStart(2, "0");
+	const m = String(Math.floor((total % 3600) / 60)).padStart(2, "0");
+	const sec = String(total % 60).padStart(2, "0");
+	return `${h}:${m}:${sec}`;
+}
+
+function formatToks(tokens: number): string {
+	const n = Math.max(0, Math.round(tokens));
+	return n < 1000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
+}
+
 export function updateStatusWidget(ctx: ExtensionContext): void {
 	const progress = executionProgress();
-	if (progress) {
-		// The below-editor panel owns the in-execution progress display; keep the
-		// status bar free of a duplicate count (and clear stale ones from before).
-		ctx.ui.setStatus("pi-plans", undefined);
+	if (progress && execution) {
+		// Progress lives in the bottom status bar — the same layer as the ⏸
+		// paused indicator — so both execution states read from one place.
+		const tail = execution.panel?.expanded ? "/plans-list hide" : "/plans-list details";
+		const line = `📋 plans ${progress.done}/${progress.total}: spent ${formatElapsed(execution.startedAt)} · ${formatToks(execution.usage.inToks)} in-toks · ${formatToks(execution.usage.outToks)} out-toks · ${tail}`;
+		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
 		return;
 	}
 	const active = readActive(ctx.cwd);
@@ -76,6 +92,7 @@ function persist(pi: ExtensionAPI): void {
 		planPath: execution.planPath,
 		items: execution.items,
 		startedAt: execution.startedAt,
+		usage: execution.usage,
 		panel: snapshotPanelState(execution),
 	});
 }
@@ -94,7 +111,7 @@ export function startExecution(
 	planPath: string,
 	items: CheckItem[],
 ): void {
-	execution = { planPath, items, startedAt: utcNow(), panel: createExecutionPanelState() };
+	execution = { planPath, items, startedAt: utcNow(), panel: createExecutionPanelState(), usage: { inToks: 0, outToks: 0 } };
 	attachPanelBaseline(execution, ctx.cwd);
 	consumePendingPanelSync(); // fresh run: drop any stale deferral from a previous one
 	persist(pi);
@@ -109,7 +126,7 @@ export function startExecution(
 	pi.sendMessage(
 		{
 			customType: "pi-plans-exec-start",
-			content: `**pi-plans: executing** \`${planPath}\` — ${items.length} verifier item(s). Progress appears below the editor; mark verified items with \`[DONE:VC-xxx]\`.`,
+			content: `**pi-plans: executing** \`${planPath}\` — ${items.length} verifier item(s). Progress appears in the bottom status bar; mark verified items with \`[DONE:VC-xxx]\`.`,
 			display: true,
 		},
 		{ triggerTurn: false },
@@ -148,8 +165,17 @@ export function recordTouchedPaths(_workdir: string, paths: string[]): void {
 	panel.touchedPaths = [...merged];
 }
 
-export function recordExecutionCompletion(pi: ExtensionAPI, ctx: ExtensionContext, completedIds: string[]): ItemDiffSummary | null {
+export function recordExecutionCompletion(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	completedIds: string[],
+	usage?: { input: number; output: number },
+): ItemDiffSummary | null {
 	if (!execution) return null;
+	if (usage) {
+		execution.usage.inToks += usage.input;
+		execution.usage.outToks += usage.output;
+	}
 	const summary = completeCompletedItems(execution, ctx.cwd, completedIds);
 	persist(pi);
 	syncExecutionPanel(ctx);
@@ -292,6 +318,7 @@ export function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext, entr
 	execution = {
 		...snapshot,
 		items: snapshot.items.map((item) => ({ ...item })),
+		usage: snapshot.usage ?? { inToks: 0, outToks: 0 },
 		panel: executionPanelFromEntryData(snapshot.panel) ?? createExecutionPanelState(),
 	};
 	for (let i = snapshotIndex + 1; i < entries.length; i++) {

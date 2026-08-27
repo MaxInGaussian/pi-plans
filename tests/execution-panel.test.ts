@@ -117,22 +117,29 @@ describe("execution panel helpers", () => {
 		const theme = { fg: (_color: string, text: string) => `\u001b[38;5;2m${text}\u001b[39m`, strikethrough: (text: string) => text };
 		const ctx = { ui: { setWidget: (_key: string, factory: any) => void factories.push(factory) } } as any;
 
+		// Collapsed execution renders no widget at all — the bottom status bar
+		// owns the count (each clear call pushes `undefined`).
 		refreshExecutionPanel(ctx, execution);
-		refreshExecutionPanel(ctx, execution); // second pass must only invalidate
-		assert.equal(factories.length, 1, "factory re-registered on refresh");
+		refreshExecutionPanel(ctx, execution); // stays cleared while collapsed
+		assert.equal(factories.length, 2);
+		assert.equal(factories[0], undefined);
+		assert.equal(factories[1], undefined);
 
-		const widget = (factories[0] as any)({}, theme);
-		assert.equal(widget.render(80).length, 1, "collapsed render should be a single line");
-
+		// Expanding registers the detail widget exactly once.
 		toggleExpanded(execution);
 		refreshExecutionPanel(ctx, execution);
-		assert.equal(factories.length, 1);
-		assert.ok(widget.render(80).length > 1, "invalidate did not pick up expanded state");
+		assert.equal(factories.length, 3);
+		const widget = (factories[2] as any)({}, theme);
+		assert.ok(widget.render(80).length >= 1, "expanded render should list items");
+
+		refreshExecutionPanel(ctx, execution); // same host: reuse, no re-register
+		assert.equal(factories.length, 3);
+		assert.ok(widget.render(80).length >= 1, "invalidate did not pick up latest state");
 
 		// Clearing releases the slot so a future run registers afresh.
 		refreshExecutionPanel(ctx, null);
 		refreshExecutionPanel(ctx, execution);
-		assert.equal(factories.length, 3); // #2 was the explicit clear (undefined)
+		assert.equal(factories.length, 5); // #4 was the explicit clear (undefined)
 	});
 });
 
