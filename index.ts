@@ -139,6 +139,16 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		};
 	});
 
+	// The turn_end projection does not carry usage; message_end delivers the
+	// full assistant message, so we cache it there and consume it per turn.
+	let lastAssistantUsage: { input: number; output: number } | null = null;
+	pi.on("message_end", async (event) => {
+		const message = event.message as { role?: string; usage?: { input?: number; output?: number } };
+		if (message?.role === "assistant" && message.usage) {
+			lastAssistantUsage = { input: message.usage.input ?? 0, output: message.usage.output ?? 0 };
+		}
+	});
+
 	pi.on("turn_end", async (event, ctx) => {
 		const message = event.message as { role?: string; content?: Array<{ type: string; text?: string }> };
 		if (!message || message.role !== "assistant") {
@@ -152,7 +162,9 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		const changedIds = applyDoneMarkers(text);
 		if (changedIds.length > 0) {
 			// Attribute this turn's token usage to the finished items.
-			const raw = (event.message as { usage?: { input?: number; output?: number } }).usage;
+			const projection = (event.message as { usage?: { input?: number; output?: number } }).usage;
+			const raw = projection ?? lastAssistantUsage;
+			lastAssistantUsage = null; // consumed: never re-attribute a stale turn
 			const usage = raw ? { input: raw.input ?? 0, output: raw.output ?? 0 } : undefined;
 			recordExecutionCompletion(pi, ctx, changedIds, usage);
 		}

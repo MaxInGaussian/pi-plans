@@ -14,6 +14,7 @@ import {
 	isExecutionComplete,
 	restoreFromSession,
 	startExecution,
+	recordExecutionCompletion,
 	stopExecution,
 	toggleExecutionPanelView,
 	updateStatusWidget,
@@ -271,6 +272,24 @@ describe("execution loop", () => {
 		updateStatusWidget(ctx);
 		assert.match(recorded.status ?? "", /⏹ plans: /);
 		assert.equal(recorded.colors.at(-1), "error");
+	});
+
+	it("accumulates token usage only for turns that finish items", () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded } = makeHarness(workdir);
+		startExecution(pi, ctx, path.join(workdir, "PLAN_v5.md"), items("VC-001", "VC-002"));
+
+		recordExecutionCompletion(pi, ctx, ["VC-001"], { input: 100, output: 40 });
+		assert.equal(getExecution()?.usage.inToks, 100);
+		assert.equal(getExecution()?.usage.outToks, 40);
+
+		// A completion without usage data must keep prior totals intact.
+		recordExecutionCompletion(pi, ctx, ["VC-002"]);
+		assert.equal(getExecution()?.usage.inToks, 100);
+		assert.equal(getExecution()?.usage.outToks, 40);
+
+		stopExecution(pi, ctx, "test-done");
+		assert.equal(getExecution(), null);
 	});
 
 	it("defers persistence and widget churn when toggling mid-turn", () => {
