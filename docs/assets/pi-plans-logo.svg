@@ -32,8 +32,8 @@
   </g>
 
   <!-- wordmark -->
-  <text x="150" y="96" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="60" font-weight="700" fill="#ffffff">pi-plans</text>
-  <rect x="153" y="110" width="236" height="6" rx="3" fill="url(#bar)"/>
+  <text x="150" y="96" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="60" font-weight="700" fill="#ffffff">π-plans</text>
+  <rect x="153" y="110" width="210" height="6" rx="3" fill="url(#bar)"/>
   <text x="151" y="147" font-family="'SF Mono',Menlo,Consolas,monospace" font-size="16" letter-spacing="4" fill="#ddd6fe">PLAN·REVIEW·EXECUTE</text>
 
   <!-- pipeline: plan -> review -> execute -->

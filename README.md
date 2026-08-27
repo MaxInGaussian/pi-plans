@@ -1,7 +1,7 @@
 <h1 align="center">pi-plans</h1>
 
 <p align="center">
-  <img src="docs/assets/pi-plans-logo.svg?v=3" alt="pi-plans: Plan. Review. Execute." width="640" />
+  <img src="docs/assets/pi-plans-logo.svg?v=4" alt="pi-plans: Plan. Review. Execute." width="640" />
 </p>
 
 <h2 align="center"><b>Plan. Review. Execute.</b></h2>
