@@ -1,0 +1,58 @@
+{
+  "name": "pi-plans",
+  "version": "0.1.0",
+  "description": "Human-in-the-loop planning extension for the Pi coding agent: researched, refined Markdown plans before any code changes.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "planning",
+    "extension"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MaxInGaussian/pi-plans.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MaxInGaussian/pi-plans/issues"
+  },
+  "homepage": "https://github.com/MaxInGaussian/pi-plans#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills",
+      "./skills/debug-and-plan",
+      "./skills/plan-small",
+      "./skills/plan-normal",
+      "./skills/plan-big",
+      "./skills/plan-with-refs"
+    ]
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "index.ts",
+    "agents/",
+    "docs/assets",
+    "references/",
+    "scripts/",
+    "skills/",
+    "src/",
+    "tests/",
+    "tools/"
+  ],
+  "scripts": {
+    "validate": "node --experimental-strip-types scripts/validate.ts",
+    "test": "node --experimental-strip-types scripts/run-tests.ts",
+    "prepack": "npm run validate && npm test"
+  }
+}

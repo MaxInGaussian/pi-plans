@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="180" viewBox="0 0 720 180" role="img" aria-label="pi-plans: Plan. Review. Execute.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="720" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#14102a"/>
+      <stop offset=".55" stop-color="#241b4d"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- backdrop -->
+  <rect width="720" height="180" rx="20" fill="url(#bg)"/>
+  <rect x="14" y="14" width="692" height="152" rx="14" fill="none" stroke="#ffffff" stroke-opacity=".08"/>
+
+  <!-- plan document -->
+  <g transform="translate(52,37)">
+    <path d="M0 10 Q0 0 10 0 H52 L74 22 V96 Q74 106 64 106 H10 Q0 106 0 96 Z" fill="#ffffff" fill-opacity=".10" stroke="#c4b5fd" stroke-width="2.5"/>
+    <path d="M52 0 V22 H74" fill="none" stroke="#c4b5fd" stroke-width="2.5" stroke-linejoin="round"/>
+    <g stroke="#a7f3d0" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 34 l5 5 l9 -10"/>
+      <path d="M12 56 l5 5 l9 -10"/>
+      <path d="M12 78 l5 5 l9 -10"/>
+    </g>
+    <g stroke="#e9d5ff" stroke-width="3" stroke-linecap="round" opacity=".85">
+      <line x1="36" y1="32" x2="62" y2="32"/>
+      <line x1="36" y1="54" x2="62" y2="54"/>
+      <line x1="36" y1="76" x2="56" y2="76"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <text x="150" y="96" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="60" font-weight="700" fill="#ffffff">pi-plans</text>
+  <rect x="153" y="110" width="236" height="6" rx="3" fill="url(#bar)"/>
+  <text x="151" y="147" font-family="'SF Mono',Menlo,Consolas,monospace" font-size="16" letter-spacing="4" fill="#ddd6fe">PLAN·REVIEW·EXECUTE</text>
+
+  <!-- pipeline: plan -> review -> execute -->
+  <g>
+    <g stroke="#c4b5fd" stroke-width="3" stroke-linecap="round" opacity=".85">
+      <line x1="502" y1="90" x2="528" y2="90"/>
+      <line x1="598" y1="90" x2="624" y2="90"/>
+    </g>
+    <polygon points="528,84 538,90 528,96" fill="#c4b5fd"/>
+    <polygon points="624,84 634,90 624,96" fill="#c4b5fd"/>
+
+    <circle cx="470" cy="90" r="26" fill="#ffffff" fill-opacity=".07" stroke="#c4b5fd" stroke-width="2.5"/>
+    <circle cx="566" cy="90" r="26" fill="#ffffff" fill-opacity=".07" stroke="#c4b5fd" stroke-width="2.5"/>
+    <circle cx="662" cy="90" r="26" fill="#7c3aed" stroke="#e9d5ff" stroke-width="2.5"/>
+
+    <!-- list -->
+    <g stroke="#e9d5ff" stroke-width="3" stroke-linecap="round">
+      <line x1="458" y1="82" x2="482" y2="82"/>
+      <line x1="458" y1="90" x2="482" y2="90"/>
+      <line x1="458" y1="98" x2="474" y2="98"/>
+    </g>
+
+    <!-- magnifier -->
+    <circle cx="561" cy="85" r="9" fill="none" stroke="#e9d5ff" stroke-width="3"/>
+    <line x1="568" y1="92" x2="578" y2="102" stroke="#e9d5ff" stroke-width="3" stroke-linecap="round"/>
+
+    <!-- play -->
+    <polygon points="654,79 654,101 673,90" fill="#ffffff"/>
+  </g>
+</svg>
