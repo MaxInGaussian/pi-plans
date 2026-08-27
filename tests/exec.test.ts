@@ -118,8 +118,18 @@ describe("execution loop", () => {
 		assert.match(expandedLines.join("\n"), /☐/);
 
 		assert.ok(getExecution());
-		assert.match(executionContextMessage()!, /PI-PLANS EXECUTION/);
-		assert.match(executionContextMessage()!, /VC-001/);
+		const rules = executionContextMessage()!;
+		assert.match(rules, /PI-PLANS EXECUTION/);
+		assert.match(rules, /VC-001/);
+		// Seven-principle rule set: representative anchors (PLAN_v2 D-003/D-004).
+		assert.match(rules, /for the long term/);
+		assert.match(rules, /Simplest implementation/);
+		assert.match(rules, /grow the change in layers/);
+		assert.match(rules, /existing dependencies \(docs and types\)/);
+		assert.match(rules, /well-maintained libraries/);
+		assert.match(rules, /clearly separated concerns/);
+		assert.match(rules, /no stopgaps/);
+		assert.doesNotMatch(rules, /ponytail/i);
 
 		assert.deepEqual(applyDoneMarkers("progress… [DONE:VC-001] done"), ["VC-001"]);
 		assert.equal(isExecutionComplete(), false);

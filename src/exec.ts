@@ -237,8 +237,10 @@ Remaining verifier items:
 ${list}
 
 Execution rules:
-- Implement implementation items in dependency order.
-- Ponytail discipline: for each item, take the laziest rung that holds (does it need to exist; already in this codebase; stdlib; native platform feature; already-installed dependency; one line). Mark deliberate simplifications with \`# ponytail: <ceiling>, <upgrade path>\`.
+- Implement implementation items in dependency order; grow the change in layers — smallest end-to-end slice first, then stack each new capability on top of what already works.
+- Simplest implementation that fully meets the item: no speculative abstractions, configuration, or indirection; keep components modular with clearly separated concerns.
+- Architectural decisions are for the long term: no stopgaps. Do not add backward-compatibility layers, fallbacks, or migrations — remove the obsolete paths this change obsoletes.
+- Prefer established, well-maintained libraries when they reduce complexity or improve reliability; before writing your own implementation or adding a package, check the project's existing dependencies (docs and types) — never reimplement common functionality without a clear reason.
 - MINIMUM tests: trivial one-liners get no test; non-trivial logic gets exactly one minimal check; reuse the repo's test runner when one exists; when unsure, skip and emit \`[test skipped: <name>, add when <trigger>]\`.
 - After verifying an item's pass condition with its stated evidence, include \`[DONE:VC-xxx]\` in your reply.
 - When every item is done, report a completion summary.`;

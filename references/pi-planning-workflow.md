@@ -132,7 +132,7 @@ After the plan is accepted or refinement converges, ask the explicit execution-h
 
 On approval, call the `execute_plan` tool (or the user runs `/plans-execute`). It re-confirms with the user, then the extension enters execution mode:
 
-- every agent turn is injected with the remaining verifier checklist and execution rules (ponytail discipline, minimum tests);
+- every agent turn is injected with the remaining verifier checklist and execution rules (layered simplest implementation, no stopgaps, dependency and library discipline, minimum tests);
 - the read-only guard lifts: full write access returns;
 - the run status moves to `executing`, then `done` when the last `[DONE:VC-xxx]` marker lands;
 - `/plans-stop` stops execution; `/plans` shows progress.
