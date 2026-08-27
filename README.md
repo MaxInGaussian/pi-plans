@@ -94,17 +94,13 @@ Pi:  Wrote ./docs/pi-plans/2026-08-26-split-execution-loop/PLAN_v1.md
      - [ ] `VC-001` covers `I-001`; pass condition: `npm test` passes;
        evidence: test output; metric: zero failing tests.
 
-Pi:  Next step for refining the plan?
-     1. Reviewer round (recommended)
-     2. Criticizer round
-     3. Accept plan for tracked execution
+Pi:  Accept the plan and execute it now?
+     1. ✓ Accept plan and execute now (recommended)
+     2. Accept plan, don't execute yet
+     3. Run another round: Reviewer
      ...
 
-You: Accept plan for tracked execution.
-
-Pi:  Execute this plan now?
-     1. Execute this plan now (recommended)
-     2. Stop after planning
+You: 1 — accept and execute.
 ```
 
 Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (public, committed). Prefer `.git/pi_plans/plans` if you want them private to the repository.
@@ -126,7 +122,7 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 | Tool / Command | Purpose |
 |---|---|
 | `plans` | State CLI: `init`, `show`, `set-language`, `set-artifact-root`, `set-role`, `start-run`, `set-status`, `record-decision`, `record-ref`, `record-subagent` |
-| `ask_choice` | Numbered choice prompt; `autoComplete: false` for execution handoff / external-state questions |
+| `ask_choice` | Numbered choice prompt; `autoComplete: false` for the merged accept/execute question and external-state questions |
 | `refine` | Reviewer/criticizer round via read-only subagents (`--tools read,grep,find,ls`); `reviewers: 3` for big plans; enforces role/model confirmation gates |
 | `execute_plan` | Execution handoff: re-confirms with the user, enters extension-managed execution mode |
 | `/plans` | Show config, active run, execution progress |
@@ -217,7 +213,7 @@ Both run on Node ≥ 22.6 via `--experimental-strip-types`; no npm dependencies.
 
 **Why do I have to approve before any code changes?**
 
-The plan is the contract. Refinement converges on scope while nothing is writable yet; the execution handoff is a separate explicit approval that also lifts the write guard. You always see — and can veto — what will happen before it happens.
+The plan is the contract. Refinement converges on scope while nothing is writable yet; the merged accept/execute question is an explicit, never-auto-completed approval that also lifts the write guard. You always see — and can veto — what will happen before it happens.
 
 **What can Auto-complete decide on my behalf?**
 

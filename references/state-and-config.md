@@ -126,7 +126,7 @@ When `mode` is `delegated-subagent`, the `refine` tool spawns a read-only `pi` s
 - receives the full plan text and a review/criticism brief;
 - returns its findings as the tool result (recorded in `subagents.jsonl` with name and model).
 
-The main agent consolidates the results, records dispositions, revises the plan, and asks the next refinement-mode question — all in the same turn.
+The main agent consolidates the results, records dispositions, revises the plan, and asks the next merged accept/execute question — all in the same turn.
 
 ## Run State
 

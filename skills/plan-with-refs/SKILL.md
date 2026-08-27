@@ -21,7 +21,7 @@ Read `../../references/pi-planning-workflow.md` and `../../references/state-and-
 6. For every reference, produce a structured analysis artifact (manual structured read recorded in `REF_ANALYSIS.md`) before asking adoption questions.
 7. For every reference after analysis, ask at least 3 ref-specific adoption questions via `ask_choice` before using its ideas in `PLAN_v1.md`; each based on downloaded content, recommended option first, `Other` second-last, `Auto-complete` last (the tool appends both).
 8. Block rather than pad if fewer than 3 credible references exist, unless the user explicitly narrows the topic or waives the minimum. `Auto-complete` cannot grant this waiver.
-9. Continue with big-plan depth: at least 10 planning questions, required web research during brainstorming and refinement (`refine` `reviewers: 3` reviewer round, then a criticizer round), no refinement limit, at most five high-priority comments or questions per refinement round. Then the execution handoff (ask_choice with `autoComplete: false`, then the `execute_plan` tool).
+9. Continue with big-plan depth: at least 10 planning questions, required web research during brainstorming and refinement (`refine` `reviewers: 3` reviewer round, then a criticizer round), no refinement limit, at most five high-priority comments or questions per refinement round. Then the merged accept/execute question (ask_choice with `autoComplete: false`: ✓ Accept & execute now / Accept, don't execute yet / another round) and the `execute_plan` tool.
 
 ## REF_ANALYSIS.md
 

@@ -337,7 +337,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			if (focus) lines.push(`User-reported problems / refocus: ${focus}`);
 			lines.push(
 				"",
-				"Follow the original planning-skill contract for revisions: collect needed clarifications via ask_choice (one question at a time, recorded), apply evidence-based revisions only, then ask the next refinement-mode question, and finish with the execution handoff (ask_choice with autoComplete: false → execute_plan pointing at the new version).",
+				"Follow the original planning-skill contract for revisions: collect needed clarifications via ask_choice (one question at a time, recorded), apply evidence-based revisions only, then ask the next merged accept/execute question (autoComplete: false — ✓ Accept & execute now / Accept, don't execute yet / another round) and call execute_plan pointing at the new version on accept.",
 			);
 
 			await pi.sendUserMessage(lines.join("\n"));

@@ -20,7 +20,7 @@ Read `../../references/pi-planning-workflow.md` and `../../references/state-and-
    2. `Stop after RCA` — keep the diagnosis only.
    3. `Other` / 4. `Auto-complete` are added by the tool.
 4. On opt-out, stop after the summary; do not write `PROBLEM_ANALYSIS.md`.
-5. On opt-in (or `Auto-complete` choosing the recommendation), select the smallest fitting planning skill and follow that skill exactly: first-turn planning question, final scope confirmation, `PLAN_v1.md`, refinement, and the execution handoff (ask_choice with `autoComplete: false`, then the `execute_plan` tool).
+5. On opt-in (or `Auto-complete` choosing the recommendation), select the smallest fitting planning skill and follow that skill exactly: first-turn planning question, final scope confirmation, `PLAN_v1.md`, refinement, and the merged accept/execute question (ask_choice with `autoComplete: false`) before calling the `execute_plan` tool.
 
 ## Level Selection
 

@@ -70,7 +70,7 @@ Summarize the user's request in one paragraph.
 
 ## Execution Handoff Notes
 
-State anything the executor should know, including order of work, files to avoid, and verification commands. The execution handoff still requires explicit user approval (ask_choice with `autoComplete: false`, then the `execute_plan` tool) and must never be auto-completed. Once approved, the extension-managed execution loop injects the remaining checklist every turn and completes when every `[DONE:VC-xxx]` marker has landed — keep this section concise enough to serve as the executor's brief.
+State anything the executor should know, including order of work, files to avoid, and verification commands. The merged accept/execute question still requires explicit user approval (ask_choice with `autoComplete: false`, then the `execute_plan` tool) and must never be auto-completed. Once approved, the extension-managed execution loop injects the remaining checklist every turn and completes when every `[DONE:VC-xxx]` marker has landed — keep this section concise enough to serve as the executor's brief.
 
 ## Revision Ledger
 

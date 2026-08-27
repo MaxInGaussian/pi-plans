@@ -16,7 +16,7 @@ Read `../../references/pi-planning-workflow.md` and `../../references/state-and-
 - Inspect the target Git repo read-only before the first product question.
 - Ask 1 to 3 planning questions, one at a time, each via `ask_choice` (recommended option first; the tool adds `Other` second-last and `Auto-complete` last).
 - Ask the final scope confirmation, then write `PLAN_v1.md` under the artifact root (normally the configured workspace root, default `./docs/pi-plans/YYYY-MM-DD-topic/`) per `../../references/plan-artifact-template.md`.
-- After each plan version, ask the refinement-mode question via `ask_choice` — never run `refine` unless the user or `Auto-complete` selected it at that question. Default: exactly one round, recommended mode `Criticizer`; afterwards the recommended option is `Accept plan for tracked execution`, then the execution handoff (ask_choice with `autoComplete: false`, then the `execute_plan` tool).
+- After each plan version, ask the merged accept/execute question via `ask_choice` with `autoComplete: false` — never run `refine` unless the user picked another round at that question. Default: exactly one round, recommended mode `Criticizer`; afterwards the recommended option is `✓ Accept & execute now` in the merged accept/execute question (ask_choice with `autoComplete: false`: ✓ Accept & execute now / Accept, don't execute yet / another round), then the `execute_plan` tool.
 
 ## Fit
 

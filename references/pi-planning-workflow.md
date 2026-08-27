@@ -59,7 +59,7 @@ Every user-facing planning or refinement question goes through the `ask_choice` 
 
 - `options`: ordered options, recommended option first with `recommended: true` (exactly one), each with the tradeoff that matters in `description`;
 - do not add `Other` or `Auto-complete` yourself — the tool appends `Other…` second-last and `Auto-complete` last;
-- pass `autoComplete: false` for the execution handoff and for any install waiver, publishing, deployment, merge, push, credential, or external-state question. Auto-complete may choose the recommended planning or refinement option only.
+- pass `autoComplete: false` for the merged accept/execute question — it contains the execution approval, so Auto-complete never appears there — and for any install waiver, publishing, deployment, merge, push, credential, or external-state question. Auto-complete may choose the recommended planning or refinement option only.
 
 Answers are recorded automatically in the active run's `decisions.jsonl`. You must still maintain `DECISIONS.md` in the artifact directory (summary table of questions, options, answers, answer sources, open assumptions).
 
@@ -100,13 +100,13 @@ The execution loop parses `- [ ] \`VC-###\`` items and tracks `[DONE:VC-###]` ma
 
 ## Refinement
 
-After each plan version, ask one refinement-mode question via `ask_choice`. The recommended (first) option follows the skill level's default sequence; the user may always pick a different mode or keep refining:
+After each plan version, ask one merged accept/execute question via `ask_choice` with `autoComplete: false` — it contains the execution approval, so Auto-complete never appears. Options:
 
-- `plan-small`: recommend `Criticizer` for the first (and only default) round; afterwards recommend `Accept plan for tracked execution`.
-- `plan-normal`: recommend `Reviewer` first, then `Criticizer`; afterwards recommend `Accept plan for tracked execution`.
-- `plan-big`: recommend `Reviewer` first as three concurrent independent reviewers (`refine` with `reviewers: 3`), then `Criticizer`; afterwards recommend `Accept plan for tracked execution`.
+1. `✓ Accept PLAN_vN and execute it now` — mark the plan accepted (`plans set-status accepted`), then call the `execute_plan` tool.
+2. `Accept PLAN_vN, don't execute yet` — mark accepted; resume later via `/plans-execute`.
+3. `Run another round: <the level's default next refine mode>` — only while the level's default sequence is unfinished.
 
-Option list for the question: the recommended next step; the other refinement modes with their tradeoffs; `Accept plan for tracked execution`; `Other`; `Auto-complete`.
+The recommended option follows the skill level's default sequence: while the default rounds are unfinished it is option 3's default next mode (`plan-small`: `Criticizer`; `plan-normal`: `Reviewer` then `Criticizer`; `plan-big`: three concurrent reviewers (`refine` with `reviewers: 3`) then `Criticizer`); once the default sequence is complete it is option 1.
 
 If the user selects `Reviewer` or `Criticizer`, run the `refine` tool with the plan path and any focus. Reviewer output consolidates into `PLAN_vN_reviewer_comments.md` with findings IDs, severity, affected plan IDs, evidence, impact, recommended fix, and disposition. Revise the next plan only for findings accepted on evidence.
 
@@ -120,17 +120,11 @@ Present each criticizer question with `ask_choice` (one call per question, in th
 
 ### Round Lifecycle
 
-A refinement round is complete when all reviewer outputs have returned or all criticizer questions have answers. In the same turn: consolidate, accept or reject each finding on evidence (the user may override any disposition), revise to `PLAN_v(N+1).md` when accepted items require it (copy, edit only the new version, update the revision ledger and verifier checklist), then immediately ask the next refinement-mode question. Never end a turn merely because a round completed.
+A refinement round is complete when all reviewer outputs have returned or all criticizer questions have answers. In the same turn: consolidate, accept or reject each finding on evidence (the user may override any disposition), revise to `PLAN_v(N+1).md` when accepted items require it (copy, edit only the new version, update the revision ledger and verifier checklist), then immediately ask the next merged accept/execute question. Never end a turn merely because a round completed.
 
 ## Execution Handoff
 
-After the plan is accepted or refinement converges, ask the explicit execution-handoff question via `ask_choice` with `autoComplete: false`:
-
-1. `Execute this plan now` — enter the tracked execution loop (recommended once refinement converged).
-2. `Stop after planning` — keep the plan artifact only.
-3. `Other`.
-
-On approval, call the `execute_plan` tool (or the user runs `/plans-execute`). It re-confirms with the user, then the extension enters execution mode:
+When the user picks `✓ Accept PLAN_vN and execute it now` in the merged question, mark the plan accepted and call the `execute_plan` tool (or the user runs `/plans-execute`). It re-confirms with the user, then the extension enters execution mode:
 
 - every agent turn is injected with the remaining verifier checklist and execution rules (layered simplest implementation, no stopgaps, dependency and library discipline, minimum tests);
 - the read-only guard lifts: full write access returns;
@@ -144,8 +138,8 @@ If the user declines, stay in planning (or stop, per their choice). Never start 
 Stop and return to the workflow if any of these happen:
 
 - implementing before the approved execution handoff;
-- running `refine` without first asking the refinement-mode question, or before the role gates pass;
-- ending a turn after a completed refinement round without asking the next refinement-mode question;
+- running `refine` without first asking the merged accept/execute question, or before the role gates pass;
+- ending a turn after a completed refinement round without asking the next merged accept/execute question;
 - storing planning settings outside the target workspace's `.git/pi_plans/` state directory;
 - asking multiple planning questions in one message, or asking them outside `ask_choice`;
 - writing `PLAN_v1.md` before final scope confirmation;
