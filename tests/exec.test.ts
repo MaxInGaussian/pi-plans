@@ -249,9 +249,16 @@ describe("execution loop", () => {
 		initState(workdir);
 		const { run } = startRun(workdir, { topic: "demo", skill: "plan-small", requestText: "x" });
 
-		// planning: nothing in flight — no indicator.
+		// planning before any PLAN draft exists: 💬 (Q&A phase).
 		updateStatusWidget(ctx);
-		assert.equal(recorded.status, undefined);
+		assert.match(recorded.status ?? "", /💬 plans: /);
+		assert.equal(recorded.colors.at(-1), "muted");
+
+		// Once a draft lands: 📝, kept until execution starts.
+		fs.writeFileSync(path.join(run.artifact_dir, "PLAN_v1.md"), "# plan");
+		updateStatusWidget(ctx);
+		assert.match(recorded.status ?? "", /📝 plans: /);
+		assert.equal(recorded.colors.at(-1), "muted");
 
 		setRunStatus(workdir, run.run_id, "accepted");
 		updateStatusWidget(ctx);

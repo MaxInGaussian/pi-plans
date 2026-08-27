@@ -23,7 +23,7 @@ import {
 	type ItemDiffSummary,
 } from "./execution-panel.ts";
 import { getRun, readActive, setRunStatus, utcNow } from "./state.ts";
-import { scanDoneMarkers, type CheckItem } from "./plan.ts";
+import { latestPlanVersion, scanDoneMarkers, type CheckItem } from "./plan.ts";
 
 export interface ExecState extends ExecutionPanelExecutionLike {
 	startedAt: string;
@@ -95,7 +95,14 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("warning", `⏸ plans: ${active.run_id}`));
 			return;
 		}
-		// planning (or unknown): nothing is in flight — no indicator.
+		if (status === "planning") {
+			// Planning phase: 💬 while still in Q&A, 📝 once a PLAN draft exists
+			// — kept until execution starts (then 📋 takes over).
+			const emoji = latestPlanVersion(active.artifact_dir) ? "📝" : "💬";
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("muted", `${emoji} plans: ${active.run_id}`));
+			return;
+		}
+		// unknown status: no indicator.
 	}
 	ctx.ui.setStatus("pi-plans", undefined);
 }
