@@ -1,4 +1,4 @@
-<h1 align="center">pi-plans</h1>
+<h1 align="center">π-plans</h1>
 
 <p align="center">
   <img src="docs/assets/pi-plans-logo.svg?v=4" alt="pi-plans: Plan. Review. Execute." width="640" />
