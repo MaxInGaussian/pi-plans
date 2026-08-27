@@ -71,10 +71,10 @@ function formatToks(tokens: number): string {
 export function updateStatusWidget(ctx: ExtensionContext): void {
 	const progress = executionProgress();
 	if (progress && execution) {
-		// Progress lives in the bottom status bar — the same layer as the ⏸
+		// Progress lives in the bottom status bar — the same layer as the ⛔/⌛
 		// paused indicator — so both execution states read from one place.
 		const tail = execution.panel?.expanded ? "/plans-list hide" : "/plans-list details";
-		const line = `📋 plans ${progress.done}/${progress.total}: spent ${formatElapsed(execution.startedAt)} · ${formatToks(execution.usage.inToks)} in-toks · ${formatToks(execution.usage.outToks)} out-toks · ${tail}`;
+		const line = `⌛ plans ${progress.done}/${progress.total}: spent ${formatElapsed(execution.startedAt)} · ${formatToks(execution.usage.inToks)} in-toks · ${formatToks(execution.usage.outToks)} out-toks · ${tail}`;
 		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
 		return;
 	}
@@ -84,20 +84,24 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 		// done reads as finished, abandoned as closed, stopped/accepted as paused.
 		const status = getRun(ctx.cwd, active.run_id)?.status;
 		if (status === "done") {
-			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("success", `✓ plans: ${active.run_id} (done)`));
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("success", `🎯 plans: ${active.run_id} (done)`));
 			return;
 		}
 		if (status === "abandoned") {
-			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("error", `⏹ plans: ${active.run_id}`));
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("error", `🚫 plans: ${active.run_id}`));
 			return;
 		}
-		if (status === "stopped" || status === "accepted") {
-			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("warning", `⏸ plans: ${active.run_id}`));
+		if (status === "stopped") {
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("warning", `⛔ plans: ${active.run_id}`));
+			return;
+		}
+		if (status === "accepted") {
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("warning", `⌛ plans: ${active.run_id}`));
 			return;
 		}
 		if (status === "planning") {
 			// Planning phase: 💬 while still in Q&A, 📝 once a PLAN draft exists
-			// — kept until execution starts (then 📋 takes over).
+			// — kept until execution starts (then ⌛ takes over).
 			const emoji = latestPlanVersion(active.artifact_dir) ? "📝" : "💬";
 			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("muted", `${emoji} plans: ${active.run_id}`));
 			return;

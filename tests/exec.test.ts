@@ -104,9 +104,9 @@ describe("execution loop", () => {
 		startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001", "VC-002"));
 
 		// Collapsed by default: progress lives in the bottom status bar (same
-		// layer as the ⏸ indicator); no panel widget is registered yet.
+		// layer as the ⛔/⌛ indicators); no panel widget is registered yet.
 		assert.equal(recorded.widget, undefined);
-		assert.match(recorded.status ?? "", /📋 plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
+		assert.match(recorded.status ?? "", /⌛ plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
 		assert.match(recorded.status ?? "", /in-toks/);
 		assert.match(recorded.status ?? "", /out-toks/);
 		assert.match(recorded.status ?? "", /\/plans-list details/);
@@ -226,9 +226,9 @@ describe("execution loop", () => {
 		const { pi, ctx, recorded } = makeHarness(workdir);
 		startExecution(pi, ctx, path.join(workdir, "PLAN_v2.md"), items("VC-001", "VC-002"));
 
-		// Bottom status bar carries the count — the same layer as ⏸ — so both
+		// Bottom status bar carries the count — the same layer as ⛔/⌛ — so both
 		// execution states read from one consistent place.
-		assert.match(recorded.status ?? "", /📋 plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
+		assert.match(recorded.status ?? "", /⌛ plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
 		assert.match(recorded.status ?? "", /in-toks/);
 		assert.match(recorded.status ?? "", /\/plans-list details/);
 
@@ -262,22 +262,22 @@ describe("execution loop", () => {
 
 		setRunStatus(workdir, run.run_id, "accepted");
 		updateStatusWidget(ctx);
-		assert.match(recorded.status ?? "", /⏸ plans: /);
+		assert.match(recorded.status ?? "", /⌛ plans: /);
 		assert.equal(recorded.colors.at(-1), "warning");
 
 		setRunStatus(workdir, run.run_id, "stopped");
 		updateStatusWidget(ctx);
-		assert.match(recorded.status ?? "", /⏸ plans: /);
+		assert.match(recorded.status ?? "", /⛔ plans: /);
 		assert.equal(recorded.colors.at(-1), "warning");
 
 		setRunStatus(workdir, run.run_id, "done");
 		updateStatusWidget(ctx);
-		assert.match(recorded.status ?? "", /✓ plans: .*\(done\)/);
+		assert.match(recorded.status ?? "", /🎯 plans: .*\(done\)/);
 		assert.equal(recorded.colors.at(-1), "success");
 
 		setRunStatus(workdir, run.run_id, "abandoned");
 		updateStatusWidget(ctx);
-		assert.match(recorded.status ?? "", /⏹ plans: /);
+		assert.match(recorded.status ?? "", /🚫 plans: /);
 		assert.equal(recorded.colors.at(-1), "error");
 	});
 
