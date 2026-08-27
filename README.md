@@ -58,8 +58,9 @@ A rough change request becomes a versioned Markdown plan instead of a surprise d
    =============================================== write guard OFF
                  |
         tracked execution loop
+   fused AGENTS.md × Ponytail executor rules
    checklist injected each turn, [DONE:VC-xxx]
-   markers tracked with a footer widget
+   markers tracked via bottom status bar + detail panel
                  |
                  v
            run status: done
@@ -116,7 +117,8 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 | Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run |
 | Refinement rounds | Read-only reviewer/criticizer Pi subagents consolidate findings into the next plan version |
 | Workspace state | Config, runs, decisions, refs, and subagent ledgers in `.git/pi_plans/` (git common dir) |
-| Tracked execution | Checklist injected each turn; `[DONE:VC-xxx]` markers drive progress |
+| Tracked execution | Checklist injected each turn; `[DONE:VC-xxx]` markers drive progress; live `x/y · spent · in/out-toks` in the bottom status bar |
+| Efficient executor prompt | Each turn, the executor is steered by a fused rule set — Marcos Hernanz's AGENTS.md principles × Ponytail minimalism: layered growth, simplest implementation, long-term architecture (no stopgaps), library discipline — so plans finish in fewer tokens and fewer detours |
 | Write guard | `edit`/`write` blocked outside planning artifacts while a run is active |
 
 ## Interface overview
@@ -132,6 +134,23 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 | `/update-plan [plan.md] [reason…]` | Interrupt-and-refine: stops execution (if any), returns the run to planning, and directs the agent to revise the plan into `PLAN_vN+1.md` while preserving verified work |
 | `/plans-stop` | Stop execution mode |
 | `/plans-abandon` | Abandon the active run (lifts the write guard; artifacts stay) |
+| Status bar (lifecycle) | 💬 Q&A → 📝 draft written (planning sub-phases) → ⌛ executing `x/y · spent · in/out-toks` → ⛔ stopped / 🎯 done / 🚫 abandoned |
+
+## The execution rules
+
+Once you approve the handoff, every turn injects a compact rule set that fuses Marcos Hernanz's AGENTS.md seven principles with Ponytail minimalism — so the executor finishes plans in fewer tokens and fewer detours:
+
+<details>
+<summary>The four fused rules (click to expand)</summary>
+
+1. **Grow in layers** — smallest end-to-end slice first, then stack each new capability on top of what already works.
+2. **Simplest implementation** — no speculative abstractions, configuration, or indirection; modular components with clearly separated concerns.
+3. **Long-term architecture, no stopgaps** — no backward-compatibility layers, fallbacks, or migrations; remove the obsolete paths a change obsoletes.
+4. **Library discipline** — prefer established, well-maintained libraries; check the project's existing dependencies (docs and types) before writing your own or adding a package.
+
+</details>
+
+The rules cost four lines per turn and buy back far more: fewer wrong turns, shorter implementation paths, plans that finish in fewer tokens.
 
 ## Skills
 
@@ -211,6 +230,10 @@ Preferences and run ledgers in `.git/pi_plans/` inside your workspace's git dire
 **How is this different from just prompting an AI to make changes?**
 
 Prompts produce one-shot diffs with no recorded reasoning. pi-plans produces versioned artifacts — decisions, references, reviewer findings, dispositions, a verifier checklist — that are auditable, resumable across sessions, and enforced by tooling rather than goodwill.
+
+**Doesn't injecting execution rules every turn cost extra tokens?**
+
+The injected rule set is four compressed lines. It buys back more than it costs: the executor stops re-deriving discipline (no speculative abstractions, no compatibility detours, no reinvented helpers), so finished items converge in fewer turns and fewer tokens overall.
 
 ## License
 
