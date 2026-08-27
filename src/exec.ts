@@ -22,7 +22,7 @@ import {
 	type ExecutionPanelState,
 	type ItemDiffSummary,
 } from "./execution-panel.ts";
-import { readActive, setRunStatus, utcNow } from "./state.ts";
+import { getRun, readActive, setRunStatus, utcNow } from "./state.ts";
 import { scanDoneMarkers, type CheckItem } from "./plan.ts";
 
 export interface ExecState extends ExecutionPanelExecutionLike {
@@ -80,8 +80,22 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 	}
 	const active = readActive(ctx.cwd);
 	if (active) {
-		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("warning", `⏸ plans: ${active.run_id}`));
-		return;
+		// Idle indicator depends on the run's lifecycle, not just its existence:
+		// done reads as finished, abandoned as closed, stopped/accepted as paused.
+		const status = getRun(ctx.cwd, active.run_id)?.status;
+		if (status === "done") {
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("success", `✓ plans: ${active.run_id} (done)`));
+			return;
+		}
+		if (status === "abandoned") {
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("error", `⏹ plans: ${active.run_id}`));
+			return;
+		}
+		if (status === "stopped" || status === "accepted") {
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("warning", `⏸ plans: ${active.run_id}`));
+			return;
+		}
+		// planning (or unknown): nothing is in flight — no indicator.
 	}
 	ctx.ui.setStatus("pi-plans", undefined);
 }

@@ -16,13 +16,16 @@ import {
 	startExecution,
 	stopExecution,
 	toggleExecutionPanelView,
+	updateStatusWidget,
 } from "../src/exec.ts";
 import type { CheckItem } from "../src/plan.ts";
+import { initState, setRunStatus, startRun } from "../src/state.ts";
 
 interface Recorded {
 	entries: { type: string; customType?: string; data?: unknown }[];
 	messages: { customType: string; content: string }[];
 	status: string | undefined;
+	colors: string[];
 	widget?: { key: string; options?: unknown; factory: any };
 	widgetCalls: number;
 }
@@ -34,7 +37,7 @@ interface Harness {
 }
 
 function makeHarness(workdir: string): Harness {
-	const recorded: Recorded = { entries: [], messages: [], status: undefined, widgetCalls: 0 };
+	const recorded: Recorded = { entries: [], messages: [], status: undefined, colors: [], widgetCalls: 0 };
 	const pi = {
 		appendEntry: (customType: string, data: unknown) => {
 			recorded.entries.push({ type: "custom", customType, data });
@@ -56,7 +59,10 @@ function makeHarness(workdir: string): Harness {
 			recorded.widget = { key, options, factory };
 		},
 		theme: {
-			fg: (_color: string, text: string) => text,
+			fg: (color: string, text: string) => {
+				recorded.colors.push(color);
+				return text;
+			},
 			strikethrough: (text: string) => `~~${text}~~`,
 		},
 	};
@@ -233,6 +239,38 @@ describe("execution loop", () => {
 		applyDoneMarkers("[DONE:VC-001]");
 		completeExecution(pi, ctx);
 		assert.equal(getExecution(), null);
+
+	});
+
+	it("renders the idle indicator by run status", () => {
+		const workdir = freshWorkdir();
+		const { ctx, recorded } = makeHarness(workdir);
+		initState(workdir);
+		const { run } = startRun(workdir, { topic: "demo", skill: "plan-small", requestText: "x" });
+
+		// planning: nothing in flight — no indicator.
+		updateStatusWidget(ctx);
+		assert.equal(recorded.status, undefined);
+
+		setRunStatus(workdir, run.run_id, "accepted");
+		updateStatusWidget(ctx);
+		assert.match(recorded.status ?? "", /⏸ plans: /);
+		assert.equal(recorded.colors.at(-1), "warning");
+
+		setRunStatus(workdir, run.run_id, "stopped");
+		updateStatusWidget(ctx);
+		assert.match(recorded.status ?? "", /⏸ plans: /);
+		assert.equal(recorded.colors.at(-1), "warning");
+
+		setRunStatus(workdir, run.run_id, "done");
+		updateStatusWidget(ctx);
+		assert.match(recorded.status ?? "", /✓ plans: .*\(done\)/);
+		assert.equal(recorded.colors.at(-1), "success");
+
+		setRunStatus(workdir, run.run_id, "abandoned");
+		updateStatusWidget(ctx);
+		assert.match(recorded.status ?? "", /⏹ plans: /);
+		assert.equal(recorded.colors.at(-1), "error");
 	});
 
 	it("defers persistence and widget churn when toggling mid-turn", () => {
