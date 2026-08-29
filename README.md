@@ -16,10 +16,9 @@
   <a href="https://www.npmjs.com/package/pi-plans"><img alt="npm version" src="https://img.shields.io/npm/v/pi-plans?color=60a5fa" /></a>
   <a href="https://www.npmjs.com/package/pi-plans"><img alt="npm downloads" src="https://img.shields.io/npm/dt/pi-plans?color=38bdf8" /></a>
   <a href="./LICENSE"><img alt="License" src="https://img.shields.io/npm/l/pi-plans?color=22c55e" /></a>
-  <a href="https://github.com/earendil-works/pi"><img alt="Pi package" src="https://img.shields.io/badge/Pi-package-fbbf24" /></a>
   <a href="https://hits.sh/github.com/MaxInGaussian/pi-plans/"><img alt="Repo views" src="https://hits.sh/github.com/MaxInGaussian/pi-plans.svg?label=repo%20views" /></a>
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-TS-3178C6?style=square&logo=typescript&logoColor=white" />
-  <img alt="pi-package" src="https://img.shields.io/badge/pi--package-ready-7c3aed?style=square" />
+  <a href="https://github.com/earendil-works/pi"><img alt="Pi package" src="https://img.shields.io/badge/Pi-package-fbbf24" /></a>
 </p>
 
 ---
