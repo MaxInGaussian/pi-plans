@@ -12,8 +12,12 @@
 
 <p align="center">
   <a href="https://github.com/MaxInGaussian/pi-plans/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/MaxInGaussian/pi-plans?style=square" /></a>
+  <a href="https://github.com/MaxInGaussian/pi-plans/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/MaxInGaussian/pi-plans/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://www.npmjs.com/package/pi-plans"><img alt="npm version" src="https://img.shields.io/npm/v/pi-plans?color=60a5fa" /></a>
+  <a href="https://www.npmjs.com/package/pi-plans"><img alt="npm downloads" src="https://img.shields.io/npm/dt/pi-plans?color=38bdf8" /></a>
+  <a href="./LICENSE"><img alt="License" src="https://img.shields.io/npm/l/pi-plans?color=22c55e" /></a>
+  <a href="https://github.com/earendil-works/pi"><img alt="Pi package" src="https://img.shields.io/badge/Pi-package-fbbf24" /></a>
   <a href="https://hits.sh/github.com/MaxInGaussian/pi-plans/"><img alt="Repo views" src="https://hits.sh/github.com/MaxInGaussian/pi-plans.svg?label=repo%20views" /></a>
-  <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg?style=square" /></a>
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-TS-3178C6?style=square&logo=typescript&logoColor=white" />
   <img alt="pi-package" src="https://img.shields.io/badge/pi--package-ready-7c3aed?style=square" />
 </p>
@@ -113,7 +117,10 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 | Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run |
 | Refinement rounds | Read-only reviewer/criticizer Pi subagents consolidate findings into the next plan version |
 | Workspace state | Config, runs, decisions, refs, and subagent ledgers in `.git/pi_plans/` (git common dir) |
-| Tracked execution | Checklist injected each turn; `[DONE:VC-xxx]` markers drive progress; live `x/y · spent · in/out-toks` in the bottom status bar |
+| Tracked execution | Checklist injected each turn; `[DONE:VC-xxx]` markers drive completion; implementation items report progress with `[I-xxx:implemented]` / `[I-xxx:validating]` markers; `plans-list` groups work by I-item with `[Pending/Implementing/Implemented/Validating/VC passed]` states (passed items struck through); the collapsed footer and expanded panel share the same progress projection, so `x/y` updates in real time in both views |
+| Execution model | With `plans set-execution-model <provider/model[:thinking]>`, the main session switches to it at handoff and restores the planning model + thinking level on stop/complete/abandon; when unset, the first execution handoff prompts for one and recommends inheriting the current session model |
+| Execution-phase compaction | Pi core owns threshold, overflow, and manual compaction scheduling; pi-plans only supplies a plan-aware `session_before_compact` summary and queues one hidden continuation when Pi reports `willRetry: false`, while preserving the raw execution tail and `previousSummary` chaining |
+| Planning-phase auto compaction | In active planning runs (run.status=planning, no execution), context usage >=100% triggers a plan-aware compaction too: pre-plan history compresses, Q&A during planning stays in a dedicated section, the latest `PLAN_vN.md` and later conversation stay raw; cooldown + resume guard prevent ping-pong, and manual `/compact` follows the same rules |
 | Efficient executor prompt | Each turn, the executor is steered by a fused rule set — Marcos Hernanz's AGENTS.md principles × Ponytail minimalism: layered growth, simplest implementation, long-term architecture (no stopgaps), library discipline — so plans finish in fewer tokens and fewer detours |
 | Write guard | `edit`/`write` blocked outside planning artifacts while a run is active |
 
@@ -121,16 +128,17 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 
 | Tool / Command | Purpose |
 |---|---|
-| `plans` | State CLI: `init`, `show`, `set-language`, `set-artifact-root`, `set-role`, `start-run`, `set-status`, `record-decision`, `record-ref`, `record-subagent` |
+| `plans` | State CLI: `init`, `show`, `set-language`, `set-artifact-root`, `set-execution-model`, `set-role`, `start-run`, `set-status`, `record-decision`, `record-ref`, `record-subagent` |
 | `ask_choice` | Numbered choice prompt; `autoComplete: false` for the merged accept/execute question and external-state questions |
 | `refine` | Reviewer/criticizer round via read-only subagents (`--tools read,grep,find,ls`); `reviewers: 3` for big plans; enforces role/model confirmation gates |
-| `execute_plan` | Execution handoff: re-confirms with the user, enters extension-managed execution mode |
-| `/plans` | Show config, active run, execution progress |
-| `/plans-execute [plan.md]` | Manual execution handoff (defaults to highest `PLAN_vN.md`) |
+| `execute_plan` | Execution handoff: re-confirms with the user, prompts for an execution model if needed, and enters extension-managed execution mode |
+| `/plans` | Show config, active run, and execution progress |
+| `/plans-list` | Toggle the execution checklist panel |
+| `/plans-execute [plan.md]` | Manual execution handoff (defaults to highest `PLAN_vN.md`; prompts for an execution model if unset) |
 | `/update-plan [plan.md] [reason…]` | Interrupt-and-refine: stops execution (if any), returns the run to planning, and directs the agent to revise the plan into `PLAN_vN+1.md` while preserving verified work |
 | `/plans-stop` | Stop execution mode |
 | `/plans-abandon` | Abandon the active run (lifts the write guard; artifacts stay) |
-| Status bar (lifecycle) | 💬 Q&A → 📝 draft written (planning sub-phases) → ⌛ executing `x/y · spent · in/out-toks` → ⛔ stopped / 🎯 done / 🚫 abandoned |
+| Status bar (lifecycle) | 💬 Q&A → 📝 draft written (planning sub-phases) → ⌛ executing `x/y · spent · in/out-toks` in the collapsed footer or expanded panel → ⛔ stopped / 🎯 done / 🚫 abandoned |
 
 ## The execution rules
 
