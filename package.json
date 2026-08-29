@@ -1,6 +1,6 @@
 {
   "name": "pi-plans",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Human-in-the-loop planning extension for the Pi coding agent: researched, refined Markdown plans before any code changes.",
   "license": "MIT",
   "type": "module",
