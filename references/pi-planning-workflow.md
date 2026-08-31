@@ -9,8 +9,9 @@ This skill set is written for the Pi coding agent's documented behavior:
 - the five skills are contributed by the pi-plans extension and loaded as Pi skills (also invokable as `/skill:<name>`);
 - skill references and helper sources are resolved relative to the directory containing `SKILL.md`;
 - the extension provides these tools: `plans` (workspace state), `ask_choice` (choice prompts), `refine` (reviewer/criticizer subagents), and `execute_plan` (execution handoff);
-- `refine` spawns read-only Pi subagents (`pi --mode json -p --no-session --tools read,grep,find,ls`) with isolated context; their results return to the main session as tool output;
-- the execution loop is extension-managed: remaining verifier items are injected each turn and `[DONE:VC-xxx]` markers are tracked with a footer progress widget.
+- `refine` spawns read-only Pi subagents (`pi --mode json -p --no-session --tools read,grep,find,ls`) with isolated context; delegated Reviewer/Criticizer runs show a standalone aggregate overlay titled `Reviewer` or `Criticizer`, close the overlay before returning, and return conclusions to the main session as tool output;
+- the execution loop is extension-managed: remaining verifier items are injected each turn, implementation items emit `[I-###:current]`/`[I-###:implemented|validating]`, and `[DONE:VC-xxx]` markers are tracked with a bottom status bar;
+- execution and planning compaction keep Pi's SessionManager as the history owner, group compacted history by implementation item, retain a legal current-I suffix, summarize paired reads as bounded `Read: <path> line <X-Y> Extracted information summary: ...` records, and target `<10%` of the model window after a current-I slice exceeds `20%`; hard-floor cases are recorded instead of looping;
 
 ## Planning Boundary
 
@@ -60,6 +61,7 @@ Every user-facing planning or refinement question goes through the `ask_choice` 
 - `options`: ordered options, recommended option first with `recommended: true` (exactly one), each with the tradeoff that matters in `description`;
 - do not add `Other` or `Auto-complete` yourself — the tool appends `Other…` second-last and `Auto-complete` last;
 - pass `autoComplete: false` for the merged accept/execute question — it contains the execution approval, so Auto-complete never appears there — and for any install waiver, publishing, deployment, merge, push, credential, or external-state question. Auto-complete may choose the recommended planning or refinement option only.
+- When the user selects Auto-complete, it remains active for the current planning run: later eligible questions use their recommended options automatically, and the extension queues one deduplicated follow-up if the model stops after an auto-completed answer. `/plans-autocomplete-stop` disables it; session restore may reactivate it only for the same active run while its status is `planning`.
 
 Answers are recorded automatically in the active run's `decisions.jsonl`. You must still maintain `DECISIONS.md` in the artifact directory (summary table of questions, options, answers, answer sources, open assumptions).
 
@@ -126,7 +128,8 @@ A refinement round is complete when all reviewer outputs have returned or all cr
 
 When the user picks `✓ Accept PLAN_vN and execute it now` in the merged question, mark the plan accepted and call the `execute_plan` tool (or the user runs `/plans-execute`). It re-confirms with the user, then the extension enters execution mode:
 
-- every agent turn is injected with the remaining verifier checklist and execution rules (layered simplest implementation, no stopgaps, dependency and library discipline, minimum tests);
+- every agent turn is injected with the remaining verifier checklist and execution rules (layered simplest implementation, waiting for subprocess-backed verification with backoff 5s -> 10s -> 20s -> 40s -> 80s, then keep polling at 80s and restart at 5s for each new subprocess, no stopgaps, dependency and library discipline, minimum tests);
+- execution-phase compaction may proactively compact the current-I slice above 20% of the model window, summarizes the oldest eligible prefix and bounded Read records, preserves a legal recent suffix, and records whether the <10% target was met; Pi still owns threshold, overflow, and manual scheduling;
 - the read-only guard lifts: full write access returns;
 - the run status moves to `executing`, then `done` when the last `[DONE:VC-xxx]` marker lands;
 - `/plans-stop` stops execution; `/plans` shows progress.

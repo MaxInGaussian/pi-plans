@@ -96,7 +96,20 @@ const PlansParams = Type.Object({
 	),
 });
 
+// Module-level reference so the start-run action can append a session entry
+// (pi-plans-run-start) at the moment the planning run begins. The ExtensionAPI
+// itself is not in scope for `startRun`, mirroring `setCurrentApi` in
+// tools/execute-plan.ts.
+let runStartAppender: ((runId: string, artifactDir: string) => void) | null = null;
+
+export function setRunStartAppender(appender: ((runId: string, artifactDir: string) => void) | null): void {
+	runStartAppender = appender;
+}
+
 export function registerPlansTool(pi: ExtensionAPI): void {
+	setRunStartAppender((runId, artifactDir) => {
+		pi.appendEntry("pi-plans-run-start", { runId, artifactDir });
+	});
 	pi.registerTool({
 		name: "plans",
 		label: "Plans",
@@ -157,6 +170,9 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 							topic: params.topic,
 							skill: params.skill,
 							requestText: params.requestText,
+							onStart: (run) => {
+								runStartAppender?.(run.run_id, run.artifact_dir);
+							},
 						});
 						break;
 					}

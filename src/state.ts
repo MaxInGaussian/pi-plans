@@ -34,6 +34,7 @@ export interface RoleConfig {
 	confirmed_at: string | null;
 }
 
+
 export interface PlansConfig {
 	schema: number;
 	language: LanguageConfig;
@@ -52,6 +53,13 @@ function normalizeArtifactRoot(config: PlansConfig): PlansConfig {
 		return { ...config, artifact_root: DEFAULT_ARTIFACT_ROOT };
 	}
 	return config;
+}
+
+type LegacyPlansConfig = PlansConfig & { execution?: unknown };
+
+function normalizeLegacyExecutionConfig(config: LegacyPlansConfig): PlansConfig {
+	const { execution: _execution, ...rest } = config;
+	return rest as PlansConfig;
 }
 
 export const DEFAULT_CONFIG: PlansConfig = {
@@ -256,7 +264,8 @@ export function loadConfig(stateRoot: string): PlansConfig {
 	} catch (error) {
 		throw new StateError(`invalid config.json: ${(error as Error).message}`);
 	}
-	return normalizeArtifactRoot(deepMergeDefaults(data as PlansConfig, DEFAULT_CONFIG));
+	const merged = deepMergeDefaults(data as LegacyPlansConfig, DEFAULT_CONFIG as LegacyPlansConfig);
+	return normalizeLegacyExecutionConfig(normalizeArtifactRoot(merged as PlansConfig));
 }
 
 function noticeIfSubdir(workdir: string, notices: string[]): void {
@@ -316,6 +325,7 @@ export function setArtifactRoot(workdir: string, artifactRoot: string, source: "
 	return { config, stateRoot, notices };
 }
 
+
 export interface SetRoleOptions {
 	role: "reviewer" | "criticizer";
 	mode?: string;
@@ -359,6 +369,7 @@ export interface StartRunOptions {
 	topic: string;
 	skill: string;
 	requestText: string;
+	onStart?: (run: RunInfo) => void;
 }
 
 export interface StartRunResult {
@@ -408,6 +419,13 @@ export function startRun(workdir: string, options: StartRunOptions): StartRunRes
 		run_dir: runDir,
 		artifact_dir: artifactDir,
 	} satisfies ActiveInfo);
+	if (options.onStart) {
+		try {
+			options.onStart(run);
+		} catch {
+			/* marker failure is non-fatal: planning start should not abort when the entry appender rejects */
+		}
+	}
 	return { run, notices };
 }
 

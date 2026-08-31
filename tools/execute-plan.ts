@@ -8,9 +8,13 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { startExecution } from "../src/exec.ts";
-import { latestPlanVersion, parseChecklist } from "../src/plan.ts";
+import {
+	startExecution,
+} from "../src/exec.ts";
+import { disableAutoComplete } from "../src/autocomplete.ts";
+import { latestPlanVersion, parseChecklist, parseImplItems } from "../src/plan.ts";
 import { normalizeWorkdir, readActive } from "../src/state.ts";
+
 
 const ExecutePlanParams = Type.Object({
 	planPath: Type.Optional(
@@ -55,14 +59,17 @@ export async function executeHandoff(
 		return { status: "error", message: `Plan file not found: ${planPath}` };
 	}
 
-	const items = parseChecklist(fs.readFileSync(planPath, "utf8"));
+	const planText = fs.readFileSync(planPath, "utf8");
+	const items = parseChecklist(planText);
 	if (items.length === 0) {
 		return {
 			status: "error",
 			message: `${planPath} has no parsable \`## Verifier Checklist\` with \`- [ ] \`VC-###\` ...\` items. Fix the plan before execution.`,
 		};
 	}
+	const implItems = parseImplItems(planText);
 
+	disableAutoComplete(ctx, "execution handoff");
 	if (!ctx.hasUI) {
 		return {
 			status: "error",
@@ -80,12 +87,13 @@ export async function executeHandoff(
 		return { status: "declined", message: "User declined execution. Stay in planning; ask how to proceed.", planPath };
 	}
 
-	startExecution(getCurrentApi(), ctx, planPath, items);
+	await startExecution(getCurrentApi(), ctx, planPath, items, implItems);
+	const scopeNote = implItems.length ? ` Tracking ${implItems.length} implementation item(s).` : "";
 	return {
 		status: "executing",
 		planPath,
 		itemCount: items.length,
-		message: `Execution approved. ${items.length} verifier item(s) queued; implement in dependency order and mark verified items with [DONE:VC-xxx].`,
+		message: `Execution approved. ${items.length} verifier item(s) queued; implement in dependency order and mark verified items with [DONE:VC-xxx].${scopeNote}`,
 	};
 }
 

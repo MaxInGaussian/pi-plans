@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { loadConfig, normalizeWorkdir, readActive, recordSubagent, resolveStateRootOrNull, StateError, type RoleConfig } from "../src/state.ts";
 import { buildCriticizerTask, buildReviewerTask, reviewerLanes } from "../src/refine-prompts.ts";
 import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
+import { RefineOverlayController, refineOverlayContext } from "../src/refine-ui.ts";
 
 const RefineParams = Type.Object({
 	role: StringEnum(["reviewer", "criticizer"] as const, { description: "Refinement role to run" }),
@@ -46,7 +47,29 @@ function roleGateError(role: string, roleConfig: RoleConfig | undefined, problem
 	);
 }
 
+function setupRefinementExecution(
+	ctx: ExtensionContext,
+	parentSignal: AbortSignal | undefined,
+	role: "reviewer" | "criticizer",
+	lanes: Array<{ id: string; label?: string }>,
+) {
+	const controller = new AbortController();
+	const relayAbort = () => controller.abort();
+	if (parentSignal?.aborted) controller.abort();
+	else parentSignal?.addEventListener("abort", relayAbort, { once: true });
 
+	const overlay = ctx.mode === "tui" ? new RefineOverlayController(role, lanes, relayAbort) : undefined;
+	overlay?.open(refineOverlayContext(ctx));
+
+	return {
+		signal: controller.signal,
+		overlay,
+		async close() {
+			await overlay?.close();
+			parentSignal?.removeEventListener("abort", relayAbort);
+		},
+	};
+}
 
 export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 	const agentsDir = path.join(baseDir, "agents");
@@ -119,28 +142,35 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 
 			if (params.role === "criticizer") {
 				const name = `${roleConfig.name_prefix}-criticizer-${Date.now().toString(36)}`;
-				const result = await runPiSubagent({
-					systemPrompt,
-					task: buildCriticizerTask({ planText, planPath, focus: params.focus, context: params.context }),
-					cwd: workdir,
-					model,
-					signal,
-				});
-				record(name, result.ok ? result.model ?? model : null);
-				if (!result.ok) {
-					throw new Error(
-						`criticizer subagent failed: ${result.errorMessage ?? "unknown error"}${result.stderr ? `\nstderr: ${result.stderr.slice(0, 2000)}` : ""}`,
-					);
+				const execution = setupRefinementExecution(ctx, signal, "criticizer", [{ id: name, label: "criticizer" }]);
+				try {
+					const result = await runPiSubagent({
+						systemPrompt,
+						task: buildCriticizerTask({ planText, planPath, focus: params.focus, context: params.context }),
+						cwd: workdir,
+						model,
+						signal: execution.signal,
+						onProgress: (event) => execution.overlay?.update(name, event),
+					});
+					execution.overlay?.complete(name, result);
+					record(name, result.ok ? result.model ?? model : null);
+					if (!result.ok) {
+						throw new Error(
+							`criticizer subagent failed: ${result.errorMessage ?? "unknown error"}${result.stderr ? `\nstderr: ${result.stderr.slice(0, 2000)}` : ""}`,
+						);
+					}
+					return {
+						content: [
+							{
+								type: "text",
+								text: `${result.output}\n\n---\nAsk each criticizer question with ask_choice (one call per question, in the configured language), record every answer, then revise the plan only after every question has an answer.`,
+							},
+						],
+						details: { mode: "delegated-subagent", role: params.role, planPath, model: result.model ?? model },
+					};
+				} finally {
+					await execution.close();
 				}
-				return {
-					content: [
-						{
-							type: "text",
-							text: `${result.output}\n\n---\nAsk each criticizer question with ask_choice (one call per question, in the configured language), record every answer, then revise the plan only after every question has an answer.`,
-						},
-					],
-					details: { mode: "delegated-subagent", role: params.role, planPath, model: result.model ?? model },
-				};
 			}
 
 			// Reviewer round: 1 by default, 3 for the big-plan concurrent round.
@@ -152,62 +182,86 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				return { lane, name, task };
 			});
 
-			const results = await Promise.all(
-				jobs.map(async (job) => {
-					try {
-						const result = await runPiSubagent({ systemPrompt, task: job.task, cwd: workdir, model, signal });
-						record(job.name, result.ok ? result.model ?? model : null);
-						return { job, result };
-					} catch (error) {
-						record(job.name, null);
-						const message = error instanceof Error ? error.message : String(error);
-						return {
-							job,
-							result: { ok: false, output: "", model: model ?? undefined, errorMessage: message, stderr: "", turns: 0 },
-						};
-					}
-				}),
+			const execution = setupRefinementExecution(
+				ctx,
+				signal,
+				"reviewer",
+				jobs.map((job) => ({ id: job.lane.id, label: job.lane.id })),
 			);
-
-			const sections: string[] = [];
-			let failures = 0;
-			for (const { job, result } of results) {
-				const title = job.lane.lens ? `${job.name} — ${job.lane.lens}` : job.name;
-				if (!result.ok) {
-					failures += 1;
-					sections.push(`### ${title} — FAILED\n${result.errorMessage ?? "unknown error"}`);
-					continue;
-				}
-				sections.push(`### ${title}\n${result.output}`);
-			}
-			if (failures === results.length) {
-				const first = results[0];
-				throw new Error(
-					`all reviewer subagents failed: ${first?.result.errorMessage ?? "unknown error"}${first?.result.stderr ? `\nstderr: ${first.result.stderr.slice(0, 2000)}` : ""}${model ? `\nIf the model selector "${model}" is unavailable, reset the confirmation (plans set-role --reset-confirmation) and re-ask the model-confirmation question.` : ""}`,
+			try {
+				const results = await Promise.all(
+					jobs.map(async (job) => {
+						try {
+							const result = await runPiSubagent({
+								systemPrompt,
+								task: job.task,
+								cwd: workdir,
+								model,
+								signal: execution.signal,
+								onProgress: (event) => execution.overlay?.update(job.lane.id, event),
+							});
+							execution.overlay?.complete(job.lane.id, result);
+							record(job.name, result.ok ? result.model ?? model : null);
+							return { job, result };
+						} catch (error) {
+							record(job.name, null);
+							const message = error instanceof Error ? error.message : String(error);
+							const result = {
+								ok: false,
+								output: "",
+								model: model ?? undefined,
+								errorMessage: message,
+								stderr: "",
+								turns: 0,
+							};
+							execution.overlay?.complete(job.lane.id, result);
+							return { job, result };
+						}
+					}),
 				);
-			}
 
-			const combined = sections.join("\n\n---\n\n");
-			const truncation = truncateHead(combined, { maxLines: 2000, maxBytes: 50 * 1024 });
-			let text = truncation.content;
-			if (truncation.truncated) text += `\n\n[Output truncated; full outputs remain in this tool result's details.]`;
+				const sections: string[] = [];
+				let failures = 0;
+				for (const { job, result } of results) {
+					const title = job.lane.lens ? `${job.name} — ${job.lane.lens}` : job.name;
+					if (!result.ok) {
+						failures += 1;
+						sections.push(`### ${title} — FAILED\n${result.errorMessage ?? "unknown error"}`);
+						continue;
+					}
+					sections.push(`### ${title}\n${result.output}`);
+				}
+				if (failures === results.length) {
+					const first = results[0];
+					throw new Error(
+						`all reviewer subagents failed: ${first?.result.errorMessage ?? "unknown error"}${first?.result.stderr ? `\nstderr: ${first.result.stderr.slice(0, 2000)}` : ""}${model ? `\nIf the model selector "${model}" is unavailable, reset the confirmation (plans set-role --reset-confirmation) and re-ask the model-confirmation question.` : ""}`,
+					);
+				}
 
-			return {
-				content: [
-					{
-						type: "text",
-						text: `${text}\n\n---\nConsolidate: merge and dedupe findings into PLAN_vN_reviewer_comments.md${count === 3 ? " (one consolidated file; keep each finding's source reviewer, severity, evidence, and disposition)" : ""}, accept or reject each finding on repo/reference evidence, surface at most five high-priority findings to the user, then immediately ask the next refinement-mode question with ask_choice.`,
+				const combined = sections.join("\n\n---\n\n");
+				const truncation = truncateHead(combined, { maxLines: 2000, maxBytes: 50 * 1024 });
+				let text = truncation.content;
+				if (truncation.truncated) text += `\n\n[Output truncated; full outputs remain in this tool result's details.]`;
+
+				return {
+					content: [
+						{
+							type: "text",
+							text: `${text}\n\n---\nConsolidate: merge and dedupe findings into PLAN_vN_reviewer_comments.md${count === 3 ? " (one consolidated file; keep each finding's source reviewer, severity, evidence, and disposition)" : ""}, accept or reject each finding on repo/reference evidence, surface at most five high-priority findings to the user, then immediately ask the next refinement-mode question with ask_choice.`,
+						},
+					],
+					details: {
+						mode: "delegated-subagent",
+						role: "reviewer",
+						planPath,
+						reviewers: count,
+						model,
+						outputs: results.map(({ job, result }) => ({ name: job.name, lane: job.lane.id, lens: job.lane.lens, ok: result.ok, output: result.output, stderr: result.stderr, turns: result.turns })),
 					},
-				],
-				details: {
-					mode: "delegated-subagent",
-					role: "reviewer",
-					planPath,
-					reviewers: count,
-					model,
-					outputs: results.map(({ job, result }) => ({ name: job.name, lane: job.lane.id, lens: job.lane.lens, ok: result.ok, output: result.output, stderr: result.stderr, turns: result.turns })),
-				},
-			};
+				};
+			} finally {
+				await execution.close();
+			}
 		},
 
 		renderCall(args, theme) {

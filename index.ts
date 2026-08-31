@@ -10,7 +10,7 @@
  *   - `refine` tool     — reviewer/criticizer rounds via read-only pi subagents
  *   - `execute_plan`    — execution handoff into the tracked execution loop
  *   - write guard       — planning runs may only write planning artifacts
- *   - execution loop    — checklist injection, [DONE:VC-xxx] tracking, progress widget
+ *   - execution loop    — checklist injection, [DONE:VC-xxx] tracking, progress status
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -19,21 +19,37 @@ import * as path from "node:path";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-	applyDoneMarkers,
-	completeExecution,
-	consumePendingPanelSync,
+	consumePlanningCompactionResumeGuard,
+	drainExecutionFlush,
 	executionContextMessage,
+	filterExecutionResumeMessages,
+	filterPlanningResumeMessages,
 	getExecution,
-	isExecutionComplete,
-	recordExecutionCompletion,
-	recordTouchedPaths,
+	handleExecutionBeforeCompact,
+	handleExecutionCompact,
+	handleExecutionCompactFailed,
+	handleExecutionTurnCompaction,
+	handlePlanningBeforeCompact,
+	handlePlanningCompact,
+	handlePlanningCompactFailed,
+	PLANNING_PLAN_WRITTEN_CUSTOM_TYPE,
+	registerExecutionTurnHandlers,
+	refreshPlanningCompactionCooldown,
+	requestPlanningCompaction,
 	restoreFromSession,
 	stopExecution,
-	syncExecutionPanel,
-	toggleExecutionPanelView,
 	updateStatusWidget,
+	shouldTriggerPlanningCompaction,
 } from "./src/exec.ts";
+import {
+	autoCompleteStatus,
+	disableAutoComplete,
+	markPlanWritten,
+	registerAutoCompleteTurnHandlers,
+	restoreAutoCompleteFromSession,
+} from "./src/autocomplete.ts";
 import { planningWriteBlockReason } from "./src/guard.ts";
+import { registerQueryInterviewHooks } from "./src/query-hook.ts";
 import { latestPlanVersion, nextPlanVersionPath } from "./src/plan.ts";
 import { getRun, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
 import { registerAskChoiceTool } from "./tools/ask-choice.ts";
@@ -43,20 +59,37 @@ import { registerRefineTool } from "./tools/refine.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
 
-function extractPathsFromBash(command: string): string[] {
-	const values = new Set<string>();
-	for (const token of command.split(/\s+/)) {
-		const cleaned = token.replace(/^["'`(<[{]+|["'`)>}\],;]+$/g, "");
-		if (!cleaned || cleaned === "." || cleaned === ".." || cleaned.startsWith("-") || cleaned.includes("=") ) continue;
-		const looksLikePath =
-			cleaned.includes("/") ||
-			cleaned.startsWith(".") ||
-			cleaned.startsWith("~") ||
-			/^[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+$/.test(cleaned);
-		if (!looksLikePath) continue;
-		values.add(cleaned);
+// When THIS copy of the extension was imported into the running pi process.
+// /plans compares it against the newest source-file mtime so a stale instance
+// (code on disk newer than the loaded copy) is immediately visible.
+const extensionLoadedAt = new Date();
+
+function extensionStalenessLine(): string {
+	try {
+		const dirs = [baseDir, path.join(baseDir, "src"), path.join(baseDir, "tools")];
+		let newest = 0;
+		for (const dir of dirs) {
+			for (const name of fs.readdirSync(dir)) {
+				if (!name.endsWith(".ts")) continue;
+				const mtime = fs.statSync(path.join(dir, name)).mtimeMs;
+				if (mtime > newest) newest = mtime;
+			}
+		}
+		if (newest > extensionLoadedAt.getTime() + 2000) {
+			return `⚠ extension code on disk is newer than the loaded copy (loaded ${extensionLoadedAt.toISOString()}); run /reload to pick it up`;
+		}
+		return `Extension loaded: ${extensionLoadedAt.toISOString()} (up to date)`;
+	} catch {
+		return `Extension loaded: ${extensionLoadedAt.toISOString()}`;
 	}
-	return [...values];
+}
+
+function hasActivePlanningWorkflow(ctx: Parameters<typeof updateStatusWidget>[0]): boolean {
+	if (getExecution()) return true;
+	const active = readActive(ctx.cwd);
+	if (!active) return false;
+	const status = getRun(ctx.cwd, active.run_id)?.status;
+	return status === "planning" || status === "accepted" || status === "executing";
 }
 
 export default function piPlansExtension(pi: ExtensionAPI): void {
@@ -64,6 +97,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	registerAskChoiceTool(pi);
 	registerRefineTool(pi, baseDir);
 	registerExecutePlanTool(pi);
+	registerQueryInterviewHooks(pi, hasActivePlanningWorkflow);
 
 	// Contribute the router skill plus the five specialist planning skills.
 	pi.on("resources_discover", () => ({
@@ -105,31 +139,71 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// not been approved), edit/write may only target planning artifacts.
 	// -----------------------------------------------------------------------
 	pi.on("tool_call", async (event, ctx) => {
-		const execution = getExecution();
-		if (execution) {
-			if (event.toolName === "edit" || event.toolName === "write") {
-				const rawPath = String((event.input as { path?: string }).path ?? "");
-				if (rawPath) recordTouchedPaths(ctx.cwd, [rawPath]);
-			}
-			if (event.toolName === "bash") {
-				const command = String((event.input as { command?: string }).command ?? "");
-				if (command) recordTouchedPaths(ctx.cwd, extractPathsFromBash(command));
-			}
-			return;
-		}
+		if (getExecution()) return;
 		const rawPath = String((event.input as { path?: string }).path ?? "");
 		if (!rawPath) return;
 		const reason = planningWriteBlockReason({ workdir: ctx.cwd, toolName: event.toolName, rawPath });
-		if (!reason) return;
-		return { block: true, reason };
+		if (reason) return { block: true, reason };
+		// Allowed write: if it lands exactly on the run's latest plan file, drop a
+		// marker entry so planning-phase compaction can anchor its cut point there.
+		if (event.toolName === "write" || event.toolName === "edit") {
+			const active = readActive(ctx.cwd);
+			if (active) {
+				const latest = latestPlanVersion(active.artifact_dir);
+				if (latest && path.resolve(ctx.cwd, rawPath) === path.resolve(ctx.cwd, latest.path)) {
+					pi.appendEntry(PLANNING_PLAN_WRITTEN_CUSTOM_TYPE, {
+						runId: active.run_id,
+						planPath: latest.path,
+					});
+					markPlanWritten(ctx);
+				}
+			}
+		}
+		return;
+	});
+
+	pi.on("context", (event) => {
+		const filteredExecution = filterExecutionResumeMessages(event.messages as Array<{ customType?: string }>);
+		const messages = filterPlanningResumeMessages(filteredExecution);
+		if (messages.length !== event.messages.length) {
+			return { messages };
+		}
+	});
+
+	pi.on("session_before_compact", async (event, ctx) => {
+		const executionResult = await handleExecutionBeforeCompact(pi, ctx, event);
+		if (executionResult) return executionResult;
+		return handlePlanningBeforeCompact(pi, ctx, event);
+	});
+	pi.on("session_compact", async (event, ctx) => {
+		handleExecutionCompact(pi, ctx, event);
+		handlePlanningCompact(pi, ctx, event);
+	});
+	pi.on("session_compact_failed", async (event, ctx) => {
+		handleExecutionCompactFailed(pi, ctx, event);
+		handlePlanningCompactFailed(pi, ctx, event);
+	});
+
+	// Flush points for deferred execution-loop writes: primary drain when the
+	// agent run fully settles, backstop drain at the next run's start (covers
+	// continuation paths that might not emit agent_settled), plus the forced
+	// synchronous flush inside stop/complete.
+	pi.on("agent_settled", async (_event, ctx) => {
+		drainExecutionFlush(pi, ctx);
 	});
 
 	// -----------------------------------------------------------------------
 	// Execution loop: inject remaining checklist each turn, track markers.
 	// -----------------------------------------------------------------------
-	pi.on("before_agent_start", async () => {
+	pi.on("before_agent_start", async (_event, ctx) => {
+		drainExecutionFlush(pi, ctx);
 		const content = executionContextMessage();
-		if (!content) return;
+		if (!content) {
+			if (!getExecution() && shouldTriggerPlanningCompaction(ctx)) {
+				requestPlanningCompaction(ctx);
+			}
+			return;
+		}
 		return {
 			message: {
 				customType: "pi-plans-exec-context",
@@ -139,58 +213,27 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		};
 	});
 
-	// The turn_end projection does not carry usage; message_end delivers the
-	// full assistant message, so we cache it there and consume it per turn.
-	let lastAssistantUsage: { input: number; output: number } | null = null;
-	pi.on("message_end", async (event) => {
-		const message = event.message as { role?: string; usage?: { input?: number; output?: number } };
-		if (message?.role === "assistant" && message.usage) {
-			lastAssistantUsage = { input: message.usage.input ?? 0, output: message.usage.output ?? 0 };
-		}
-	});
-
-	pi.on("turn_end", async (event, ctx) => {
-		const message = event.message as { role?: string; content?: Array<{ type: string; text?: string }> };
-		if (!message || message.role !== "assistant") {
-			updateStatusWidget(ctx);
-			return;
-		}
-		const text = (message.content ?? [])
-			.filter((part) => part.type === "text")
-			.map((part) => part.text ?? "")
-			.join("\n");
-		const changedIds = applyDoneMarkers(text);
-		if (changedIds.length > 0) {
-			// Attribute this turn's token usage to the finished items.
-			const projection = (event.message as { usage?: { input?: number; output?: number } }).usage;
-			const raw = projection ?? lastAssistantUsage;
-			lastAssistantUsage = null; // consumed: never re-attribute a stale turn
-			const usage = raw ? { input: raw.input ?? 0, output: raw.output ?? 0 } : undefined;
-			recordExecutionCompletion(pi, ctx, changedIds, usage);
-		}
-		if (getExecution() && isExecutionComplete()) {
-			completeExecution(pi, ctx);
-		}
-		// A busy-toggle during the previous turn deferred its re-render; the
-		// turn just ended, so this is the safe point to apply it.
-		if (consumePendingPanelSync()) syncExecutionPanel(ctx);
-		updateStatusWidget(ctx);
-	});
-
-	// -----------------------------------------------------------------------
-	// Commands and shortcuts
-	// -----------------------------------------------------------------------
-	pi.registerShortcut("alt+o", {
-		description: "Toggle pi-plans execution checklist widget",
-		handler: async (ctx) => {
-			const expanded = toggleExecutionPanelView(pi, ctx);
-			if (expanded === null) {
-				ctx.ui.notify("No execution in progress.", "info");
+	registerExecutionTurnHandlers(pi, async (ctx) => {
+		if (getExecution()) {
+			handleExecutionTurnCompaction(ctx);
+		} else {
+			refreshPlanningCompactionCooldown(ctx);
+			if (consumePlanningCompactionResumeGuard(ctx)) {
+				updateStatusWidget(ctx);
 				return;
 			}
-			ctx.ui.notify(expanded ? "Execution checklist expanded." : "Execution checklist collapsed.", "info");
-		},
+			if (shouldTriggerPlanningCompaction(ctx)) {
+				requestPlanningCompaction(ctx);
+			}
+		}
+		// A completed turn is the safe point for status updates.
+		updateStatusWidget(ctx);
 	});
+	registerAutoCompleteTurnHandlers(pi);
+
+	// -----------------------------------------------------------------------
+	// Commands
+	// -----------------------------------------------------------------------
 
 	pi.registerCommand("plans", {
 		description: "Show pi-plans state: config, active run, and execution progress",
@@ -215,19 +258,17 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 					lines.push(`  ${item.done ? "☑" : "☐"} ${item.id}`);
 				}
 			}
+			lines.push(`Auto-complete: ${autoCompleteStatus(ctx)}`);
+			lines.push(extensionStalenessLine());
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 
-	pi.registerCommand("plans-list", {
-		description: "Toggle the pi-plans execution checklist widget",
+	pi.registerCommand("plans-autocomplete-stop", {
+		description: "Stop Auto-complete for the active planning run",
 		handler: async (_args, ctx) => {
-			const expanded = toggleExecutionPanelView(pi, ctx);
-			if (expanded === null) {
-				ctx.ui.notify("No execution in progress.", "info");
-				return;
-			}
-			ctx.ui.notify(expanded ? "Execution checklist expanded." : "Execution checklist collapsed.", "info");
+			const stopped = disableAutoComplete(ctx, "stopped by user");
+			ctx.ui.notify(stopped ? "Auto-complete stopped." : "Auto-complete is not active.", stopped ? "info" : "warning");
 		},
 	});
 
@@ -264,6 +305,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 
 			const active = readActive(ctx.cwd);
 			const execution = getExecution();
+			disableAutoComplete(ctx, "plan update");
 
 			// Resolve the plan to revise: explicit arg > running execution > latest in artifact dir.
 			let sourcePlanPath: string | null = planArg
@@ -292,7 +334,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 					`${doneIds.length}/${execution.items.length} verifier item(s) already verified; their work stays. Remaining items return to planning.`,
 				);
 				if (!ok) return;
-				stopExecution(pi, ctx, "interrupted by /update-plan");
+				await stopExecution(pi, ctx, "interrupted by /update-plan");
 			}
 
 			// Return the run to planning so refinement rules and guards apply again.
@@ -353,7 +395,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			}
 			const ok = await ctx.ui.confirm("Stop execution?", "Remaining verifier items will be left unfinished.");
 			if (!ok) return;
-			stopExecution(pi, ctx, "stopped by user via /plans-stop");
+			await stopExecution(pi, ctx, "stopped by user via /plans-stop");
 			ctx.ui.notify("Execution stopped.", "info");
 		},
 	});
@@ -371,6 +413,11 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 				`${active.run_id}\nThe read-only guard lifts; committed artifacts stay in place.`,
 			);
 			if (!ok) return;
+			// Abandon must end execution first so the planning model is restored.
+			disableAutoComplete(ctx, "run abandoned");
+			if (getExecution()) {
+				await stopExecution(pi, ctx, "run abandoned via /plans-abandon");
+			}
 			try {
 				setRunStatus(ctx.cwd, active.run_id, "abandoned");
 				ctx.ui.notify(`Run ${active.run_id} abandoned.`, "info");
@@ -385,6 +432,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// Session lifecycle
 	// -----------------------------------------------------------------------
 	pi.on("session_start", async (_event, ctx) => {
-		restoreFromSession(pi, ctx, ctx.sessionManager.getEntries() as unknown as Parameters<typeof restoreFromSession>[2]);
+		await restoreFromSession(pi, ctx, ctx.sessionManager.getEntries() as unknown as Parameters<typeof restoreFromSession>[2]);
+		restoreAutoCompleteFromSession(ctx, ctx.sessionManager.getEntries() as unknown as Parameters<typeof restoreAutoCompleteFromSession>[1]);
 	});
 }

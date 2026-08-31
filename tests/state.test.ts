@@ -68,6 +68,7 @@ describe("init", () => {
 		assert.equal(config.reviewer.mode, "delegated-subagent");
 		assert.equal(config.reviewer.confirmed_at, null);
 		assert.equal(config.criticizer.confirmed_at, null);
+		assert.equal("execution" in config, false);
 		assert.equal(config.artifact_root, "./docs/pi-plans");
 		assert.equal(config.artifact_root_source, "unset");
 		assert.equal(config.artifact_root_updated_at, null);
@@ -193,6 +194,62 @@ describe("runs", () => {
 		assert.equal(updated.status, "accepted");
 		assert.equal(getRun(workdir, run.run_id)?.status, "accepted");
 		assert.throws(() => setRunStatus(workdir, run.run_id, "bogus"), StateError);
+	});
+
+	it("invokes the onStart callback exactly once when startRun succeeds", () => {
+		const workdir = mkWorkdir("onstart");
+		git(workdir, "init", "-q");
+		const calls: string[] = [];
+		const { run } = startRun(workdir, {
+			topic: "marker demo",
+			skill: "plan-normal",
+			requestText: "x",
+			onStart: (current) => {
+				calls.push(current.run_id);
+			},
+		});
+		assert.deepEqual(calls, [run.run_id]);
+	});
+
+	it("does not invoke the onStart callback when startRun throws", () => {
+		const workdir = mkWorkdir("onstart-throw");
+		git(workdir, "init", "-q");
+		const calls: string[] = [];
+		assert.throws(() =>
+			startRun({
+				workdir: path.resolve(workdir),
+				artifact_root: "./docs/pi-plans",
+				artifact_root_source: "user",
+				artifact_root_updated_at: new Date().toISOString(),
+				schema: 1,
+				language: { tag: null, source: "unset", updated_at: null },
+				reviewer: { mode: "delegated-subagent", model_selector: null, name_prefix: "pi-plans-reviewer", confirmed_at: null },
+				criticizer: { mode: "delegated-subagent", model_selector: null, name_prefix: "pi-plans-criticizer", confirmed_at: null },
+				execution: { model_selector: null, source: "unset", updated_at: null },
+			}, {
+				topic: "" as string,
+				skill: "plan-normal",
+				requestText: "x",
+				onStart: () => calls.push("called"),
+			} as any),
+		);
+		assert.equal(calls.length, 0);
+	});
+});
+
+describe("legacy execution config", () => {
+	it("strips legacy execution config on load and rewrite", () => {
+		const workdir = mkWorkdir("legacy-exec");
+		git(workdir, "init", "-q");
+		initState(workdir);
+		const configPath = path.join(commonDir(workdir), "pi_plans", "config.json");
+		const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+		config.execution = { model_selector: "zai/glm-5.3-flash:high", source: "user", updated_at: null };
+		fs.writeFileSync(configPath, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
+		const shown = showConfig(workdir) as any;
+		assert.equal(shown.execution, undefined);
+		setLanguage(workdir, "zh-Hans", "user");
+		assert.equal(readConfig(workdir).execution, undefined);
 	});
 });
 

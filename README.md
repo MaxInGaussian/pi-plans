@@ -7,7 +7,7 @@
 <h2 align="center"><b>Plan. Review. Execute.</b></h2>
 
 <p align="center">
-  <i>Versioned, reviewed Markdown plans land before any code changes.<br>Human-in-the-loop planning for the Pi coding agent.</i>
+  <i>Versioned, reviewed Markdown plans land before any code changes.<br>Human-in-the-loop planning for the <a href="https://github.com/earendil-works/pi">Pi coding agent</a>.</i>
 </p>
 
 <p align="center">
@@ -16,6 +16,7 @@
   <a href="https://www.npmjs.com/package/pi-plans"><img alt="npm downloads" src="https://img.shields.io/npm/dt/pi-plans?color=38bdf8" /></a>
   <a href="https://www.npmjs.com/package/pi-plans"><img alt="npm version" src="https://img.shields.io/npm/v/pi-plans?color=60a5fa" /></a>
   <a href="https://github.com/earendil-works/pi"><img alt="Pi package" src="https://img.shields.io/badge/Pi-package-fbbf24" /></a>
+  <a href="https://github.com/earendil-works/pi"><img alt="Pi coding agent" src="https://img.shields.io/badge/Pi%20coding%20agent-earendil--works-22d3ee" /></a>
   <a href="./LICENSE"><img alt="License" src="https://img.shields.io/npm/l/pi-plans?color=22c55e" /></a>
   <a href="https://github.com/MaxInGaussian/pi-plans/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/MaxInGaussian/pi-plans/actions/workflows/ci.yml/badge.svg" /></a>
 </p>
@@ -62,7 +63,7 @@ A rough change request becomes a versioned Markdown plan instead of a surprise d
         tracked execution loop
    fused AGENTS.md × Ponytail executor rules
    checklist injected each turn, [DONE:VC-xxx]
-   markers tracked via bottom status bar + detail panel
+   markers tracked via bottom status bar
                  |
                  v
            run status: done
@@ -112,13 +113,15 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 | Capability | In short |
 |---|---|
 | Planning router + five specialist skills | Start with `/skill:planning` to route to the narrowest matching specialist (`plan-small` → `plan-big`, `debug-and-plan`, `plan-with-refs`) |
-| Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run |
-| Refinement rounds | Read-only reviewer/criticizer Pi subagents consolidate findings into the next plan version |
+| Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run; choosing Auto-complete enables recommendation-only answers for later eligible questions in the current planning run, with `/plans-autocomplete-stop` available to take back control |
+| Refinement rounds | Read-only reviewer/criticizer Pi subagents consolidate findings into the next plan version; delegated runs have standalone `Reviewer`/`Criticizer` progress overlays that close before the tool result returns |
 | Workspace state | Config, runs, decisions, refs, and subagent ledgers in `.git/pi_plans/` (git common dir) |
-| Tracked execution | Checklist injected each turn; `[DONE:VC-xxx]` markers drive completion; implementation items report progress with `[I-xxx:implemented]` / `[I-xxx:validating]` markers; `plans-list` groups work by I-item with `[Pending/Implementing/Implemented/Validating/VC passed]` states (passed items struck through); the collapsed footer and expanded panel share the same progress projection, so `x/y` updates in real time in both views |
-| Execution model | With `plans set-execution-model <provider/model[:thinking]>`, the main session switches to it at handoff and restores the planning model + thinking level on stop/complete/abandon; when unset, the first execution handoff prompts for one and recommends inheriting the current session model |
-| Execution-phase compaction | Pi core owns threshold, overflow, and manual compaction scheduling; pi-plans only supplies a plan-aware `session_before_compact` summary and queues one hidden continuation when Pi reports `willRetry: false`, while preserving the raw execution tail and `previousSummary` chaining |
-| Planning-phase auto compaction | In active planning runs (run.status=planning, no execution), context usage >=100% triggers a plan-aware compaction too: pre-plan history compresses, Q&A during planning stays in a dedicated section, the latest `PLAN_vN.md` and later conversation stay raw; cooldown + resume guard prevent ping-pong, and manual `/compact` follows the same rules |
+| Smart compact (I-aware) | History is sliced by `I-###` instead of VC. The current-I slice above 20% of the model window triggers a bounded summary with paired `Read:` records, retains a legal recent suffix, targets <10% post-context, and records a hard-floor reason when unreachable. Planning phase falls back to the latest plan/Q&A focus when no current marker exists; cooldown + resume guard prevent ping-pong; one hidden continuation is queued when Pi reports `willRetry: false` |
+| Visible Refiner overlay | Delegated reviewer/criticizer subagents surface as a named public overlay in the TUI — one `Reviewer`/`Criticizer` panel with per-lane tool progress, bounded output preview, and clean cancelled/timed-out vs completed states. The overlay opens when the round starts and closes before the tool result returns to the main session |
+| Tracked execution | Checklist injected each turn; `[DONE:VC-xxx]` markers drive completion; implementation items report progress with `[I-xxx:implemented]` / `[I-xxx:validating]` markers; the bottom status bar shows lifecycle, `x/y` progress, elapsed time, and input/output token usage in real time |
+| Execution handoff | The accepted plan resumes in the current session model; no separate model selection is performed. |
+| Execution-phase compaction | Pi core owns threshold, overflow, and manual scheduling; pi-plans adds a current-I proactive check once the current-I slice exceeds 20% of the model window, summarizes I-level history and bounded `Read:` records, retains a legal recent suffix, targets under 10% when possible, and records hard-floor reasons when not; one hidden continuation is queued when Pi reports `willRetry: false` |
+| Planning-phase auto compaction | In active planning runs (run.status=planning, no execution), the current-I check uses the same 20%/10% best-effort policy when a marker exists; without a marker it protects the latest plan/Q&A focus, while Pi threshold, overflow, and manual compaction remain supported; cooldown + resume guard prevent ping-pong and hidden resume messages stay out of model context |
 | Efficient executor prompt | Each turn, the executor is steered by a fused rule set — Marcos Hernanz's AGENTS.md principles × Ponytail minimalism: layered growth, simplest implementation, long-term architecture (no stopgaps), library discipline — so plans finish in fewer tokens and fewer detours |
 | Write guard | `edit`/`write` blocked outside planning artifacts while a run is active |
 
@@ -126,17 +129,37 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 
 | Tool / Command | Purpose |
 |---|---|
-| `plans` | State CLI: `init`, `show`, `set-language`, `set-artifact-root`, `set-execution-model`, `set-role`, `start-run`, `set-status`, `record-decision`, `record-ref`, `record-subagent` |
+| `plans` | State CLI: `init`, `show`, `set-language`, `set-artifact-root`, `set-role`, `start-run`, `set-status`, `record-decision`, `record-ref`, `record-subagent` |
 | `ask_choice` | Numbered choice prompt; `autoComplete: false` for the merged accept/execute question and external-state questions |
-| `refine` | Reviewer/criticizer round via read-only subagents (`--tools read,grep,find,ls`); `reviewers: 3` for big plans; enforces role/model confirmation gates |
-| `execute_plan` | Execution handoff: re-confirms with the user, prompts for an execution model if needed, and enters extension-managed execution mode |
+| `refine` | Reviewer/criticizer round via standalone read-only subagents (`--mode json -p --no-session --tools read,grep,find,ls`); delegated TUI runs show one `Reviewer`/`Criticizer` overlay and close it before returning; `reviewers: 3` for big plans; enforces role/model confirmation gates |
+| `execute_plan` | Execution handoff: re-confirms with the user and enters extension-managed execution mode |
 | `/plans` | Show config, active run, and execution progress |
-| `/plans-list` | Toggle the execution checklist panel |
-| `/plans-execute [plan.md]` | Manual execution handoff (defaults to highest `PLAN_vN.md`; prompts for an execution model if unset) |
+| `/plans-execute [plan.md]` | Manual execution handoff (defaults to highest `PLAN_vN.md`) |
 | `/update-plan [plan.md] [reason…]` | Interrupt-and-refine: stops execution (if any), returns the run to planning, and directs the agent to revise the plan into `PLAN_vN+1.md` while preserving verified work |
+| `/plans-autocomplete-stop` | Stop the current run's Auto-complete mode and return later planning questions to normal interaction |
 | `/plans-stop` | Stop execution mode |
 | `/plans-abandon` | Abandon the active run (lifts the write guard; artifacts stay) |
-| Status bar (lifecycle) | 💬 Q&A → 📝 draft written (planning sub-phases) → ⌛ executing `x/y · spent · in/out-toks` in the collapsed footer or expanded panel → ⛔ stopped / 🎯 done / 🚫 abandoned |
+| Status bar (lifecycle) | 💬 Q&A → 📝 draft written (planning sub-phases) → ⌛ executing `x/y · spent · in/out-toks` in the bottom status bar → ⛔ stopped / 🎯 done / 🚫 abandoned |
+
+## Smart compact (I-aware)
+
+Default `compaction` is Pi-core-owned: threshold, overflow, and manual `/compact` always run as designed. On top of that, pi-plans layers an **I-aware policy** so long, tool-heavy sessions survive the same run instead of running out of context:
+
+- **Slice by implementation item.** History is grouped by `[I-###:current]` markers instead of `[DONE:VC-xxx]`. The current I's prefix can be summarized, the current I's recent suffix stays raw, and finished `I-###` items become independent sections.
+- **Bounded read history.** Every paired `read` call/result is reduced to `Read: <path> line <X-Y> Extracted information summary: ...` (line range is `unknown` when no offset/limit is given). Records deduplicate by path/range across compactions and never embed full raw tool output.
+- **20%/10% best-effort budget.** When the current-I slice exceeds 20% of `ctx.getContextUsage().contextWindow`, a compact is requested on the next settled turn. The summary's `details` record `contextWindow`, `tokensBefore`, `currentITokens`, `summaryTokens`, `keptSuffixTokens`, `estimatedAfterTokens`, `targetRatio`, `currentI`, `firstKeptEntryId`, `targetMet`, and a `hardFloorReason` when the 10% target cannot be reached (system prompt, tool definitions, single oversized tool result). Hard floors stop the loop; they do not silently fall through.
+- **Pi-owned scheduling preserved.** Threshold, overflow, and manual triggers still come from Pi core. pi-plans only customizes the summary and re-arms once usage falls below the low watermark. The hidden `Continue execution.` resume message is queued on non-retry compactions and never enters model context.
+- **Bounded model call.** Custom summaries reuse the current Pi model via `ctx.modelRegistry.complete(model, context, options)` with `event.signal`, `cacheRetention: "none"`, a fresh `sessionId`, and bounded `maxTokens`. Empty, length-stopped, error, or tool-call responses fall back to Pi's default compaction — no half-checkpoint is ever written.
+- **Phase isolation.** Planning and execution keep independent compaction state (`pi-plans-plan-resume` vs `pi-plans-exec-resume`); planning without a current marker protects the latest plan/Q&A focus rather than leaking execution state.
+
+## Visible Refiner overlay
+
+Delegated `refine` rounds (reviewer or criticizer) show their progress directly inside the Pi TUI instead of disappearing into the child process's terminal. The overlay is a public, named panel so users always know who is doing what:
+
+- **Named public overlays.** Each round uses the literal overlay name `Reviewer` or `Criticizer` (no dependency on `pi-btw`; the renderer is built on Pi's public `pi-tui` primitives). The big-plan concurrent reviewer round renders one reviewer lane per subagent under the same `Reviewer` overlay.
+- **Bounded live detail.** The overlay tracks lane state (`pending → running → completed | cancelled | timed-out`) and the most recent tool call plus a clipped argument preview. Raw tool output is never surfaced, so progress stays legible even when subagents read large files.
+- **Clean lifecycle edges.** The overlay opens at round start, advances via the JSONL progress feed emitted by `pi --mode json`, and is `close()`d before the round's conclusion returns as a tool result to the main session. Cancelled and timed-out children render as terminal states with the original error message — never as silent drops.
+- **Tool-only progress.** The overlay only consumes tool and message lifecycle events from the child; unrelated `pi` events are ignored, so a noisy upstream release does not desync the panel.
 
 ## The execution rules
 
@@ -153,6 +176,9 @@ Once you approve the handoff, every turn injects a compact rule set that fuses M
 </details>
 
 The rules cost four lines per turn and buy back far more: fewer wrong turns, shorter implementation paths, plans that finish in fewer tokens.
+
+Waiting for subprocess-backed verification:
+For subprocess-backed verification, when a step starts a subprocess and needs its result before verifying, use literal `waiting for` with backoff `5s -> 10s -> 20s -> 40s -> 80s`, then keep polling at 80s; restart at 5s for each new subprocess.
 
 ## Skills
 
@@ -194,12 +220,12 @@ or register the absolute path in `~/.pi/agent/settings.json`:
 pi-plans/
 ├── index.ts               # Extension entry: tools, commands, guard, execution loop
 ├── tools/                 # plans, ask-choice, refine, execute-plan
-├── src/                   # state, guard, plan parsing, subagent runner, exec loop
+├── src/                   # state, guard, plan parsing, subagent runner, refine overlay, exec loop
 ├── skills/                # The planning router plus five specialist planning skills
 ├── references/            # Shared workflow, state/config, plan template (normative)
 ├── agents/                # reviewer.md / criticizer.md subagent prompts
 ├── scripts/validate.ts    # Structure validator
-└── tests/                 # node:test suite (state, guard, plan parsing, execution)
+└── tests/                 # node:test suite (state, guard, plan parsing, execution, refine progress)
 ```
 
 ## Safety model
@@ -223,7 +249,7 @@ The plan is the contract. Refinement converges on scope while nothing is writabl
 
 **What can Auto-complete decide on my behalf?**
 
-Planning and refinement choices only (the recommended option). It is never offered for execution approval, installs, publishing, deployment, merge, push, or credentials — those questions stop and wait for you.
+Planning and refinement choices only (the recommended option). Choosing Auto-complete enables the recommended answer for later eligible planning questions in the current run and the extension continues the planning turn when the model stops early. Use `/plans-autocomplete-stop` to take back control. It is never offered for execution approval, installs, publishing, deployment, merge, push, or credentials — those questions stop and wait for you.
 
 **Where does all the state live?**
 

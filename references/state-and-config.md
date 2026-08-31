@@ -120,7 +120,7 @@ If a spawn later fails because the stored selector is unavailable, reset the mar
 
 ## Subagent Spawning
 
-When `mode` is `delegated-subagent`, the `refine` tool spawns a read-only `pi` subprocess (`--mode json -p --no-session --tools read,grep,find,ls`) whose system prompt comes from `agents/reviewer.md` or `agents/criticizer.md`. The subagent:
+When `mode` is `delegated-subagent`, the `refine` tool spawns a read-only `pi` subprocess (`--mode json -p --no-session --tools read,grep,find,ls`) whose system prompt comes from `agents/reviewer.md` or `agents/criticizer.md`. In TUI mode, delegated runs also show a standalone `Reviewer` or `Criticizer` overlay with live lane/tool status; the child is awaited and the overlay is closed before the tool result returns. The subagent:
 
 - performs read-only analysis and never edits files;
 - receives the full plan text and a review/criticism brief;

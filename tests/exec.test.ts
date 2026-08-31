@@ -7,16 +7,36 @@ import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
 	applyDoneMarkers,
+	applyImplMarkers,
+	applyCurrentIMarker,
+	buildExecutionCompactionResult,
+	buildPlanningCompactionResult,
 	completeExecution,
-	consumePendingPanelSync,
+	consumePendingExecutionFlush,
+	consumePlanningCompactionResumeGuard,
+	drainExecutionFlush,
 	executionContextMessage,
+	filterExecutionResumeMessages,
+	filterPlanningResumeMessages,
 	getExecution,
+	handleExecutionBeforeCompact,
+	handleExecutionCompact,
+	handleExecutionTurnCompaction,
+	handleExecutionCompactFailed,
+	handlePlanningBeforeCompact,
+	handlePlanningCompact,
+	handlePlanningCompactFailed,
 	isExecutionComplete,
+	PLANNING_PLAN_WRITTEN_CUSTOM_TYPE,
+	PLANNING_RUN_START_CUSTOM_TYPE,
+	refreshPlanningCompactionCooldown,
+	requestPlanningCompaction,
 	restoreFromSession,
+	shouldTriggerPlanningCompaction,
 	startExecution,
-	recordExecutionCompletion,
+	recordExecutionTurn,
+	registerExecutionTurnHandlers,
 	stopExecution,
-	toggleExecutionPanelView,
 	updateStatusWidget,
 } from "../src/exec.ts";
 import type { CheckItem } from "../src/plan.ts";
@@ -24,40 +44,92 @@ import { initState, setRunStatus, startRun } from "../src/state.ts";
 
 interface Recorded {
 	entries: { type: string; customType?: string; data?: unknown }[];
-	messages: { customType: string; content: string }[];
+	messages: { customType: string; content: string; options?: { triggerTurn?: boolean } }[];
 	status: string | undefined;
+	statusCalls: number;
 	colors: string[];
-	widget?: { key: string; options?: unknown; factory: any };
-	widgetCalls: number;
+	models: { provider: string; id: string }[];
+	thinkingLevels: (string | null)[];
+	notifies: { message: string; severity: string }[];
+	selects: { title: string; options: string[] }[];
+	selectAnswer?: string;
+	current: { provider: string; id: string } | null;
+	thinking: string | null;
+	compacts?: { customInstructions?: string }[];
 }
 
 interface Harness {
 	pi: any;
 	ctx: any;
 	recorded: Recorded;
+	emit: (eventName: string, event: unknown) => Promise<unknown[]>;
 }
 
 function makeHarness(workdir: string): Harness {
-	const recorded: Recorded = { entries: [], messages: [], status: undefined, colors: [], widgetCalls: 0 };
+	const recorded: Recorded = {
+		entries: [],
+		messages: [],
+		status: undefined,
+		statusCalls: 0,
+		colors: [],
+		models: [],
+		thinkingLevels: [],
+		notifies: [],
+		selects: [],
+		current: { provider: "p", id: "m" },
+		thinking: "high",
+	};
+	let contextPercent: number | null = 0;
+	const registryModels = [
+		{ provider: "p", id: "m" },
+		{ provider: "prov", id: "other" },
+	];
+	const handlers = new Map<string, Array<(event: unknown, ctx: any) => unknown>>();
+	const emit = async (eventName: string, event: unknown): Promise<unknown[]> => {
+		const results: unknown[] = [];
+		for (const handler of handlers.get(eventName) ?? []) {
+			results.push(await handler(event, ctx));
+		}
+		return results;
+	};
 	const pi = {
+		on: (eventName: string, handler: (event: unknown, ctx: any) => unknown) => {
+			const registered = handlers.get(eventName) ?? [];
+			registered.push(handler);
+			handlers.set(eventName, registered);
+		},
+		registerTool: () => {},
+		registerCommand: () => {},
+		registerShortcut: () => {},
+		registerFlag: () => {},
 		appendEntry: (customType: string, data: unknown) => {
 			recorded.entries.push({ type: "custom", customType, data });
 		},
-		sendMessage: (message: { customType: string; content: string }) => {
-			recorded.messages.push(message);
+		sendMessage: (message: { customType: string; content: string }, options?: { triggerTurn?: boolean }) => {
+			recorded.messages.push({ ...message, options });
+		},
+		sendUserMessage: async () => {},
+		setModel: async (model: { provider: string; id: string }) => {
+			recorded.models.push({ provider: model.provider, id: model.id });
+			recorded.current = { provider: model.provider, id: model.id };
+			return true;
+		},
+		setThinkingLevel: (level: string) => {
+			recorded.thinkingLevels.push(level);
+			recorded.thinking = level;
 		},
 	};
 	const ui = {
 		setStatus: (_key: string, value: string | undefined) => {
+			recorded.statusCalls += 1;
 			recorded.status = value;
 		},
-		setWidget: (key: string, factory: any, options?: unknown) => {
-			recorded.widgetCalls += 1;
-			if (factory === undefined) {
-				recorded.widget = undefined;
-				return;
-			}
-			recorded.widget = { key, options, factory };
+		notify: (message: string, severity: string) => {
+			recorded.notifies.push({ message, severity });
+		},
+		select: async (title: string, options: string[]) => {
+			recorded.selects.push({ title, options });
+			return recorded.selectAnswer ?? options[0];
 		},
 		theme: {
 			fg: (color: string, text: string) => {
@@ -67,12 +139,38 @@ function makeHarness(workdir: string): Harness {
 			strikethrough: (text: string) => `~~${text}~~`,
 		},
 	};
+	const sessionManager: any = {};
 	const ctx = {
 		cwd: workdir,
 		ui,
 		isIdle: () => true,
+		hasUI: true,
+		scopedModels: [] as Array<{ model: { provider: string; id: string }; thinkingLevel?: string }>,
+		get model() {
+			return recorded.current;
+		},
+		get thinkingLevel() {
+			return recorded.thinking;
+		},
+		modelRegistry: {
+			find: (provider: string, modelId: string) =>
+				registryModels.find((entry) => entry.provider === provider && entry.id === modelId),
+			getAvailable: () => registryModels,
+		},
+		getContextUsage: () =>
+			contextPercent === null
+				? undefined
+				: { tokens: contextPercent * 1000, contextWindow: 100000, percent: contextPercent },
+		compact: (options: { customInstructions?: string }) => {
+			recorded.compacts = recorded.compacts ?? [];
+			recorded.compacts.push(options);
+		},
+		sessionManager,
+		setUsagePercent: (percent: number | null) => {
+			contextPercent = percent;
+		},
 	};
-	return { pi, ctx, recorded };
+	return { pi, ctx, recorded, emit, setUsagePercent: ctx.setUsagePercent } as Harness & { setUsagePercent: (percent: number | null) => void };
 }
 
 function items(...ids: string[]): CheckItem[] {
@@ -98,39 +196,25 @@ describe("execution loop", () => {
 		return workdir;
 	}
 
-	it("tracks done markers and completes", () => {
+	it("tracks done markers and completes", async () => {
 		const workdir = freshWorkdir();
 		const { pi, ctx, recorded } = makeHarness(workdir);
-		startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001", "VC-002"));
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001", "VC-002"));
 
-		// Collapsed by default: progress lives in the bottom status bar (same
-		// layer as the ⛔/⌛ indicators); no panel widget is registered yet.
-		assert.equal(recorded.widget, undefined);
 		assert.match(recorded.status ?? "", /⌛ plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
 		assert.match(recorded.status ?? "", /in-toks/);
 		assert.match(recorded.status ?? "", /out-toks/);
-		assert.match(recorded.status ?? "", /\/plans-list details/);
-
-		toggleExecutionPanelView(pi, ctx);
-		assert.ok(recorded.widget);
-		assert.equal(recorded.widget?.key, "pi-plans-execution");
-		assert.deepEqual(recorded.widget?.options, { placement: "belowEditor" });
-		const expandedWidget = recorded.widget?.factory(
-			{} as any,
-			{ fg: (_color: string, text: string) => text, strikethrough: (text: string) => `~~${text}~~` },
-		);
-		assert.ok(expandedWidget);
-		const expandedLines = expandedWidget.render(80);
-		assert.match(expandedLines.join("\n"), /☐/);
-		// Detail view never repeats the count or the keyboard hint.
-		assert.doesNotMatch(expandedLines.join("\n"), /📋 plans/);
-		assert.doesNotMatch(expandedLines.join("\n"), /alt\+o/);
 
 		assert.ok(getExecution());
 		const rules = executionContextMessage()!;
 		assert.match(rules, /PI-PLANS EXECUTION/);
 		assert.match(rules, /VC-001/);
-		// Seven-principle rule set: representative anchors (PLAN_v2 D-003/D-004).
+		assert.match(rules, /subprocess-backed verification/);
+		assert.match(rules, /waiting for/);
+		assert.match(rules, /5s\s*->\s*10s\s*->\s*20s\s*->\s*40s\s*->\s*80s/);
+		assert.match(rules, /keep polling at 80s/);
+		assert.match(rules, /restart at 5s for each new subprocess/);
+		// Representative anchors for the core execution rules (PLAN_v2 D-003/D-004).
 		assert.match(rules, /for the long term/);
 		assert.match(rules, /Simplest implementation/);
 		assert.match(rules, /grow the change in layers/);
@@ -145,28 +229,25 @@ describe("execution loop", () => {
 		assert.deepEqual(applyDoneMarkers("final: [DONE:VC-002]"), ["VC-002"]);
 		assert.equal(isExecutionComplete(), true);
 
-		completeExecution(pi, ctx);
+		await completeExecution(pi, ctx);
 		assert.equal(getExecution(), null);
 		assert.ok(recorded.messages.some((message) => message.customType === "pi-plans-complete"));
 	});
 
-	it("restores progress from session entries and rescans messages", () => {
+	it("restores progress from session entries and rescans messages", async () => {
 		const workdir = freshWorkdir();
 		const { pi, ctx, recorded } = makeHarness(workdir);
 		const snapshot = {
 			planPath: path.join(workdir, "PLAN_v1.md"),
 			items: items("VC-001", "VC-002"),
 			startedAt: "2026-08-25T00:00:00Z",
-			panel: {
-				expanded: true,
-				baseline: { added: 0, removed: 0, files: 0 },
-				lastSnapshot: { added: 1, removed: 0, files: 1 },
-				touchedPaths: ["src/exec.ts"],
-				itemSummaries: {
-					"VC-001": {
-						summary: { added: 1, removed: 0, files: 1, paths: ["src/exec.ts"] },
-					},
-				},
+			compaction: {
+				inFlight: true,
+				resumeGuard: true,
+				cooldownActive: true,
+				lastAttemptReason: "threshold",
+				lastSuccessfulUsagePercent: 100,
+				lastSuccessfulAt: "2026-08-25T00:01:00Z",
 			},
 		};
 		fs.writeFileSync(snapshot.planPath, "# plan");
@@ -177,25 +258,17 @@ describe("execution loop", () => {
 				message: { role: "assistant", content: [{ type: "text", text: "did [DONE:VC-001]" }] },
 			},
 		];
-		restoreFromSession(pi, ctx, entries as any);
+		await restoreFromSession(pi, ctx, entries as any);
 		const execution = getExecution();
 		assert.ok(execution);
-		assert.ok(recorded.widget);
-		const widget = recorded.widget?.factory(
-			{} as any,
-			{ fg: (_color: string, text: string) => text, strikethrough: (text: string) => `~~${text}~~` },
-		);
-		assert.ok(widget);
-		const rendered = widget.render(80);
-		assert.match(rendered.join("\n"), /☑/);
-		assert.match(rendered.join("\n"), /\+1/);
+		assert.equal("compaction" in execution!, false, "legacy scheduler state must not reactivate on restore");
 
 		const clearedEntries = [...entries, { type: "custom", customType: "pi-plans-exec-cleared", data: {} }];
-		restoreFromSession(pi, ctx, clearedEntries as any);
+		await restoreFromSession(pi, ctx, clearedEntries as any);
 		assert.equal(getExecution(), null);
 	});
 
-	it("ignores restore when the plan file vanished", () => {
+	it("ignores restore when the plan file vanished", async () => {
 		const workdir = freshWorkdir();
 		const { pi, ctx } = makeHarness(workdir);
 		const entries = [
@@ -209,28 +282,41 @@ describe("execution loop", () => {
 				},
 			},
 		];
-		restoreFromSession(pi, ctx, entries as any);
+		await restoreFromSession(pi, ctx, entries as any);
 		assert.equal(getExecution(), null);
 	});
 
-	it("stop clears execution", () => {
+	it("stop clears execution", async () => {
 		const workdir = freshWorkdir();
 		const { pi, ctx } = makeHarness(workdir);
-		startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
-		stopExecution(pi, ctx, "test");
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
+		await stopExecution(pi, ctx, "test");
 		assert.equal(getExecution(), null);
 	});
 
-	it("keeps the status bar count-free while executing and points at the panel", () => {
+	it("starts execution without switching models", async () => {
 		const workdir = freshWorkdir();
 		const { pi, ctx, recorded } = makeHarness(workdir);
-		startExecution(pi, ctx, path.join(workdir, "PLAN_v2.md"), items("VC-001", "VC-002"));
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v6.md"), items("VC-001"));
+
+		assert.deepEqual(recorded.models, []);
+		assert.equal(recorded.thinking, "high");
+		assert.match(recorded.status ?? "", /⌛ plans 0\/1/);
+
+		await stopExecution(pi, ctx, "restore-check");
+		assert.deepEqual(recorded.models, []);
+		assert.equal(recorded.thinking, "high");
+	});
+
+	it("keeps the execution status bar current while executing", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v2.md"), items("VC-001", "VC-002"));
 
 		// Bottom status bar carries the count — the same layer as ⛔/⌛ — so both
 		// execution states read from one consistent place.
 		assert.match(recorded.status ?? "", /⌛ plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
 		assert.match(recorded.status ?? "", /in-toks/);
-		assert.match(recorded.status ?? "", /\/plans-list details/);
 
 		const start = recorded.messages.find((message) => message.customType === "pi-plans-exec-start");
 		assert.ok(start);
@@ -238,7 +324,7 @@ describe("execution loop", () => {
 		assert.doesNotMatch(start.content, /footer/);
 
 		applyDoneMarkers("[DONE:VC-001]");
-		completeExecution(pi, ctx);
+		await completeExecution(pi, ctx);
 		assert.equal(getExecution(), null);
 
 	});
@@ -281,47 +367,663 @@ describe("execution loop", () => {
 		assert.equal(recorded.colors.at(-1), "error");
 	});
 
-	it("accumulates token usage only for turns that finish items", () => {
+	it("accumulates token usage on token-only and completion turns", async () => {
 		const workdir = freshWorkdir();
 		const { pi, ctx, recorded } = makeHarness(workdir);
-		startExecution(pi, ctx, path.join(workdir, "PLAN_v5.md"), items("VC-001", "VC-002"));
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v5.md"), items("VC-001", "VC-002"));
 
-		recordExecutionCompletion(pi, ctx, ["VC-001"], { input: 100, output: 40 });
+		recordExecutionTurn(pi, ctx, [], { input: 100, output: 40 });
+		updateStatusWidget(ctx);
 		assert.equal(getExecution()?.usage.inToks, 100);
 		assert.equal(getExecution()?.usage.outToks, 40);
+		assert.match(recorded.status ?? "", /100 in-toks/);
+		assert.match(recorded.status ?? "", /40 out-toks/);
 
-		// A completion without usage data must keep prior totals intact.
-		recordExecutionCompletion(pi, ctx, ["VC-002"]);
-		assert.equal(getExecution()?.usage.inToks, 100);
-		assert.equal(getExecution()?.usage.outToks, 40);
+		assert.deepEqual(applyDoneMarkers("[DONE:VC-001]"), ["VC-001"]);
+		recordExecutionTurn(pi, ctx, ["VC-001"], { input: 20, output: 10 });
+		updateStatusWidget(ctx);
+		assert.equal(getExecution()?.usage.inToks, 120);
+		assert.equal(getExecution()?.usage.outToks, 50);
+		assert.equal(getExecution()?.items[0].done, true);
+		assert.match(recorded.status ?? "", /120 in-toks/);
+		assert.match(recorded.status ?? "", /50 out-toks/);
 
-		stopExecution(pi, ctx, "test-done");
+		await stopExecution(pi, ctx, "test-done");
 		assert.equal(getExecution(), null);
 	});
 
-	it("defers persistence and widget churn when toggling mid-turn", () => {
+	it("lets Pi core own execution compaction scheduling and customizes every reason", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, setUsagePercent } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v8.md"), items("VC-001", "VC-002"));
+
+		setUsagePercent(50);
+		const below = handleExecutionBeforeCompact(pi, ctx, {
+			type: "session_before_compact",
+			preparation: makePreparation("threshold", null),
+			branchEntries: [],
+			reason: "threshold",
+			willRetry: false,
+			signal: new AbortController().signal,
+		});
+		assert.equal(below?.cancel, undefined);
+		assert.ok(below?.compaction, "threshold compaction should remain Pi-core-owned but use the custom summary");
+
+		setUsagePercent(105);
+		const above = handleExecutionBeforeCompact(pi, ctx, {
+			type: "session_before_compact",
+			preparation: makePreparation("threshold", null),
+			branchEntries: [],
+			reason: "threshold",
+			willRetry: false,
+			signal: new AbortController().signal,
+		});
+		assert.equal(above?.cancel, undefined);
+		assert.ok(above?.compaction);
+
+		const overflow = handleExecutionBeforeCompact(pi, ctx, {
+			type: "session_before_compact",
+			preparation: makePreparation("overflow", null),
+			branchEntries: [],
+			reason: "overflow",
+			willRetry: true,
+			signal: new AbortController().signal,
+		});
+		assert.equal(overflow?.cancel, undefined);
+		assert.ok(overflow?.compaction);
+
+		const manual = handleExecutionBeforeCompact(pi, ctx, {
+			type: "session_before_compact",
+			preparation: makePreparation("manual", null),
+			branchEntries: [],
+			reason: "manual",
+			willRetry: false,
+			signal: new AbortController().signal,
+		});
+		assert.equal(manual?.cancel, undefined);
+		assert.ok(manual?.compaction);
+
+		await stopExecution(pi, ctx, "test-done");
+	});
+
+	it("triggers execution compaction at the high watermark, suppresses repeats, and re-arms below the low watermark", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v9.md"), items("VC-001", "VC-002"));
+
+		setUsagePercent(96);
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 1, "first high-watermark turn should request one compact");
+
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 1, "in-flight compact must not be requested twice");
+
+		handleExecutionCompact(pi, ctx, {
+			type: "session_compact",
+			compactionEntry: { type: "compaction" } as never,
+			fromExtension: true,
+			reason: "threshold",
+			willRetry: false,
+		});
+		assert.equal(
+			recorded.messages.filter((message) => message.customType === "pi-plans-exec-resume").length,
+			1,
+			"non-retry execution compaction should queue one hidden resume",
+		);
+
+		setUsagePercent(96);
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 1, "resume guard should suppress the immediate follow-up turn");
+
+		setUsagePercent(79);
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 1, "low-watermark turns stay quiet while below re-arm");
+
+		setUsagePercent(96);
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 2, "high watermark should re-arm after the low-watermark drop");
+
+		await stopExecution(pi, ctx, "test-done");
+	});
+
+	it("skips proactive current-I compaction when no eligible prefix exists", async () => {
 		const workdir = freshWorkdir();
 		const { pi, ctx, recorded } = makeHarness(workdir);
-		startExecution(pi, ctx, path.join(workdir, "PLAN_v3.md"), items("VC-001", "VC-002"));
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v22.md"), items("VC-001"), [
+			{ id: "I-001", text: "First item." },
+		]);
+		(ctx.sessionManager as any).getBranch = () => [
+			{ id: "only", type: "message", tokens: 30000, message: { role: "assistant", content: [{ type: "text", text: "[I-001:current] one oversized turn" }] } },
+		];
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 0);
+		await stopExecution(pi, ctx, "no-prefix");
+	});
+	it("wires execution compaction without restoring execution model helpers", () => {
+		const indexSource = fs.readFileSync(path.join(process.cwd(), "index.ts"), "utf8");
+		const execSource = fs.readFileSync(path.join(process.cwd(), "src/exec.ts"), "utf8");
+		assert.match(indexSource, /handleExecutionTurnCompaction/);
+		assert.match(execSource, /shouldTriggerExecutionCompaction/);
+		assert.match(execSource, /requestExecutionCompaction/);
+		assert.doesNotMatch(
+			indexSource,
+			/setExecutionModel|chooseExecutionModelSelection|snapshotCurrentModelSelector|ensureExecutionModelActive|restorePlanningModel/,
+		);
+		assert.doesNotMatch(
+			execSource,
+			/setExecutionModel|chooseExecutionModelSelection|snapshotCurrentModelSelector|ensureExecutionModelActive|restorePlanningModel/,
+		);
+	});
 
-		const entriesBefore = recorded.entries.length;
-		const factoriesBefore = recorded.widgetCalls;
+	it("queues one non-retry resume, skips overflow retry, and keeps execution after failure", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v9.md"), items("VC-001"));
 
-		// Mid-turn: flip must be pure memory — no session writes, no re-register.
-		(ctx as any).isIdle = () => false;
-		assert.equal(toggleExecutionPanelView(pi, ctx), true);
-		assert.equal(recorded.entries.length, entriesBefore, "busy toggle appended a session entry");
-		assert.equal(recorded.widgetCalls, factoriesBefore, "busy toggle re-registered the widget");
-		assert.equal(consumePendingPanelSync(), true, "expected a pending panel sync marker");
-		assert.equal(consumePendingPanelSync(), false, "marker should be consumed exactly once");
+		const beforeRequests = recorded.compacts?.length ?? 0;
+		handleExecutionCompact(pi, ctx, {
+			type: "session_compact",
+			compactionEntry: { type: "compaction" } as never,
+			fromExtension: true,
+			reason: "threshold",
+			willRetry: false,
+		});
+		const resumes = recorded.messages.filter((message) => message.customType === "pi-plans-exec-resume");
+		assert.equal(resumes.length, 1, "non-retry compaction should queue one hidden resume");
+		assert.equal(resumes[0]?.options?.triggerTurn, true);
+		assert.equal(recorded.compacts?.length ?? 0, beforeRequests, "compaction hook must not invoke ctx.compact");
 
-		// Back to idle: the next toggle persists and syncs. It flips the panel to
-		// expanded, which registers the detail widget exactly once (no teardown).
-		ctx.isIdle = () => true;
-		assert.equal(toggleExecutionPanelView(pi, ctx), false);
-		assert.ok(recorded.entries.length > entriesBefore, "idle toggle did not persist");
-		assert.equal(recorded.widgetCalls, factoriesBefore + 1, "idle toggle churned the widget registration");
+		handleExecutionCompact(pi, ctx, {
+			type: "session_compact",
+			compactionEntry: { type: "compaction" } as never,
+			fromExtension: true,
+			reason: "overflow",
+			willRetry: true,
+		});
+		assert.equal(
+			recorded.messages.filter((message) => message.customType === "pi-plans-exec-resume").length,
+			1,
+			"overflow retry is owned by Pi core",
+		);
 
-		stopExecution(pi, ctx, "test-done");
+		handleExecutionCompactFailed(pi, ctx, {
+			type: "session_compact_failed",
+			reason: "manual",
+			aborted: false,
+			willRetry: false,
+			fromExtension: true,
+			errorMessage: "boom",
+		});
+		assert.ok(getExecution(), "compaction failure must keep execution active");
+		assert.ok(recorded.notifies.some((note) => note.severity === "warning" && note.message.includes("execution remains active")));
+
+		await stopExecution(pi, ctx, "test-done");
+	});
+
+	it("builds a plan-aware summary with per-item sections and chains the previous summary", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, setUsagePercent } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v10.md"), items("VC-001", "VC-002"));
+
+		applyDoneMarkers("[DONE:VC-001]");
+
+		const previousSummary = "## Goal\nDeliver auto-compact in execution phase.\n\n## Finished Items\n- legacy VC-000 summary";
+		const preparation = makePreparation("threshold", previousSummary);
+		const branchEntries: any[] = [
+			{ id: "exec-start", type: "custom", customType: "pi-plans-exec-start" },
+			{ id: "u-1", type: "message", message: { role: "user", content: [{ type: "text", text: "implement VC-001" }] } },
+			{ id: "a-1", type: "message", message: { role: "assistant", content: [{ type: "text", text: "wrote helper [DONE:VC-001]" }] } },
+			{ id: "u-2", type: "message", message: { role: "user", content: [{ type: "text", text: "implement VC-002" }] } },
+			{ id: "a-2", type: "message", message: { role: "assistant", content: [{ type: "text", text: "almost done" }] } },
+			{ id: "exec-ctx", type: "custom", customType: "pi-plans-exec-context" },
+		];
+		const result = buildExecutionCompactionResult(
+			{
+				type: "session_before_compact",
+				preparation,
+				branchEntries,
+				customInstructions: "keep current task visible",
+				reason: "threshold",
+				willRetry: false,
+				signal: new AbortController().signal,
+			},
+			ctx,
+		);
+		assert.ok(result);
+		assert.match(result!.summary, /## Compact Instructions/);
+		assert.match(result!.summary, /keep current task visible/);
+		assert.match(result!.summary, /## Plan Before This Run/);
+		assert.match(result!.summary, /## Previous Compact Summary/);
+		assert.match(result!.summary, /## Finished VC Items/);
+		assert.match(result!.summary, /### `VC-001`/);
+		assert.match(result!.summary, /## Current Work/);
+		assert.match(result!.summary, /Raw tail preserved from `u-2`/);
+		assert.deepEqual(result!.firstKeptEntryId, "u-2");
+
+		setUsagePercent(110);
+		handleExecutionBeforeCompact(pi, ctx, {
+			type: "session_before_compact",
+			preparation,
+			branchEntries,
+			reason: "threshold",
+			willRetry: false,
+			signal: new AbortController().signal,
+		});
+
+		await stopExecution(pi, ctx, "test-done");
+	});
+
+	it("uses the current model for bounded valid summaries and falls back on invalid output", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v21.md"), items("VC-001"), [
+			{ id: "I-001", text: "First item." },
+		]);
+		const signal = new AbortController().signal;
+		const calls: unknown[][] = [];
+		let response: any = {
+			stopReason: "stop",
+			content: [{ type: "text", text: "## Implementation Items\n- I-001\n\n## Current I\n- I-001\n\n## Read Records\n- none\n\n## Compaction Boundary\n- a-2\n\n## Decisions\n- preserved\n\n## Open Questions\n- none\n\n## Next Steps\n- continue" }],
+			usage: { input: 12, output: 34 },
+		};
+		(ctx.modelRegistry as any).complete = async (...args: unknown[]) => {
+			calls.push(args);
+			return response;
+		};
+		const event: any = {
+			type: "session_before_compact",
+			preparation: makePreparation("threshold", null),
+			branchEntries: [
+				{ id: "i-1", type: "message", tokens: 100, message: { role: "assistant", content: [{ type: "text", text: "[I-001:current] work" }] } },
+				{ id: "a-1", type: "message", tokens: 100, message: { role: "assistant", content: [{ type: "text", text: "details" }] } },
+			],
+			reason: "threshold",
+			willRetry: false,
+			signal,
+		};
+		const valid = await handleExecutionBeforeCompact(pi, ctx, event);
+		assert.ok(valid?.compaction);
+		assert.equal(calls[0]?.[0], recorded.current);
+		assert.equal((calls[0]?.[2] as any).signal, signal);
+		assert.equal((calls[0]?.[2] as any).cacheRetention, "none");
+		assert.ok((calls[0]?.[2] as any).maxTokens <= 2048);
+		assert.deepEqual(valid?.compaction?.usage, response.usage);
+		assert.equal((valid?.compaction?.details as any)?.metrics?.summaryTokens, Math.ceil(response.content[0].text.length / 4));
+
+		response = { stopReason: "length", content: [{ type: "text", text: "## Implementation Items\npartial" }] };
+		const invalid = await handleExecutionBeforeCompact(pi, ctx, { ...event, signal: new AbortController().signal });
+		assert.equal(invalid, undefined, "incomplete model output must return control to Pi default compaction");
+		await stopExecution(pi, ctx, "model-test");
+	});	it("filters the hidden resume message out of the LLM context payload", () => {
+		const messages = [
+			{ customType: "user", content: "real prompt" },
+			{ customType: "pi-plans-exec-resume", content: "Continue execution." },
+			{ customType: "pi-plans-plan-resume", content: "Continue planning." },
+			{ customType: "assistant", content: "ok" },
+		];
+		assert.equal(filterExecutionResumeMessages(messages).length, 3);
+		assert.equal(filterPlanningResumeMessages(messages).length, 3);
+	});
+
+	it("planning compaction cuts at plan-written when present and falls back to run-start", () => {
+		const workdir = freshWorkdir();
+		const { ctx } = makeHarness(workdir);
+		initState(workdir);
+		const { run } = startRun(workdir, { topic: "planning compact", skill: "plan-normal", requestText: "demo" });
+		fs.writeFileSync(path.join(run.artifact_dir, "PLAN_v1.md"), "# plan");
+
+		const makePlanningPreparation = (previousSummary: string | null) => ({
+			firstKeptEntryId: "fallback",
+			messagesToSummarize: [],
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 50000,
+			previousSummary,
+			fileOps: { read: [], written: [], edited: [] },
+			settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+		});
+
+		// Case A: plan written → cut at next non-internal entry after plan-written; QA section included.
+		const branchEntriesWithPlan = [
+			{ id: "rs", type: "custom", customType: PLANNING_RUN_START_CUSTOM_TYPE, data: { runId: run.run_id, artifactDir: run.artifact_dir } },
+			{ id: "u-1", type: "message", message: { role: "user", content: [{ type: "text", text: "background question?" }] } },
+			{ id: "a-1", type: "message", message: { role: "assistant", content: [{ type: "text", text: "some context" }] } },
+			{ id: "pw", type: "custom", customType: PLANNING_PLAN_WRITTEN_CUSTOM_TYPE, data: { runId: run.run_id, planPath: path.join(run.artifact_dir, "PLAN_v1.md") } },
+			{ id: "u-2", type: "message", message: { role: "user", content: [{ type: "text", text: "review please" }] } },
+		] as any;
+		const withPlan = buildPlanningCompactionResult(
+			{
+				type: "session_before_compact",
+				preparation: makePlanningPreparation(null),
+				branchEntries: branchEntriesWithPlan,
+				reason: "threshold",
+				willRetry: false,
+				signal: new AbortController().signal,
+			},
+			ctx,
+		);
+		assert.ok(withPlan);
+		assert.deepEqual(withPlan!.firstKeptEntryId, "u-2");
+		assert.match(withPlan!.summary, /## Q&A During Planning/);
+		assert.match(withPlan!.summary, /background question?/);
+
+		// Case B: only run-start → cut at first non-internal entry after marker; no QA section.
+		const branchEntriesWithoutPlan = [
+			{ id: "rs", type: "custom", customType: PLANNING_RUN_START_CUSTOM_TYPE, data: { runId: run.run_id, artifactDir: run.artifact_dir } },
+			{ id: "u-1", type: "message", message: { role: "user", content: [{ type: "text", text: "open question" }] } },
+			{ id: "a-1", type: "message", message: { role: "assistant", content: [{ type: "text", text: "thinking out loud" }] } },
+		] as any;
+		const withoutPlan = buildPlanningCompactionResult(
+			{
+				type: "session_before_compact",
+				preparation: makePlanningPreparation(null),
+				branchEntries: branchEntriesWithoutPlan,
+				reason: "manual",
+				willRetry: false,
+				signal: new AbortController().signal,
+			},
+			ctx,
+		);
+		assert.ok(withoutPlan);
+		assert.deepEqual(withoutPlan!.firstKeptEntryId, "u-1");
+		assert.doesNotMatch(withoutPlan!.summary, /## Q&A During Planning/);
+
+		// Case C: no markers → fallback to preparation.firstKeptEntryId and no QA section.
+		const fallback = buildPlanningCompactionResult(
+			{
+				type: "session_before_compact",
+				preparation: makePlanningPreparation("## Previous\nEarlier summary."),
+				branchEntries: [],
+				reason: "threshold",
+				willRetry: false,
+				signal: new AbortController().signal,
+			},
+			ctx,
+		);
+		assert.ok(fallback);
+		assert.deepEqual(fallback!.firstKeptEntryId, "fallback");
+		assert.doesNotMatch(fallback!.summary, /## Q&A During Planning/);
+		assert.match(fallback!.summary, /## Previous Compact Summary/);
+	});
+
+	it("planning hook is gated by run.status=planning and defers to execution hook when execution is running", async () => {
+		const workdir = freshWorkdir();
+		const { ctx, setUsagePercent } = makeHarness(workdir);
+		initState(workdir);
+		const { run } = startRun(workdir, { topic: "planning gate", skill: "plan-small", requestText: "x" });
+
+		setUsagePercent(110);
+		const resultPlanning = handlePlanningBeforeCompact({} as any, ctx as any, {
+			type: "session_before_compact",
+			preparation: {
+				firstKeptEntryId: "fb",
+				messagesToSummarize: [],
+				turnPrefixMessages: [],
+				isSplitTurn: false,
+				tokensBefore: 1,
+				previousSummary: null,
+				fileOps: { read: [], written: [], edited: [] },
+				settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+			},
+			branchEntries: [],
+			reason: "threshold",
+			willRetry: false,
+			signal: new AbortController().signal,
+		});
+		assert.ok(resultPlanning?.compaction || resultPlanning === undefined);
+
+		// Flip status to done; planning hook should refuse.
+		setRunStatus(workdir, run.run_id, "done");
+		setUsagePercent(110);
+		const resultDone = handlePlanningBeforeCompact({} as any, ctx as any, {
+			type: "session_before_compact",
+			preparation: {
+				firstKeptEntryId: "fb",
+				messagesToSummarize: [],
+				turnPrefixMessages: [],
+				isSplitTurn: false,
+				tokensBefore: 1,
+				previousSummary: null,
+				fileOps: { read: [], written: [], edited: [] },
+				settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+			},
+			branchEntries: [],
+			reason: "threshold",
+			willRetry: false,
+			signal: new AbortController().signal,
+		});
+		assert.equal(resultDone, undefined);
+	});
+
+	it("turn_end writes are unconditionally deferred even when isIdle reads true", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v11.md"), items("VC-001", "VC-002"));
+		const snapshotCount = () => recorded.entries.filter((e) => e.customType === "pi-plans-exec").length;
+		const baseline = snapshotCount();
+
+		// No isIdle override: the harness default (() => true) IS the real
+		// turn_end reading — this encodes the field regression (60 writes in
+		// 23 minutes) as a permanent zero-write assertion.
+		recordExecutionTurn(pi, ctx, [], { input: 10, output: 5 });
+		setUsagePercent(50);
+		handleExecutionBeforeCompact(pi, ctx, {
+			type: "session_before_compact",
+			preparation: makePreparation("threshold", null),
+			branchEntries: [],
+			reason: "threshold",
+			willRetry: false,
+			signal: new AbortController().signal,
+		});
+		assert.equal(snapshotCount(), baseline, "turn_end wrote session entries despite deferral");
+		// Status line stays real-time while the write is deferred.
+		assert.match(recorded.status ?? "", /10 in-toks/);
+
+		drainExecutionFlush(pi, ctx);
+		assert.equal(snapshotCount(), baseline + 1, "settle flush did not write exactly one snapshot");
+		const last = (recorded.entries.filter((e) => e.customType === "pi-plans-exec").at(-1)?.data ?? {}) as { usage?: { inToks: number } };
+		assert.equal(last.usage?.inToks, 10, "flushed snapshot missing busy-turn usage");
+		drainExecutionFlush(pi, ctx);
+		assert.equal(snapshotCount(), baseline + 1, "second drain wrote again");
+		assert.equal(consumePendingExecutionFlush(), false);
+
+		await stopExecution(pi, ctx, "done");
+	});
+
+	it("stop and complete drain pending writes synchronously with final state", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v12.md"), items("VC-001", "VC-002"));
+		const snapshotCount = () => recorded.entries.filter((e) => e.customType === "pi-plans-exec").length;
+
+		ctx.isIdle = () => false;
+		recordExecutionTurn(pi, ctx, [], { input: 7, output: 3 });
+		const busyCount = snapshotCount();
+
+		await stopExecution(pi, ctx, "force");
+		assert.ok(snapshotCount() > busyCount, "stop did not write the final snapshot");
+		assert.ok(recorded.entries.some((e) => e.customType === "pi-plans-exec-cleared"));
+		const lastStop = (recorded.entries.filter((e) => e.customType === "pi-plans-exec").at(-1)?.data ?? {}) as { usage?: { inToks: number } };
+		assert.equal(lastStop.usage?.inToks, 7, "stop lost the busy-turn usage");
+
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v13.md"), items("VC-001"));
+		ctx.isIdle = () => false;
+		applyDoneMarkers("[DONE:VC-001]");
+		recordExecutionTurn(pi, ctx, ["VC-001"], { input: 1, output: 1 });
+		await completeExecution(pi, ctx);
+		assert.equal(getExecution(), null);
+		const lastComplete = (recorded.entries.filter((e) => e.customType === "pi-plans-exec").at(-1)?.data ?? {}) as { items?: Array<{ done: boolean }> };
+		assert.equal(lastComplete.items?.[0]?.done, true, "completion snapshot missing final done state");
+	});
+
+	it("updates the status bar in real time on every turn without session writes", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v15.md"), items("VC-001", "VC-002"), [
+			{ id: "I-001", text: "First item." },
+			{ id: "I-002", text: "Second item." },
+		]);
+		const snapshotCount = () => recorded.entries.filter((e) => e.customType === "pi-plans-exec").length;
+		const baseline = snapshotCount();
+
+		recordExecutionTurn(pi, ctx, [], { input: 33, output: 11 });
+		// Real-time: status line already reflects the turn's usage...
+		assert.match(recorded.status ?? "", /33 in-toks/);
+		assert.match(recorded.status ?? "", /⌛ plans 0\/2: spent/);
+		// ...without any session write (anti-jitter preserved).
+		assert.equal(snapshotCount(), baseline);
+
+		setUsagePercent(null);
+		drainExecutionFlush(pi, ctx);
+		assert.equal(snapshotCount(), baseline + 1);
+
+		await stopExecution(pi, ctx, "done");
+	});
+
+	it("syncs progress through the registered message_end and turn_end handlers", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, emit } = makeHarness(workdir);
+		registerExecutionTurnHandlers(pi);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v19.md"), items("VC-001", "VC-002", "VC-003"));
+
+		// The usage is delivered by message_end and consumed by the following
+		// turn_end, matching Pi's lifecycle contract.
+		await emit("message_end", {
+			message: { role: "assistant", usage: { input: 12, output: 5 } },
+		});
+		await emit("turn_end", {
+			message: { role: "assistant", content: [{ type: "text", text: "verified [DONE:VC-001]" }] },
+		});
+		assert.match(recorded.status ?? "", /⌛ plans 1\/3: spent/);
+		assert.match(recorded.status ?? "", /12 in-toks/);
+
+		await emit("message_end", {
+			message: { role: "assistant", usage: { input: 8, output: 3 } },
+		});
+		await emit("turn_end", {
+			message: { role: "assistant", content: [{ type: "text", text: "verified [DONE:VC-002]" }] },
+		});
+		assert.match(recorded.status ?? "", /⌛ plans 2\/3: spent/);
+		assert.match(recorded.status ?? "", /20 in-toks/);
+
+		await stopExecution(pi, ctx, "event-chain-test");
+	});
+	it("applies impl markers with silent unknown ids and later-overwrite semantics", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v16.md"), items("VC-001"), [
+			{ id: "I-001", text: "First item." },
+		]);
+
+		assert.deepEqual(applyImplMarkers("[I-999:implemented]"), []); // unknown id silently ignored
+		assert.deepEqual(applyImplMarkers("[I-001:implemented]"), ["I-001"]);
+		assert.deepEqual(applyImplMarkers("[I-001:validating]"), ["I-001"]); // later overwrites
+		assert.equal(getExecution()?.implStatus?.["I-001"], "validating");
+
+		await stopExecution(pi, ctx, "done");
+	});
+
+	it("applies current-I markers to the live progress bar and snapshot", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, emit } = makeHarness(workdir);
+		registerExecutionTurnHandlers(pi);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v20.md"), items("VC-001", "VC-002", "VC-003"), [
+			{ id: "I-001", text: "First item." },
+			{ id: "I-002", text: "Second item." },
+			{ id: "I-003", text: "Third item." },
+		]);
+
+		await emit("turn_end", {
+			message: { role: "assistant", content: [{ type: "text", text: "starting [I-003:current]" }] },
+		});
+		assert.match(recorded.status ?? "", /⌛ plans 2\/3: spent/);
+		assert.equal(getExecution()?.currentI, "I-003");
+		drainExecutionFlush(pi, ctx);
+		const snapshot = recorded.entries.filter((entry) => entry.customType === "pi-plans-exec").at(-1)?.data as { currentI?: string };
+		assert.equal(snapshot.currentI, "I-003");
+		assert.equal(applyCurrentIMarker("[I-999:current]"), false);
+		await stopExecution(pi, ctx, "current-I-test");
+	});
+	it("replays impl markers from post-snapshot messages on restore", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx } = makeHarness(workdir);
+		const snapshot = {
+			planPath: path.join(workdir, "PLAN_v17.md"),
+			items: items("VC-001"),
+			startedAt: "2026-08-29T00:00:00Z",
+			implItems: [{ id: "I-001", text: "First item." }],
+			implStatus: {},
+		};
+		fs.writeFileSync(snapshot.planPath, "# plan");
+		const entries = [
+			{ type: "custom", customType: "pi-plans-exec", data: snapshot },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "work done [I-001:implemented]" }] } },
+		];
+		await restoreFromSession(pi, ctx, entries as any);
+		assert.equal(getExecution()?.implStatus?.["I-001"], "implemented");
+	});
+
+
+	it("keeps the injection rules teaching the impl markers", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v18.md"), items("VC-001"), [
+			{ id: "I-001", text: "First item." },
+		]);
+		const rules = executionContextMessage()!;
+		assert.match(rules, /\[I-001:implemented\]/);
+		assert.match(rules, /\[I-001:validating\]/);
+		assert.match(rules, /subprocess-backed verification/);
+		assert.match(rules, /waiting for/);
+		assert.match(rules, /5s\s*->\s*10s\s*->\s*20s\s*->\s*40s\s*->\s*80s/);
+		assert.match(rules, /keep polling at 80s/);
+		assert.match(rules, /restart at 5s for each new subprocess/);
+		await stopExecution(pi, ctx, "done");
+	});
+
+	it("planning compaction honors cooldown + resume guard and survives manual /compact", () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, setUsagePercent, recorded } = makeHarness(workdir);
+		initState(workdir);
+		startRun(workdir, { topic: "planning cooldown", skill: "plan-normal", requestText: "x" });
+
+		setUsagePercent(120);
+		assert.equal(shouldTriggerPlanningCompaction(ctx as any), true);
+		requestPlanningCompaction(ctx as any);
+		// In flight, second trigger ignored.
+		requestPlanningCompaction(ctx as any);
+		assert.equal(shouldTriggerPlanningCompaction(ctx as any), false);
+
+		setUsagePercent(50);
+		handlePlanningCompact(pi as any, ctx as any, {
+			type: "session_compact",
+			compactionEntry: { type: "compaction" } as never,
+			fromExtension: true,
+			reason: "manual",
+			willRetry: false,
+		});
+		const resume = recorded.messages.find((message) => message.customType === "pi-plans-plan-resume");
+		assert.ok(resume);
+		assert.equal(consumePlanningCompactionResumeGuard(ctx as any), true);
+		// Cooldown blocks retrigger while usage is still mid-band.
+		setUsagePercent(95);
+		assert.equal(shouldTriggerPlanningCompaction(ctx as any), false);
+		setUsagePercent(50);
+		refreshPlanningCompactionCooldown(ctx as any);
+		setUsagePercent(120);
+		assert.equal(shouldTriggerPlanningCompaction(ctx as any), true);
 	});
 });
+
+function makePreparation(reason: "manual" | "threshold" | "overflow", previousSummary: string | null): any {
+	return {
+		firstKeptEntryId: "a-2",
+		messagesToSummarize: [],
+		turnPrefixMessages: [],
+		isSplitTurn: false,
+		tokensBefore: 12345,
+		previousSummary,
+		fileOps: { read: [], written: [], edited: [] },
+		settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+	};
+}

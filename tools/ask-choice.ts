@@ -14,6 +14,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { disableAutoComplete, enableAutoComplete, isAutoCompleteEnabled, recordAskChoice } from "../src/autocomplete.ts";
 import { normalizeWorkdir, readActive, recordDecision } from "../src/state.ts";
 
 const Option = Type.Object({
@@ -85,14 +86,28 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 				source,
 			});
 
+			// Once enabled for this planning run, eligible questions answer with the
+			// recommendation without opening another UI prompt.
+			if (autoComplete && isAutoCompleteEnabled(ctx)) {
+				recordAskChoice(ctx, true);
+				record(recommended.label, "auto-complete");
+				return {
+					content: [{ type: "text", text: `Auto-complete selected the recommended option: ${recommended.label}` }],
+					details: details(recommended.label, "auto-complete"),
+				};
+			}
+
 			// No UI (print/json mode): planning questions may auto-complete;
 			// questions without Auto-complete must stop and wait for the user.
 			if (!ctx.hasUI) {
 				if (!autoComplete) {
+					disableAutoComplete(ctx, "non-interactive boundary");
 					throw new Error(
 						"No UI available and this question must not be auto-completed (execution handoff or external-state change). Stop and wait for the user.",
 					);
 				}
+				enableAutoComplete(ctx);
+				recordAskChoice(ctx, true);
 				record(recommended.label, "auto-complete");
 				return {
 					content: [
@@ -116,6 +131,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 
 			const selected = await ctx.ui.select(params.question, displayLabels);
 			if (selected === undefined) {
+				disableAutoComplete(ctx, "question cancelled");
 				return {
 					content: [
 						{
@@ -128,6 +144,8 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			}
 
 			if (autoComplete && selected.startsWith("Auto-complete")) {
+				enableAutoComplete(ctx);
+				recordAskChoice(ctx, true);
 				record(recommended.label, "auto-complete");
 				return {
 					content: [
@@ -143,11 +161,13 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			if (allowOther && selected.startsWith("Other…")) {
 				const typed = await ctx.ui.input(`${params.question} — your answer:`);
 				if (typed === undefined || !typed.trim()) {
+					disableAutoComplete(ctx, "free-form answer cancelled");
 					return {
 						content: [{ type: "text", text: "User cancelled the free-form answer. Ask again or stop." }],
 						details: details(null, "cancelled"),
 					};
 				}
+				recordAskChoice(ctx, false);
 				const answer = typed.trim();
 				record(answer, "user");
 				return {
@@ -159,11 +179,13 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			const index = displayLabels.indexOf(selected);
 			const option = index >= 0 && index < options.length ? options[index] : undefined;
 			if (!option) {
+				recordAskChoice(ctx, false);
 				return {
 					content: [{ type: "text", text: `User selected: ${selected}` }],
 					details: details(selected, "user"),
 				};
 			}
+			recordAskChoice(ctx, false);
 			record(option.label, "user");
 			return {
 				content: [{ type: "text", text: `User selected: ${index + 1}. ${option.label}` }],
