@@ -340,3 +340,179 @@ test("declined consent still short-circuits before batching", async (t) => {
 	) as { summary_status: string };
 	assert.equal(row.summary_status, "declined");
 });
+
+// ---------------------------------------------------------------------------
+// ref alignment + object-stream parsing (summary-jsonl-alignment plan)
+// ---------------------------------------------------------------------------
+
+import { alignByRef, buildRef, parseSummaryObjects, pendingFunctions } from "../src/code-graph/summary.ts";
+
+function rec(ref: string | null, description = "d"): Record<string, unknown> {
+	return ref === null ? { description, inputs: [], outputs: [] } : { ref, description, inputs: [], outputs: [] };
+}
+
+test("parseSummaryObjects tolerates pretty-print, parallel objects, garbage, and escapes", () => {
+	const raw = [
+		"Here you go:",
+		JSON.stringify({ ref: "./a.ts::f", description: "brace } inside { string", inputs: [], outputs: [{ nested: true }] }, null, 1),
+		JSON.stringify(rec("./a.ts::g")) + " " + JSON.stringify(rec("./a.ts::h")),
+		"trailing garbage { unclosed",
+	].join("\n");
+	const objects = parseSummaryObjects(raw);
+	assert.equal(objects.length, 3);
+	assert.deepEqual(
+		objects.map((o) => (o as { ref?: string }).ref),
+		["./a.ts::f", "./a.ts::g", "./a.ts::h"],
+	);
+	assert.deepEqual((objects[0] as { outputs: unknown[] }).outputs, [{ nested: true }]);
+});
+
+test("parseSummaryObjects drops a truncated final object without affecting earlier ones", () => {
+	const raw = `${JSON.stringify(rec("./a.ts::f"))}\n{"ref": "./a.ts::g", "description": "trunc`;
+	const objects = parseSummaryObjects(raw);
+	assert.equal(objects.length, 1);
+});
+
+test("alignByRef maps by ref, drops unknown/duplicate-later, and falls back to order only when zero refs and counts equal", () => {
+	const updates = [makeEntry("f", "c1"), makeEntry("g", "c2"), makeEntry("h", "c3")];
+	const refs = updates.map((e) => buildRef(e.fileDir, e.fileName, e.functionName));
+	// unknown ref + duplicate later + missing h
+	const outcome = alignByRef(updates, [rec("nope::x"), rec(refs[0]!), rec(refs[1]!), rec(refs[1]!)]);
+	assert.equal(outcome.orderFallback, false);
+	assert.ok(outcome.aligned[0]?.record, "f matched (unknown record dropped, uncounted)");
+	assert.ok(outcome.aligned[1]?.record, "g matched first duplicate");
+	assert.equal(outcome.aligned[2]?.record === null, true, "h missing");
+
+	// zero refs, counts equal → order fallback (legacy contract)
+	const legacy = alignByRef(updates, [rec(null), rec(null), rec(null)]);
+	assert.equal(legacy.orderFallback, true);
+	assert.ok(legacy.aligned.every((slot) => slot.record !== null));
+
+	// zero refs, counts differ → no fallback, all unmatched
+	const mismatch = alignByRef(updates, [rec(null)]);
+	assert.equal(mismatch.orderFallback, false);
+	assert.equal(mismatch.aligned.every((slot) => slot.record === null), true);
+});
+
+test("buildRef edge seeds stay distinct", () => {
+	const refs = [
+		buildRef("pkg", "math.js", "same"),
+		buildRef("pkg", "math.js", "same#2"),
+		buildRef("pkg", "anon.ts", "<anonymous:1>"),
+		buildRef("weird", "a::b.ts", "fn::weird"),
+	];
+	assert.equal(new Set(refs).size, refs.length);
+});
+
+test("generateSummaries applies ref-aligned records record-by-record despite format drift", async (t) => {
+	const opened = await openTemp();
+	if (!opened) return;
+	t.after(() => opened.cleanup());
+	const { store } = opened;
+	const entries = [makeEntry("f", "function f() { return 1; }"), makeEntry("g", "function g() { return 2; }"), makeEntry("h", "function h() { return 3; }")];
+	seedEntries(store, entries);
+	const refs = entries.map((e) => buildRef(e.fileDir, e.fileName, e.functionName));
+	const handle: CompletionHandle = {
+		...allowConsent(),
+		complete: async () => ({
+			content: [{
+				type: "text",
+				// pretty-print f across lines; g normal; h missing; garbage around
+				text: [
+					"Sure:",
+					JSON.stringify({ ref: refs[0], description: "f summary", inputs: ["a"], outputs: ["b"] }, null, 2),
+					JSON.stringify({ ref: refs[1], description: "g summary", inputs: [], outputs: [] }),
+					"thanks!",
+				].join("\n"),
+			}],
+		}),
+	};
+	const report = await generateSummaries({ store, ctx: handle, skipConsent: true, batchTokens: 100_000 });
+	assert.equal(report.ok, 2);
+	assert.equal(report.failed, 1);
+	assert.equal(report.processed, 3);
+	const statuses = store.read(() =>
+		store.db.prepare(`SELECT function_name, summary_status, summary_error FROM functions ORDER BY function_name`).all(),
+	) as Array<{ function_name: string; summary_status: string; summary_error: string | null }>;
+	const byName = new Map(statuses.map((row) => [row.function_name, row]));
+	assert.equal(byName.get("f")?.summary_status, "ok");
+	assert.equal(byName.get("g")?.summary_status, "ok");
+	assert.equal(byName.get("h")?.summary_status, "failed");
+	assert.match(byName.get("h")?.summary_error ?? "", /no aligned summary record/);
+});
+
+test("pendingFunctions retries previously failed summaries", async (t) => {
+	const opened = await openTemp();
+	if (!opened) return;
+	t.after(() => opened.cleanup());
+	const { store } = opened;
+	const entries = [makeEntry("ok1", "function ok1() {}")];
+	seedEntries(store, entries);
+	store.tx(() => {
+		store.db.prepare(`UPDATE functions SET summary_status = 'failed', summary_error = 'summary response returned 62 record(s) for batch of 63'`).run();
+	});
+	const pending = pendingFunctions(store);
+	assert.equal(pending.length, 1, "failed rows must be re-selected");
+});
+
+test("parseSummaryObjects handles escaped quotes, escaped backslashes, and CRLF", () => {
+	const tricky = JSON.stringify({ ref: "./e.ts::esc", description: 'quote " brace } backslash \\ end', inputs: [], outputs: [] });
+	const raw = ["prefix", tricky, '{"ref": "./e.ts::trail", "description": "ends with backslash \\\\", "inputs": [], "outputs": []}'].join("\r\n");
+	const objects = parseSummaryObjects(raw);
+	assert.equal(objects.length, 2);
+	assert.equal((objects[0] as { description?: string }).description, 'quote " brace } backslash \\ end');
+});
+
+test("all-unaligned batch marks every function failed with the aligned-record reason", async (t) => {
+	const opened = await openTemp();
+	if (!opened) return;
+	t.after(() => opened.cleanup());
+	const { store } = opened;
+	const entries = [makeEntry("x", "function x() {}"), makeEntry("y", "function y() {}")];
+	seedEntries(store, entries);
+	const handle: CompletionHandle = {
+		...allowConsent(),
+		complete: async () => ({ content: [{ type: "text", text: "not jsonl at all" }] }),
+	};
+	const report = await generateSummaries({ store, ctx: handle, skipConsent: true, batchTokens: 100_000 });
+	assert.equal(report.ok, 0);
+	assert.equal(report.failed, 2);
+	const rows = store.read(() =>
+		store.db.prepare(`SELECT function_name, summary_error FROM functions ORDER BY function_name`).all(),
+	) as Array<{ function_name: string; summary_error: string | null }>;
+	for (const row of rows) {
+		assert.match(row.summary_error ?? "", /no aligned summary record for pkg\/math\.js::(x|y)/);
+	}
+});
+
+test("validate clamps oversized fields instead of failing (documented contract)", async (t) => {
+	const opened = await openTemp();
+	if (!opened) return;
+	t.after(() => opened.cleanup());
+	const { store } = opened;
+	const entries = [makeEntry("clamp", "function clamp() {}")];
+	seedEntries(store, entries);
+	const refs = entries.map((e) => buildRef(e.fileDir, e.fileName, e.functionName));
+	const handle: CompletionHandle = {
+		...allowConsent(),
+		complete: async () => ({
+			content: [{
+				type: "text",
+				text: JSON.stringify({
+					ref: refs[0],
+					description: "d".repeat(500),
+					inputs: Array.from({ length: 20 }, (_, i) => `in${i}-${"x".repeat(100)}`),
+					outputs: [],
+				}),
+			}],
+		}),
+	};
+	const report = await generateSummaries({ store, ctx: handle, skipConsent: true, batchTokens: 100_000 });
+	assert.equal(report.ok, 1, "clamped record counts as ok (R-003 reuse-existing bounds)");
+	const row = store.read(() =>
+		store.db.prepare(`SELECT summary_description, summary_inputs FROM functions`).get(),
+	) as { summary_description: string; summary_inputs: string };
+	assert.equal(row.summary_description.length, 280);
+	assert.equal((JSON.parse(row.summary_inputs) as string[]).length, 8);
+	assert.equal((JSON.parse(row.summary_inputs) as string[])[0]!.length, 80);
+});

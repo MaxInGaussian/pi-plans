@@ -63,7 +63,13 @@ const PER_ENTRY_OVERHEAD_TOKENS = 32;
 /** Maximum allowed characters for a persisted `summary_error` value. */
 const SUMMARY_ERROR_MAX_LENGTH = 240;
 
-const SYSTEM_PROMPT = `You summarize code functions in structured JSON. For each input return exactly one JSON object matching {description: string, inputs: string[], outputs: string[]} with description <= 280 chars and arrays of short strings (<= 80 chars, <= 8 entries). Do not include any explanation or additional fields. Output one JSON object per line.`;
+const SYSTEM_PROMPT = `You summarize code functions in structured JSON. Each input block starts with a "ref:" line. For each input return exactly one JSON object matching {ref: string, description: string, inputs: string[], outputs: string[]} where ref is the exact ref line value copied verbatim, description <= 280 chars, and arrays of short strings (<= 80 chars, <= 8 entries). Do not include any explanation or additional fields. Output one JSON object per input.`;
+
+/** Opaque alignment key echoed back by the model. Built in ONE place so
+ * prompt, alignment, and DB writes can never disagree. */
+export function buildRef(fileDir: string, fileName: string, functionName: string): string {
+	return `${fileDir}/${fileName}::${functionName}`;
+}
 
 export interface PendingSummary {
 	fileDir: string;
@@ -81,7 +87,7 @@ export function pendingFunctions(store: Store): PendingSummary[] {
 				.prepare(
 					`SELECT file_dir, file_name, function_name, full_code_hash, language, full_code
 					 FROM functions
-					 WHERE summary_status IS NULL OR summary_status = 'pending'`,
+					 WHERE summary_status IS NULL OR summary_status = 'pending' OR summary_status = 'failed'`,
 				)
 				.all(),
 		) as Array<{ file_dir: string; file_name: string; function_name: string; full_code_hash: string; language: string; full_code: string }>;
@@ -168,15 +174,77 @@ function validate(record: unknown): SummaryRecord | null {
 	};
 }
 
-function parseJsonl(raw: string): unknown[] {
-	const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
-	return lines.map((line) => {
-		try {
-			return JSON.parse(line);
-		} catch {
-			return null;
+/** Quote-aware balanced-brace scanner: extracts top-level {...} object
+ *  substrings from raw model output, tolerating pretty-printed objects that
+ *  span lines, multiple objects on one line, and garbage between objects.
+ *  A truncated final object is dropped (never mis-parsed). Strings and
+ *  escapes are skipped so braces inside literals cannot split an object. */
+export function parseSummaryObjects(raw: string): unknown[] {
+	const objects: unknown[] = [];
+	let depth = 0;
+	let start = -1;
+	let inString = false;
+	let escaped = false;
+	for (let i = 0; i < raw.length; i++) {
+		const ch = raw[i]!;
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (ch === "\\") escaped = true;
+			else if (ch === '"') inString = false;
+			continue;
 		}
+		if (ch === '"') {
+			inString = true;
+			continue;
+		}
+		if (ch === "{") {
+			if (depth === 0) start = i;
+			depth++;
+		} else if (ch === "}") {
+			if (depth > 0) {
+				depth--;
+				if (depth === 0 && start >= 0) {
+						try {
+							objects.push(JSON.parse(raw.slice(start, i + 1)));
+						} catch {
+							/* malformed object: skip */
+						}
+						start = -1;
+					}
+				}
+			}
+	}
+	return objects;
+}
+
+export interface AlignOutcome {
+	/** Per-input-function resolution, aligned with `updates` order. */
+	aligned: Array<{ entry: PendingSummary; record: unknown } | { entry: PendingSummary; record: null }>;
+	/** true when order fallback was used (zero ref-carrying records, count equal). */
+	orderFallback: boolean;
+}
+
+/** Align parsed records back to batch functions by their echoed `ref`.
+ *  Duplicates: first wins. Unknown refs are dropped (uncounted). When NO
+ *  record carries a usable ref AND counts match exactly, fall back to order
+ *  alignment (the pre-ref contract) so legacy responses keep working. */
+export function alignByRef(updates: PendingSummary[], records: unknown[]): AlignOutcome {
+	const byRef = new Map<string, unknown>();
+	let refRecords = 0;
+	for (const record of records) {
+		const ref = record && typeof record === "object" && typeof (record as Record<string, unknown>).ref === "string"
+			? (record as Record<string, unknown>).ref
+			: null;
+		if (ref === null) continue;
+		refRecords++;
+		if (!byRef.has(ref)) byRef.set(ref, record);
+	}
+	const orderFallback = refRecords === 0 && records.length === updates.length;
+	const aligned: AlignOutcome["aligned"] = updates.map((entry, index) => {
+		if (orderFallback) return { entry, record: records[index] ?? null };
+		return { entry, record: byRef.get(buildRef(entry.fileDir, entry.fileName, entry.functionName)) ?? null };
 	});
+	return { aligned, orderFallback };
 }
 
 function effectiveEffort(ctx: CompletionHandle): string | undefined {
@@ -231,7 +299,7 @@ export async function generateSummaries(opts: SummaryOptions): Promise<SummaryRe
 			"info",
 		);
 		const prompts = updates
-			.map((entry) => `${entry.fileDir}/${entry.fileName}::${entry.functionName}\n${entry.fullCode}`)
+			.map((entry) => `ref: ${buildRef(entry.fileDir, entry.fileName, entry.functionName)}\n${entry.fullCode}`)
 			.join("\n---\n");
 		try {
 			const response = await opts.ctx.complete({
@@ -241,17 +309,12 @@ export async function generateSummaries(opts: SummaryOptions): Promise<SummaryRe
 				.filter((part) => part.type === "text")
 				.map((part) => part.text)
 				.join("\n");
-			const records = parseJsonl(texts);
-			if (records.length !== updates.length) {
-				const message = boundedErrorMessage(
-					`summary response returned ${records.length} record(s) for batch of ${updates.length}`,
-				);
-				markFailed(opts.store, updates, message);
-				report.processed += updates.length;
-				report.failed += updates.length;
-				continue;
+			const records = parseSummaryObjects(texts);
+			const { aligned, orderFallback } = alignByRef(updates, records);
+			if (orderFallback) {
+				opts.ctx.notify?.("code-graph summary: no refs echoed; aligned by order (legacy response shape)", "info");
 			}
-			const applied = applyRecords(opts.store, updates, records, effort);
+			const applied = applyAligned(opts.store, aligned, effort);
 			report.processed += applied.processed;
 			report.ok += applied.ok;
 			report.failed += applied.failed;
@@ -295,10 +358,9 @@ function markFailed(store: Store, pending: PendingSummary[], message: string): v
 	});
 }
 
-function applyRecords(
+function applyAligned(
 	store: Store,
-	entries: PendingSummary[],
-	records: unknown[],
+	aligned: AlignOutcome["aligned"],
 	effort: string | undefined,
 ): { processed: number; ok: number; failed: number } {
 	const stmt = store.prepare(
@@ -315,22 +377,23 @@ function applyRecords(
 			summary_updated_at = ?
 		 WHERE file_dir = ? AND file_name = ? AND function_name = ?`,
 	);
-	const model = (function () {
-		try {
-			return "(current-model)";
-		} catch {
-			return null;
-		}
-	})();
+	const failStmt = store.prepare(
+		"update_failed_single",
+		`UPDATE functions SET summary_status = 'failed', summary_error = ?, summary_updated_at = ?
+		 WHERE file_dir = ? AND file_name = ? AND function_name = ?`,
+	);
 	let ok = 0;
 	let failed = 0;
 	store.tx(() => {
 		const now = new Date().toISOString();
-		for (let i = 0; i < entries.length; i++) {
-			const record = records[i];
-			const validated = validate(record);
-			const entry = entries[i];
-			if (!validated || !entry) {
+		for (const slot of aligned) {
+			const validated = slot.record === null ? null : validate(slot.record);
+			if (!validated) {
+				const ref = buildRef(slot.entry.fileDir, slot.entry.fileName, slot.entry.functionName);
+				const reason = slot.record === null
+					? `no aligned summary record for ${ref} (missing/unknown ref or unparseable object)`
+					: `invalid summary fields for ${ref}`;
+				failStmt.run(boundedErrorMessage(reason), now, slot.entry.fileDir, slot.entry.fileName, slot.entry.functionName);
 				failed++;
 				continue;
 			}
@@ -339,19 +402,19 @@ function applyRecords(
 				JSON.stringify(validated.inputs),
 				JSON.stringify(validated.outputs),
 				"ok",
-				model,
+				"(current-model)",
 				1,
 				effort ?? null,
 				now,
-				entry.fileDir,
-				entry.fileName,
-				entry.functionName,
+				slot.entry.fileDir,
+				slot.entry.fileName,
+				slot.entry.functionName,
 			);
-			cache.set(cacheKey(entry), { summary: validated });
+			cache.set(cacheKey(slot.entry), { summary: validated });
 			ok++;
 		}
 	});
-	return { processed: entries.length, ok, failed };
+	return { processed: aligned.length, ok, failed };
 }
 
 export function clearSummaryCache(): void {
