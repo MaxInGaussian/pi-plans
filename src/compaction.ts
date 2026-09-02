@@ -27,6 +27,8 @@ export interface CompactionEntryLike {
 	message?: CompactionMessage;
 	data?: Record<string, unknown>;
 	details?: Record<string, unknown>;
+	/** Compaction entries carry their kept boundary at the top level (Pi schema). */
+	firstKeptEntryId?: string;
 	/** Test fixtures and callers may provide a native estimate. */
 	tokens?: number;
 }
@@ -160,6 +162,55 @@ function safeJson(value: unknown): string {
 	} catch {
 		return "[unserializable]";
 	}
+}
+
+/**
+ * Conservative mirror of Pi's `prepareCompaction` eligibility: is there
+ * anything outside the keep-recent window that Pi could actually summarize?
+ * Pi refuses manual compaction ("Nothing to compact (session too small)" /
+ * "Already compacted") when the answer is no, so the auto-trigger must not
+ * fire in that regime. Uncertainty (missing entry ids, unreadable branch)
+ * resolves to `true` — the caller prefers one Pi rejection, which the
+ * terminal-failure backoff absorbs, over permanently blocked compaction.
+ */
+export function hasCompactableContent(
+	entries: CompactionEntryLike[],
+	keepRecentTokens = 20_000,
+): boolean {
+	if (!Array.isArray(entries) || entries.length === 0) return false;
+	if (entries[entries.length - 1]?.type === "compaction") return false;
+	let prevCompactionIndex = -1;
+	for (let index = entries.length - 1; index >= 0; index--) {
+		if (entries[index]?.type === "compaction") {
+			prevCompactionIndex = index;
+			break;
+		}
+	}
+	let boundaryStart = 0;
+	if (prevCompactionIndex >= 0) {
+		const prev = entries[prevCompactionIndex];
+		const known = prev?.firstKeptEntryId
+			?? (typeof prev?.details?.firstKeptEntryId === "string" ? prev.details.firstKeptEntryId : undefined);
+		const firstKeptIndex = known
+			? entries.findIndex((entry) => entry.id === known)
+			: -1;
+		boundaryStart = firstKeptIndex >= 0 ? firstKeptIndex : prevCompactionIndex + 1;
+	}
+	// Walk backwards from the newest entry, reserving the keep-recent budget,
+	// exactly like Pi's findCutPoint accumulation.
+	let reserved = 0;
+	let cutIndex = boundaryStart;
+	for (let index = entries.length - 1; index >= boundaryStart; index--) {
+		reserved += estimateEntryTokens(entries[index] ?? { type: "raw" });
+		cutIndex = index;
+		if (reserved >= keepRecentTokens) break;
+	}
+	// Anything summarizable between the previous boundary and the cut point?
+	for (let index = boundaryStart; index < cutIndex; index++) {
+		const entry = entries[index];
+		if (entry?.message && !isInternalEntry(entry)) return true;
+	}
+	return false;
 }
 
 function entryHasToolCall(entry: CompactionEntryLike, id: string): boolean {

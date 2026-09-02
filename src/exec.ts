@@ -24,6 +24,7 @@ import {
 	compactionCurrentI,
 	currentIExceedsTrigger,
 	entryCurrentIMarkers,
+	hasCompactableContent,
 	extractReadRecords,
 	formatReadRecord,
 	mergeCompactionDetails,
@@ -31,7 +32,8 @@ import {
 	type CompactionDetailsLike,
 	type CompactionEntryLike,
 } from "./compaction.ts";
-import { getRun, readActive, setRunStatus, utcNow } from "./state.ts";
+import { getRun, loadConfig, readActive, resolveStateRootOrNull, setRunStatus, utcNow } from "./state.ts";
+import { graphBlockForExecutor } from "./code-graph/prompts.ts";
 import {
 	extractCoverage,
 	latestPlanVersion,
@@ -54,6 +56,7 @@ export interface ExecState {
 	implItems?: ImplItem[];
 	implStatus?: Record<string, ImplMarkerState>;
 	currentI?: string;
+	graphEnabled?: boolean;
 }
 
 let execution: ExecState | null = null;
@@ -89,6 +92,10 @@ export function getExecution(): ExecState | null {
 const EXECUTION_COMPACTION_TRIGGER_PERCENT = 20;
 const EXECUTION_COMPACTION_REARM_PERCENT = 80;
 const EXECUTION_COMPACTION_REARM_HIGH_PERCENT = 95;
+/** Terminal "nothing to compact" backoff: re-arm only after the session has
+ * grown past Pi's default keep-recent window (20k) or usage is nearly full. */
+const TERMINAL_BACKOFF_GROWTH_TOKENS = 20_000;
+const TERMINAL_BACKOFF_HIGH_PERCENT = 85;
 const EXECUTION_COMPACTION_RESUME_MESSAGE = "Continue execution.";
 
 interface ExecutionCompactionState {
@@ -99,6 +106,8 @@ interface ExecutionCompactionState {
 	lastSuccessfulUsagePercent: number | null;
 	lastSuccessfulAt: string | null;
 	rearmPending: boolean;
+	/** Terminal "nothing to compact" backoff: tokens observed when Pi refused. */
+	terminalBackoffTokens: number | null;
 }
 
 type ExecutionCompactionSession = { __executionCompaction?: ExecutionCompactionState };
@@ -126,6 +135,7 @@ function ensureExecutionCompactionState(ctx: ExtensionContext): ExecutionCompact
 		lastSuccessfulUsagePercent: null,
 		lastSuccessfulAt: null,
 		rearmPending: false,
+		terminalBackoffTokens: null,
 	});
 }
 
@@ -185,10 +195,12 @@ function executionCurrentIUsage(ctx: ExtensionContext): { tokens: number; contex
 export function shouldTriggerExecutionCompaction(ctx: ExtensionContext): boolean {
 	const currentUsage = executionCurrentIUsage(ctx);
 	if (!currentUsage || currentUsage.eligible === false || !currentIExceedsTrigger(currentUsage.tokens, currentUsage.contextWindow)) return false;
+	if (!branchIsCompactable(ctx)) return false;
 	const percent = (currentUsage.tokens / currentUsage.contextWindow) * 100;
 	const state = executionCompactionState(ctx);
 	if (!state) return true;
 	if (state.inFlight || state.resumeGuard || state.cooldownActive) return false;
+	if (terminalBackoffBlocks(state, currentUsage.tokens, currentUsage.contextWindow)) return false;
 	if (state.rearmPending) {
 		if (percent < EXECUTION_COMPACTION_REARM_HIGH_PERCENT) return false;
 		state.rearmPending = false;
@@ -199,6 +211,10 @@ export function shouldTriggerExecutionCompaction(ctx: ExtensionContext): boolean
 function requestExecutionCompaction(ctx: ExtensionContext): void {
 	const state = ensureExecutionCompactionState(ctx);
 	if (state.inFlight || state.resumeGuard) return;
+	if (compactionInFlight(ctx, "execution")) return; // Pi core already running one; skip this turn
+	if (agentIsBusy(ctx)) return; // never abort an in-flight turn; retry on the next turn_end
+	const usage = ctx.getContextUsage();
+	if (terminalBackoffBlocks(state, usage?.tokens, usage?.contextWindow)) return;
 	state.inFlight = true;
 	state.lastAttemptReason = "threshold";
 	try {
@@ -322,7 +338,16 @@ export async function startExecution(
 	items: CheckItem[],
 	implItems?: ImplItem[],
 ): Promise<void> {
-	execution = { planPath, items, startedAt: utcNow(), usage: { inToks: 0, outToks: 0 }, implItems: implItems ?? [], implStatus: {} };
+	let graphEnabled: boolean | undefined;
+	const stateRoot = resolveStateRootOrNull(ctx.cwd);
+	if (stateRoot) {
+		try {
+			graphEnabled = loadConfig(stateRoot).graph_enabled === true;
+		} catch {
+			graphEnabled = undefined;
+		}
+	}
+	execution = { planPath, items, startedAt: utcNow(), usage: { inToks: 0, outToks: 0 }, implItems: implItems ?? [], implStatus: {}, graphEnabled };
 	pendingExecutionFlush = false; // fresh run: no inherited flush debt
 	resetExecutionCompactionState(ctx);
 	persist(pi);
@@ -742,6 +767,7 @@ export function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionContext, 
 	state.lastAttemptReason = event.reason;
 	state.cooldownActive = true;
 	state.rearmPending = false;
+	state.terminalBackoffTokens = null;
 	state.lastSuccessfulAt = utcNow();
 	state.lastSuccessfulUsagePercent = ctx.getContextUsage()?.percent ?? state.lastSuccessfulUsagePercent;
 	if (!event.willRetry) {
@@ -764,9 +790,24 @@ export function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionContext, 
 export function handleExecutionCompactFailed(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactFailedEvent): void {
 	if (!execution) return;
 	const state = executionCompactionState(ctx);
-	const expectedThresholdCancel = event.reason === "threshold" && event.aborted && !state?.inFlight;
-	if (expectedThresholdCancel) {
-		if (state) state.lastAttemptReason = event.reason;
+	const terminal = isTerminalCompactionFailure(event);
+	if (terminal) {
+		// Pi refused or aborted the compaction. Hold the cooldown and re-arm
+		// only after real growth or high-watermark pressure so the loop stops.
+		if (state) {
+			state.inFlight = false;
+			state.resumeGuard = false;
+			state.cooldownActive = true;
+			state.rearmPending = false;
+			state.lastAttemptReason = event.reason;
+			const tokens = ctx.getContextUsage()?.tokens;
+			state.terminalBackoffTokens = typeof tokens === "number" ? tokens : Number.POSITIVE_INFINITY;
+		}
+		const message = terminal.kind === "content"
+			? "pi-plans: compaction found nothing to summarize; backing off until the session grows past the keep-recent window."
+			: "pi-plans: compaction was aborted (provider interruption, user cancel, or a competing manual compact); backing off until the session grows or usage nears the window.";
+		ctx.ui.notify(message, "info");
+		requestExecutionFlush(pi, ctx);
 		return;
 	}
 	if (state) {
@@ -806,6 +847,141 @@ interface PlanningCompactionState {
 	lastAttemptReason: "manual" | "threshold" | "overflow" | null;
 	lastSuccessfulUsagePercent: number | null;
 	lastSuccessfulAt: string | null;
+	/** Terminal "nothing to compact" backoff: tokens observed when Pi refused. */
+	terminalBackoffTokens: number | null;
+}
+
+/** Shared helpers for both compaction phases. */
+function agentIsBusy(ctx: ExtensionContext): boolean {
+	const host = ctx as unknown as { isIdle?: () => boolean; hasPendingMessages?: () => boolean };
+	try {
+		if (typeof host.hasPendingMessages === "function" && host.hasPendingMessages()) return true;
+		if (typeof host.isIdle === "function" && !host.isIdle()) return true;
+	} catch {
+		// Host projection unavailable: treat as idle to preserve prior behavior.
+	}
+	return false;
+}
+
+function sessionBranchEntries(ctx: ExtensionContext): CompactionEntryLike[] | null {
+	const manager = ctx.sessionManager as unknown as { getBranch?: () => unknown };
+	if (typeof manager.getBranch !== "function") return null;
+	try {
+		const entries = manager.getBranch() as CompactionEntryLike[];
+		return Array.isArray(entries) ? entries : null;
+	} catch {
+		return null;
+	}
+}
+
+function branchIsCompactable(ctx: ExtensionContext): boolean {
+	const entries = sessionBranchEntries(ctx);
+	if (!entries) return true; // conservative: let Pi decide, backoff absorbs a rejection
+	return hasCompactableContent(entries);
+}
+
+function isTerminalCompactionFailure(event: { errorMessage?: string; aborted?: boolean }): { kind: "content" | "abort-stream" } | null {
+	const message = (event.errorMessage ?? "").toLowerCase();
+	if (message.includes("nothing to compact") || message.includes("already compacted") || message.includes("session too small")) {
+		return { kind: "content" };
+	}
+	// abort/stream class: explicit event names only, so that provider blips
+	// (network down, etc.) stay retryable.
+	const abortPatterns = [
+		"this operation was aborted",
+		"aborted",
+		"stream ended before a terminal response event",
+		"turn prefix summarization failed",
+		"auto-compaction failed",
+		"context overflow recovery failed",
+	];
+	if (abortPatterns.some((pattern) => message.includes(pattern))) {
+		return { kind: "abort-stream" };
+	}
+	// Aborted with no recognized message: still an abort-class terminal so the
+	// next eligible turn does not immediately retry the same operation.
+	if (event.aborted === true) {
+		return { kind: "abort-stream" };
+	}
+	return null;
+}
+
+/** True while the terminal "nothing to compact" backoff is still active.
+ * Releases (and clears) the anchor once the session grew past Pi's keep-recent
+ * window or usage reached the high watermark. Shared by the shouldTrigger
+ * gate and the request functions so a direct request cannot bypass it. */
+function terminalBackoffBlocks(
+	state: { terminalBackoffTokens: number | null },
+	tokens?: number,
+	contextWindow?: number,
+): boolean {
+	if (state.terminalBackoffTokens === null) return false;
+	const grown = typeof tokens === "number" ? tokens - state.terminalBackoffTokens : Number.NEGATIVE_INFINITY;
+	const percent = typeof tokens === "number" && typeof contextWindow === "number" && contextWindow > 0
+		? (tokens / contextWindow) * 100
+		: 0;
+	if (grown >= TERMINAL_BACKOFF_GROWTH_TOKENS || percent >= TERMINAL_BACKOFF_HIGH_PERCENT) {
+		state.terminalBackoffTokens = null;
+		return false;
+	}
+	return true;
+}
+
+/** Session-scoped phase-local "compaction in flight" guard.
+ *  - Set on `session_before_compact` for the phase attributed by the custom
+ *    instructions hint; auto-compaction (no hint) marks both phases defensively.
+ *  - Cleared on `session_compact` and `session_compact_failed`.
+ *  - Read by `requestPlanningCompaction` / `requestExecutionCompaction` to skip
+ *    a manual compact while Pi core is already running one. */
+type CompactionPhase = "planning" | "execution";
+
+function compactionLifecycleStore(ctx: ExtensionContext): {
+	planning: boolean;
+	execution: boolean;
+} {
+	const carrier = ctx.sessionManager as unknown as {
+		__piPlansCompactionInFlight?: { planning: boolean; execution: boolean };
+	};
+	carrier.__piPlansCompactionInFlight ??= { planning: false, execution: false };
+	return carrier.__piPlansCompactionInFlight;
+}
+
+function isPlanningCustomInstructions(hint: unknown): boolean {
+	return typeof hint === "string" && hint.startsWith("pi-plans planning");
+}
+
+function isExecutionCustomInstructions(hint: unknown): boolean {
+	return typeof hint === "string" && hint.startsWith("pi-plans execution");
+}
+
+export function noteCompactionStarted(ctx: ExtensionContext, customInstructions: unknown): void {
+	const store = compactionLifecycleStore(ctx);
+	if (isPlanningCustomInstructions(customInstructions)) {
+		store.planning = true;
+	} else if (isExecutionCustomInstructions(customInstructions)) {
+		store.execution = true;
+	} else {
+		// Auto-compaction (threshold/overflow/manual without our hint) marks both.
+		store.planning = true;
+		store.execution = true;
+	}
+}
+
+/** Pi core's `SessionCompactEvent` / `SessionCompactFailedEvent` do not carry
+ *  `customInstructions` in any emission site, so the END side has no way to
+ *  know which phase the compaction belonged to. Clearing both phases is the
+ *  safe default — the per-phase start side (above) already encodes the hint
+ *  attribution. The hint parameter is retained for API symmetry and future
+ *  Pi core schema additions. */
+export function noteCompactionEnded(ctx: ExtensionContext, _customInstructions: unknown): void {
+	const store = compactionLifecycleStore(ctx);
+	store.planning = false;
+	store.execution = false;
+}
+
+export function compactionInFlight(ctx: ExtensionContext, phase: CompactionPhase): boolean {
+	const store = compactionLifecycleStore(ctx);
+	return store[phase];
 }
 
 interface PlanningBranchEntry {
@@ -944,10 +1120,12 @@ export function shouldTriggerPlanningCompaction(ctx: ExtensionContext): boolean 
 	if (!resolvePlanningCompactionContext(ctxWorkdir)) return false;
 	const currentUsage = planningCurrentIUsage(ctx);
 	if (!currentUsage || currentUsage.eligible === false || !currentIExceedsTrigger(currentUsage.tokens, currentUsage.contextWindow)) return false;
+	if (!branchIsCompactable(ctx)) return false;
 	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
 	const state = session.__planningCompaction;
 	if (!state) return true;
 	if (state.inFlight || state.resumeGuard || state.cooldownActive) return false;
+	if (terminalBackoffBlocks(state, currentUsage.tokens, currentUsage.contextWindow)) return false;
 	return true;
 }
 
@@ -977,8 +1155,13 @@ export function requestPlanningCompaction(ctx: ExtensionContext): void {
 		lastAttemptReason: null,
 		lastSuccessfulUsagePercent: null,
 		lastSuccessfulAt: null,
+		terminalBackoffTokens: null,
 	} satisfies PlanningCompactionState);
 	if (state.inFlight || state.resumeGuard) return;
+	if (compactionInFlight(ctx, "planning")) return; // Pi core already running one; skip this turn
+	if (agentIsBusy(ctx)) return; // never abort an in-flight turn; retry on the next turn_end
+	const usage = ctx.getContextUsage();
+	if (terminalBackoffBlocks(state, usage?.tokens, usage?.contextWindow)) return;
 	state.inFlight = true;
 	state.lastAttemptReason = "threshold";
 	try {
@@ -1088,6 +1271,7 @@ export function handlePlanningBeforeCompact(
 		lastAttemptReason: null,
 		lastSuccessfulUsagePercent: null,
 		lastSuccessfulAt: null,
+		terminalBackoffTokens: null,
 	} satisfies PlanningCompactionState);
 	const percent = ctx.getContextUsage()?.percent ?? null;
 	if (event.reason === "threshold" && (percent === null || percent < 100)) {
@@ -1123,6 +1307,7 @@ export function handlePlanningCompact(pi: ExtensionAPI, ctx: ExtensionContext, e
 	if (!state) return;
 	state.inFlight = false;
 	state.lastAttemptReason = event.reason;
+	state.terminalBackoffTokens = null;
 	state.cooldownActive = true;
 	state.lastSuccessfulAt = utcNow();
 	state.lastSuccessfulUsagePercent = ctx.getContextUsage()?.percent ?? state.lastSuccessfulUsagePercent;
@@ -1146,9 +1331,20 @@ export function handlePlanningCompactFailed(pi: ExtensionAPI, ctx: ExtensionCont
 	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
 	const state = session.__planningCompaction;
 	if (!state) return;
-	const expectedThresholdCancel = event.reason === "threshold" && event.aborted && !state.inFlight;
-	if (expectedThresholdCancel) {
+	const terminal = isTerminalCompactionFailure(event);
+	if (terminal) {
+		// Pi refused or aborted the compaction. Hold the cooldown and re-arm
+		// only after real growth or high-watermark pressure so the loop stops.
+		state.inFlight = false;
+		state.resumeGuard = false;
+		state.cooldownActive = true;
 		state.lastAttemptReason = event.reason;
+		const tokens = ctx.getContextUsage()?.tokens;
+		state.terminalBackoffTokens = typeof tokens === "number" ? tokens : Number.POSITIVE_INFINITY;
+		const message = terminal.kind === "content"
+			? "pi-plans: compaction found nothing to summarize; backing off until the session grows past the keep-recent window."
+			: "pi-plans: compaction was aborted (provider interruption, user cancel, or a competing manual compact); backing off until the session grows or usage nears the window.";
+		ctx.ui.notify(message, "info");
 		return;
 	}
 	state.inFlight = false;
@@ -1249,14 +1445,26 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 	const planPath = execution.planPath;
 	execution = null;
 	pi.appendEntry("pi-plans-exec-cleared", { reason: "complete" });
+	// Post-execution amelioration prompt: in interactive sessions, attach the
+	// amelioration instruction block and trigger a new turn so the agent can
+	// ask the user via ask_choice. Headless sessions keep the silent-completion
+	// behavior. Both completeExecution call sites (turn_end and the
+	// restoreFromSession recovery path) share this behavior.
+	const interactive = ctx.hasUI === true;
+	const content = interactive
+		? `**Plan complete!** ✅ \`${planPath}\`\n\n${summary}\n\n${AMELIORATION_PROMPT_TEXT}`
+		: `**Plan complete!** ✅ \`${planPath}\`\n\n${summary}`;
 	pi.sendMessage(
 		{
 			customType: "pi-plans-complete",
-			content: `**Plan complete!** ✅ \`${planPath}\`\n\n${summary}`,
+			content,
 			display: true,
 		},
-		{ triggerTurn: false },
+		{ triggerTurn: interactive },
 	);
+	if (interactive) {
+		pi.appendEntry("pi-plans-ameliorate", { planPath, phase: "prompted", rounds: null, currentRound: 0 });
+	}
 	const active = readActive(ctx.cwd);
 	if (active) {
 		try {
@@ -1268,12 +1476,19 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 	updateStatusWidget(ctx);
 }
 
+/** Instructions appended to the post-execution completion message in
+ * interactive sessions, asking the agent to invite the user into a Reviewer /
+ * Criticizer / Auto-refine loop run on the implementation result. */
+export const AMELIORATION_PROMPT_TEXT = `---
+Post-execution amelioration: ask the user now via ask_choice (autoComplete: false, trailing: "auto-refine-loop", in the session language): "Run a post-execution amelioration round on the implementation?" Options (recommended first): 1. Run one Reviewer round (target: "implementation") and fix high/medium findings, re-running relevant tests 2. Run one Criticizer round (target: "implementation") and answer its questions with the user first 3. Finish here. If the user picks Auto-refine loop, ask the follow-up via ask_choice (autoComplete: false): termination = until no high-severity finding (hard cap 5 rounds, recommended) / 1 round / 2 rounds / 3 rounds. Then loop: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and records progress, until the termination condition or the 5-round cap.`;
+
 /** Injection text for before_agent_start while executing. */
 export function executionContextMessage(): string | null {
 	if (!execution) return null;
 	const remaining = execution.items.filter((item) => !item.done);
 	const list =
 		remaining.map((item) => `- \`${item.id}\` ${item.text}`).join("\n") || "(none — report completion now)";
+	const graphLine = graphBlockForExecutor(execution.graphEnabled === true);
 	const implementationItems = execution.implItems?.length
 		? `\nImplementation items: ${execution.implItems.map((item) => item.id).join(", ")}${execution.currentI ? `\nCurrent implementation item: \`${execution.currentI}\`` : ""}\nWhen beginning an implementation item, emit its current anchor exactly once as \`[I-###:current]\`; then use \`[I-###:implemented]\` or \`[I-###:validating]\` for progress.`
 		: "";
@@ -1282,6 +1497,8 @@ Implement the accepted plan at ${execution.planPath} (${execution.items.length -
 
 Remaining verifier items:
 ${list}${implementationItems}
+
+${graphLine}
 
 Execution rules:
 - Implement implementation items in dependency order; grow the change in layers — smallest end-to-end slice first, then stack each new capability on top of what already works.

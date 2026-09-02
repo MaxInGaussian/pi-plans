@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
 	extractReadRecords,
 	formatReadRecord,
+	hasCompactableContent,
 	legalFirstKeptEntryIndex,
 	mergeCompactionDetails,
 	planIAwareCompaction,
@@ -70,5 +71,51 @@ describe("I-aware compaction policy", () => {
 		const plan = planIAwareCompaction({ entries, currentI: "I-001", contextWindow: 1000, tokensBefore: 1300 });
 		assert.equal(plan.metrics.targetMet, false);
 		assert.ok(plan.metrics.hardFloorReason);
+	});
+});
+
+describe("hasCompactableContent", () => {
+	it("returns true when messages exist beyond the keep-recent window", () => {
+		const entries = [
+			textEntry("a-1", "old turn body", 15_000),
+			textEntry("a-2", "middle turn", 15_000),
+			textEntry("a-3", "recent turn", 15_000),
+		];
+		assert.equal(hasCompactableContent(entries, 20_000), true);
+	});
+
+	it("returns false when everything fits inside the keep-recent window", () => {
+		const entries = [
+			textEntry("a-1", "old turn body", 15_000),
+			textEntry("a-2", "recent turn", 10_000),
+		];
+		assert.equal(hasCompactableContent(entries, 20_000), false);
+	});
+
+	it("returns false when the branch was just compacted", () => {
+		const entries = [
+			textEntry("a-1", "old", 30_000),
+			{ id: "c-1", type: "compaction", firstKeptEntryId: "a-1" },
+		];
+		assert.equal(hasCompactableContent(entries, 20_000), false);
+	});
+
+	it("honors the previous compaction's kept boundary", () => {
+		const compacted = [
+			{ id: "c-1", type: "compaction", firstKeptEntryId: "k-1" },
+			textEntry("k-1", "kept by compaction", 5_000),
+		];
+		// Kept boundary content stays inside the window: nothing compactable.
+		assert.equal(hasCompactableContent([...compacted, textEntry("k-2", "new", 16_000)], 20_000), false);
+		// Once post-compaction growth exceeds the window, older kept content becomes compactable.
+		assert.equal(hasCompactableContent([...compacted, textEntry("k-2", "new huge", 30_000)], 20_000), true);
+	});
+
+	it("returns false for an empty branch and ignores entries without messages", () => {
+		assert.equal(hasCompactableContent([], 20_000), false);
+		assert.equal(hasCompactableContent([
+			{ id: "r-1", type: "raw", tokens: 30_000 },
+			{ id: "r-2", type: "raw" },
+		], 20_000), false);
 	});
 });

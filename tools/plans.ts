@@ -6,6 +6,11 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { computeDrift } from "../src/code-graph/commands.ts";
+import { gitAddAllAndCommit } from "../src/code-graph/git.ts";
+import { loadGraphRuntime } from "../src/code-graph/runtime.ts";
+import { resolveCanonicalWorktree } from "../src/code-graph/paths.ts";
+import { Store } from "../src/code-graph/store.ts";
 import {
 	initState,
 	loadConfig,
@@ -15,6 +20,7 @@ import {
 	recordSubagent,
 	resolveStateRootOrNull,
 	setArtifactRoot,
+	setGraphEnabled,
 	setLanguage,
 	setRunStatus,
 	setRole,
@@ -31,9 +37,11 @@ const PlansParams = Type.Object({
 			"show",
 			"set-language",
 			"set-artifact-root",
+			"set-graph-enabled",
 			"set-role",
 			"start-run",
 			"set-status",
+			"final-commit",
 			"record-decision",
 			"record-ref",
 			"record-subagent",
@@ -50,6 +58,8 @@ const PlansParams = Type.Object({
 	languageSource: Type.Optional(StringEnum(["user", "auto"] as const)),
 	artifactRoot: Type.Optional(Type.String({ description: "set-artifact-root: planning docs root, e.g. ./docs/pi-plans" })),
 	artifactRootSource: Type.Optional(StringEnum(["user", "auto"] as const)),
+	enabled: Type.Optional(Type.Boolean({ description: "set-graph-enabled: enable/disable the code graph" })),
+	message: Type.Optional(Type.String({ description: "final-commit: commit message body" })),
 	role: Type.Optional(StringEnum(["reviewer", "criticizer"] as const)),
 	mode: Type.Optional(StringEnum(["delegated-subagent", "current-session"] as const)),
 	modelSelector: Type.Optional(
@@ -106,6 +116,54 @@ export function setRunStartAppender(appender: ((runId: string, artifactDir: stri
 	runStartAppender = appender;
 }
 
+/** plans action final-commit: gate on code-graph drift (zero pending +
+ *  invariants (a)/(b) clean), then `git add -A` and commit the plan delivery.
+ *  A clean tree is a safe no-op. Returns a machine-readable result. */
+export async function finalCommit(
+	workdir: string,
+	message: string,
+): Promise<{
+	ok: boolean;
+	committed: string | null;
+	noop: boolean;
+	reason?: string;
+	drift?: unknown;
+}> {
+	const paths = resolveCanonicalWorktree(workdir);
+	const runtime = await loadGraphRuntime();
+	if (!runtime.status.sqliteAvailable) {
+		throw new StateError("final-commit requires node:sqlite (code graph unavailable)");
+	}
+	const store = new Store(
+		{ dbPath: paths.codeGraphDb, worktreeRoot: paths.worktreeRoot, gitCommonDir: paths.gitCommonDir },
+		runtime.runtime.sqlite,
+	);
+	try {
+		let drift: ReturnType<typeof computeDrift> | null = null;
+		try {
+			drift = computeDrift(store, paths.worktreeRoot);
+		} catch {
+			drift = null; // graph never initialized: fall through to plain commit
+		}
+		if (drift && (drift.pending.length > 0 || !drift.ok)) {
+			return {
+				ok: false,
+				committed: null,
+				noop: false,
+				reason: `graph drift dirty: ${drift.recommendation}`,
+				drift,
+			};
+		}
+		const head = gitAddAllAndCommit(paths.worktreeRoot, message);
+		if (!head) {
+			return { ok: true, committed: null, noop: true, reason: "nothing to commit — tree already clean" };
+		}
+		return { ok: true, committed: head, noop: false };
+	} finally {
+		store.close();
+	}
+}
+
 export function registerPlansTool(pi: ExtensionAPI): void {
 	setRunStartAppender((runId, artifactDir) => {
 		pi.appendEntry("pi-plans-run-start", { runId, artifactDir });
@@ -114,7 +172,7 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 		name: "plans",
 		label: "Plans",
 		description:
-			"Manage pi-plans planning state in the target workspace: init/show config, set language and planning docs root plus reviewer/criticizer roles, start planning runs, record decisions/refs/subagents, and update run status. State lives in .git/pi_plans/ inside the resolved git common dir. Actions: init, show, set-language, set-artifact-root, set-role, start-run, set-status, record-decision, record-ref, record-subagent.",
+			"Manage pi-plans planning state in the target workspace: init/show config, set language and planning docs root plus reviewer/criticizer roles and the code-graph enabled flag, start planning runs, record decisions/refs/subagents, and update run status. State lives in .git/pi_plans/ inside the resolved git common dir. Actions: init, show, set-language, set-artifact-root, set-graph-enabled, set-role, start-run, set-status, final-commit, record-decision, record-ref, record-subagent.",
 		promptSnippet: "Manage pi-plans planning state, runs, and ledgers",
 		parameters: PlansParams,
 
@@ -126,12 +184,32 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 					case "init": {
 						const ensured = initState(workdir);
 						result = { config: ensured.config, stateRoot: ensured.stateRoot, notices: ensured.notices };
+						if (ensured.config.graph_enabled === null) {
+							result = {
+								...(result as Record<string, unknown>),
+								hint: "graph_enabled is null (never asked). Ask the user once via ask_choice whether to enable the code graph (recommended: yes for repos with an initialized graph; see references/state-and-config.md), then persist with plans (action: set-graph-enabled, enabled: true|false). This question does not count against the planning-question limit.",
+							};
+						}
 						break;
 					}
 					case "show": {
 						const config = showConfig(workdir);
 						const stateRoot = resolveStateRootOrNull(workdir);
 						result = { config, stateRoot };
+						if (config.graph_enabled === null) {
+							result = {
+								...(result as Record<string, unknown>),
+								hint: "graph_enabled is null (never asked). Ask the user once via ask_choice, then persist with plans (action: set-graph-enabled, enabled: true|false).",
+							};
+						}
+						break;
+					}
+					case "set-graph-enabled": {
+						if (typeof params.enabled !== "boolean") {
+							throw new StateError("set-graph-enabled requires enabled (boolean)");
+						}
+						const updated = setGraphEnabled(workdir, params.enabled);
+						result = { config: updated.config, stateRoot: updated.stateRoot, notices: updated.notices };
 						break;
 					}
 					case "set-language": {
@@ -179,6 +257,11 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 					case "set-status": {
 						if (!params.runId || !params.status) throw new StateError("set-status requires runId and status");
 						result = setRunStatus(workdir, params.runId, params.status);
+						break;
+					}
+					case "final-commit": {
+						if (!params.message) throw new StateError("final-commit requires message");
+						result = await finalCommit(workdir, params.message);
 						break;
 					}
 					case "record-decision": {

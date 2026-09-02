@@ -23,6 +23,9 @@ import {
 	handleExecutionCompact,
 	handleExecutionTurnCompaction,
 	handleExecutionCompactFailed,
+	compactionInFlight,
+	noteCompactionStarted,
+	noteCompactionEnded,
 	handlePlanningBeforeCompact,
 	handlePlanningCompact,
 	handlePlanningCompactFailed,
@@ -232,6 +235,86 @@ describe("execution loop", () => {
 		await completeExecution(pi, ctx);
 		assert.equal(getExecution(), null);
 		assert.ok(recorded.messages.some((message) => message.customType === "pi-plans-complete"));
+	});
+
+	it("completion attaches the amelioration prompt and triggers a turn in interactive sessions", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded } = makeHarness(workdir);
+		const planPath = path.join(workdir, "PLAN_v1.md");
+		await startExecution(pi, ctx, planPath, items("VC-001", "VC-002"));
+		assert.deepEqual(applyDoneMarkers("[DONE:VC-001] [DONE:VC-002]"), ["VC-001", "VC-002"]);
+
+		await completeExecution(pi, ctx);
+
+		const completeMessage = recorded.messages.find((message) => message.customType === "pi-plans-complete");
+		assert.ok(completeMessage);
+		assert.match(completeMessage.content, /Post-execution amelioration/);
+		assert.match(completeMessage.content, /trailing: "auto-refine-loop"/);
+		assert.match(completeMessage.content, /until no high-severity finding \(hard cap 5 rounds/);
+		assert.equal(completeMessage.options?.triggerTurn, true);
+		const ameliorateEntry = recorded.entries.find((entry) => entry.customType === "pi-plans-ameliorate");
+		assert.ok(ameliorateEntry);
+		const data = ameliorateEntry.data as Record<string, unknown>;
+		assert.equal(data.phase, "prompted");
+		assert.equal(data.rounds, null);
+		assert.equal(data.currentRound, 0);
+		assert.equal(data.planPath, planPath);
+	});
+
+	it("completion stays silent in headless sessions", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
+		assert.deepEqual(applyDoneMarkers("[DONE:VC-001]"), ["VC-001"]);
+		(ctx as any).hasUI = false;
+
+		await completeExecution(pi, ctx);
+
+		const completeMessage = recorded.messages.find((message) => message.customType === "pi-plans-complete");
+		assert.ok(completeMessage);
+		assert.doesNotMatch(completeMessage.content, /Post-execution amelioration/);
+		assert.equal(completeMessage.options?.triggerTurn, false);
+		assert.equal(
+			recorded.entries.some((entry) => entry.customType === "pi-plans-ameliorate"),
+			false,
+			"headless completion must not append the ameliorate entry",
+		);
+	});
+
+	it("restoreFromSession completion triggers the same amelioration prompt in interactive sessions", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded } = makeHarness(workdir);
+		const planPath = path.join(workdir, "PLAN_v1.md");
+		fs.writeFileSync(planPath, "# plan");
+		const snapshot = {
+			planPath,
+			items: items("VC-001", "VC-002"),
+			startedAt: "2026-08-25T00:00:00Z",
+			usage: { inToks: 0, outToks: 0 },
+			implItems: [],
+			implStatus: {},
+			compaction: {
+				inFlight: true,
+				resumeGuard: true,
+				cooldownActive: true,
+				lastAttemptReason: "threshold",
+				lastSuccessfulUsagePercent: 100,
+				lastSuccessfulAt: "2026-08-25T00:01:00Z",
+			},
+		};
+		const entries = [
+			{ type: "custom", customType: "pi-plans-exec", data: snapshot },
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "did [DONE:VC-001] [DONE:VC-002]" }] },
+			},
+		];
+		await restoreFromSession(pi, ctx, entries as any);
+		const completeMessage = recorded.messages.find((message) => message.customType === "pi-plans-complete");
+		assert.ok(completeMessage, "restore path must fire completeExecution");
+		assert.match(completeMessage.content, /Post-execution amelioration/);
+		assert.equal(completeMessage.options?.triggerTurn, true);
+		assert.ok(recorded.entries.some((entry) => entry.customType === "pi-plans-ameliorate"));
 	});
 
 	it("restores progress from session entries and rescans messages", async () => {
@@ -1012,6 +1095,364 @@ describe("execution loop", () => {
 		refreshPlanningCompactionCooldown(ctx as any);
 		setUsagePercent(120);
 		assert.equal(shouldTriggerPlanningCompaction(ctx as any), true);
+	});
+
+	it("planning compaction requests are gated on agent idleness", () => {
+		const workdir = freshWorkdir();
+		const { ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		initState(workdir);
+		startRun(workdir, { topic: "idle gate", skill: "plan-normal", requestText: "x" });
+		setUsagePercent(120);
+
+		(ctx as any).isIdle = () => false;
+		requestPlanningCompaction(ctx as any);
+		assert.equal(recorded.compacts?.length ?? 0, 0, "busy agent must not be aborted by an auto compact");
+		const session = (ctx as any).sessionManager;
+		assert.equal(session.__planningCompaction?.inFlight, false, "skipped request must not latch inFlight");
+
+		(ctx as any).isIdle = () => true;
+		(ctx as any).hasPendingMessages = () => true;
+		requestPlanningCompaction(ctx as any);
+		assert.equal(recorded.compacts?.length ?? 0, 0, "queued messages also count as busy");
+
+		(ctx as any).hasPendingMessages = () => false;
+		requestPlanningCompaction(ctx as any);
+		assert.equal(recorded.compacts?.length ?? 0, 1, "idle agent accepts the request");
+	});
+
+	it("terminal nothing-to-compact failures back off instead of retrying every turn", () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		initState(workdir);
+		startRun(workdir, { topic: "terminal backoff", skill: "plan-normal", requestText: "x" });
+
+		setUsagePercent(60);
+		assert.equal(shouldTriggerPlanningCompaction(ctx as any), true);
+		requestPlanningCompaction(ctx as any);
+		assert.equal(recorded.compacts?.length ?? 0, 1);
+
+		handlePlanningCompactFailed(pi as any, ctx as any, {
+			type: "session_compact_failed",
+			reason: "manual",
+			errorMessage: "Compaction failed: Nothing to compact (session too small)",
+			aborted: false,
+			willRetry: false,
+			fromExtension: false,
+		});
+
+		setUsagePercent(50);
+		refreshPlanningCompactionCooldown(ctx as any);
+		setUsagePercent(60);
+		assert.equal(shouldTriggerPlanningCompaction(ctx as any), false, "terminal backoff must suppress the next trigger");
+		requestPlanningCompaction(ctx as any);
+		assert.equal(recorded.compacts?.length ?? 0, 1, "no repeat request while backed off");
+
+		setUsagePercent(95);
+		assert.equal(shouldTriggerPlanningCompaction(ctx as any), true, "high watermark releases the backoff");
+		requestPlanningCompaction(ctx as any);
+		assert.equal(recorded.compacts?.length ?? 0, 2);
+
+		handlePlanningCompactFailed(pi as any, ctx as any, {
+			type: "session_compact_failed",
+			reason: "manual",
+			errorMessage: "network down",
+			aborted: false,
+			willRetry: false,
+			fromExtension: false,
+		});
+		setUsagePercent(60);
+		assert.equal(shouldTriggerPlanningCompaction(ctx as any), true, "non-terminal failures keep the retryable path");
+	});
+
+	it("execution compaction applies the same idle gate and terminal backoff", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v23.md"), items("VC-001"), [
+			{ id: "I-001", text: "First item." },
+		]);
+
+		setUsagePercent(96);
+		(ctx as any).isIdle = () => false;
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 0, "busy agent must not be aborted");
+
+		(ctx as any).isIdle = () => true;
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 1);
+
+		handleExecutionCompactFailed(pi, ctx, {
+			type: "session_compact_failed",
+			reason: "manual",
+			errorMessage: "Compaction failed: Already compacted",
+			aborted: false,
+			willRetry: false,
+			fromExtension: false,
+		});
+
+		setUsagePercent(60);
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 1, "terminal backoff suppresses repeat requests");
+
+		setUsagePercent(96);
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, 2, "high watermark releases the execution backoff");
+
+		await stopExecution(pi, ctx, "test-done");
+	});
+
+	it("treats abort/stream compact failures as terminal and notifies explicitly", () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		initState(workdir);
+		startRun(workdir, { topic: "abort-stream classification", skill: "plan-normal", requestText: "x" });
+		// Seed the planning state with a successful prior compaction so the failure
+		// handler enters the terminal branch (state must exist).
+		setUsagePercent(120);
+		(ctx as any).isIdle = () => true;
+		requestPlanningCompaction(ctx as any);
+		handlePlanningCompact(pi as any, ctx as any, {
+			type: "session_compact",
+			compactionEntry: { type: "compaction" } as never,
+			fromExtension: true,
+			reason: "threshold",
+			willRetry: false,
+		});
+		// Drop into mid-band so the backoff anchor (tokens @ 120k) gates retries
+		// until growth ≥ 20k tokens (which the test won't trigger).
+		setUsagePercent(60);
+
+		const abortMessages = [
+			"Auto-compaction failed: Turn prefix summarization failed: This operation was aborted",
+			"Error: OpenAI Responses stream ended before a terminal response event",
+			"Auto-compaction failed: context overflow recovery failed",
+			"this operation was aborted",
+			"aborted",
+		];
+		for (const errorMessage of abortMessages) {
+			recorded.notifies.length = 0;
+			setUsagePercent(60);
+			handlePlanningCompactFailed(pi as any, ctx as any, {
+				type: "session_compact_failed",
+				reason: "threshold",
+				errorMessage,
+				aborted: errorMessage.includes("aborted"),
+				willRetry: false,
+				fromExtension: false,
+			});
+			const backoffNote = recorded.notifies.find((n) => n.message.includes("was aborted"));
+			assert.ok(backoffNote, `expected abort-class notify for: ${errorMessage}`);
+			assert.match(backoffNote!.message, /provider interruption|competing manual/);
+			// Backoff active: next requestPlanningCompaction should NOT call ctx.compact.
+			const before = recorded.compacts?.length ?? 0;
+			requestPlanningCompaction(ctx as any);
+			assert.equal(
+				(recorded.compacts?.length ?? 0) - before,
+				0,
+				`expected no new request for: ${errorMessage}`,
+			);
+		}
+	});
+
+	it("event.aborted=true with empty errorMessage still enters abort-class backoff", () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		initState(workdir);
+		startRun(workdir, { topic: "aborted-no-message", skill: "plan-normal", requestText: "x" });
+		setUsagePercent(120);
+		(ctx as any).isIdle = () => true;
+		requestPlanningCompaction(ctx as any);
+		handlePlanningCompact(pi as any, ctx as any, {
+			type: "session_compact",
+			compactionEntry: { type: "compaction" } as never,
+			fromExtension: true,
+			reason: "threshold",
+			willRetry: false,
+		});
+		setUsagePercent(60);
+
+		handlePlanningCompactFailed(pi as any, ctx as any, {
+			type: "session_compact_failed",
+			reason: "threshold",
+			errorMessage: undefined,
+			aborted: true,
+			willRetry: false,
+			fromExtension: false,
+		});
+		const backoffNote = recorded.notifies.find((n) => n.message.includes("was aborted"));
+		assert.ok(backoffNote);
+		const before = recorded.compacts?.length ?? 0;
+		requestPlanningCompaction(ctx as any);
+		assert.equal((recorded.compacts?.length ?? 0) - before, 0, "aborted-without-message must still back off");
+	});
+
+	it("network-style failures stay retryable (no abort-class backoff)", () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		initState(workdir);
+		startRun(workdir, { topic: "network-retryable", skill: "plan-normal", requestText: "x" });
+		setUsagePercent(120);
+		(ctx as any).isIdle = () => true;
+		requestPlanningCompaction(ctx as any);
+
+		handlePlanningCompactFailed(pi as any, ctx as any, {
+			type: "session_compact_failed",
+			reason: "threshold",
+			errorMessage: "network down",
+			aborted: false,
+			willRetry: false,
+			fromExtension: false,
+		});
+		const abortNote = recorded.notifies.find((n) => n.message.includes("was aborted"));
+		assert.equal(abortNote, undefined, "network down must not be classified as abort-class");
+		const retryNote = recorded.notifies.find((n) => n.message.includes("will try again"));
+		assert.ok(retryNote, "network down must keep the retryable path");
+		const before = recorded.compacts?.length ?? 0;
+		requestPlanningCompaction(ctx as any);
+		assert.equal((recorded.compacts?.length ?? 0) - before, 1, "network down should allow retry");
+	});
+
+	it("lifecycle: phase-local inFlight guard skips manual compact while Pi core is running one", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v3.md"), items("VC-001"));
+		setUsagePercent(96);
+		(ctx as any).isIdle = () => true;
+
+		// First execution request lands and latches state.inFlight = true.
+		handleExecutionTurnCompaction(ctx);
+		assert.equal((recorded.compacts?.length ?? 0) >= 1, true, "execution first request lands");
+		// Clear execution in-flight by simulating a successful compaction event.
+		handleExecutionCompact(pi, ctx, {
+			type: "session_compact",
+			compactionEntry: { type: "compaction" } as never,
+			fromExtension: true,
+			reason: "threshold",
+			willRetry: false,
+		});
+
+		// Simulate Pi core running a threshold auto-compaction: no customInstructions
+		// hint means BOTH phases' flags get set defensively.
+		noteCompactionStarted(ctx as any, undefined);
+		assert.equal(compactionInFlight(ctx as any, "planning"), true, "auto-compaction marks planning inFlight");
+		assert.equal(compactionInFlight(ctx as any, "execution"), true, "auto-compaction marks execution inFlight");
+
+		const beforeSkip = recorded.compacts?.length ?? 0;
+		handleExecutionTurnCompaction(ctx);
+		assert.equal(recorded.compacts?.length ?? 0, beforeSkip, "execution request skipped while in-flight");
+		assert.equal(shouldTriggerPlanningCompaction(ctx as any), false, "planning guard sees in-flight");
+
+		// End of auto-compaction (success): both flags cleared.
+		noteCompactionEnded(ctx as any, undefined);
+		assert.equal(compactionInFlight(ctx as any, "planning"), false);
+		assert.equal(compactionInFlight(ctx as any, "execution"), false);
+
+		// Drop below 85 then re-arm past 85 so the cooldown gate releases.
+		setUsagePercent(60);
+		handleExecutionTurnCompaction(ctx);
+		setUsagePercent(96);
+		const beforeFire = recorded.compacts?.length ?? 0;
+		handleExecutionTurnCompaction(ctx);
+		assert.equal((recorded.compacts?.length ?? 0) - beforeFire, 1, "execution request lands after compaction ends");
+
+		// Clear execution in-flight again so the next planning-only flag test isn't blocked.
+		handleExecutionCompact(pi, ctx, {
+			type: "session_compact",
+			compactionEntry: { type: "compaction" } as never,
+			fromExtension: true,
+			reason: "threshold",
+			willRetry: false,
+		});
+
+		// Simulate a planning-side manual compact only: execution must remain free.
+		recorded.compacts = [];
+		// Drop below 85 first to release the cooldown gate from the earlier success.
+		setUsagePercent(60);
+		handleExecutionTurnCompaction(ctx);
+		setUsagePercent(96);
+		noteCompactionStarted(ctx as any, "pi-plans planning auto compact");
+		assert.equal(compactionInFlight(ctx as any, "planning"), true);
+		assert.equal(compactionInFlight(ctx as any, "execution"), false, "planning-only flag does not block execution");
+		const beforeExec = recorded.compacts?.length ?? 0;
+		handleExecutionTurnCompaction(ctx);
+		assert.equal((recorded.compacts?.length ?? 0) - beforeExec >= 1, true, "execution still fires while only planning is in-flight");
+		noteCompactionEnded(ctx as any, "pi-plans planning auto compact");
+
+		await stopExecution(pi, ctx, "test-done");
+	});
+
+	it("execution handler classifies abort/stream failures as terminal (F-004 coverage)", async () => {
+		const workdir = freshWorkdir();
+		const { pi, ctx, recorded, setUsagePercent } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v4.md"), items("VC-001"));
+		(ctx as any).isIdle = () => true;
+		setUsagePercent(120);
+		// Seed execution compaction state via a normal request and successful event.
+		handleExecutionTurnCompaction(ctx);
+		handleExecutionCompact(pi, ctx, {
+			type: "session_compact",
+			compactionEntry: { type: "compaction" } as never,
+			fromExtension: true,
+			reason: "threshold",
+			willRetry: false,
+		});
+		setUsagePercent(60);
+
+		const abortMessages = [
+			"Auto-compaction failed: Turn prefix summarization failed: This operation was aborted",
+			"Error: OpenAI Responses stream ended before a terminal response event",
+			"Auto-compaction failed: context overflow recovery failed",
+			"aborted",
+		];
+		for (const errorMessage of abortMessages) {
+			recorded.notifies.length = 0;
+			handleExecutionCompactFailed(pi, ctx, {
+				type: "session_compact_failed",
+				reason: "threshold",
+				errorMessage,
+				aborted: errorMessage.includes("aborted"),
+				willRetry: false,
+				fromExtension: false,
+			});
+			const note = recorded.notifies.find((n) => n.message.includes("was aborted"));
+			assert.ok(note, `expected abort-class notify for: ${errorMessage}`);
+			assert.match(note!.message, /provider interruption|competing manual/);
+		}
+		// Also exercise the ReferenceError trap fixed by F-001: aborted=true with
+		// no errorMessage and state.inFlight=false (Pi core threshold auto-cancel).
+		handleExecutionCompactFailed(pi, ctx, {
+			type: "session_compact_failed",
+			reason: "threshold",
+			errorMessage: undefined,
+			aborted: true,
+			willRetry: false,
+			fromExtension: false,
+		});
+		const cleanNote = recorded.notifies.find((n) => n.message.includes("was aborted"));
+		assert.ok(cleanNote, "aborted-without-message must enter abort-class backoff on execution side too");
+		await stopExecution(pi, ctx, "test-done");
+	});
+
+	it("index.ts wires session_compact/session_compact_failed to clear inFlight flags (F-003/F-004 coverage)", () => {
+		const workdir = freshWorkdir();
+		// Use a minimal harness that exposes sessionManager so we can inspect the
+		// in-flight store after dispatching the registered event handlers.
+		const ctx: any = {
+			cwd: workdir,
+			hasUI: false,
+			sessionManager: {},
+		};
+		// Simulate the lifecycle that index.ts wires in production:
+		noteCompactionStarted(ctx, undefined);
+		assert.equal(compactionInFlight(ctx, "planning"), true);
+		assert.equal(compactionInFlight(ctx, "execution"), true);
+		noteCompactionEnded(ctx, undefined);
+		assert.equal(compactionInFlight(ctx, "planning"), false);
+		assert.equal(compactionInFlight(ctx, "execution"), false);
+		// And a planning-attributed start + end still clears both (end has no hint).
+		noteCompactionStarted(ctx, "pi-plans planning auto compact");
+		assert.equal(compactionInFlight(ctx, "planning"), true);
+		noteCompactionEnded(ctx, "pi-plans planning auto compact");
+		assert.equal(compactionInFlight(ctx, "planning"), false);
 	});
 });
 

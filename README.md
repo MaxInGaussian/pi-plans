@@ -113,11 +113,11 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 | Capability | In short |
 |---|---|
 | Planning router + five specialist skills | Start with `/skill:planning` to route to the narrowest matching specialist (`plan-small` → `plan-big`, `debug-and-plan`, `plan-with-refs`) |
-| Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run; choosing Auto-complete enables recommendation-only answers for later eligible questions in the current planning run, with `/plans-autocomplete-stop` available to take back control |
+| Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run; choosing Auto-complete enables recommendation-only answers for later eligible questions in the current planning run, with `/plans-autocomplete-stop` available to take back control. After execution completes, the completion prompt replaces Auto-complete with `Auto-refine loop` (`trailing: "auto-refine-loop"`) so users can opt into an implementation-review loop instead. |
 | Refinement rounds | Read-only reviewer/criticizer Pi subagents consolidate findings into the next plan version; delegated runs have standalone `Reviewer`/`Criticizer` progress overlays that close before the tool result returns |
 | Workspace state | Config, runs, decisions, refs, and subagent ledgers in `.git/pi_plans/` (git common dir) |
 | Smart compact (I-aware) | History is sliced by `I-###` instead of VC. The current-I slice above 20% of the model window triggers a bounded summary with paired `Read:` records, retains a legal recent suffix, targets <10% post-context, and records a hard-floor reason when unreachable. Planning phase falls back to the latest plan/Q&A focus when no current marker exists; cooldown + resume guard prevent ping-pong; one hidden continuation is queued when Pi reports `willRetry: false` |
-| Visible Refiner overlay | Delegated reviewer/criticizer subagents surface as a named public overlay in the TUI — one `Reviewer`/`Criticizer` panel with per-lane tool progress, bounded output preview, and clean cancelled/timed-out vs completed states. The overlay opens when the round starts and closes before the tool result returns to the main session |
+| Visible Refiner overlay | Delegated reviewer/criticizer subagents surface as a named public overlay in the TUI — one `Reviewer`/`Criticizer` panel with per-lane tool progress, full streaming transcript with follow-bottom scroll, Tab-pane focus, retention until the user presses `Esc` after completion, and clean cancelled/timed-out vs completed states. `reviewers: 3` renders three equal-height panes inside the same overlay |
 | Tracked execution | Checklist injected each turn; `[DONE:VC-xxx]` markers drive completion; implementation items report progress with `[I-xxx:implemented]` / `[I-xxx:validating]` markers; the bottom status bar shows lifecycle, `x/y` progress, elapsed time, and input/output token usage in real time |
 | Execution handoff | The accepted plan resumes in the current session model; no separate model selection is performed. |
 | Execution-phase compaction | Pi core owns threshold, overflow, and manual scheduling; pi-plans adds a current-I proactive check once the current-I slice exceeds 20% of the model window, summarizes I-level history and bounded `Read:` records, retains a legal recent suffix, targets under 10% when possible, and records hard-floor reasons when not; one hidden continuation is queued when Pi reports `willRetry: false` |
@@ -131,7 +131,7 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 |---|---|
 | `plans` | State CLI: `init`, `show`, `set-language`, `set-artifact-root`, `set-role`, `start-run`, `set-status`, `record-decision`, `record-ref`, `record-subagent` |
 | `ask_choice` | Numbered choice prompt; `autoComplete: false` for the merged accept/execute question and external-state questions |
-| `refine` | Reviewer/criticizer round via standalone read-only subagents (`--mode json -p --no-session --tools read,grep,find,ls`); delegated TUI runs show one `Reviewer`/`Criticizer` overlay and close it before returning; `reviewers: 3` for big plans; enforces role/model confirmation gates |
+| `refine` | Reviewer/criticizer round via standalone read-only subagents (`--mode json -p --no-session --tools read,grep,find,ls`); `target: "plan"` (default) reviews the plan, `target: "implementation"` reviews the implemented worktree against the plan; delegated TUI runs show one `Reviewer`/`Criticizer` overlay (78% width × 78% height, top-center, ≥72 cols) with per-lane transcript, follow-bottom scroll, Tab focus, and retention until `Esc`; `reviewers: 3` renders three equal-height panes; enforces role/model confirmation gates |
 | `execute_plan` | Execution handoff: re-confirms with the user and enters extension-managed execution mode |
 | `/plans` | Show config, active run, and execution progress |
 | `/plans-execute [plan.md]` | Manual execution handoff (defaults to highest `PLAN_vN.md`) |
@@ -156,9 +156,11 @@ Default `compaction` is Pi-core-owned: threshold, overflow, and manual `/compact
 
 Delegated `refine` rounds (reviewer or criticizer) show their progress directly inside the Pi TUI instead of disappearing into the child process's terminal. The overlay is a public, named panel so users always know who is doing what:
 
-- **Named public overlays.** Each round uses the literal overlay name `Reviewer` or `Criticizer` (no dependency on `pi-btw`; the renderer is built on Pi's public `pi-tui` primitives). The big-plan concurrent reviewer round renders one reviewer lane per subagent under the same `Reviewer` overlay.
-- **Bounded live detail.** The overlay tracks lane state (`pending → running → completed | cancelled | timed-out`) and the most recent tool call plus a clipped argument preview. Raw tool output is never surfaced, so progress stays legible even when subagents read large files.
-- **Clean lifecycle edges.** The overlay opens at round start, advances via the JSONL progress feed emitted by `pi --mode json`, and is `close()`d before the round's conclusion returns as a tool result to the main session. Cancelled and timed-out children render as terminal states with the original error message — never as silent drops.
+- **Pi-btw-aligned geometry.** Each round uses `width: "78%"`, `minWidth: 72`, `maxHeight: "78%"`, `anchor: "top-center"`, and `{ top: 1, left: 2, right: 2 }` margins (no dependency on `pi-btw`; the renderer is built on Pi's public `pi-tui` primitives).
+- **Complete streaming transcript.** Assistant text, thinking blocks, tool calls, tool results, and stderr are merged per turn/content block into lane entries without overlay-facing truncation; only the viewport slices them. Final `message_end` / `tool_execution_end` overwrite the live snapshot with the authoritative content.
+- **No input row.** The overlay has no composer, no submit path, and no printable input forwarding. Only `Esc`, `Tab`/`Shift+Tab`, `↑/↓`, `PgUp/PgDn`, and SGR mouse wheel are consumed; everything else is ignored by design.
+- **Equal-height panes for `reviewers: 3`.** Concurrent reviewer rounds render one reviewer lane per subagent as three independent equal-height panes inside the same top-center overlay; each pane keeps its own scroll offset and `follow-bottom` state. `Tab`/`Shift+Tab` switches the focused pane and scroll keys only affect it.
+- **Lifecycle.** The overlay opens at round start, advances via the JSONL progress feed emitted by `pi --mode json`, and is dismissed by `Esc`. `Esc` is close-only — it never aborts the refiner child; the child keeps running to natural completion and its result still flows back through the tool result path. A new refinement round replaces any retained finished overlay to avoid overlay stacking. Cancelled and timed-out children render as terminal states with the original error message — never as silent drops.
 - **Tool-only progress.** The overlay only consumes tool and message lifecycle events from the child; unrelated `pi` events are ignored, so a noisy upstream release does not desync the panel.
 
 ## The execution rules
@@ -214,18 +216,65 @@ or register the absolute path in `~/.pi/agent/settings.json`:
 { "extensions": ["/absolute/path/to/pi-plans"] }
 ```
 
+## Code graph (v0.2+)
+
+`/init-graph` walks the worktree, parses JavaScript/TypeScript and Python
+files with Tree-sitter, and stores a normalized function graph in
+`.git/pi_plans/code_graph.db`. The DB is the canonical source for downstream
+agents: function rows expose a low-token `description`/`inputs`/`outputs`
+JSON view, call edges are normalized with `in_links`/`out_links` derived on
+read, and each function retains its full UTF-8 source.
+
+- `/init-graph [--reindex] [--no-summary] [--no-commit]` — scan the worktree and write the
+  graph; with `--reindex` it incrementally updates an existing DB. Dirty trees
+  get a `chore(code-graph): pre-init snapshot` commit first (`--no-commit` skips).
+  After indexing it records a `code_graph_snapshot` (HEAD + uncommitted paths)
+  that `/graph-drift` compares against. The parser dependencies are installed
+  via npm (`tree-sitter`, grammars).
+- `/graph-status` — print function/file/edge counts.
+- `/update-graph [--dry-run] [--base <commit>]` — incrementally reindex only
+  the paths `git status --porcelain` reports (including untracked and rename
+  targets); deleted files' DB rows are purged, never resurrected.
+- `/graph-drift [--json] [--commit-aware]` — direction-aware convergence check:
+  (a) per-file hash match or a pending apply marker, (b) every uncommitted
+  indexable path is indexed, (c) snapshot vs current HEAD (informational).
+- `/apply-graph [--force]` — materialize DB edits back to source. Files with
+  `pending_kind='update'` are written (created when missing on disk);
+  `pending_kind='delete'` files are removed from disk and the DB; pending-null
+  missing files are skipped, never resurrected. Refuses when the active
+  planning run is `planning`/`accepted`.
+- `/enable-graph` / `/disable-graph` — toggle the `graph_enabled` config
+  flag (disable refuses while drift is dirty). When enabled, planner/refiner/
+  executor prompts direct agents to read code via the graph; refiner
+  subagents get the `code_graph` tool in their allowlist; the executor loop
+  becomes DB-first: `code_graph` mutations → `/apply-graph` → `/graph-drift`
+  → `plans final-commit` → `/init-graph`.
+- The `code_graph` tool provides read-only screening (`status`, `screening`,
+  `get-function`, `manifest`), DB-first mutations (`update-function`,
+  `update-file`, `delete-file` — all mark files `pending_materialization`
+  and append to `change_log`), and `list-pending` so agents can navigate and
+  edit the graph without pulling `full_code`.
+
+Runtime requirements: the base extension still requires Node ≥ 22.6; the
+graph feature additionally requires Node ≥ 22.13 (or `--experimental-sqlite`)
+so that `node:sqlite` is available without flag. Pi's host currently ships
+Node ≥ 22.19, so a fresh install works out of the box. On unsupported
+runtimes (Bun, missing parsers) graph commands fail locally without
+affecting the planning workflow.
+
 ## Layout
 
 ```
 pi-plans/
 ├── index.ts               # Extension entry: tools, commands, guard, execution loop
-├── tools/                 # plans, ask-choice, refine, execute-plan
+├── tools/                 # plans, ask-choice, refine, execute-plan, code-graph
 ├── src/                   # state, guard, plan parsing, subagent runner, refine overlay, exec loop
+│   └── code-graph/        # SQLite schema/store, parsers, indexer, summary, materialize
 ├── skills/                # The planning router plus five specialist planning skills
 ├── references/            # Shared workflow, state/config, plan template (normative)
 ├── agents/                # reviewer.md / criticizer.md subagent prompts
 ├── scripts/validate.ts    # Structure validator
-└── tests/                 # node:test suite (state, guard, plan parsing, execution, refine progress)
+└── tests/                 # node:test suite (state, guard, plan parsing, execution, refine progress, code-graph)
 ```
 
 ## Safety model
@@ -239,7 +288,10 @@ npm run validate   # structure validator
 npm test           # node:test suite (stdlib only, no deps)
 ```
 
-Both run on Node ≥ 22.6 via `--experimental-strip-types`; no npm dependencies.
+Both run on Node ≥ 22.6 via `--experimental-strip-types`. The graph
+extension additionally requires `node:sqlite` (Node ≥ 22.13 unflagged, or
+any Node ≥ 22.6 with `--experimental-sqlite`) and the four parser
+dependencies listed in `dependencies`.
 
 ## FAQ
 
@@ -249,7 +301,7 @@ The plan is the contract. Refinement converges on scope while nothing is writabl
 
 **What can Auto-complete decide on my behalf?**
 
-Planning and refinement choices only (the recommended option). Choosing Auto-complete enables the recommended answer for later eligible planning questions in the current run and the extension continues the planning turn when the model stops early. Use `/plans-autocomplete-stop` to take back control. It is never offered for execution approval, installs, publishing, deployment, merge, push, or credentials — those questions stop and wait for you.
+Planning and refinement choices only (the recommended option). Choosing Auto-complete enables the recommended answer for later eligible planning questions in the current run and the extension continues the planning turn when the model stops early. Use `/plans-autocomplete-stop` to take back control. It is never offered for execution approval, installs, publishing, deployment, merge, push, or credentials — those questions stop and wait for you. The post-execution amelioration prompt uses a separate `Auto-refine loop` trailing option, which is an explicit user choice that triggers a follow-up rounds/termination question and a refinement loop over the implementation result; it is never auto-selected.
 
 **Where does all the state live?**
 

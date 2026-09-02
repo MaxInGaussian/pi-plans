@@ -43,6 +43,9 @@ export interface PlansConfig {
 	artifact_root: string;
 	artifact_root_source: SettingSource;
 	artifact_root_updated_at: string | null;
+	/** null = never asked; the plans tool surfaces a hint so the agent asks once. */
+	graph_enabled: boolean | null;
+	graph_enabled_updated_at: string | null;
 }
 
 const DEFAULT_ARTIFACT_ROOT = "./docs/pi-plans";
@@ -80,6 +83,8 @@ export const DEFAULT_CONFIG: PlansConfig = {
 	artifact_root: DEFAULT_ARTIFACT_ROOT,
 	artifact_root_source: "unset",
 	artifact_root_updated_at: null,
+	graph_enabled: null,
+	graph_enabled_updated_at: null,
 };
 
 export const VALID_ROLE_MODES = new Set(["delegated-subagent", "current-session"]);
@@ -321,6 +326,14 @@ export function setArtifactRoot(workdir: string, artifactRoot: string, source: "
 	config.artifact_root = artifactRoot;
 	config.artifact_root_source = source;
 	config.artifact_root_updated_at = utcNow();
+	atomicWriteJson(path.join(stateRoot, "config.json"), config);
+	return { config, stateRoot, notices };
+}
+
+export function setGraphEnabled(workdir: string, enabled: boolean): EnsureResult {
+	const { config, stateRoot, notices } = ensureState(workdir);
+	config.graph_enabled = enabled;
+	config.graph_enabled_updated_at = utcNow();
 	atomicWriteJson(path.join(stateRoot, "config.json"), config);
 	return { config, stateRoot, notices };
 }

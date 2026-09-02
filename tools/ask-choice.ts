@@ -33,6 +33,12 @@ const AskChoiceParams = Type.Object({
 				"Offer the Auto-complete option (default true). MUST be false for the execution handoff, install waivers, publishing, deployment, merge, push, credential use, or any external-state change.",
 		}),
 	),
+	trailing: Type.Optional(
+		StringEnum(["auto-refine-loop"] as const, {
+			description:
+				'Replace the trailing Auto-complete option with "Auto-refine loop" (post-execution amelioration prompt). Selecting it returns instructions to ask the rounds/termination follow-up; Auto-complete is suppressed entirely for this question.',
+		}),
+	),
 	workdir: Type.Optional(Type.String({ description: "Target workspace; default current working directory" })),
 });
 
@@ -48,7 +54,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 		name: "ask_choice",
 		label: "Ask Choice",
 		description:
-			"Ask the user one planning or refinement question as a numbered choice prompt: recommended option first, alternatives next, then Other and Auto-complete. One question per call. Use for every user-facing planning question, the final scope confirmation, refinement-mode questions, language/role/model settings, and the execution handoff (with autoComplete: false).",
+			"Ask the user one planning or refinement question as a numbered choice prompt: recommended option first, alternatives next, then Other and Auto-complete. One question per call. Use for every user-facing planning question, the final scope confirmation, refinement-mode questions, language/role/model settings, and the execution handoff (with autoComplete: false). The optional trailing parameter swaps the trailing option to Auto-refine loop for the post-execution amelioration prompt.",
 		promptSnippet: "Ask structured planning questions with recommended/Other/Auto-complete ordering",
 		promptGuidelines: [
 			"Use ask_choice for every pi-plans question to the user instead of plain-text questions; it enforces option ordering and records decisions.",
@@ -59,7 +65,10 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const workdir = normalizeWorkdir(params.workdir ?? ctx.cwd);
 			const allowOther = params.allowOther ?? true;
-			const autoComplete = params.autoComplete ?? true;
+			// Param normalization: a trailing option replaces Auto-complete entirely,
+			// so an erroneously passed autoComplete flag is suppressed here.
+			const trailing = params.trailing;
+			const autoComplete = (params.autoComplete ?? true) && trailing === undefined;
 			const options = params.options;
 			if (options.length === 0) throw new Error("ask_choice requires at least one option");
 			const recommended = options.find((option) => option.recommended) ?? options[0];
@@ -120,6 +129,8 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 				};
 			}
 
+			const AUTO_REFINE_LOOP_LABEL =
+				"Auto-refine loop  (run refinement rounds until no high-severity finding or the 5-round cap)";
 			const displayLabels: string[] = options.map((option, index) => {
 				let label = `${index + 1}. ${option.label}`;
 				if (option === recommended) label += "  (recommended)";
@@ -128,6 +139,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			});
 			if (allowOther) displayLabels.push("Other…  (type your own answer)");
 			if (autoComplete) displayLabels.push("Auto-complete  (take the recommended option)");
+			else if (trailing) displayLabels.push(AUTO_REFINE_LOOP_LABEL);
 
 			const selected = await ctx.ui.select(params.question, displayLabels);
 			if (selected === undefined) {
@@ -155,6 +167,20 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 						},
 					],
 					details: details(recommended.label, "auto-complete"),
+				};
+			}
+
+			if (trailing && selected.startsWith("Auto-refine loop")) {
+				recordAskChoice(ctx, false);
+				record("Auto-refine loop", "user");
+				return {
+					content: [
+						{
+							type: "text",
+							text: `User selected Auto-refine loop. Immediately ask the follow-up with ask_choice (autoComplete: false, in the session language): how should the amelioration loop terminate? Options (recommended first): 1. until no high-severity finding (hard cap 5 rounds) 2. 1 round 3. 2 rounds 4. 3 rounds. Then run the loop per the completion instructions: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and continues until the termination condition or the 5-round cap.`,
+						},
+					],
+					details: details("Auto-refine loop", "user"),
 				};
 			}
 

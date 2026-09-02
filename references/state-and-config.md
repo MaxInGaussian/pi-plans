@@ -88,6 +88,12 @@ Before the first product planning question, check the persisted config (`plans` 
 
 Persist with `plans` (`set-language`, `languageSource: "user"`). Use the selected language for visible questions, choices, review summaries, criticizer questions, and Markdown artifacts. Keep IDs, file paths, command names, JSON keys, and protocol labels stable in English.
 
+## Code Graph Enabled
+
+`graph_enabled` (`boolean | null`) records whether the workspace wants agents to prefer the code graph. `null` means the question was never asked: the first `plans` `init`/`show` in a workspace returns a `hint` instructing the agent to ask the user once via `ask_choice` (recommended: yes) and persist with the `plans` tool (`set-graph-enabled`, `enabled: true|false`). This question does not count against the planning-question limit. `/enable-graph` and `/disable-graph` toggle it later; disable refuses while graph drift is dirty.
+
+When `true`: planner/refiner/executor prompts instruct graph reads (refiner subagents get the `code_graph` tool in their allowlist), and the executor loop runs DB-first (`code_graph` mutations → `/apply-graph` → `/graph-drift` → `plans final-commit` → `/init-graph`). When `false`: prompts fall back to raw `Read`/`grep`/`ls`.
+
 ## Planning Docs Location
 
 Before the first product planning question, check the persisted config again. If `artifact_root_source` is missing or `unset`, ask exactly one `ask_choice` question:

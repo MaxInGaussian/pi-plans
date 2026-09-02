@@ -32,6 +32,8 @@ import {
 	handlePlanningBeforeCompact,
 	handlePlanningCompact,
 	handlePlanningCompactFailed,
+	noteCompactionEnded,
+	noteCompactionStarted,
 	PLANNING_PLAN_WRITTEN_CUSTOM_TYPE,
 	registerExecutionTurnHandlers,
 	refreshPlanningCompactionCooldown,
@@ -50,8 +52,18 @@ import {
 } from "./src/autocomplete.ts";
 import { planningWriteBlockReason } from "./src/guard.ts";
 import { registerQueryInterviewHooks } from "./src/query-hook.ts";
+import { registerCodeGraphTool } from "./tools/code-graph.ts";
+import {
+	initGraphCommand,
+	applyGraphCommand,
+	graphStatusCommand,
+	updateGraphCommand,
+	graphDriftCommand,
+	enableGraphCommand,
+	disableGraphCommand,
+} from "./src/code-graph/commands.ts";
 import { latestPlanVersion, nextPlanVersionPath } from "./src/plan.ts";
-import { getRun, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
+import { getRun, loadConfig, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
 import { registerAskChoiceTool } from "./tools/ask-choice.ts";
 import { executeHandoff, registerExecutePlanTool } from "./tools/execute-plan.ts";
 import { registerPlansTool } from "./tools/plans.ts";
@@ -67,12 +79,17 @@ const extensionLoadedAt = new Date();
 function extensionStalenessLine(): string {
 	try {
 		const dirs = [baseDir, path.join(baseDir, "src"), path.join(baseDir, "tools")];
+		const stack: string[] = [...dirs];
 		let newest = 0;
-		for (const dir of dirs) {
-			for (const name of fs.readdirSync(dir)) {
-				if (!name.endsWith(".ts")) continue;
-				const mtime = fs.statSync(path.join(dir, name)).mtimeMs;
-				if (mtime > newest) newest = mtime;
+		while (stack.length) {
+			const dir = stack.pop()!;
+			for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+				const full = path.join(dir, entry.name);
+				if (entry.isDirectory()) stack.push(full);
+				else if (entry.isFile() && entry.name.endsWith(".ts")) {
+					const mtime = fs.statSync(full).mtimeMs;
+					if (mtime > newest) newest = mtime;
+				}
 			}
 		}
 		if (newest > extensionLoadedAt.getTime() + 2000) {
@@ -98,6 +115,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	registerRefineTool(pi, baseDir);
 	registerExecutePlanTool(pi);
 	registerQueryInterviewHooks(pi, hasActivePlanningWorkflow);
+	registerCodeGraphTool(pi);
 
 	// Contribute the router skill plus the five specialist planning skills.
 	pi.on("resources_discover", () => ({
@@ -162,6 +180,32 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		return;
 	});
 
+	// Bidirectional code-graph reminder hook: separate from the planning guard
+	// above (which early-returns during execution). Fires only when the graph
+	// is enabled and an execution is active. Reminders are best-effort notifies.
+	pi.on("tool_call", async (event, ctx) => {
+		if (!getExecution()) return;
+		const stateRoot = resolveStateRootOrNull(ctx.cwd);
+		if (!stateRoot) return;
+		let graphEnabled = false;
+		try {
+			graphEnabled = loadConfig(stateRoot).graph_enabled === true;
+		} catch {
+			return;
+		}
+		if (!graphEnabled) return;
+		if (event.toolName === "edit" || event.toolName === "write") {
+			ctx.ui?.notify?.("code-graph: source edited directly — run /update-graph to sync the graph, or use code_graph mutations + /apply-graph for DB-first edits", "info");
+			return;
+		}
+		if (event.toolName === "code_graph") {
+			const action = String((event.input as { action?: string }).action ?? "");
+			if (action === "update-function" || action === "update-file" || action === "delete-file") {
+				ctx.ui?.notify?.("code-graph: mutation staged — run /apply-graph to materialize, then /graph-drift to verify", "info");
+			}
+		}
+	});
+
 	pi.on("context", (event) => {
 		const filteredExecution = filterExecutionResumeMessages(event.messages as Array<{ customType?: string }>);
 		const messages = filterPlanningResumeMessages(filteredExecution);
@@ -171,6 +215,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
+		noteCompactionStarted(ctx, event.customInstructions);
 		const executionResult = await handleExecutionBeforeCompact(pi, ctx, event);
 		if (executionResult) return executionResult;
 		return handlePlanningBeforeCompact(pi, ctx, event);
@@ -178,10 +223,12 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	pi.on("session_compact", async (event, ctx) => {
 		handleExecutionCompact(pi, ctx, event);
 		handlePlanningCompact(pi, ctx, event);
+		noteCompactionEnded(ctx, event.customInstructions);
 	});
 	pi.on("session_compact_failed", async (event, ctx) => {
 		handleExecutionCompactFailed(pi, ctx, event);
 		handlePlanningCompactFailed(pi, ctx, event);
+		noteCompactionEnded(ctx, event.customInstructions);
 	});
 
 	// Flush points for deferred execution-loop writes: primary drain when the
@@ -234,6 +281,55 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	// Commands
 	// -----------------------------------------------------------------------
+
+	pi.registerCommand("init-graph", {
+		description: "Index the worktree into .git/pi_plans/code_graph.db (Node SQLite + Tree-sitter).",
+		handler: async (args, ctx) => {
+			await initGraphCommand(args, ctx);
+		},
+	});
+
+	pi.registerCommand("apply-graph", {
+		description: "Apply code_graph.db changes back to source. Refuses during active planning/accepted run.",
+		handler: async (args, ctx) => {
+			await applyGraphCommand(args, ctx);
+		},
+	});
+
+	pi.registerCommand("graph-status", {
+		description: "Show code graph counts (functions, files, edges).",
+		handler: async (args, ctx) => {
+			await graphStatusCommand(args, ctx);
+		},
+	});
+
+	pi.registerCommand("update-graph", {
+		description: "Incrementally reindex working-tree changes (git status porcelain, incl. untracked/renames) into code_graph.db. Flags: --dry-run, --base <commit>.",
+		handler: async (args, ctx) => {
+			await updateGraphCommand(args, ctx);
+		},
+	});
+
+	pi.registerCommand("graph-drift", {
+		description: "Check DB↔source convergence (hash/pending, uncommitted coverage, snapshot). Flags: --json, --commit-aware.",
+		handler: async (args, ctx) => {
+			await graphDriftCommand(args, ctx);
+		},
+	});
+
+	pi.registerCommand("enable-graph", {
+		description: "Enable the code graph: agents prefer graph reads and DB-first edits.",
+		handler: async (_args, ctx) => {
+			await enableGraphCommand(_args, ctx);
+		},
+	});
+
+	pi.registerCommand("disable-graph", {
+		description: "Disable the code graph (refuses while DB/source drift is dirty).",
+		handler: async (_args, ctx) => {
+			await disableGraphCommand(_args, ctx);
+		},
+	});
 
 	pi.registerCommand("plans", {
 		description: "Show pi-plans state: config, active run, and execution progress",

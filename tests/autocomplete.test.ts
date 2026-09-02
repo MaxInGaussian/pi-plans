@@ -132,6 +132,10 @@ describe("ask_choice Auto-complete wiring", () => {
 		assert.match(source, /isAutoCompleteEnabled/);
 		assert.match(source, /recordAskChoice\(ctx, true\)/);
 		assert.match(source, /autoComplete && selected\.startsWith\("Auto-complete"\)/);
+		// Trailing option: Auto-refine loop replaces Auto-complete and is suppressed in headless sessions.
+		assert.match(source, /trailing === undefined/);
+		assert.match(source, /AUTO_REFINE_LOOP_LABEL/);
+		assert.match(source, /trailing && selected\.startsWith\("Auto-refine loop"\)/);
 		const indexSource = fs.readFileSync(path.join(process.cwd(), "index.ts"), "utf8");
 		assert.match(indexSource, /plans-autocomplete-stop/);
 		assert.match(indexSource, /autoCompleteStatus\(ctx\)/);

@@ -22,11 +22,15 @@ const REQUIRED_TOOL_FILES = [
 	"tools/ask-choice.ts",
 	"tools/refine.ts",
 	"tools/execute-plan.ts",
+	"tools/code-graph.ts",
 	"src/state.ts",
 	"src/guard.ts",
 	"src/plan.ts",
 	"src/subagent.ts",
 	"src/exec.ts",
+	"src/code-graph/runtime.ts",
+	"src/code-graph/schema.ts",
+	"src/code-graph/store.ts",
 ];
 
 const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
