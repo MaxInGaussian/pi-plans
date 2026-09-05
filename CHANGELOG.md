@@ -13,14 +13,16 @@ adheres to [Semantic Versioning](https://semver.org/).
   execution. `/init-graph` indexes the worktree (function descriptions,
   call edges, provenance), `/update-graph` reindexes changed paths
   incrementally, `/apply-graph` materializes DB-first edits back to source,
-  `/graph-drift` checks convergence, and `/enable-graph`//`/disable-graph`
+  `/graph-drift` checks convergence, and `/enable-graph` / `/disable-graph`
   toggle the mode (plus `/graph-status`). When enabled: `read`/`write`/`edit`
   become graph-aware for indexed source files — `read` returns a capped
   function digest instead of whole files (with `full: true` as the only
   whole-file exit), `write`/`edit` stage DB-first mutations until
   `/apply-graph`, and the loop ends with a reindex so the graph stays
-  authoritative. The read-only `code_graph` tool provides screening,
-  `get-function`, and `manifest` queries; planner/refiner/executor prompts
+  authoritative. The `code_graph` tool provides read-only screening,
+  `get-function`, and `manifest` queries plus DB-first mutation actions
+  (`update-function`, `update-file`, `delete-file`, `list-pending`);
+  planner/refiner/executor prompts
   hard-require function-level reads, and refiner/criticizer subagents get
   `code_graph` in their allowlist.
 - **`/config-pi-plans`.** Interactive workspace configuration wizard that
