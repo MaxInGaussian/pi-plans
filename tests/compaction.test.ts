@@ -1,121 +1,388 @@
 import * as assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { after, before, describe, it } from "node:test";
 import {
-	extractReadRecords,
-	formatReadRecord,
-	hasCompactableContent,
-	legalFirstKeptEntryIndex,
-	mergeCompactionDetails,
-	planIAwareCompaction,
-	currentIExceedsTrigger,
+	buildOwnCut,
+	buildPiPlansVccCompaction,
+	compactionCurrentI,
+	DEFAULT_VCC_SETTINGS,
+	loadVccSettings,
+	parseCompactionInstructions,
+	PI_VCC_COMPACT_INSTRUCTION,
+	scaffoldVccSettings,
+	shouldScheduleAutoContinue,
+	vccSettingsPath,
+	type CompactionEntryLike,
 } from "../src/compaction.ts";
 
-function textEntry(id: string, text: string, tokens = 100) {
-	return { id, type: "message", tokens, message: { role: "assistant", content: [{ type: "text", text }] } };
+function textEntry(id: string, role: string, text: string): CompactionEntryLike {
+	return { id, type: "message", message: { role, content: [{ type: "text", text }] } };
 }
 
-describe("I-aware compaction policy", () => {
-	it("keeps a legal current-I suffix and never starts at a tool result", () => {
+function toolCallEntry(id: string, name: string, args: Record<string, unknown>): CompactionEntryLike {
+	return { id, type: "message", message: { role: "assistant", content: [{ type: "toolCall", name, arguments: args }] } };
+}
+
+function toolResultEntry(id: string, name: string, text: string): CompactionEntryLike {
+	return { id, type: "message", message: { role: "toolResult", toolName: name, content: [{ type: "text", text }] } };
+}
+
+describe("pi-vcc compaction", () => {
+	let tmpRoot: string;
+
+	before(() => {
+		tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-vcc-"));
+	});
+
+	after(() => {
+		fs.rmSync(tmpRoot, { recursive: true, force: true });
+	});
+
+	it("builds an own cut that keeps the requested recent user turns", () => {
 		const entries = [
-			textEntry("i1", "[I-001:current] completed"),
-			{ id: "call", type: "message", tokens: 100, message: { role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "/repo/a.ts", offset: 4, limit: 2 } }] } },
-			{ id: "result", type: "message", tokens: 100, message: { role: "toolResult", toolCallId: "read-1", content: [{ type: "text", text: "private source output that must be bounded" }] } },
-			textEntry("i2", "[I-002:current] active"),
-			{ id: "u", type: "message", tokens: 100, message: { role: "user", content: [{ type: "text", text: "latest question" }] } },
-			textEntry("a", "latest answer"),
+			textEntry("u-1", "user", "implement compact support"),
+			textEntry("a-1", "assistant", "started the helper"),
+			textEntry("u-2", "user", "continue from the current task"),
+			textEntry("a-2", "assistant", "working on tests"),
 		];
-		const plan = planIAwareCompaction({ entries, currentI: "I-002", knownIIds: ["I-001", "I-002"], contextWindow: 1000, tokensBefore: 600 });
-		assert.equal(plan.currentI, "I-002");
-		assert.equal(plan.slices.filter((slice) => slice.id !== null).length, 2);
-		assert.ok(plan.firstKeptEntryId);
-		assert.notEqual(plan.firstKeptEntryId, "result");
-		assert.ok(plan.summaryEntries.every((entry) => !plan.keptEntries.includes(entry)));
-		assert.equal(legalFirstKeptEntryIndex(entries, 2), 1);
+		const cut = buildOwnCut(entries, 1);
+		assert.equal(cut.ok, true);
+		assert.equal(cut.ok ? cut.firstKeptEntryId : undefined, "u-2");
+		assert.deepEqual(cut.ok ? cut.messages.map((message) => message.role) : [], ["user", "assistant"]);
+
+		const compactAll = buildOwnCut(entries, 0);
+		assert.equal(compactAll.ok, true);
+		assert.equal(compactAll.ok ? compactAll.compactAll : false, true);
+		assert.equal(compactAll.ok ? compactAll.firstKeptEntryId : "not-ok", "");
+		assert.deepEqual(buildOwnCut([textEntry("u", "user", "only one turn")], 1), { ok: false, reason: "too_few_live_messages" });
 	});
 
-	it("starts a new current-I slice after a prior compaction snapshot", () => {
+	it("reads legacy compaction details without writing the old schema", () => {
+		const legacyCompaction: CompactionEntryLike = {
+			id: "old-compact",
+			type: "compaction",
+			details: {
+				kind: "pi-plans-execution-compaction",
+				readRecords: [
+					{ path: "src/legacy.ts", lineStart: 5, lineEnd: 9, range: "5-9", summary: "legacy facts", key: "src/legacy.ts|5-9" },
+				],
+				metrics: {
+					currentI: "I-007",
+					firstKeptEntryId: "u-2",
+					targetMet: false,
+					hardFloorReason: "single oversized tool result",
+				},
+			},
+		};
+		assert.equal(compactionCurrentI(legacyCompaction), "I-007");
+
 		const entries = [
-			{ id: "old-summary", type: "compaction", details: { currentI: "I-002" } },
-			textEntry("u", "new question", 100),
-			textEntry("a", "new answer", 100),
+			textEntry("u-1", "user", "old prefix"),
+			textEntry("a-1", "assistant", "old answer"),
+			legacyCompaction,
+			textEntry("u-2", "user", "retained user from old boundary"),
+			textEntry("a-2", "assistant", "live answer"),
+			textEntry("u-3", "user", "latest user"),
+			textEntry("a-3", "assistant", "latest answer"),
 		];
-		const plan = planIAwareCompaction({ entries, currentI: "I-002", knownIIds: ["I-001", "I-002"], contextWindow: 1000, tokensBefore: 200 });
-		assert.equal(plan.currentStartIndex, 1);
-		assert.equal(plan.slices.at(-1)?.id, "I-002");
-		assert.equal(plan.slices.at(-1)?.current, true);
-		assert.equal(plan.slices.at(-1)?.entries[0]?.id, "u");
-	});	it("extracts bounded paired Read records and merges by path/range", () => {
-		const raw = "x".repeat(500);
-		const entries = [
-			{ id: "call", type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "/repo/a.ts", offset: 7, limit: 3 } }] } },
-			{ id: "result", type: "message", message: { role: "toolResult", toolCallId: "read-1", content: [{ type: "text", text: raw }] } },
-		];
-		const records = extractReadRecords(entries);
-		assert.equal(records.length, 1);
-		assert.equal(records[0]?.range, "7-9");
-		assert.equal(records[0]?.formatted, formatReadRecord(records[0]!));
-		assert.match(records[0]?.formatted ?? "", /^Read: \/repo\/a\.ts line 7-9 Extracted information summary: /);
-		assert.ok((records[0]?.formatted.length ?? 0) < raw.length);
-		const merged = mergeCompactionDetails(
-			{ readRecords: records },
-			{ readRecords: [{ ...records[0]!, summary: "new extraction", formatted: "" }] },
-		);
-		assert.equal(merged.readRecords?.length, 1);
-		assert.equal(merged.readRecords?.[0]?.summary, "new extraction");
+		const cut = buildOwnCut(entries, 1);
+		assert.equal(cut.ok, true);
+		assert.deepEqual(cut.ok ? cut.messages.map((message) => message.content) : [], [
+			[{ type: "text", text: "retained user from old boundary" }],
+			[{ type: "text", text: "live answer" }],
+		]);
+
+		const result = buildPiPlansVccCompaction({
+			branchEntries: entries,
+			preparation: { tokensBefore: 20_000 },
+			reason: "threshold",
+			willRetry: false,
+			settings: DEFAULT_VCC_SETTINGS,
+			phaseContext: { phase: "planning" },
+		});
+		assert.equal(result.kind, "compaction");
+		if (result.kind !== "compaction") return;
+		assert.match(result.compaction.summary, /Read: src\/legacy\.ts line 5-9 Extracted information summary: legacy facts/);
+		assert.match(result.compaction.summary, /Previous compaction hard floor: single oversized tool result/);
+		assert.equal((result.compaction.details as any).kind, undefined);
+		assert.equal((result.compaction.details as any).readRecords, undefined);
+		assert.equal((result.compaction.details as any).metrics?.currentI, undefined);
+		assert.equal(result.compaction.details.compactor, "pi-vcc");
 	});
 
-	it("uses strict trigger and records a hard floor when the retained suffix cannot fit", () => {
-		assert.equal(currentIExceedsTrigger(200, 1000), false);
-		assert.equal(currentIExceedsTrigger(201, 1000), true);
-		const entries = [textEntry("i1", "[I-001:current] " + "work ".repeat(40), 900), textEntry("u", "latest", 200), textEntry("a", "answer", 200)];
-		const plan = planIAwareCompaction({ entries, currentI: "I-001", contextWindow: 1000, tokensBefore: 1300 });
-		assert.equal(plan.metrics.targetMet, false);
-		assert.ok(plan.metrics.hardFloorReason);
-	});
-});
-
-describe("hasCompactableContent", () => {
-	it("returns true when messages exist beyond the keep-recent window", () => {
-		const entries = [
-			textEntry("a-1", "old turn body", 15_000),
-			textEntry("a-2", "middle turn", 15_000),
-			textEntry("a-3", "recent turn", 15_000),
+	it("applies smart keep, explicit keep, budget cuts, and tool-result-safe boundaries", () => {
+		const smallTurns = [
+			textEntry("u-1", "user", "first task"),
+			textEntry("a-1", "assistant", "first answer"),
+			textEntry("u-2", "user", "second task"),
+			textEntry("a-2", "assistant", "second answer"),
+			textEntry("u-3", "user", "third task"),
+			textEntry("a-3", "assistant", "third answer"),
 		];
-		assert.equal(hasCompactableContent(entries, 20_000), true);
+		const smart = buildPiPlansVccCompaction({
+			branchEntries: smallTurns,
+			preparation: { tokensBefore: 10_000 },
+			reason: "threshold",
+			willRetry: false,
+			settings: DEFAULT_VCC_SETTINGS,
+			phaseContext: { phase: "planning" },
+		});
+		assert.equal(smart.kind, "compaction");
+		if (smart.kind !== "compaction") return;
+		assert.equal(smart.stats.smartKeepAdjusted, true);
+		assert.equal(smart.stats.smartFromKeep, 1);
+		assert.equal(smart.stats.requestedKeepUserTurns, 2);
+		assert.equal(smart.compaction.firstKeptEntryId, "u-2");
+
+		const explicit = buildPiPlansVccCompaction({
+			branchEntries: smallTurns,
+			preparation: { tokensBefore: 10_000 },
+			customInstructions: `${PI_VCC_COMPACT_INSTRUCTION} keep:1`,
+			reason: "threshold",
+			willRetry: false,
+			settings: DEFAULT_VCC_SETTINGS,
+			phaseContext: { phase: "planning" },
+		});
+		assert.equal(explicit.kind, "compaction");
+		if (explicit.kind !== "compaction") return;
+		assert.equal(explicit.stats.smartKeepAdjusted, false);
+		assert.equal(explicit.stats.requestedKeepUserTurns, 1);
+		assert.equal(explicit.compaction.firstKeptEntryId, "u-3");
+
+		const huge = "x".repeat(300_000);
+		const noAnchor = buildPiPlansVccCompaction({
+			branchEntries: [
+				textEntry("u-1", "user", "single user turn"),
+				textEntry("a-1", "assistant", huge),
+				textEntry("a-2", "assistant", "safe assistant boundary"),
+			],
+			preparation: { tokensBefore: 200_000 },
+			reason: "threshold",
+			willRetry: false,
+			settings: DEFAULT_VCC_SETTINGS,
+			phaseContext: { phase: "planning" },
+		});
+		assert.equal(noAnchor.kind, "compaction");
+		if (noAnchor.kind !== "compaction") return;
+		assert.equal(noAnchor.stats.budgetCut, "no_anchor");
+		assert.equal(noAnchor.compaction.firstKeptEntryId, "a-1");
+
+		const oversizedTail = buildPiPlansVccCompaction({
+			branchEntries: [
+				textEntry("u-1", "user", "one"),
+				textEntry("a-1", "assistant", "done"),
+				textEntry("u-2", "user", "two"),
+				textEntry("a-2", "assistant", "done"),
+				textEntry("u-3", "user", "three"),
+				textEntry("a-3", "assistant", huge),
+			],
+			preparation: { tokensBefore: 250_000 },
+			reason: "threshold",
+			willRetry: false,
+			settings: { ...DEFAULT_VCC_SETTINGS, smartKeepTail: false },
+			phaseContext: { phase: "planning" },
+		});
+		assert.equal(oversizedTail.kind, "compaction");
+		if (oversizedTail.kind !== "compaction") return;
+		assert.equal(oversizedTail.stats.budgetCut, "oversized_tail");
+		assert.equal(oversizedTail.compaction.firstKeptEntryId, "a-3");
+
+		const toolBoundary = buildPiPlansVccCompaction({
+			branchEntries: [
+				textEntry("u-1", "user", "single user turn"),
+				toolCallEntry("tc-1", "read", { path: "src/exec.ts" }),
+				toolResultEntry("tr-1", "read", huge),
+				textEntry("a-after", "assistant", "safe boundary after the tool result"),
+			],
+			preparation: { tokensBefore: 250_000 },
+			reason: "threshold",
+			willRetry: false,
+			settings: DEFAULT_VCC_SETTINGS,
+			phaseContext: { phase: "planning" },
+		});
+		assert.equal(toolBoundary.kind, "compaction");
+		if (toolBoundary.kind !== "compaction") return;
+		assert.equal(toolBoundary.stats.budgetCut, "no_anchor");
+		assert.equal(toolBoundary.compaction.firstKeptEntryId, "a-after");
 	});
 
-	it("returns false when everything fits inside the keep-recent window", () => {
-		const entries = [
-			textEntry("a-1", "old turn body", 15_000),
-			textEntry("a-2", "recent turn", 10_000),
-		];
-		assert.equal(hasCompactableContent(entries, 20_000), false);
+	it("compiles a deterministic five-section summary with phase context and file activity", () => {
+		const result = buildPiPlansVccCompaction({
+			branchEntries: [
+				textEntry("u-1", "user", "Please implement repo-private VCC compaction. Always keep ASCII output."),
+				toolCallEntry("tc-1", "edit", { path: "src/compaction.ts" }),
+				textEntry("a-1", "assistant", "Updated src/compaction.ts and ran npm test."),
+				textEntry("u-2", "user", "Continue execution."),
+				textEntry("a-2", "assistant", "Current work is in the retained tail."),
+			],
+			preparation: {
+				firstKeptEntryId: "fallback",
+				tokensBefore: 40_000,
+				previousSummary: "## Legacy Summary\nEarlier compact facts.",
+				fileOps: { read: ["src/exec.ts"], written: ["src/compaction.ts"], edited: [] },
+			},
+			customInstructions: `${PI_VCC_COMPACT_INSTRUCTION} keep:1`,
+			reason: "threshold",
+			willRetry: false,
+			settings: DEFAULT_VCC_SETTINGS,
+			phaseContext: {
+				phase: "execution",
+				planPath: "/repo/PLAN_v3.md",
+				currentI: "I-002",
+				remainingVerifierIds: ["VC-002"],
+				implementationIds: ["I-001", "I-002"],
+			},
+		});
+		assert.equal(result.kind, "compaction");
+		if (result.kind !== "compaction") return;
+		assert.equal(result.compaction.firstKeptEntryId, "u-2");
+		assert.match(result.compaction.summary, /\[Session Goal\]/);
+		assert.match(result.compaction.summary, /Execute accepted plan \/repo\/PLAN_v3\.md/);
+		assert.match(result.compaction.summary, /\[Files And Changes\]/);
+		assert.match(result.compaction.summary, /Modified: src\/compaction\.ts/);
+		assert.match(result.compaction.summary, /Read: src\/exec\.ts/);
+		assert.match(result.compaction.summary, /\[Outstanding Context\]/);
+		assert.match(result.compaction.summary, /Current implementation item: I-002/);
+		assert.match(result.compaction.summary, /Previous compact summary: Legacy Summary Earlier compact facts\./);
+		assert.match(result.compaction.summary, /\[User Preferences\]/);
+		assert.match(result.compaction.summary, /Always keep ASCII output/);
+		assert.equal(result.compaction.details.compactor, "pi-vcc");
+		assert.equal(result.compaction.details.phase, "execution");
+		assert.equal(result.stats.keptUserTurns, 1);
+		assert.equal(result.followUpPrompt, null);
 	});
 
-	it("returns false when the branch was just compacted", () => {
-		const entries = [
-			textEntry("a-1", "old", 30_000),
-			{ id: "c-1", type: "compaction", firstKeptEntryId: "a-1" },
-		];
-		assert.equal(hasCompactableContent(entries, 20_000), false);
+	it("cancels unsafe manual cuts but falls back to Pi core for overflow retry", () => {
+		const manual = buildPiPlansVccCompaction({
+			branchEntries: [],
+			preparation: { firstKeptEntryId: "fallback", tokensBefore: 100 },
+			reason: "manual",
+			willRetry: false,
+			settings: DEFAULT_VCC_SETTINGS,
+			phaseContext: { phase: "planning" },
+		});
+		assert.equal(manual.kind, "cancel");
+
+		const overflowRetry = buildPiPlansVccCompaction({
+			branchEntries: [],
+			preparation: { firstKeptEntryId: "fallback", tokensBefore: 100 },
+			reason: "overflow",
+			willRetry: true,
+			settings: DEFAULT_VCC_SETTINGS,
+			phaseContext: { phase: "planning" },
+		});
+		assert.deepEqual(overflowRetry, { kind: "fallback", reason: "no_live_messages" });
+
+		const overrideDisabled = buildPiPlansVccCompaction({
+			branchEntries: [
+				textEntry("u-1", "user", "old"),
+				textEntry("a-1", "assistant", "old answer"),
+				textEntry("u-2", "user", "new"),
+			],
+			preparation: { firstKeptEntryId: "fallback", tokensBefore: 100 },
+			settings: { ...DEFAULT_VCC_SETTINGS, overrideDefaultCompaction: false },
+			phaseContext: { phase: "planning" },
+		});
+		assert.deepEqual(overrideDisabled, { kind: "fallback", reason: "override-disabled" });
 	});
 
-	it("honors the previous compaction's kept boundary", () => {
-		const compacted = [
-			{ id: "c-1", type: "compaction", firstKeptEntryId: "k-1" },
-			textEntry("k-1", "kept by compaction", 5_000),
-		];
-		// Kept boundary content stays inside the window: nothing compactable.
-		assert.equal(hasCompactableContent([...compacted, textEntry("k-2", "new", 16_000)], 20_000), false);
-		// Once post-compaction growth exceeds the window, older kept content becomes compactable.
-		assert.equal(hasCompactableContent([...compacted, textEntry("k-2", "new huge", 30_000)], 20_000), true);
+	it("parses manual keep/follow-up instructions and gates auto-continue by version", () => {
+		assert.deepEqual(parseCompactionInstructions("pi-plans execution auto compact"), {
+			isPiVcc: false,
+			isInternalPiPlans: true,
+			keepUserTurns: 1,
+			keepUserTurnsExplicit: false,
+			followUpPrompt: null,
+		});
+		assert.deepEqual(parseCompactionInstructions("keep:2 Continue with tests"), {
+			isPiVcc: false,
+			isInternalPiPlans: false,
+			keepUserTurns: 2,
+			keepUserTurnsExplicit: true,
+			followUpPrompt: "Continue with tests",
+		});
+		assert.deepEqual(parseCompactionInstructions(`${PI_VCC_COMPACT_INSTRUCTION} keep:3`), {
+			isPiVcc: true,
+			isInternalPiPlans: false,
+			keepUserTurns: 3,
+			keepUserTurnsExplicit: true,
+			followUpPrompt: null,
+		});
+		assert.deepEqual(parseCompactionInstructions("Continue with tests keep:2"), {
+			isPiVcc: false,
+			isInternalPiPlans: false,
+			keepUserTurns: 2,
+			keepUserTurnsExplicit: true,
+			followUpPrompt: "Continue with tests",
+		});
+		assert.equal(shouldScheduleAutoContinue(true, "0.84.3"), true);
+		assert.equal(shouldScheduleAutoContinue(true, "0.84.4"), false);
+		assert.equal(shouldScheduleAutoContinue(false, "0.84.3"), false);
 	});
 
-	it("returns false for an empty branch and ignores entries without messages", () => {
-		assert.equal(hasCompactableContent([], 20_000), false);
-		assert.equal(hasCompactableContent([
-			{ id: "r-1", type: "raw", tokens: 30_000 },
-			{ id: "r-2", type: "raw" },
-		], 20_000), false);
+	it("scaffolds and loads repo-private VCC settings", () => {
+		const stateRoot = path.join(tmpRoot, "state");
+		scaffoldVccSettings(stateRoot);
+		assert.equal(fs.existsSync(vccSettingsPath(stateRoot)), true);
+		assert.deepEqual(loadVccSettings(stateRoot), DEFAULT_VCC_SETTINGS);
+
+		fs.writeFileSync(vccSettingsPath(stateRoot), JSON.stringify({ overrideDefaultCompaction: false }), "utf8");
+		scaffoldVccSettings(stateRoot);
+		assert.deepEqual(loadVccSettings(stateRoot), {
+			...DEFAULT_VCC_SETTINGS,
+			overrideDefaultCompaction: false,
+		});
+
+		const invalidRoot = path.join(tmpRoot, "invalid-state");
+		fs.mkdirSync(invalidRoot, { recursive: true });
+		const invalidPath = vccSettingsPath(invalidRoot);
+		fs.writeFileSync(invalidPath, "{ invalid json", "utf8");
+		scaffoldVccSettings(invalidRoot);
+		assert.equal(fs.readFileSync(invalidPath, "utf8"), "{ invalid json");
+		assert.deepEqual(loadVccSettings(invalidRoot), DEFAULT_VCC_SETTINGS);
+
+		const envRoot = path.join(tmpRoot, "env-state");
+		const envConfig = path.join(tmpRoot, "external-pi-vcc-config.json");
+		const previousEnv = process.env.PI_VCC_CONFIG_PATH;
+		try {
+			process.env.PI_VCC_CONFIG_PATH = envConfig;
+			fs.writeFileSync(envConfig, JSON.stringify({ smartKeepTail: false, continueAfterThresholdCompact: false }), "utf8");
+			assert.deepEqual(loadVccSettings(envRoot), DEFAULT_VCC_SETTINGS);
+		} finally {
+			if (previousEnv === undefined) delete process.env.PI_VCC_CONFIG_PATH;
+			else process.env.PI_VCC_CONFIG_PATH = previousEnv;
+		}
+	});
+
+	it("writes debug snapshots only when enabled", () => {
+		const debugPath = "/tmp/pi-vcc-debug.json";
+		const previous = fs.existsSync(debugPath) ? fs.readFileSync(debugPath, "utf8") : null;
+		try {
+			fs.rmSync(debugPath, { force: true });
+			const event = {
+				branchEntries: [
+					textEntry("u-1", "user", "implement debug test"),
+					textEntry("a-1", "assistant", "working"),
+					textEntry("u-2", "user", "continue"),
+					textEntry("a-2", "assistant", "tail"),
+				],
+				preparation: { tokensBefore: 10_000 },
+				reason: "threshold" as const,
+				willRetry: false,
+				phaseContext: { phase: "planning" as const },
+			};
+			buildPiPlansVccCompaction({ ...event, settings: DEFAULT_VCC_SETTINGS });
+			assert.equal(fs.existsSync(debugPath), false);
+
+			buildPiPlansVccCompaction({ ...event, settings: { ...DEFAULT_VCC_SETTINGS, debug: true } });
+			const debug = JSON.parse(fs.readFileSync(debugPath, "utf8"));
+			assert.equal(debug.usedOwnCut, true);
+			assert.equal(debug.phase, "planning");
+		} finally {
+			if (previous === null) fs.rmSync(debugPath, { force: true });
+			else fs.writeFileSync(debugPath, previous, "utf8");
+		}
 	});
 });

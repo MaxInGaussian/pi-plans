@@ -9,8 +9,32 @@
 
 const ELLIPSIS = "…";
 
-export function visibleWidth(text: string): number {
-	if (!text) return 0;
+/**
+ * ECMA-48 CSI sequence: ESC [ parameter bytes (0x30-0x3F), intermediate bytes
+ * (0x20-0x2F), final byte (0x40-0x7E). Matched atomically so styling payloads
+ * never leak into width math and are never split mid-sequence.
+ */
+const CSI_PATTERN = /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/g;
+
+interface AnsiPart {
+	kind: "csi" | "text";
+	value: string;
+}
+
+function splitAnsi(text: string): AnsiPart[] {
+	const parts: AnsiPart[] = [];
+	let last = 0;
+	for (const match of text.matchAll(CSI_PATTERN)) {
+		const start = match.index ?? 0;
+		if (start > last) parts.push({ kind: "text", value: text.slice(last, start) });
+		parts.push({ kind: "csi", value: match[0] });
+		last = start + match[0].length;
+	}
+	if (last < text.length) parts.push({ kind: "text", value: text.slice(last) });
+	return parts;
+}
+
+function graphemeWidth(text: string): number {
 	let width = 0;
 	for (const segment of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)) {
 		const cp = segment.segment.codePointAt(0) ?? 0;
@@ -26,6 +50,16 @@ export function visibleWidth(text: string): number {
 	return width;
 }
 
+export function visibleWidth(text: string): number {
+	if (!text) return 0;
+	let width = 0;
+	for (const part of splitAnsi(text)) {
+		if (part.kind === "csi") continue; // escape sequences render at zero width
+		width += graphemeWidth(part.value);
+	}
+	return width;
+}
+
 export function truncateToWidth(text: string, maxWidth: number, ellipsis = ELLIPSIS): string {
 	const measured = visibleWidth(text);
 	if (measured <= maxWidth) return text;
@@ -33,12 +67,25 @@ export function truncateToWidth(text: string, maxWidth: number, ellipsis = ELLIP
 	const target = Math.max(0, maxWidth - ellipsisWidth);
 	let result = "";
 	let used = 0;
-	for (const segment of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)) {
-		const w = visibleWidth(segment.segment);
-		if (used + w > target) break;
-		result += segment.segment;
-		used += w;
+	let exhausted = false;
+	for (const part of splitAnsi(text)) {
+		if (part.kind === "csi") {
+			if (!exhausted) result += part.value; // keep styling runs intact; never split them
+			continue;
+		}
+		for (const segment of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(part.value)) {
+			const w = visibleWidth(segment.segment);
+			if (used + w > target) {
+				exhausted = true;
+				break;
+			}
+			result += segment.segment;
+			used += w;
+		}
 	}
+	// A kept open SGR (its reset lived past the cut) must not bleed into the
+	// ellipsis or anything rendered after this string.
+	if (exhausted && result.includes("\x1b[")) result += "\x1b[0m";
 	return ellipsis ? `${result}${ellipsis}` : result;
 }
 
@@ -53,19 +100,25 @@ export function wrapTextWithAnsi(text: string, maxWidth: number): string[] {
 		if (word === "") continue;
 		const wordWidth = visibleWidth(word);
 		if (wordWidth > maxWidth) {
-			// Hard split a single overlong word.
+			// Hard split a single overlong word (ANSI-aware: CSI runs are zero-width and atomic).
 			if (current) { lines.push(current); current = ""; currentWidth = 0; }
 			let buffer = "";
 			let bufferWidth = 0;
-			for (const segment of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(word)) {
-				const w = visibleWidth(segment.segment);
-				if (bufferWidth + w > maxWidth) {
-					lines.push(buffer);
-					buffer = segment.segment;
-					bufferWidth = w;
-				} else {
-					buffer += segment.segment;
-					bufferWidth += w;
+			for (const part of splitAnsi(word)) {
+				if (part.kind === "csi") {
+					buffer += part.value;
+					continue;
+				}
+				for (const segment of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(part.value)) {
+					const w = visibleWidth(segment.segment);
+					if (bufferWidth + w > maxWidth) {
+						lines.push(buffer);
+						buffer = segment.segment;
+						bufferWidth = w;
+					} else {
+						buffer += segment.segment;
+						bufferWidth += w;
+					}
 				}
 			}
 			if (buffer) { lines.push(buffer); buffer = ""; bufferWidth = 0; }

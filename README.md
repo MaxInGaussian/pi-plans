@@ -113,15 +113,15 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 | Capability | In short |
 |---|---|
 | Planning router + five specialist skills | Start with `/skill:planning` to route to the narrowest matching specialist (`plan-small` → `plan-big`, `debug-and-plan`, `plan-with-refs`) |
-| Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run; choosing Auto-complete enables recommendation-only answers for later eligible questions in the current planning run, with `/plans-autocomplete-stop` available to take back control. After execution completes, the completion prompt replaces Auto-complete with `Auto-refine loop` (`trailing: "auto-refine-loop"`) so users can opt into an implementation-review loop instead. |
+| Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run; choosing Auto-complete enables recommendation-only answers for later eligible questions in the current planning run, with `/plans-autocomplete-stop` available to take back control. After execution completes, the continuation prompt enters goal-running mode by default: it asks only for the implementation-review loop's termination condition and then keeps refining until the loop ends or the cap is reached. |
 | Refinement rounds | Read-only reviewer/criticizer Pi subagents consolidate findings into the next plan version; delegated runs have standalone `Reviewer`/`Criticizer` progress overlays that close before the tool result returns |
 | Workspace state | Config, runs, decisions, refs, and subagent ledgers in `.git/pi_plans/` (git common dir) |
-| Smart compact (I-aware) | History is sliced by `I-###` instead of VC. The current-I slice above 20% of the model window triggers a bounded summary with paired `Read:` records, retains a legal recent suffix, targets <10% post-context, and records a hard-floor reason when unreachable. Planning phase falls back to the latest plan/Q&A focus when no current marker exists; cooldown + resume guard prevent ping-pong; one hidden continuation is queued when Pi reports `willRetry: false` |
+| VCC compact | Active planning/execution compaction uses deterministic, no-LLM VCC-style summaries when Pi core emits manual `/compact`, threshold, or overflow events. Summaries use five bracket sections plus a brief transcript, keep a smart recent tail, support `keep:N`, and write VCC details/stats without adding `/pi-vcc` commands. |
 | Visible Refiner overlay | Delegated reviewer/criticizer subagents surface as a named public overlay in the TUI — one `Reviewer`/`Criticizer` panel with per-lane tool progress, full streaming transcript with follow-bottom scroll, Tab-pane focus, retention until the user presses `Esc` after completion, and clean cancelled/timed-out vs completed states. `reviewers: 3` renders three equal-height panes inside the same overlay |
 | Tracked execution | Checklist injected each turn; `[DONE:VC-xxx]` markers drive completion; implementation items report progress with `[I-xxx:implemented]` / `[I-xxx:validating]` markers; the bottom status bar shows lifecycle, `x/y` progress, elapsed time, and input/output token usage in real time |
 | Execution handoff | The accepted plan resumes in the current session model; no separate model selection is performed. |
-| Execution-phase compaction | Pi core owns threshold, overflow, and manual scheduling; pi-plans adds a current-I proactive check once the current-I slice exceeds 20% of the model window, summarizes I-level history and bounded `Read:` records, retains a legal recent suffix, targets under 10% when possible, and records hard-floor reasons when not; one hidden continuation is queued when Pi reports `willRetry: false` |
-| Planning-phase auto compaction | In active planning runs (run.status=planning, no execution), the current-I check uses the same 20%/10% best-effort policy when a marker exists; without a marker it protects the latest plan/Q&A focus, while Pi threshold, overflow, and manual compaction remain supported; cooldown + resume guard prevent ping-pong and hidden resume messages stay out of model context |
+| Execution-phase compaction | Pi core owns scheduling; pi-plans maps the active plan path, current `I-###`, implementation IDs, and remaining `VC-###` checklist into the VCC sections. The old current-I proactive trigger and model-generated summary path are removed. |
+| Planning-phase compaction | During `run.status=planning` with no active execution, pi-plans maps active run, artifact directory, latest plan path from session entries, and observed current-I markers into the VCC sections. Without an active planning run, compaction returns to Pi core. |
 | Efficient executor prompt | Each turn, the executor is steered by a fused rule set — Marcos Hernanz's AGENTS.md principles × Ponytail minimalism: layered growth, simplest implementation, long-term architecture (no stopgaps), library discipline — so plans finish in fewer tokens and fewer detours |
 | Write guard | `edit`/`write` blocked outside planning artifacts while a run is active |
 
@@ -131,9 +131,10 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 |---|---|
 | `plans` | State CLI: `init`, `show`, `set-language`, `set-artifact-root`, `set-role`, `start-run`, `set-status`, `record-decision`, `record-ref`, `record-subagent` |
 | `ask_choice` | Numbered choice prompt; `autoComplete: false` for the merged accept/execute question and external-state questions |
-| `refine` | Reviewer/criticizer round via standalone read-only subagents (`--mode json -p --no-session --tools read,grep,find,ls`); `target: "plan"` (default) reviews the plan, `target: "implementation"` reviews the implemented worktree against the plan; delegated TUI runs show one `Reviewer`/`Criticizer` overlay (78% width × 78% height, top-center, ≥72 cols) with per-lane transcript, follow-bottom scroll, Tab focus, and retention until `Esc`; `reviewers: 3` renders three equal-height panes; enforces role/model confirmation gates |
+| `refine` | Reviewer/criticizer round via standalone read-only subagents (`--mode json -p --no-session --tools read,grep,find,ls`, plus `code_graph` for both roles when the workspace has the code graph enabled); `target: "plan"` (default) reviews the plan, `target: "implementation"` reviews the implemented worktree against the plan; delegated TUI runs show one `Reviewer`/`Criticizer` overlay (78% width × 78% height, top-center, ≥72 cols) with per-lane transcript, follow-bottom scroll, Tab focus, and retention until `Esc`; `reviewers: 3` renders three equal-height panes; enforces role/model confirmation gates |
 | `execute_plan` | Execution handoff: re-confirms with the user and enters extension-managed execution mode |
 | `/plans` | Show config, active run, and execution progress |
+| `/config-pi-plans` | Re-ask workspace defaults for language, artifact root, code graph, reviewer mode/model, and criticizer mode/model |
 | `/plans-execute [plan.md]` | Manual execution handoff (defaults to highest `PLAN_vN.md`) |
 | `/update-plan [plan.md] [reason…]` | Interrupt-and-refine: stops execution (if any), returns the run to planning, and directs the agent to revise the plan into `PLAN_vN+1.md` while preserving verified work |
 | `/plans-autocomplete-stop` | Stop the current run's Auto-complete mode and return later planning questions to normal interaction |
@@ -141,16 +142,16 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 | `/plans-abandon` | Abandon the active run (lifts the write guard; artifacts stay) |
 | Status bar (lifecycle) | 💬 Q&A → 📝 draft written (planning sub-phases) → ⌛ executing `x/y · spent · in/out-toks` in the bottom status bar → ⛔ stopped / 🎯 done / 🚫 abandoned |
 
-## Smart compact (I-aware)
+## VCC compact
 
-Default `compaction` is Pi-core-owned: threshold, overflow, and manual `/compact` always run as designed. On top of that, pi-plans layers an **I-aware policy** so long, tool-heavy sessions survive the same run instead of running out of context:
+Pi core remains the owner of compaction scheduling: manual `/compact`, threshold, and overflow events are emitted by Pi as usual. During an active pi-plans planning or execution run, pi-plans handles `session_before_compact` with a deterministic VCC-style compiler instead of calling a model for a summary.
 
-- **Slice by implementation item.** History is grouped by `[I-###:current]` markers instead of `[DONE:VC-xxx]`. The current I's prefix can be summarized, the current I's recent suffix stays raw, and finished `I-###` items become independent sections.
-- **Bounded read history.** Every paired `read` call/result is reduced to `Read: <path> line <X-Y> Extracted information summary: ...` (line range is `unknown` when no offset/limit is given). Records deduplicate by path/range across compactions and never embed full raw tool output.
-- **20%/10% best-effort budget.** When the current-I slice exceeds 20% of `ctx.getContextUsage().contextWindow`, a compact is requested on the next settled turn. The summary's `details` record `contextWindow`, `tokensBefore`, `currentITokens`, `summaryTokens`, `keptSuffixTokens`, `estimatedAfterTokens`, `targetRatio`, `currentI`, `firstKeptEntryId`, `targetMet`, and a `hardFloorReason` when the 10% target cannot be reached (system prompt, tool definitions, single oversized tool result). Hard floors stop the loop; they do not silently fall through.
-- **Pi-owned scheduling preserved.** Threshold, overflow, and manual triggers still come from Pi core. pi-plans only customizes the summary and re-arms once usage falls below the low watermark. The hidden `Continue execution.` resume message is queued on non-retry compactions and never enters model context.
-- **Bounded model call.** Custom summaries reuse the current Pi model via `ctx.modelRegistry.complete(model, context, options)` with `event.signal`, `cacheRetention: "none"`, a fresh `sessionId`, and bounded `maxTokens`. Empty, length-stopped, error, or tool-call responses fall back to Pi's default compaction — no half-checkpoint is ever written.
-- **Phase isolation.** Planning and execution keep independent compaction state (`pi-plans-plan-resume` vs `pi-plans-exec-resume`); planning without a current marker protects the latest plan/Q&A focus rather than leaking execution state.
+- **Summary shape.** The summary contains exactly five bracket sections: `[Session Goal]`, `[Files And Changes]`, `[Commits]`, `[Outstanding Context]`, and `[User Preferences]`, followed by `---` and a ranked brief transcript. Execution contributes plan path, current `I-###`, implementation IDs, and remaining verifier IDs; planning contributes run ID, artifact directory, latest plan path from session entries, and any observed current-I marker.
+- **Session-only input.** Compact summaries are built from the event's branch entries, previous summary, file ops, pi-plans custom session entries, and live phase state. The compiler does not read plan files, git history, or the worktree to invent context.
+- **Tail policy.** The default keep is one recent user turn; smart keep may retain more turns when the tail is still small. Explicit `keep:N` is honored, while no-anchor and oversized-tail cases use a deterministic token-budget cut that avoids starting retained context with an orphan tool result.
+- **Manual matrix.** Plain `/compact` and `/compact keep:N` compact and show stats without continuing. `/compact <text>` and `/compact keep:N <text>` compact, then send the text once as the follow-up prompt. Internal pi-plans compaction markers are never reused as user follow-up prompts.
+- **Fallbacks and stats.** Unsafe manual/threshold cuts cancel with a warning; overflow or retrying unsafe cuts return control to Pi core. Successful VCC compactions notify with kept-tail and summarized-message stats. Threshold/overflow compactions may queue one hidden continuation only when the running Pi version still needs it and `continueAfterThresholdCompact` is enabled.
+- **Repo-private config.** Defaults are scaffolded in `.git/pi_plans/pi-vcc-config.json` under the resolved git common dir: `overrideDefaultCompaction:true`, `smartKeepTail:true`, `continueAfterThresholdCompact:true`, `debug:false`. Global pi-vcc config and `PI_VCC_CONFIG_PATH` are intentionally ignored.
 
 ## Visible Refiner overlay
 
@@ -216,7 +217,7 @@ or register the absolute path in `~/.pi/agent/settings.json`:
 { "extensions": ["/absolute/path/to/pi-plans"] }
 ```
 
-## Code graph (v0.2+)
+## Code graph (v0.3+)
 
 `/init-graph` walks the worktree, parses JavaScript/TypeScript and Python
 files with Tree-sitter, and stores a normalized function graph in
@@ -225,16 +226,9 @@ agents: function rows expose a low-token `description`/`inputs`/`outputs`
 JSON view, call edges are normalized with `in_links`/`out_links` derived on
 read, and each function retains its full UTF-8 source.
 
-- `/init-graph [--reindex] [--no-summary] [--no-commit]` — scan the worktree and write the
-  graph; with `--reindex` it incrementally updates an existing DB. Dirty trees
-  get a `chore(code-graph): pre-init snapshot` commit first (`--no-commit` skips).
-  After indexing it records a `code_graph_snapshot` (HEAD + uncommitted paths)
-  that `/graph-drift` compares against. The parser dependencies are installed
-  via npm (`tree-sitter`, grammars).
+- `/init-graph [--reindex] [--no-summary] [--no-commit]` — scan the worktree and write the graph; if `code_graph.db` already exists, it first asks whether to rebuild or sync changed paths via `/update-graph` (non-interactive runs and `--reindex` stay on the rebuild path). With `--reindex` it keeps the existing full-worktree reindex semantics on the rebuild path. Dirty trees get a `chore(code-graph): pre-init snapshot` commit first (`--no-commit` skips). After indexing it records a `code_graph_snapshot` (HEAD + uncommitted paths) that `/graph-drift` compares against. The parser dependencies are installed via npm (`tree-sitter`, grammars).
 - `/graph-status` — print function/file/edge counts.
-- `/update-graph [--dry-run] [--base <commit>]` — incrementally reindex only
-  the paths `git status --porcelain` reports (including untracked and rename
-  targets); deleted files' DB rows are purged, never resurrected.
+- `/update-graph [--dry-run] [--base <commit>]` — incrementally reindex only the paths `git status --porcelain` reports (including untracked and rename targets); deleted files' DB rows are purged, never resurrected. `/init-graph` uses this path when you choose the sync-changes branch.
 - `/graph-drift [--json] [--commit-aware]` — direction-aware convergence check:
   (a) per-file hash match or a pending apply marker, (b) every uncommitted
   indexable path is indexed, (c) snapshot vs current HEAD (informational).
@@ -245,8 +239,15 @@ read, and each function retains its full UTF-8 source.
   planning run is `planning`/`accepted`.
 - `/enable-graph` / `/disable-graph` — toggle the `graph_enabled` config
   flag (disable refuses while drift is dirty). When enabled, planner/refiner/
-  executor prompts direct agents to read code via the graph; refiner
-  subagents get the `code_graph` tool in their allowlist; the executor loop
+  executor prompts hard-require function-level reads for indexed code, and the
+  built-in `read`/`write`/`edit` tools become graph-aware overrides for
+  indexed source files: `read` returns a capped function digest (≤50 lines,
+  synthetic anonymous entries folded) with `full: true` as the only whole-file
+  exit (small/zero-function files return full text); `write`/`edit` stage
+  DB-first mutations; unexpected fallbacks (not indexed / runtime unavailable /
+  config unreadable) are marked in the result; refiner and criticizer
+  subagents get the `code_graph` tool in their allowlist (verified in headless
+  no-session children); the executor loop
   becomes DB-first: `code_graph` mutations → `/apply-graph` → `/graph-drift`
   → `plans final-commit` → `/init-graph`.
 - The `code_graph` tool provides read-only screening (`status`, `screening`,
@@ -301,7 +302,7 @@ The plan is the contract. Refinement converges on scope while nothing is writabl
 
 **What can Auto-complete decide on my behalf?**
 
-Planning and refinement choices only (the recommended option). Choosing Auto-complete enables the recommended answer for later eligible planning questions in the current run and the extension continues the planning turn when the model stops early. Use `/plans-autocomplete-stop` to take back control. It is never offered for execution approval, installs, publishing, deployment, merge, push, or credentials — those questions stop and wait for you. The post-execution amelioration prompt uses a separate `Auto-refine loop` trailing option, which is an explicit user choice that triggers a follow-up rounds/termination question and a refinement loop over the implementation result; it is never auto-selected.
+Planning and refinement choices only (the recommended option). Choosing Auto-complete enables the recommended answer for later eligible planning questions in the current run and the extension continues the planning turn when the model stops early. Use `/plans-autocomplete-stop` to take back control. It is never offered for execution approval, installs, publishing, deployment, merge, push, or credentials — those questions stop and wait for you. After execution completes, interactive sessions enter goal-running review mode automatically and ask only for the implementation-review loop's termination condition; the loop then continues until that condition or the 5-round cap. Headless sessions stay silent.
 
 **Where does all the state live?**
 

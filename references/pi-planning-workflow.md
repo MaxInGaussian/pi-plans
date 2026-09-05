@@ -9,9 +9,10 @@ This skill set is written for the Pi coding agent's documented behavior:
 - the five skills are contributed by the pi-plans extension and loaded as Pi skills (also invokable as `/skill:<name>`);
 - skill references and helper sources are resolved relative to the directory containing `SKILL.md`;
 - the extension provides these tools: `plans` (workspace state), `ask_choice` (choice prompts), `refine` (reviewer/criticizer subagents), and `execute_plan` (execution handoff);
-- `refine` spawns read-only Pi subagents (`pi --mode json -p --no-session --tools read,grep,find,ls`) with isolated context; delegated Reviewer/Criticizer runs show a standalone aggregate overlay titled `Reviewer` or `Criticizer` (78% × 78% top-center, ≥72 cols, no input row), stream assistant/thinking/tool events into per-lane transcripts with follow-bottom scroll, dismiss on `Esc` (close-only — the refiner child keeps running and its result still flows back as tool output), replace any retained finished overlay when a new round begins, and return conclusions to the main session as tool output;
+- `refine` spawns read-only Pi subagents (`pi --mode json -p --no-session --tools read,grep,find,ls`, plus `code_graph` for both roles when workspace `graph_enabled` is true) with isolated context; delegated Reviewer/Criticizer runs show a standalone aggregate overlay titled `Reviewer` or `Criticizer` (78% × 78% top-center, ≥72 cols, no input row), stream assistant/thinking/tool events into per-lane transcripts with follow-bottom scroll, dismiss on `Esc` (close-only — the refiner child keeps running and its result still flows back as tool output), replace any retained finished overlay when a new round begins, and return conclusions to the main session as tool output;
+- when graph mode is enabled, graph-aware `read`/`edit` overrides are active for indexed source files: `read` returns a capped function digest (≤50 lines, synthetic anonymous entries folded) by default — drill in via `offset/limit` or `code_graph get-function`, and `full: true` is the only whole-file exit (small/zero-function files return full text; safety truncation matches native read); `write`/`edit` stage DB-first mutations until `/apply-graph`; unexpected fallbacks (`not indexed` / `runtime unavailable` / `config read failed`) are marked at the top of the result while flag-off fallbacks stay unmarked;
 - the execution loop is extension-managed: remaining verifier items are injected each turn, implementation items emit `[I-###:current]`/`[I-###:implemented|validating]`, and `[DONE:VC-xxx]` markers are tracked with a bottom status bar;
-- execution and planning compaction keep Pi's SessionManager as the history owner, group compacted history by implementation item, retain a legal current-I suffix, summarize paired reads as bounded `Read: <path> line <X-Y> Extracted information summary: ...` records, and target `<10%` of the model window after a current-I slice exceeds `20%`; hard-floor cases are recorded instead of looping;
+- execution and planning compaction keep Pi's SessionManager as the history owner; during active pi-plans runs, `session_before_compact` uses a deterministic no-LLM VCC-style summary with `[Session Goal]`, `[Files And Changes]`, `[Commits]`, `[Outstanding Context]`, `[User Preferences]`, and a ranked brief transcript; Pi core owns manual `/compact`, threshold, and overflow scheduling, while pi-plans handles smart tail keep, `keep:N`, stats, and phase-specific run/plan/current-I/checklist context;
 
 ## Planning Boundary
 
@@ -129,24 +130,23 @@ A refinement round is complete when all reviewer outputs have returned or all cr
 When the user picks `✓ Accept PLAN_vN and execute it now` in the merged question, mark the plan accepted and call the `execute_plan` tool (or the user runs `/plans-execute`). It re-confirms with the user, then the extension enters execution mode:
 
 - every agent turn is injected with the remaining verifier checklist and execution rules (layered simplest implementation, waiting for subprocess-backed verification with backoff 5s -> 10s -> 20s -> 40s -> 80s, then keep polling at 80s and restart at 5s for each new subprocess, no stopgaps, dependency and library discipline, minimum tests);
-- execution-phase compaction may proactively compact the current-I slice above 20% of the model window, summarizes the oldest eligible prefix and bounded Read records, preserves a legal recent suffix, and records whether the <10% target was met; Pi still owns threshold, overflow, and manual scheduling;
+- execution-phase compaction is handled only when Pi core emits manual `/compact`, threshold, or overflow events; summaries are deterministic VCC-style summaries, include session-derived plan/current-I/checklist context, use smart tail keep and `keep:N`, and never call a model or request proactive current-I compaction;
 - the read-only guard lifts: full write access returns;
 - the run status moves to `executing`, then `done` when the last `[DONE:VC-xxx]` marker lands;
 - `/plans-stop` stops execution; `/plans` shows progress.
 
 If the user declines, stay in planning (or stop, per their choice). Never start implementation without the approved handoff.
 
-### Post-Execution Amelioration
+### Post-Execution Continuation
 
-When execution completes in an interactive session, the completion message attaches an amelioration instruction block and triggers a new agent turn so the user can be invited into a review/refinement loop on the implementation. The interactive-only trigger keeps headless sessions silent (no unconsented subagent cost). The same behavior applies on both completion call sites (the normal `turn_end` completion and the `restoreFromSession` recovery path).
+When execution completes in an interactive session, the completion message attaches a goal-running continuation block and triggers a new agent turn so the model can enter the implementation-review loop immediately. The interactive-only trigger keeps headless sessions silent (no unconsented subagent cost). The same behavior applies on both completion call sites (the normal `turn_end` completion and the `restoreFromSession` recovery path).
 
-The agent then asks one `ask_choice` question with the trailing option replaced by `Auto-refine loop`:
+The agent then asks one `ask_choice` question for the termination condition of the implementation-review loop:
 
-- `autoComplete: false`, `trailing: "auto-refine-loop"` — suppresses the run-scoped Auto-complete mode for this question and renders the trailing option as `Auto-refine loop  (run refinement rounds until no high-severity finding or the 5-round cap)` instead of `Auto-complete`.
-- Options (recommended first): 1. Run one Reviewer round on the implementation (`target: "implementation"`) and fix high/medium findings, re-running relevant tests; 2. Run one Criticizer round on the implementation and answer its questions with the user first; 3. Finish here.
-- Selecting `Auto-refine loop` triggers one follow-up `ask_choice` (`autoComplete: false`) for the termination condition: until no high-severity finding (hard cap 5 rounds, recommended) / 1 round / 2 rounds / 3 rounds.
+- `autoComplete: false` — suppresses the run-scoped Auto-complete mode for this question.
+- Options (recommended first): 1. until no high-severity finding (hard cap 5 rounds) 2. 1 round 3. 2 rounds 4. 3 rounds.
 - Each refinement round calls `refine` with `role: "reviewer", target: "implementation"`, accepts findings on evidence, applies fixes, re-runs relevant tests, and records progress. The hard cap is 5 rounds regardless of the chosen termination condition.
-- Round audit trail: `decisions.jsonl`, `subagents.jsonl`, and `pi-plans-ameliorate` entries (one per round) carry `currentRound` for post-hoc verification.
+- Round audit trail: `decisions.jsonl`, `subagents.jsonl`, and `pi-plans-ameliorate` entries (one at goal start, then one per round) carry `currentRound` for post-hoc verification.
 - Headless sessions skip the prompt entirely; no `pi-plans-ameliorate` entry is appended.
 
 `refine` accepts a `target` parameter (`"plan"` default, `"implementation"` for the post-execution loop). The implementation brief anchors findings to the plan's goals and acceptance criteria, explicitly assesses delivery maturity (MVP-only vs. long-term refinement: stopgaps, missing tests, technical debt, production readiness), and tags out-of-scope improvements as low severity.

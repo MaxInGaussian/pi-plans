@@ -53,6 +53,7 @@ import {
 import { planningWriteBlockReason } from "./src/guard.ts";
 import { registerQueryInterviewHooks } from "./src/query-hook.ts";
 import { registerCodeGraphTool } from "./tools/code-graph.ts";
+import { registerGraphAwareFileTools } from "./tools/graph-aware-file-tools.ts";
 import {
 	initGraphCommand,
 	applyGraphCommand,
@@ -63,6 +64,7 @@ import {
 	disableGraphCommand,
 } from "./src/code-graph/commands.ts";
 import { latestPlanVersion, nextPlanVersionPath } from "./src/plan.ts";
+import { configPiPlansCommand } from "./src/config-command.ts";
 import { getRun, loadConfig, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
 import { registerAskChoiceTool } from "./tools/ask-choice.ts";
 import { executeHandoff, registerExecutePlanTool } from "./tools/execute-plan.ts";
@@ -116,6 +118,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	registerExecutePlanTool(pi);
 	registerQueryInterviewHooks(pi, hasActivePlanningWorkflow);
 	registerCodeGraphTool(pi);
+	registerGraphAwareFileTools(pi);
 
 	// Contribute the router skill plus the five specialist planning skills.
 	pi.on("resources_discover", () => ({
@@ -221,8 +224,8 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		return handlePlanningBeforeCompact(pi, ctx, event);
 	});
 	pi.on("session_compact", async (event, ctx) => {
-		handleExecutionCompact(pi, ctx, event);
-		handlePlanningCompact(pi, ctx, event);
+		await handleExecutionCompact(pi, ctx, event);
+		await handlePlanningCompact(pi, ctx, event);
 		noteCompactionEnded(ctx, event.customInstructions);
 	});
 	pi.on("session_compact_failed", async (event, ctx) => {
@@ -244,7 +247,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	pi.on("before_agent_start", async (_event, ctx) => {
 		drainExecutionFlush(pi, ctx);
-		const content = executionContextMessage();
+		const content = executionContextMessage(ctx);
 		if (!content) {
 			if (!getExecution() && shouldTriggerPlanningCompaction(ctx)) {
 				requestPlanningCompaction(ctx);
@@ -283,7 +286,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 
 	pi.registerCommand("init-graph", {
-		description: "Index the worktree into .git/pi_plans/code_graph.db (Node SQLite + Tree-sitter).",
+		description: "Index the worktree into .git/pi_plans/code_graph.db. If a graph DB already exists, prompt to rebuild or sync changed paths via /update-graph; `--reindex` and non-interactive runs stay on the rebuild path.",
 		handler: async (args, ctx) => {
 			await initGraphCommand(args, ctx);
 		},
@@ -304,7 +307,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("update-graph", {
-		description: "Incrementally reindex working-tree changes (git status porcelain, incl. untracked/renames) into code_graph.db. Flags: --dry-run, --base <commit>.",
+		description: "Incrementally reindex working-tree changes (git status porcelain, incl. untracked/renames) into code_graph.db. Also used by /init-graph when you choose the sync-changes branch. Flags: --dry-run, --base <commit>.",
 		handler: async (args, ctx) => {
 			await updateGraphCommand(args, ctx);
 		},
@@ -357,6 +360,13 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			lines.push(`Auto-complete: ${autoCompleteStatus(ctx)}`);
 			lines.push(extensionStalenessLine());
 			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("config-pi-plans", {
+		description: "Re-ask and update pi-plans workspace config: language, artifact root, graph, reviewer, and criticizer defaults",
+		handler: async (args, ctx) => {
+			await configPiPlansCommand(args, ctx);
 		},
 	});
 

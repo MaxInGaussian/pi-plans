@@ -9,7 +9,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Store } from "../src/code-graph/store.ts";
-import { materializeFile } from "../src/code-graph/materialize.ts";
+import { materialize, materializeFile } from "../src/code-graph/materialize.ts";
+import { runIndex } from "../src/code-graph/indexer.ts";
+import { makeBackend } from "../src/code-graph/parsers/javascript.ts";
+import { PythonBackend } from "../src/code-graph/parsers/python.ts";
+import { loadGraphRuntime } from "../src/code-graph/runtime.ts";
+import type { ParserBackend } from "../src/code-graph/parser.ts";
+import type { Language } from "../src/code-graph/types.ts";
 
 async function setup(): Promise<{ store: Store; cleanup: () => void } | null> {
 	try {
@@ -130,4 +136,50 @@ test("pending_kind drives convergence: update writes/creates, delete purges, mis
 	const skipped = materializeFile(store, dir, ".", "ghost.js");
 	assert.equal(skipped.status, "skipped-missing");
 	assert.equal(fs.existsSync(path.join(dir, "ghost.js")), false, "ghost not resurrected");
+});
+
+test("materialize never rewrites pending-NULL files from real-index manifests", async (t) => {
+	let sqlite: typeof import("node:sqlite");
+	try {
+		sqlite = await import("node:sqlite");
+	} catch {
+		return;
+	}
+	const runtime = await loadGraphRuntime();
+	if (!runtime.status.parserAvailable || !runtime.status.sqliteAvailable) return;
+	const ParserCtor = runtime.runtime.parser.Parser as unknown as new () => {
+		parse(input: string | Buffer): unknown;
+		setLanguage(language: unknown): void;
+	};
+	const parsers: Record<Language, ParserBackend> = {
+		javascript: makeBackend("javascript", ParserCtor, runtime.runtime.parser.javascript),
+		typescript: makeBackend("typescript", ParserCtor, runtime.runtime.parser.typescript),
+		tsx: makeBackend("tsx", ParserCtor, runtime.runtime.parser.tsx),
+		python: new PythonBackend(ParserCtor, runtime.runtime.parser.python),
+	};
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "code-graph-apply-real-"));
+	t.after(() => {
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+	});
+	const source = "export function add(a: number, b: number): number { return a + b; }\n";
+	fs.writeFileSync(path.join(dir, "math.ts"), source);
+	const store = new Store({ dbPath: path.join(dir, "g.db"), worktreeRoot: dir, gitCommonDir: path.join(dir, ".git") }, sqlite);
+	t.after(() => store.close());
+	await runIndex({ store, worktreeRoot: dir, parsers });
+
+	// Real indexes store empty/overlapping render-unit texts; a pending-NULL
+	// apply must treat source_text as canonical and not rewrite the file.
+	const report = materialize({ store, worktreeRoot: dir });
+	assert.ok(report.files.every((file) => file.status === "ok"), JSON.stringify(report.files));
+	assert.equal(fs.readFileSync(path.join(dir, "math.ts"), "utf8"), source);
+
+	// force converges from source_text, never from manifest reassembly.
+	fs.writeFileSync(path.join(dir, "math.ts"), "tampered\n");
+	const forced = materialize({ store, worktreeRoot: dir, force: true });
+	assert.ok(forced.files.every((file) => file.status === "ok"), JSON.stringify(forced.files));
+	assert.equal(fs.readFileSync(path.join(dir, "math.ts"), "utf8"), source);
 });

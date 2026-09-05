@@ -338,7 +338,6 @@ export function setGraphEnabled(workdir: string, enabled: boolean): EnsureResult
 	return { config, stateRoot, notices };
 }
 
-
 export interface SetRoleOptions {
 	role: "reviewer" | "criticizer";
 	mode?: string;
@@ -367,8 +366,13 @@ export function setRole(workdir: string, options: SetRoleOptions): EnsureResult 
 	return { config, stateRoot, notices };
 }
 
-// ---------------------------------------------------------------------------
-// Runs
+export function updateConfig(workdir: string, updater: (config: PlansConfig) => PlansConfig): EnsureResult {
+	const { config, stateRoot, notices } = ensureState(workdir);
+	const next = updater(structuredClone(config));
+	atomicWriteJson(path.join(stateRoot, "config.json"), next);
+	return { config: next, stateRoot, notices };
+}
+
 // ---------------------------------------------------------------------------
 
 const SLUG_RE = /[^a-z0-9]+/g;
@@ -514,8 +518,4 @@ export function setRunStatus(workdir: string, runId: string, status: string): Ru
 	run.updated_at = utcNow();
 	atomicWriteJson(runPath, run);
 	return run;
-}
-
-export function refsCacheDir(): string {
-	return path.join(os.homedir(), ".cache", "pi-plans", "refs");
 }

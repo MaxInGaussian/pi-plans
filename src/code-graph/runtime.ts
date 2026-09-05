@@ -8,8 +8,6 @@
  */
 
 import { execSync } from "node:child_process";
-import * as fs from "node:fs";
-import * as path from "node:path";
 
 export type RuntimeIssue =
 	| { kind: "node-version"; detail: string }
@@ -157,13 +155,4 @@ export function describeRuntimeIssues(status: RuntimeStatus): string[] {
 				return "unknown runtime issue";
 		}
 	});
-}
-
-export function isPackageAvailable(packageName: string, cwd: string): boolean {
-	try {
-		const resolved = path.resolve(cwd, "node_modules", packageName);
-		return fs.existsSync(resolved);
-	} catch {
-		return false;
-	}
 }

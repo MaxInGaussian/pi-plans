@@ -281,7 +281,7 @@ function emitProgress(options: SubagentOptions, event: SubagentProgressEvent): v
 	}
 }
 
-const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 
 export async function runPiSubagent(options: SubagentOptions): Promise<SubagentResult> {
 	const tools = options.tools ?? ["read", "grep", "find", "ls"];

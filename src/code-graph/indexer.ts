@@ -10,7 +10,7 @@ import { discoverFiles, type DiscoveredFile } from "./discovery.ts";
 import { Store } from "./store.ts";
 import type { ParserBackend } from "./parser.ts";
 import { hashText } from "./parser.ts";
-import type { CallEdge, FileRecord, FunctionRecord, Language, SummaryRecord } from "./types.ts";
+import type { Language } from "./types.ts";
 import { resolveCalls, type CallSite } from "./resolver.ts";
 import { assertUniqueFunctionKeys, normalizeFunctionIdentities } from "./identity.ts";
 
@@ -278,76 +278,4 @@ export async function runIndex(opts: IndexerOptions): Promise<IndexReport> {
 	report.durationMs = Date.now() - started;
 	report.conflicts += preflightConflict;
 	return report;
-}
-
-export interface FileSnapshot {
-	absolutePath: string;
-	fileDir: string;
-	fileName: string;
-	language: Language;
-	sourceText: string;
-	sourceHash: string;
-	record: FileRecord;
-}
-
-export function loadFileSnapshot(store: Store, worktreeRoot: string): FileSnapshot[] {
-	const rows = store
-		.read(() =>
-			store.db
-				.prepare(
-					`SELECT file_dir, file_name, language, source_hash, source_text
-					 FROM files ORDER BY file_dir, file_name`,
-				)
-				.all(),
-		) as Array<{ file_dir: string; file_name: string; language: string; source_hash: string; source_text: string }>;
-	return rows.map((row) => ({
-		absolutePath: `${worktreeRoot}/${row.file_dir === "." ? "" : row.file_dir + "/"}${row.file_name}`,
-		fileDir: row.file_dir,
-		fileName: row.file_name,
-		language: row.language as Language,
-		sourceText: row.source_text,
-		sourceHash: row.source_hash,
-		record: {
-			fileDir: row.file_dir,
-			fileName: row.file_name,
-			language: row.language as Language,
-			sourceHash: row.source_hash,
-			sourceText: row.source_text,
-			entries: [],
-			updatedAt: "",
-		},
-	}));
-}
-
-export function emptySummary(): SummaryRecord {
-	return {
-		description: "",
-		inputs: [],
-		outputs: [],
-		status: "pending",
-		schemaVersion: 1,
-	};
-}
-
-export function edgesForFunction(
-	store: Store,
-	fileDir: string,
-	fileName: string,
-	functionName: string,
-): CallEdge[] {
-	return store
-		.read(() =>
-			store.db
-				.prepare(
-					`SELECT id, from_file_dir, from_file_name, from_function,
-						to_file_dir, to_file_name, to_function, to_callee_text,
-						kind, resolution, reason,
-						provenance_start_byte, provenance_end_byte,
-						provenance_start_line, provenance_start_col,
-						provenance_end_line, provenance_end_col
-					 FROM call_edges
-					 WHERE from_file_dir = ? AND from_file_name = ? AND from_function = ?`,
-				)
-				.all(fileDir, fileName, functionName),
-		) as CallEdge[];
 }

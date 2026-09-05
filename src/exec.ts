@@ -7,7 +7,6 @@
  * progress is reported through the bottom status bar until every item passes.
  */
 
-import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import type {
 	CompactionResult,
@@ -18,22 +17,25 @@ import type {
 	SessionCompactEvent,
 	SessionCompactFailedEvent,
 } from "@earendil-works/pi-coding-agent";
-import { AUTOCOMPLETE_ENTRY } from "./autocomplete.ts";
+import { VERSION } from "@earendil-works/pi-coding-agent";
 import {
-	compactText as boundedCompactionText,
+	buildPiPlansVccCompaction,
 	compactionCurrentI,
-	currentIExceedsTrigger,
 	entryCurrentIMarkers,
-	hasCompactableContent,
-	extractReadRecords,
-	formatReadRecord,
-	mergeCompactionDetails,
-	planIAwareCompaction,
-	type CompactionDetailsLike,
+	formatVccCompactionStats,
+	loadVccSettings,
+	scaffoldVccSettings,
+	shouldScheduleAutoContinue,
 	type CompactionEntryLike,
+	type PiPlansCompactionPhase,
+	type PiPlansVccPhaseContext,
+	type PiPlansVccSettings,
+	type VccCompactionBuildResult,
+	type VccCompactionStats,
 } from "./compaction.ts";
-import { getRun, loadConfig, readActive, resolveStateRootOrNull, setRunStatus, utcNow } from "./state.ts";
+import { getRun, readActive, resolveStateRootOrNull, setRunStatus, utcNow } from "./state.ts";
 import { graphBlockForExecutor } from "./code-graph/prompts.ts";
+import { resolveGraphMode } from "./code-graph/mode.ts";
 import {
 	extractCoverage,
 	latestPlanVersion,
@@ -56,7 +58,6 @@ export interface ExecState {
 	implItems?: ImplItem[];
 	implStatus?: Record<string, ImplMarkerState>;
 	currentI?: string;
-	graphEnabled?: boolean;
 }
 
 let execution: ExecState | null = null;
@@ -89,13 +90,6 @@ export function getExecution(): ExecState | null {
 	return execution;
 }
 
-const EXECUTION_COMPACTION_TRIGGER_PERCENT = 20;
-const EXECUTION_COMPACTION_REARM_PERCENT = 80;
-const EXECUTION_COMPACTION_REARM_HIGH_PERCENT = 95;
-/** Terminal "nothing to compact" backoff: re-arm only after the session has
- * grown past Pi's default keep-recent window (20k) or usage is nearly full. */
-const TERMINAL_BACKOFF_GROWTH_TOKENS = 20_000;
-const TERMINAL_BACKOFF_HIGH_PERCENT = 85;
 const EXECUTION_COMPACTION_RESUME_MESSAGE = "Continue execution.";
 
 interface ExecutionCompactionState {
@@ -106,8 +100,11 @@ interface ExecutionCompactionState {
 	lastSuccessfulUsagePercent: number | null;
 	lastSuccessfulAt: string | null;
 	rearmPending: boolean;
-	/** Terminal "nothing to compact" backoff: tokens observed when Pi refused. */
+	/** Terminal failure metadata is retained for diagnostics, not proactive retry. */
 	terminalBackoffTokens: number | null;
+	pendingStats: VccCompactionStats | null;
+	pendingFollowUpPrompt: string | null;
+	pendingContinueAfterThresholdCompact: boolean;
 }
 
 type ExecutionCompactionSession = { __executionCompaction?: ExecutionCompactionState };
@@ -136,6 +133,9 @@ function ensureExecutionCompactionState(ctx: ExtensionContext): ExecutionCompact
 		lastSuccessfulAt: null,
 		rearmPending: false,
 		terminalBackoffTokens: null,
+		pendingStats: null,
+		pendingFollowUpPrompt: null,
+		pendingContinueAfterThresholdCompact: false,
 	});
 }
 
@@ -152,85 +152,12 @@ function consumeExecutionCompactionResumeGuard(ctx: ExtensionContext): boolean {
 	return true;
 }
 
-function refreshExecutionCompactionCooldown(ctx: ExtensionContext): void {
-	const state = executionCompactionState(ctx);
-	if (!state) return;
-	const percent = ctx.getContextUsage()?.percent ?? null;
-	if (percent !== null && percent < EXECUTION_COMPACTION_REARM_PERCENT && state.cooldownActive) {
-		state.cooldownActive = false;
-		state.rearmPending = true;
-	}
-}
-
-function executionCurrentIUsage(ctx: ExtensionContext): { tokens: number; contextWindow: number; eligible?: boolean } | null {
-	const usage = ctx.getContextUsage();
-	if (!usage || typeof usage.contextWindow !== "number" || usage.contextWindow <= 0) return null;
-	const manager = ctx.sessionManager as unknown as { getBranch?: () => CompactionEntryLike[] };
-	if (execution?.implItems?.length && typeof manager.getBranch === "function") {
-		try {
-			const entries = manager.getBranch();
-			if (entries.length) {
-				const plan = planIAwareCompaction({
-					entries,
-					currentI: execution.currentI,
-					knownIIds: execution.implItems.map((item) => item.id),
-					contextWindow: usage.contextWindow,
-					tokensBefore: usage.tokens ?? undefined,
-				});
-				if (plan.currentI || execution.currentI) {
-					return {
-						tokens: plan.currentITokens,
-						contextWindow: usage.contextWindow,
-						eligible: plan.firstKeptEntryIndex !== null && plan.firstKeptEntryIndex > 0,
-					};
-				}
-			}
-		} catch {
-			// A read-only session projection is optional in test and startup contexts.
-		}
-	}
-	if (typeof usage.tokens !== "number") return null;
-	return { tokens: usage.tokens, contextWindow: usage.contextWindow };
-}
-export function shouldTriggerExecutionCompaction(ctx: ExtensionContext): boolean {
-	const currentUsage = executionCurrentIUsage(ctx);
-	if (!currentUsage || currentUsage.eligible === false || !currentIExceedsTrigger(currentUsage.tokens, currentUsage.contextWindow)) return false;
-	if (!branchIsCompactable(ctx)) return false;
-	const percent = (currentUsage.tokens / currentUsage.contextWindow) * 100;
-	const state = executionCompactionState(ctx);
-	if (!state) return true;
-	if (state.inFlight || state.resumeGuard || state.cooldownActive) return false;
-	if (terminalBackoffBlocks(state, currentUsage.tokens, currentUsage.contextWindow)) return false;
-	if (state.rearmPending) {
-		if (percent < EXECUTION_COMPACTION_REARM_HIGH_PERCENT) return false;
-		state.rearmPending = false;
-	}
-	return true;
-}
-
-function requestExecutionCompaction(ctx: ExtensionContext): void {
-	const state = ensureExecutionCompactionState(ctx);
-	if (state.inFlight || state.resumeGuard) return;
-	if (compactionInFlight(ctx, "execution")) return; // Pi core already running one; skip this turn
-	if (agentIsBusy(ctx)) return; // never abort an in-flight turn; retry on the next turn_end
-	const usage = ctx.getContextUsage();
-	if (terminalBackoffBlocks(state, usage?.tokens, usage?.contextWindow)) return;
-	state.inFlight = true;
-	state.lastAttemptReason = "threshold";
-	try {
-		ctx.compact({ customInstructions: "pi-plans execution auto compact" });
-	} catch (error) {
-		state.inFlight = false;
-		ctx.ui.notify(`pi-plans: could not request execution compaction (${String(error)}).`, "warning");
-	}
+export function shouldTriggerExecutionCompaction(_ctx: ExtensionContext): boolean {
+	return false;
 }
 
 export function handleExecutionTurnCompaction(ctx: ExtensionContext): void {
-	refreshExecutionCompactionCooldown(ctx);
-	if (consumeExecutionCompactionResumeGuard(ctx)) return;
-	if (shouldTriggerExecutionCompaction(ctx)) {
-		requestExecutionCompaction(ctx);
-	}
+	consumeExecutionCompactionResumeGuard(ctx);
 }
 
 export function computeExecutionProgress(execution: ExecState): { done: number; total: number } {
@@ -254,11 +181,6 @@ export function computeExecutionProgress(execution: ExecState): { done: number; 
 		done: execution.items.filter((item) => item.done).length,
 		total: execution.items.length,
 	};
-}
-
-export function executionProgress(): { done: number; total: number } | null {
-	if (!execution) return null;
-	return computeExecutionProgress(execution);
 }
 
 function formatElapsed(startedAt: string): string {
@@ -338,16 +260,7 @@ export async function startExecution(
 	items: CheckItem[],
 	implItems?: ImplItem[],
 ): Promise<void> {
-	let graphEnabled: boolean | undefined;
-	const stateRoot = resolveStateRootOrNull(ctx.cwd);
-	if (stateRoot) {
-		try {
-			graphEnabled = loadConfig(stateRoot).graph_enabled === true;
-		} catch {
-			graphEnabled = undefined;
-		}
-	}
-	execution = { planPath, items, startedAt: utcNow(), usage: { inToks: 0, outToks: 0 }, implItems: implItems ?? [], implStatus: {}, graphEnabled };
+	execution = { planPath, items, startedAt: utcNow(), usage: { inToks: 0, outToks: 0 }, implItems: implItems ?? [], implStatus: {} };
 	pendingExecutionFlush = false; // fresh run: no inherited flush debt
 	resetExecutionCompactionState(ctx);
 	persist(pi);
@@ -430,339 +343,117 @@ export function registerExecutionTurnHandlers(
 
 const EXECUTION_RESUME_CUSTOM_TYPE = "pi-plans-exec-resume";
 
-type CompactBranchEntry = SessionBeforeCompactEvent["branchEntries"][number];
-type CompactMessage = { role?: string; content?: Array<{ type: string; text?: string }> };
-
-function compactText(text: string, limit = 180): string {
-	const normalized = text.replace(/\s+/g, " ").trim();
-	if (normalized.length <= limit) return normalized;
-	return `${normalized.slice(0, Math.max(0, limit - 1))}…`;
-}
-
-function messageText(message: CompactMessage | undefined): string {
-	if (!message) return "";
-	return (message.content ?? [])
-		.filter((part) => part.type === "text")
-		.map((part) => part.text ?? "")
-		.join("\n")
-		.trim();
-}
-
-function messageRoleLabel(role?: string): string {
-	switch (role) {
-		case "assistant": return "Assistant";
-		case "user": return "User";
-		case "toolResult": return "Tool";
-		case "custom": return "Custom";
-		default: return role ? role : "Message";
-	}
-}
-
-function isInternalExecutionCustomType(customType?: string): boolean {
-	return customType === "pi-plans-exec"
-		|| customType === "pi-plans-exec-cleared"
-		|| customType === "pi-plans-exec-start"
-		|| customType === "pi-plans-exec-context"
-		|| customType === EXECUTION_RESUME_CUSTOM_TYPE;
-}
-
-function isSummarizableEntry(entry: CompactBranchEntry): boolean {
-	return entry.type === "message" && !!entry.message;
-}
-
-function renderMessageLine(entry: CompactBranchEntry): string {
-	if (!isSummarizableEntry(entry)) return "";
-	const text = messageText(entry.message);
-	if (!text) return "";
-	return `- [${messageRoleLabel(entry.message?.role)}] ${compactText(text)}`;
-}
-
-function findExecutionCompactionCutEntryId(branchEntries: CompactBranchEntry[], fallback: string): string {
-	const completionIds = new Set(execution?.items.filter((item) => item.done).map((item) => item.id) ?? []);
-	let lastCompletionIndex = -1;
-	for (let i = 0; i < branchEntries.length; i++) {
-		const entry = branchEntries[i];
-		if (!isSummarizableEntry(entry)) continue;
-		const markers = scanDoneMarkers(messageText(entry.message));
-		if (markers.some((marker) => completionIds.has(marker))) {
-			lastCompletionIndex = i;
-		}
-	}
-	if (lastCompletionIndex >= 0) {
-		const next = branchEntries.slice(lastCompletionIndex + 1).find((entry) => entry.id && !isInternalExecutionCustomType(entry.customType));
-		if (next?.id) return next.id;
-	}
-	const startIndex = branchEntries.findIndex((entry) => entry.type === "custom" && entry.customType === "pi-plans-exec-start");
-	if (startIndex >= 0) {
-		const next = branchEntries.slice(startIndex + 1).find((entry) => entry.id && !isInternalExecutionCustomType(entry.customType));
-		if (next?.id) return next.id;
-	}
-	return fallback;
-}
-
-function buildFinishedItemSections(summaryEntries: CompactBranchEntry[]): string[] {
-	if (!execution) return [];
-	const completedItems = execution.items.filter((item) => item.done);
-	const sections: string[] = [];
-	let completedIndex = 0;
-	let currentLines: string[] = [];
-	for (const entry of summaryEntries) {
-		if (!isSummarizableEntry(entry)) continue;
-		const line = renderMessageLine(entry);
-		if (line) currentLines.push(line);
-		for (const marker of scanDoneMarkers(messageText(entry.message))) {
-			const itemIndex = completedItems.findIndex((item, index) => index >= completedIndex && item.id === marker);
-			if (itemIndex < 0) continue;
-			const item = completedItems[itemIndex];
-			sections.push(`### \`${item.id}\` ${item.text.split(";")[0]}
-${currentLines.length ? currentLines.join("\n") : "- (no transcript captured)"}`);
-			currentLines = [];
-			completedIndex = itemIndex + 1;
-		}
-	}
-	return sections;
-}
-
-function splitTurnBoundaryIndex(event: SessionBeforeCompactEvent): number | undefined {
-	if (!event.preparation.isSplitTurn) return undefined;
-	const index = event.branchEntries.findIndex((entry) => entry.id === event.preparation.firstKeptEntryId);
-	return index >= 0 ? index : undefined;
-}
-
-function buildExecutionIPlan(event: SessionBeforeCompactEvent, ctx?: ExtensionContext): ReturnType<typeof planIAwareCompaction> {
-	if (!execution) throw new Error("execution state is unavailable");
-	const usage = eventPreparationUsage(event, ctx);
-	return planIAwareCompaction({
-		entries: event.branchEntries as unknown as CompactionEntryLike[],
-		currentI: execution.currentI,
-		knownIIds: execution.implItems?.map((item) => item.id),
-		contextWindow: usage.contextWindow,
-		tokensBefore: event.preparation.tokensBefore,
-		fallbackFirstKeptEntryId: event.preparation.firstKeptEntryId,
-		maxFirstKeptEntryIndex: splitTurnBoundaryIndex(event),
-	});
-}
-
-function eventPreparationUsage(event: SessionBeforeCompactEvent, ctx?: ExtensionContext): { contextWindow: number | null } {
-	const fromContext = ctx?.getContextUsage()?.contextWindow;
-	const contextWindow = (event as SessionBeforeCompactEvent & { contextWindow?: number }).contextWindow ?? fromContext;
-	return { contextWindow: typeof contextWindow === "number" && contextWindow > 0 ? contextWindow : null };
-}
-
-function previousCompactionDetails(entries: CompactionEntryLike[]): CompactionDetailsLike | undefined {
-	let merged: CompactionDetailsLike | undefined;
-	for (const entry of entries) {
-		if (entry.type !== "compaction") continue;
-		const raw = entry.details ?? entry.data;
-		if (!raw || typeof raw !== "object") continue;
-		const details = raw as CompactionDetailsLike;
-		if (!details.readRecords && !details.metrics && !details.iSections) continue;
-		merged = mergeCompactionDetails(merged, details);
-	}
-	return merged;
-}
-
-function buildImplementationSections(plan: ReturnType<typeof planIAwareCompaction>): string[] {
-	const sections: string[] = [];
-	for (const slice of plan.slices) {
-		if (slice.id === null) continue;
-		const lines = slice.entries
-			.filter((entry) => plan.summaryEntries.includes(entry))
-			.map((entry) => renderMessageLine(entry as CompactBranchEntry))
-			.filter(Boolean);
-		if (lines.length) {
-			sections.push(`### ${slice.current ? "Current I" : "Implementation I"} \`${slice.id}\`\n${lines.join("\\n")}`);
-		}
-	}
-	return sections;
-}
-
-function executionSummaryParts(
-	event: SessionBeforeCompactEvent,
-	ctx: ExtensionContext,
-	firstKeptEntryId: string,
-	boundaryIndex: number,
-	plan: ReturnType<typeof planIAwareCompaction> | null,
-): { parts: string[]; details: CompactionDetailsLike } {
-	if (!execution) return { parts: [], details: {} };
+function activeVccSettings(ctx: ExtensionContext, phase: PiPlansCompactionPhase): { settings: PiPlansVccSettings; runId: string; artifactDir: string } | null {
+	const stateRoot = resolveStateRootOrNull(ctx.cwd);
+	if (!stateRoot) return null;
 	const active = readActive(ctx.cwd);
-	const run = active ? getRun(ctx.cwd, active.run_id) : null;
-	const branchEntries = event.branchEntries as unknown as CompactionEntryLike[];
-	const summaryEntries = boundaryIndex >= 0
-		? (branchEntries.slice(0, boundaryIndex) as CompactBranchEntry[])
-		: (branchEntries as CompactBranchEntry[]);
-	const sections = buildFinishedItemSections(summaryEntries);
-	const readRecords = plan?.readRecords ?? extractReadRecords(summaryEntries as unknown as CompactionEntryLike[]);
-	const priorDetails = previousCompactionDetails(branchEntries);
-	const metrics = plan?.metrics ?? {
-		contextWindow: ctx.getContextUsage()?.contextWindow ?? null,
-		tokensBefore: event.preparation.tokensBefore,
-		currentITokens: 0,
-		summaryTokens: 0,
-		keptSuffixTokens: 0,
-		estimatedAfterTokens: null,
-		targetRatio: 0.1,
-		currentI: execution.currentI ?? null,
-		firstKeptEntryId,
-		targetMet: false,
-		hardFloorReason: "I-aware budget unavailable for this legacy execution snapshot",
+	if (!active) return null;
+	const run = getRun(ctx.cwd, active.run_id);
+	if (!run) return null;
+	if (phase === "planning" && run.status !== "planning") return null;
+	if (phase === "execution" && run.status !== "executing") return null;
+	scaffoldVccSettings(stateRoot);
+	return { settings: loadVccSettings(stateRoot), runId: run.run_id, artifactDir: run.artifact_dir };
+}
+
+function executionVccContext(): PiPlansVccPhaseContext {
+	return {
+		phase: "execution",
+		planPath: execution?.planPath ?? null,
+		currentI: execution?.currentI ?? null,
+		remainingVerifierIds: execution?.items.filter((item) => !item.done).map((item) => item.id) ?? [],
+		implementationIds: execution?.implItems?.map((item) => item.id) ?? [],
 	};
-	const details = mergeCompactionDetails(priorDetails, {
-		kind: "pi-plans-execution-compaction",
-		version: 1,
-		currentI: execution.currentI ?? plan?.currentI ?? null,
-		iSections: plan?.slices.map((slice) => ({ id: slice.id, entryIds: slice.entries.map((entry) => entry.id).filter((id): id is string => !!id) })) ?? [],
-		readRecords,
-		metrics: { ...metrics, firstKeptEntryId },
+}
+
+function planningVccContext(branchEntries: CompactionEntryLike[], fallback: { runId?: string; artifactDir?: string }): PiPlansVccPhaseContext {
+	let runId: string | null = fallback.runId ?? null;
+	let artifactDir: string | null = fallback.artifactDir ?? null;
+	let planPath: string | null = null;
+	let currentI: string | null = null;
+	for (const entry of branchEntries) {
+		if (entry.type === "custom" && entry.customType === PLANNING_RUN_START_CUSTOM_TYPE) {
+			runId = typeof entry.data?.runId === "string" ? entry.data.runId : runId;
+			artifactDir = typeof entry.data?.artifactDir === "string" ? entry.data.artifactDir : artifactDir;
+		}
+		if (entry.type === "custom" && entry.customType === PLANNING_PLAN_WRITTEN_CUSTOM_TYPE) {
+			planPath = typeof entry.data?.planPath === "string" ? entry.data.planPath : planPath;
+		}
+		for (const id of entryCurrentIMarkers(entry)) currentI = id;
+		currentI = compactionCurrentI(entry) ?? currentI;
+	}
+	return { phase: "planning", runId, artifactDir, planPath, currentI };
+}
+
+function buildExecutionVccResult(event: SessionBeforeCompactEvent, ctx: ExtensionContext): VccCompactionBuildResult | null {
+	if (!execution) return null;
+	const active = activeVccSettings(ctx, "execution");
+	if (!active) return null;
+	return buildPiPlansVccCompaction({
+		branchEntries: event.branchEntries as unknown as CompactionEntryLike[],
+		preparation: event.preparation,
+		customInstructions: event.customInstructions,
 		reason: event.reason,
 		willRetry: event.willRetry,
-		finishedItems: execution.items.filter((item) => item.done).map((item) => item.id),
+		settings: active.settings,
+		phaseContext: executionVccContext(),
 	});
-	const parts: string[] = [];
-	if (event.customInstructions?.trim()) {
-		parts.push(`## Compact Instructions\n${compactText(event.customInstructions, 1000)}`);
-	}
-	parts.push(`## Plan Before This Run\n- Request: ${compactText(run?.request_text ?? execution.planPath, 280)}\n- Plan file: \`${execution.planPath}\``);
-	if (event.preparation.previousSummary?.trim()) {
-		parts.push(`## Previous Compact Summary\n${event.preparation.previousSummary.trim()}`);
-	}
-	parts.push(`## Implementation Items\n${plan?.slices.length ? (buildImplementationSections(plan).join("\\n\\n") || "- (no I transcript captured)") : "- Legacy snapshot: current I is inferred from the execution frontier."}`);
-	parts.push(`## Finished VC Items\n${sections.length ? sections.join("\\n\\n") : "- (none yet)"}`);
-	parts.push(`## Current I\n- \`${execution.currentI ?? plan?.currentI ?? "unknown"}\`\n- Recent legal suffix begins at \`${firstKeptEntryId}\`.`);
-	parts.push(`## Read Records\n${readRecords.length ? readRecords.map((record) => formatReadRecord(record)).join("\\n") : "- (none)"}`);
-	parts.push(`## Compaction Boundary\n- firstKeptEntryId: \`${firstKeptEntryId}\`\n- currentI: \`${execution.currentI ?? plan?.currentI ?? "unknown"}\`\n- tokensBefore: ${metrics.tokensBefore}\n- estimatedAfterTokens: ${metrics.estimatedAfterTokens ?? "unknown"}\n- targetRatio: ${metrics.targetRatio}\n- targetMet: ${metrics.targetMet}\n- hardFloorReason: ${metrics.hardFloorReason ?? "none"}`);
-	parts.push(`## Current Work\n- Raw tail preserved from \`${firstKeptEntryId}\` onward.${event.preparation.isSplitTurn ? "\\n- Split-turn prefix remains in the kept tail." : ""}`);
-	return { parts, details };
 }
 
 export function buildExecutionCompactionResult(event: SessionBeforeCompactEvent, ctx: ExtensionContext): CompactionResult | null {
-	if (!execution) return null;
-	const branchEntries = event.branchEntries as unknown as CompactionEntryLike[];
-	const hasIState = (execution.implItems?.length ?? 0) > 0;
-	const plan = hasIState ? buildExecutionIPlan(event, ctx) : null;
-	const firstKeptEntryId = plan?.firstKeptEntryId
-		?? findExecutionCompactionCutEntryId(event.branchEntries as CompactBranchEntry[], event.preparation.firstKeptEntryId);
-	const boundaryIndex = event.branchEntries.findIndex((entry) => entry.id === firstKeptEntryId);
-	const { parts, details } = executionSummaryParts(event, ctx, firstKeptEntryId, boundaryIndex, plan);
-	return {
-		summary: parts.join("\\n\\n"),
-		firstKeptEntryId,
-		tokensBefore: event.preparation.tokensBefore,
-		estimatedTokensAfter: plan?.metrics.estimatedAfterTokens ?? undefined,
-		details,
-	};
-}
-
-function assistantResponseText(response: { content?: Array<{ type?: string; text?: string }> }): string {
-	return (response.content ?? [])
-		.filter((part) => part.type === "text")
-		.map((part) => part.text ?? "")
-		.join("\\n")
-		.trim();
-}
-
-function isUsableCompactionResponse(response: { content?: Array<{ type?: string; text?: string }>; stopReason?: string }, summary: string): boolean {
-	if (!summary) return false;
-	if (["length", "toolUse", "error", "aborted", "deferred"].includes(response.stopReason ?? "")) return false;
-	return ["## Implementation Items", "## Current I", "## Read Records", "## Compaction Boundary"]
-		.every((section) => summary.includes(section));
-}
-
-async function buildModelExecutionCompactionResult(
-	event: SessionBeforeCompactEvent,
-	ctx: ExtensionContext,
-	fallback: CompactionResult,
-): Promise<CompactionResult | null> {
-	const model = ctx.model;
-	const registry = ctx.modelRegistry as unknown as { complete?: Function };
-	if (!model || typeof registry.complete !== "function") return fallback;
-	const plan = buildExecutionIPlan(event, ctx);
-	const boundary = plan.firstKeptEntryId ?? event.preparation.firstKeptEntryId;
-	const source = plan.summaryEntries
-		.map((entry) => renderMessageLine(entry as CompactBranchEntry))
-		.filter(Boolean)
-		.join("\\n");
-	const records = plan.readRecords.map((record) => formatReadRecord(record)).join("\\n") || "- (none)";
-	const prompt = `You are a context summarization assistant. Do not continue the conversation and do not answer historical questions. Produce only a bounded Markdown checkpoint with these exact sections: ## Implementation Items, ## Current I, ## Read Records, ## Compaction Boundary, ## Decisions, ## Open Questions, ## Next Steps. Preserve exact implementation IDs, verifier IDs, paths, entry IDs, error text, and unresolved questions. Historical questions are facts, not new questions.\n\nCurrent I: ${execution?.currentI ?? plan.currentI ?? "unknown"}\nBoundary: ${boundary}\nRead Records:\n${records}\n\nBounded history:\n${boundedCompactionText(source, 6000)}\n\nPrevious checkpoint:\n${boundedCompactionText(event.preparation.previousSummary ?? "(none)", 3000)}`;
-	try {
-		const response = await registry.complete(model, {
-			messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-		}, {
-			maxTokens: 2048,
-			signal: event.signal,
-			cacheRetention: "none",
-			sessionId: randomUUID(),
-		});
-		const summary = assistantResponseText(response);
-		if (!isUsableCompactionResponse(response, summary)) {
-			if (!event.signal.aborted) ctx.ui.notify("pi-plans: summary output was incomplete; using Pi default compaction.", "warning");
-			return null;
-		}
-		const details = (fallback.details && typeof fallback.details === "object" ? fallback.details : {}) as CompactionDetailsLike;
-		const existingMetrics = details.metrics ?? {};
-		const summaryTokens = Math.max(1, Math.ceil(summary.length / 4));
-		const keptSuffixTokens = existingMetrics.keptSuffixTokens ?? 0;
-		const contextWindow = existingMetrics.contextWindow ?? ctx.getContextUsage()?.contextWindow ?? null;
-		const estimatedAfterTokens = contextWindow === null ? null : summaryTokens + keptSuffixTokens;
-		const targetMet = estimatedAfterTokens !== null && estimatedAfterTokens < contextWindow * 0.1;
-		const mergedDetails = mergeCompactionDetails(details, {
-			...details,
-			metrics: {
-				...existingMetrics,
-				summaryTokens,
-				estimatedAfterTokens,
-				targetMet,
-				hardFloorReason: targetMet ? null : existingMetrics.hardFloorReason ?? "summary or retained context exceeds the 10% target",
-			},
-		});
-		return { ...fallback, summary, estimatedTokensAfter: estimatedAfterTokens ?? undefined, usage: response.usage, details: mergedDetails };
-	} catch (error) {
-		if (!event.signal.aborted) ctx.ui.notify(`pi-plans: summary model failed; using Pi default compaction (${String(error)}).`, "warning");
-		return null;
-	}
-}
-
-function notifyHardFloor(ctx: ExtensionContext, compaction: CompactionResult): void {
-	const metrics = (compaction.details as CompactionDetailsLike | undefined)?.metrics;
-	if (!metrics || metrics.targetMet !== false) return;
-	ctx.ui.notify(
-		`pi-plans: compaction target <10% is unreachable; retaining the legal floor (${metrics.hardFloorReason ?? "unknown reason"}).`,
-		"warning",
-	);
+	const built = buildExecutionVccResult(event, ctx);
+	return built?.kind === "compaction" ? built.compaction : null;
 }
 
 export function handleExecutionBeforeCompact(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	event: SessionBeforeCompactEvent,
-): SessionBeforeCompactResult | Promise<SessionBeforeCompactResult | undefined> | undefined {
+): SessionBeforeCompactResult | undefined {
 	if (!execution) return undefined;
-	let fallback: CompactionResult | null;
+	const state = ensureExecutionCompactionState(ctx);
+	state.inFlight = true;
+	state.lastAttemptReason = event.reason;
+	state.pendingStats = null;
+	state.pendingFollowUpPrompt = null;
+	state.pendingContinueAfterThresholdCompact = false;
+	let built: VccCompactionBuildResult | null;
 	try {
-		fallback = buildExecutionCompactionResult(event, ctx);
+		built = buildExecutionVccResult(event, ctx);
 	} catch (error) {
-		const state = executionCompactionState(ctx);
-		if (state) state.inFlight = false;
-		ctx.ui.notify(`pi-plans: compaction preparation failed; using Pi default compaction (${String(error)}).`, "warning");
+		state.inFlight = false;
+		ctx.ui.notify(`pi-plans: VCC compaction preparation failed; using Pi default compaction (${String(error)}).`, "warning");
 		return undefined;
 	}
-	if (!fallback) return undefined;
-	notifyHardFloor(ctx, fallback);
-	const registry = ctx.modelRegistry as unknown as { complete?: Function };
-	if (!ctx.model || typeof registry.complete !== "function") {
-		requestExecutionFlush(pi, ctx);
-		return { compaction: fallback };
+	if (!built || built.kind === "fallback") {
+		state.inFlight = false;
+		return undefined;
 	}
-	return buildModelExecutionCompactionResult(event, ctx, fallback).then((compaction) => {
-		if (!compaction) return undefined;
-		requestExecutionFlush(pi, ctx);
-		return { compaction };
-	});
+	if (built.kind === "cancel") {
+		state.inFlight = false;
+		ctx.ui.notify(built.message, "warning");
+		return { cancel: true };
+	}
+	state.pendingStats = built.stats;
+	state.pendingFollowUpPrompt = built.followUpPrompt;
+	state.pendingContinueAfterThresholdCompact = built.settings.continueAfterThresholdCompact;
+	requestExecutionFlush(pi, ctx);
+	return { compaction: built.compaction };
 }
 
-export function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactEvent): void {
+function runtimePiVersion(ctx: ExtensionContext): unknown {
+	return (ctx as ExtensionContext & { piVersion?: unknown }).piVersion ?? VERSION;
+}
+
+export async function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactEvent): Promise<void> {
 	if (!execution) return;
 	const state = ensureExecutionCompactionState(ctx);
+	const stats = state.pendingStats;
+	const followUpPrompt = state.pendingFollowUpPrompt;
+	const continueAfterThresholdCompact = state.pendingContinueAfterThresholdCompact;
+	state.pendingStats = null;
+	state.pendingFollowUpPrompt = null;
+	state.pendingContinueAfterThresholdCompact = false;
 	state.inFlight = false;
 	state.lastAttemptReason = event.reason;
 	state.cooldownActive = true;
@@ -770,22 +461,27 @@ export function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionContext, 
 	state.terminalBackoffTokens = null;
 	state.lastSuccessfulAt = utcNow();
 	state.lastSuccessfulUsagePercent = ctx.getContextUsage()?.percent ?? state.lastSuccessfulUsagePercent;
-	if (!event.willRetry) {
-		state.resumeGuard = true;
-		pi.sendMessage(
-			{
-				customType: EXECUTION_RESUME_CUSTOM_TYPE,
-				content: EXECUTION_COMPACTION_RESUME_MESSAGE,
-				display: false,
-			},
-			{ triggerTurn: true },
-		);
-	} else {
-		state.resumeGuard = false;
+	state.resumeGuard = false;
+	if (!event.willRetry && stats) {
+		ctx.ui.notify(formatVccCompactionStats(stats), "info");
+		if (followUpPrompt) {
+			await pi.sendUserMessage?.(followUpPrompt);
+		} else if ((event.reason === "threshold" || event.reason === "overflow") && shouldScheduleAutoContinue(continueAfterThresholdCompact, runtimePiVersion(ctx))) {
+			state.resumeGuard = true;
+			pi.sendMessage(
+				{
+					customType: EXECUTION_RESUME_CUSTOM_TYPE,
+					content: EXECUTION_COMPACTION_RESUME_MESSAGE,
+					display: false,
+				},
+				{ triggerTurn: true },
+			);
+		}
 	}
 	requestExecutionFlush(pi, ctx);
 	updateStatusWidget(ctx);
 }
+
 
 export function handleExecutionCompactFailed(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactFailedEvent): void {
 	if (!execution) return;
@@ -802,6 +498,9 @@ export function handleExecutionCompactFailed(pi: ExtensionAPI, ctx: ExtensionCon
 			state.lastAttemptReason = event.reason;
 			const tokens = ctx.getContextUsage()?.tokens;
 			state.terminalBackoffTokens = typeof tokens === "number" ? tokens : Number.POSITIVE_INFINITY;
+			state.pendingStats = null;
+			state.pendingFollowUpPrompt = null;
+			state.pendingContinueAfterThresholdCompact = false;
 		}
 		const message = terminal.kind === "content"
 			? "pi-plans: compaction found nothing to summarize; backing off until the session grows past the keep-recent window."
@@ -816,6 +515,9 @@ export function handleExecutionCompactFailed(pi: ExtensionAPI, ctx: ExtensionCon
 		state.cooldownActive = false;
 		state.rearmPending = false;
 		state.lastAttemptReason = event.reason;
+		state.pendingStats = null;
+		state.pendingFollowUpPrompt = null;
+		state.pendingContinueAfterThresholdCompact = false;
 	}
 	ctx.ui.notify(
 		`pi-plans: compaction failed (${event.reason}); execution remains active and will wait for the next eligible turn.`,
@@ -829,15 +531,14 @@ export function filterExecutionResumeMessages<T extends { customType?: string }>
 }
 
 // ---------------------------------------------------------------------------
-// Planning-phase auto compaction: same trigger rules and resume pattern as
-// the execution side, but with a different cut-point algorithm and summary
-// shape. The two state machines are kept independent (different memory slot
-// and snapshot key) so execution never bleeds into planning.
+// Planning-phase compaction: Pi core owns scheduling; this hook customizes
+// active planning compact events with the same VCC builder used by execution.
+// The two state machines are kept independent (different memory slot and
+// snapshot key) so execution never bleeds into planning.
 // ---------------------------------------------------------------------------
 
 export const PLANNING_RUN_START_CUSTOM_TYPE = "pi-plans-run-start";
 export const PLANNING_PLAN_WRITTEN_CUSTOM_TYPE = "pi-plans-plan-written";
-const PLANNING_QA_SECTION_HEADER = "## Q&A During Planning";
 const PLANNING_RESUME_CUSTOM_TYPE = "pi-plans-plan-resume";
 
 interface PlanningCompactionState {
@@ -849,35 +550,25 @@ interface PlanningCompactionState {
 	lastSuccessfulAt: string | null;
 	/** Terminal "nothing to compact" backoff: tokens observed when Pi refused. */
 	terminalBackoffTokens: number | null;
+	pendingStats: VccCompactionStats | null;
+	pendingFollowUpPrompt: string | null;
+	pendingContinueAfterThresholdCompact: boolean;
 }
 
-/** Shared helpers for both compaction phases. */
-function agentIsBusy(ctx: ExtensionContext): boolean {
-	const host = ctx as unknown as { isIdle?: () => boolean; hasPendingMessages?: () => boolean };
-	try {
-		if (typeof host.hasPendingMessages === "function" && host.hasPendingMessages()) return true;
-		if (typeof host.isIdle === "function" && !host.isIdle()) return true;
-	} catch {
-		// Host projection unavailable: treat as idle to preserve prior behavior.
-	}
-	return false;
-}
-
-function sessionBranchEntries(ctx: ExtensionContext): CompactionEntryLike[] | null {
-	const manager = ctx.sessionManager as unknown as { getBranch?: () => unknown };
-	if (typeof manager.getBranch !== "function") return null;
-	try {
-		const entries = manager.getBranch() as CompactionEntryLike[];
-		return Array.isArray(entries) ? entries : null;
-	} catch {
-		return null;
-	}
-}
-
-function branchIsCompactable(ctx: ExtensionContext): boolean {
-	const entries = sessionBranchEntries(ctx);
-	if (!entries) return true; // conservative: let Pi decide, backoff absorbs a rejection
-	return hasCompactableContent(entries);
+function ensurePlanningCompactionState(ctx: ExtensionContext): PlanningCompactionState {
+	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
+	return (session.__planningCompaction ??= {
+		inFlight: false,
+		resumeGuard: false,
+		cooldownActive: false,
+		lastAttemptReason: null,
+		lastSuccessfulUsagePercent: null,
+		lastSuccessfulAt: null,
+		terminalBackoffTokens: null,
+		pendingStats: null,
+		pendingFollowUpPrompt: null,
+		pendingContinueAfterThresholdCompact: false,
+	});
 }
 
 function isTerminalCompactionFailure(event: { errorMessage?: string; aborted?: boolean }): { kind: "content" | "abort-stream" } | null {
@@ -906,33 +597,12 @@ function isTerminalCompactionFailure(event: { errorMessage?: string; aborted?: b
 	return null;
 }
 
-/** True while the terminal "nothing to compact" backoff is still active.
- * Releases (and clears) the anchor once the session grew past Pi's keep-recent
- * window or usage reached the high watermark. Shared by the shouldTrigger
- * gate and the request functions so a direct request cannot bypass it. */
-function terminalBackoffBlocks(
-	state: { terminalBackoffTokens: number | null },
-	tokens?: number,
-	contextWindow?: number,
-): boolean {
-	if (state.terminalBackoffTokens === null) return false;
-	const grown = typeof tokens === "number" ? tokens - state.terminalBackoffTokens : Number.NEGATIVE_INFINITY;
-	const percent = typeof tokens === "number" && typeof contextWindow === "number" && contextWindow > 0
-		? (tokens / contextWindow) * 100
-		: 0;
-	if (grown >= TERMINAL_BACKOFF_GROWTH_TOKENS || percent >= TERMINAL_BACKOFF_HIGH_PERCENT) {
-		state.terminalBackoffTokens = null;
-		return false;
-	}
-	return true;
-}
-
 /** Session-scoped phase-local "compaction in flight" guard.
  *  - Set on `session_before_compact` for the phase attributed by the custom
  *    instructions hint; auto-compaction (no hint) marks both phases defensively.
  *  - Cleared on `session_compact` and `session_compact_failed`.
- *  - Read by `requestPlanningCompaction` / `requestExecutionCompaction` to skip
- *    a manual compact while Pi core is already running one. */
+ *  - Retained so lifecycle events expose the same phase-local state to tests
+ *    and future Pi core schema additions. */
 type CompactionPhase = "planning" | "execution";
 
 function compactionLifecycleStore(ctx: ExtensionContext): {
@@ -984,149 +654,8 @@ export function compactionInFlight(ctx: ExtensionContext, phase: CompactionPhase
 	return store[phase];
 }
 
-interface PlanningBranchEntry {
-	id?: string;
-	type?: string;
-	customType?: string;
-	data?: { planPath?: string; runId?: string; artifactDir?: string };
-	message?: { role?: string; content?: Array<{ type: string; text?: string }> };
-}
-
-function isPlanningInternalCustomType(customType?: string): boolean {
-	return (
-		customType === "pi-plans-exec"
-		|| customType === "pi-plans-exec-cleared"
-		|| customType === "pi-plans-exec-start"
-		|| customType === "pi-plans-exec-context"
-		|| customType === EXECUTION_RESUME_CUSTOM_TYPE
-		|| customType === PLANNING_RUN_START_CUSTOM_TYPE
-		|| customType === PLANNING_PLAN_WRITTEN_CUSTOM_TYPE
-		|| customType === PLANNING_RESUME_CUSTOM_TYPE
-		|| customType === AUTOCOMPLETE_ENTRY
-	);
-}
-
-function summarizePlanningEntryText(entry: PlanningBranchEntry): string {
-	return (entry.message?.content ?? [])
-		.filter((part) => part.type === "text")
-		.map((part) => part.text ?? "")
-		.join("\n")
-		.trim();
-}
-
-function summarizePlanningEntryLine(entry: PlanningBranchEntry): string | null {
-	return summarizePlanningMessageLine(entry);
-}
-
-function summarizePlanningMessageLine(entry: PlanningBranchEntry): string | null {
-	if (!entry.message) return null;
-	const text = (entry.message.content ?? [])
-		.filter((part) => part.type === "text")
-		.map((part) => part.text ?? "")
-		.join("\n")
-		.trim();
-	if (!text) return null;
-	const role = entry.message.role ?? "message";
-	const normalized = text.replace(/\s+/g, " ").trim();
-	const limit = 180;
-	const clipped = normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized;
-	return `- [${role}] ${clipped}`;
-}
-
-function findPlanningCutEntryId(
-	branchEntries: PlanningBranchEntry[],
-	fallback: string,
-): { id: string; qaWindowEntries: PlanningBranchEntry[]; hasMarker: boolean } {
-	const planWrittenIndexes: number[] = [];
-	const runStartIndexes: number[] = [];
-	for (let i = 0; i < branchEntries.length; i++) {
-		const entry = branchEntries[i];
-		if (entry.type === "custom" && entry.customType === PLANNING_PLAN_WRITTEN_CUSTOM_TYPE) {
-			planWrittenIndexes.push(i);
-		} else if (entry.type === "custom" && entry.customType === PLANNING_RUN_START_CUSTOM_TYPE) {
-			runStartIndexes.push(i);
-		}
-	}
-	const planIndex = planWrittenIndexes[planWrittenIndexes.length - 1] ?? -1;
-	const startIndex = runStartIndexes[runStartIndexes.length - 1] ?? -1;
-	const anchorIndex = planIndex >= 0 ? planIndex : startIndex;
-	if (anchorIndex < 0) {
-		return { id: fallback, qaWindowEntries: [], hasMarker: false };
-	}
-	const next = branchEntries
-		.slice(anchorIndex + 1)
-		.find((entry) => entry.id && !isPlanningInternalCustomType(entry.customType));
-	if (!next?.id) {
-		return { id: fallback, qaWindowEntries: [], hasMarker: true };
-	}
-	const qaWindowEntries = branchEntries
-		.slice(startIndex >= 0 ? startIndex + 1 : 0, anchorIndex)
-		.filter((entry) => entry.type === "message" && entry.message);
-	return { id: next.id, qaWindowEntries, hasMarker: true };
-}
-
-function buildPlanningQASection(qaWindowEntries: PlanningBranchEntry[]): string | null {
-	if (!qaWindowEntries.length) return null;
-	const lines: string[] = [];
-	for (const entry of qaWindowEntries) {
-		const line = summarizePlanningMessageLine(entry);
-		if (line) lines.push(line);
-	}
-	if (!lines.length) return null;
-	return `${PLANNING_QA_SECTION_HEADER}
-${lines.join("\n")}`;
-}
-
-function resolvePlanningCompactionContext(workdir: string): { runId: string; artifactDir: string } | null {
-	const active = readActive(workdir);
-	if (!active) return null;
-	const run = getRun(workdir, active.run_id);
-	if (!run || run.status !== "planning") return null;
-	return { runId: run.run_id, artifactDir: run.artifact_dir };
-}
-
-function planningCurrentIUsage(ctx: ExtensionContext): { tokens: number; contextWindow: number; eligible?: boolean } | null {
-	const usage = ctx.getContextUsage();
-	if (!usage || typeof usage.contextWindow !== "number" || usage.contextWindow <= 0) return null;
-	const manager = ctx.sessionManager as unknown as { getBranch?: () => CompactionEntryLike[] };
-	if (typeof manager.getBranch === "function") {
-		try {
-			const entries = manager.getBranch();
-			const currentI = entries.flatMap((entry) => entryCurrentIMarkers(entry)).at(-1)
-				?? entries.map((entry) => compactionCurrentI(entry)).filter((id): id is string => !!id).at(-1);
-			if (currentI) {
-				const plan = planIAwareCompaction({
-					entries,
-					currentI,
-					contextWindow: usage.contextWindow,
-					tokensBefore: usage.tokens ?? undefined,
-				});
-				return {
-					tokens: plan.currentITokens,
-					contextWindow: usage.contextWindow,
-					eligible: plan.firstKeptEntryIndex !== null && plan.firstKeptEntryIndex > 0,
-				};
-			}
-		} catch {
-			// Session projection is unavailable during startup in some hosts.
-		}
-	}
-	if (typeof usage.tokens !== "number") return null;
-	return { tokens: usage.tokens, contextWindow: usage.contextWindow };
-}
-export function shouldTriggerPlanningCompaction(ctx: ExtensionContext): boolean {
-	if (getExecution()) return false;
-	const ctxWorkdir = ctx.cwd;
-	if (!resolvePlanningCompactionContext(ctxWorkdir)) return false;
-	const currentUsage = planningCurrentIUsage(ctx);
-	if (!currentUsage || currentUsage.eligible === false || !currentIExceedsTrigger(currentUsage.tokens, currentUsage.contextWindow)) return false;
-	if (!branchIsCompactable(ctx)) return false;
-	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
-	const state = session.__planningCompaction;
-	if (!state) return true;
-	if (state.inFlight || state.resumeGuard || state.cooldownActive) return false;
-	if (terminalBackoffBlocks(state, currentUsage.tokens, currentUsage.contextWindow)) return false;
-	return true;
+export function shouldTriggerPlanningCompaction(_ctx: ExtensionContext): boolean {
+	return false;
 }
 
 export function consumePlanningCompactionResumeGuard(ctx: ExtensionContext): boolean {
@@ -1136,124 +665,34 @@ export function consumePlanningCompactionResumeGuard(ctx: ExtensionContext): boo
 	return true;
 }
 
-export function refreshPlanningCompactionCooldown(ctx: ExtensionContext): void {
-	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
-	const state = session.__planningCompaction;
-	if (!state) return;
-	const percent = ctx.getContextUsage()?.percent ?? null;
-	if (percent !== null && percent < 85 && state.cooldownActive) {
-		state.cooldownActive = false;
-	}
+export function refreshPlanningCompactionCooldown(_ctx: ExtensionContext): void {
+	// Pi core owns scheduling; retained for lifecycle compatibility only.
 }
 
-export function requestPlanningCompaction(ctx: ExtensionContext): void {
-	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
-	const state = (session.__planningCompaction ??= {
-		inFlight: false,
-		resumeGuard: false,
-		cooldownActive: false,
-		lastAttemptReason: null,
-		lastSuccessfulUsagePercent: null,
-		lastSuccessfulAt: null,
-		terminalBackoffTokens: null,
-	} satisfies PlanningCompactionState);
-	if (state.inFlight || state.resumeGuard) return;
-	if (compactionInFlight(ctx, "planning")) return; // Pi core already running one; skip this turn
-	if (agentIsBusy(ctx)) return; // never abort an in-flight turn; retry on the next turn_end
-	const usage = ctx.getContextUsage();
-	if (terminalBackoffBlocks(state, usage?.tokens, usage?.contextWindow)) return;
-	state.inFlight = true;
-	state.lastAttemptReason = "threshold";
-	try {
-		ctx.compact({ customInstructions: "pi-plans planning auto compact" });
-	} catch (error) {
-		state.inFlight = false;
-		ctx.ui.notify(`pi-plans: could not request planning compaction (${String(error)}).`, "warning");
-	}
+export function requestPlanningCompaction(_ctx: ExtensionContext): void {
+	// Proactive pi-plans compaction is intentionally disabled. Manual,
+	// threshold, and overflow compactions are handled by session_before_compact.
+}
+
+function buildPlanningVccResult(event: SessionBeforeCompactEvent, ctx: ExtensionContext): VccCompactionBuildResult | null {
+	if (getExecution()) return null;
+	const active = activeVccSettings(ctx, "planning");
+	if (!active) return null;
+	const branchEntries = event.branchEntries as unknown as CompactionEntryLike[];
+	return buildPiPlansVccCompaction({
+		branchEntries,
+		preparation: event.preparation,
+		customInstructions: event.customInstructions,
+		reason: event.reason,
+		willRetry: event.willRetry,
+		settings: active.settings,
+		phaseContext: planningVccContext(branchEntries, active),
+	});
 }
 
 export function buildPlanningCompactionResult(event: SessionBeforeCompactEvent, ctx: ExtensionContext): CompactionResult | null {
-	const ctxWorkdir = ctx.cwd;
-	const planningCtx = resolvePlanningCompactionContext(ctxWorkdir);
-	if (!planningCtx) return null;
-	const branchEntries = event.branchEntries as unknown as PlanningBranchEntry[];
-	const legacyCut = findPlanningCutEntryId(branchEntries, event.preparation.firstKeptEntryId);
-	const markerIds = branchEntries.flatMap((entry) => scanCurrentIMarkers(summarizePlanningEntryText(entry)));
-	const currentI = markerIds.at(-1)?.id
-		?? branchEntries.map((entry) => compactionCurrentI(entry)).filter((id): id is string => !!id).at(-1)
-		?? null;
-	const iPlan = currentI
-		? planIAwareCompaction({
-			entries: branchEntries as unknown as CompactionEntryLike[],
-			currentI,
-			contextWindow: eventPreparationUsage(event, ctx).contextWindow,
-			tokensBefore: event.preparation.tokensBefore,
-			fallbackFirstKeptEntryId: event.preparation.firstKeptEntryId,
-			maxFirstKeptEntryIndex: splitTurnBoundaryIndex(event),
-		})
-		: null;
-	const firstKeptEntryId = iPlan?.firstKeptEntryId ?? legacyCut.id;
-	const qaSection = legacyCut.hasMarker ? buildPlanningQASection(legacyCut.qaWindowEntries) : null;
-	const boundaryIndex = event.branchEntries.findIndex((entry) => entry.id === firstKeptEntryId);
-	const summaryEntries = boundaryIndex >= 0 ? branchEntries.slice(0, boundaryIndex) : branchEntries;
-	const readRecords = iPlan?.readRecords ?? extractReadRecords(summaryEntries as unknown as CompactionEntryLike[]);
-	const parts: string[] = [];
-	if (event.customInstructions?.trim()) {
-		parts.push(`## Compact Instructions
-${compactText(event.customInstructions, 1000)}`);
-	}
-	if (qaSection) {
-		parts.push(qaSection);
-	}
-	const previousSummary = event.preparation.previousSummary?.trim();
-	parts.push(`## Goal
-${compactText(planningCtx.runId, 80)} — keep current planning progress.`);
-	parts.push(`## Constraints & Preferences
-- Stay in the active planning run (\`${planningCtx.runId}\`).
-- Plan files live under \`${planningCtx.artifactDir}\`.`);
-	parts.push(`## Progress
-### Done
-- Pre-plan history compressed below.
-
-### In Progress
-- Current planning question or open decision.
-
-### Blocked
-- ${legacyCut.hasMarker ? "None" : "Planning cut-point marker missing; falling back to default."}`);
-	if (iPlan) {
-		const iSections = iPlan.slices
-			.map((slice) => {
-				const lines = slice.entries.filter((entry) => iPlan.summaryEntries.includes(entry)).map((entry) => summarizePlanningEntryLine(entry)).filter(Boolean);
-				return slice.id && lines.length ? `### ${slice.current ? "Current I" : "Implementation I"} \`${slice.id}\`\n${lines.join("\\n")}` : "";
-			})
-			.filter(Boolean);
-		parts.push(`## Current I\n- \`${currentI}\`\n${iSections.join("\\n\\n") || "- Current I transcript is in the retained suffix."}`);
-		parts.push(`## Read Records\n${readRecords.length ? readRecords.map((record) => formatReadRecord(record)).join("\\n") : "- (none)"}`);
-		parts.push(`## Compaction Boundary\n- firstKeptEntryId: \`${firstKeptEntryId}\`\n- currentI: \`${currentI}\`\n- targetMet: ${iPlan.metrics.targetMet}\n- hardFloorReason: ${iPlan.metrics.hardFloorReason ?? "none"}`);
-	}
-	if (previousSummary) {
-		parts.push(`## Previous Compact Summary\n${previousSummary}`);
-	}
-	parts.push(`## Next Steps
-- Resume the active planning turn from the raw tail.`);
-	const priorDetails = previousCompactionDetails(branchEntries as unknown as CompactionEntryLike[]);
-	const details = mergeCompactionDetails(priorDetails, {
-		kind: "pi-plans-planning-compaction",
-		version: 1,
-		currentI,
-		iSections: iPlan?.slices.map((slice) => ({ id: slice.id, entryIds: slice.entries.map((entry) => entry.id).filter((id): id is string => !!id) })),
-		readRecords,
-		metrics: iPlan?.metrics,
-		reason: event.reason,
-		hasMarker: legacyCut.hasMarker,
-	});
-	return {
-		summary: parts.join("\n\n"),
-		firstKeptEntryId,
-		tokensBefore: event.preparation.tokensBefore,
-		estimatedTokensAfter: iPlan?.metrics.estimatedAfterTokens ?? undefined,
-		details,
-	};
+	const built = buildPlanningVccResult(event, ctx);
+	return built?.kind === "compaction" ? built.compaction : null;
 }
 
 export function handlePlanningBeforeCompact(
@@ -1262,69 +701,71 @@ export function handlePlanningBeforeCompact(
 	event: SessionBeforeCompactEvent,
 ): SessionBeforeCompactResult | undefined {
 	if (getExecution()) return undefined;
-	if (!resolvePlanningCompactionContext(ctx.cwd)) return undefined;
-	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
-	const state = (session.__planningCompaction ??= {
-		inFlight: false,
-		resumeGuard: false,
-		cooldownActive: false,
-		lastAttemptReason: null,
-		lastSuccessfulUsagePercent: null,
-		lastSuccessfulAt: null,
-		terminalBackoffTokens: null,
-	} satisfies PlanningCompactionState);
-	const percent = ctx.getContextUsage()?.percent ?? null;
-	if (event.reason === "threshold" && (percent === null || percent < 100)) {
-		state.inFlight = false;
-		state.lastAttemptReason = event.reason;
-		return { cancel: true };
-	}
+	const state = ensurePlanningCompactionState(ctx);
 	state.inFlight = true;
 	state.lastAttemptReason = event.reason;
-	if (percent !== null && percent < 85) {
-		state.cooldownActive = false;
-	}
-	let compaction: CompactionResult | null;
+	state.pendingStats = null;
+	state.pendingFollowUpPrompt = null;
+	state.pendingContinueAfterThresholdCompact = false;
+	let built: VccCompactionBuildResult | null;
 	try {
-		compaction = buildPlanningCompactionResult(event, ctx);
+		built = buildPlanningVccResult(event, ctx);
 	} catch (error) {
 		state.inFlight = false;
-		ctx.ui.notify(`pi-plans: planning compaction preparation failed; using Pi default compaction (${String(error)}).`, "warning");
+		ctx.ui.notify(`pi-plans: VCC planning compaction preparation failed; using Pi default compaction (${String(error)}).`, "warning");
 		return undefined;
 	}
-	if (!compaction) {
+	if (!built || built.kind === "fallback") {
 		state.inFlight = false;
 		return undefined;
 	}
-	notifyHardFloor(ctx, compaction);
-	return { compaction };
+	if (built.kind === "cancel") {
+		state.inFlight = false;
+		ctx.ui.notify(built.message, "warning");
+		return { cancel: true };
+	}
+	state.pendingStats = built.stats;
+	state.pendingFollowUpPrompt = built.followUpPrompt;
+	state.pendingContinueAfterThresholdCompact = built.settings.continueAfterThresholdCompact;
+	return { compaction: built.compaction };
 }
 
-export function handlePlanningCompact(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactEvent): void {
+export async function handlePlanningCompact(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactEvent): Promise<void> {
 	if (getExecution()) return;
 	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
 	const state = session.__planningCompaction;
 	if (!state) return;
+	const stats = state.pendingStats;
+	const followUpPrompt = state.pendingFollowUpPrompt;
+	const continueAfterThresholdCompact = state.pendingContinueAfterThresholdCompact;
+	state.pendingStats = null;
+	state.pendingFollowUpPrompt = null;
+	state.pendingContinueAfterThresholdCompact = false;
 	state.inFlight = false;
 	state.lastAttemptReason = event.reason;
 	state.terminalBackoffTokens = null;
 	state.cooldownActive = true;
 	state.lastSuccessfulAt = utcNow();
 	state.lastSuccessfulUsagePercent = ctx.getContextUsage()?.percent ?? state.lastSuccessfulUsagePercent;
-	if (!event.willRetry) {
-		state.resumeGuard = true;
-		pi.sendMessage(
-			{
-				customType: PLANNING_RESUME_CUSTOM_TYPE,
-				content: "Continue planning.",
-				display: false,
-			},
-			{ triggerTurn: true },
-		);
-	} else {
-		state.resumeGuard = false;
+	state.resumeGuard = false;
+	if (!event.willRetry && stats) {
+		ctx.ui.notify(formatVccCompactionStats(stats), "info");
+		if (followUpPrompt) {
+			await pi.sendUserMessage?.(followUpPrompt);
+		} else if ((event.reason === "threshold" || event.reason === "overflow") && shouldScheduleAutoContinue(continueAfterThresholdCompact, runtimePiVersion(ctx))) {
+			state.resumeGuard = true;
+			pi.sendMessage(
+				{
+					customType: PLANNING_RESUME_CUSTOM_TYPE,
+					content: "Continue planning.",
+					display: false,
+				},
+				{ triggerTurn: true },
+			);
+		}
 	}
 }
+
 
 export function handlePlanningCompactFailed(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactFailedEvent): void {
 	if (getExecution()) return;
@@ -1341,6 +782,9 @@ export function handlePlanningCompactFailed(pi: ExtensionAPI, ctx: ExtensionCont
 		state.lastAttemptReason = event.reason;
 		const tokens = ctx.getContextUsage()?.tokens;
 		state.terminalBackoffTokens = typeof tokens === "number" ? tokens : Number.POSITIVE_INFINITY;
+		state.pendingStats = null;
+		state.pendingFollowUpPrompt = null;
+		state.pendingContinueAfterThresholdCompact = false;
 		const message = terminal.kind === "content"
 			? "pi-plans: compaction found nothing to summarize; backing off until the session grows past the keep-recent window."
 			: "pi-plans: compaction was aborted (provider interruption, user cancel, or a competing manual compact); backing off until the session grows or usage nears the window.";
@@ -1351,6 +795,9 @@ export function handlePlanningCompactFailed(pi: ExtensionAPI, ctx: ExtensionCont
 	state.resumeGuard = false;
 	state.cooldownActive = false;
 	state.lastAttemptReason = event.reason;
+	state.pendingStats = null;
+	state.pendingFollowUpPrompt = null;
+	state.pendingContinueAfterThresholdCompact = false;
 	ctx.ui.notify(
 		`pi-plans: planning compaction failed (${event.reason}); will try again on the next eligible turn.`,
 		"warning",
@@ -1445,10 +892,10 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 	const planPath = execution.planPath;
 	execution = null;
 	pi.appendEntry("pi-plans-exec-cleared", { reason: "complete" });
-	// Post-execution amelioration prompt: in interactive sessions, attach the
-	// amelioration instruction block and trigger a new turn so the agent can
-	// ask the user via ask_choice. Headless sessions keep the silent-completion
-	// behavior. Both completeExecution call sites (turn_end and the
+	// Post-execution goal-running continuation: in interactive sessions, attach
+	// the continuation block and trigger a new turn so the agent immediately
+	// enters the implementation-review loop. Headless sessions keep the silent
+	// completion behavior. Both completeExecution call sites (turn_end and the
 	// restoreFromSession recovery path) share this behavior.
 	const interactive = ctx.hasUI === true;
 	const content = interactive
@@ -1463,7 +910,7 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 		{ triggerTurn: interactive },
 	);
 	if (interactive) {
-		pi.appendEntry("pi-plans-ameliorate", { planPath, phase: "prompted", rounds: null, currentRound: 0 });
+		pi.appendEntry("pi-plans-ameliorate", { planPath, phase: "goal-started", rounds: null, currentRound: 0 });
 	}
 	const active = readActive(ctx.cwd);
 	if (active) {
@@ -1477,18 +924,24 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 }
 
 /** Instructions appended to the post-execution completion message in
- * interactive sessions, asking the agent to invite the user into a Reviewer /
- * Criticizer / Auto-refine loop run on the implementation result. */
+ * interactive sessions, telling the agent to enter the goal-running
+ * implementation-review loop. */
 export const AMELIORATION_PROMPT_TEXT = `---
-Post-execution amelioration: ask the user now via ask_choice (autoComplete: false, trailing: "auto-refine-loop", in the session language): "Run a post-execution amelioration round on the implementation?" Options (recommended first): 1. Run one Reviewer round (target: "implementation") and fix high/medium findings, re-running relevant tests 2. Run one Criticizer round (target: "implementation") and answer its questions with the user first 3. Finish here. If the user picks Auto-refine loop, ask the follow-up via ask_choice (autoComplete: false): termination = until no high-severity finding (hard cap 5 rounds, recommended) / 1 round / 2 rounds / 3 rounds. Then loop: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and records progress, until the termination condition or the 5-round cap.`;
+Goal-running continuation: immediately ask the user now via ask_choice (autoComplete: false, in the session language) for the termination condition of the implementation-review loop: until no high-severity finding (hard cap 5 rounds, recommended) / 1 round / 2 rounds / 3 rounds. Then keep running the loop without asking whether to continue: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and repeats until the chosen termination condition or the 5-round cap.`;
 
 /** Injection text for before_agent_start while executing. */
-export function executionContextMessage(): string | null {
+export function executionContextMessage(ctx: ExtensionContext): string | null {
 	if (!execution) return null;
 	const remaining = execution.items.filter((item) => !item.done);
 	const list =
 		remaining.map((item) => `- \`${item.id}\` ${item.text}`).join("\n") || "(none — report completion now)";
-	const graphLine = graphBlockForExecutor(execution.graphEnabled === true);
+	// Live read: the injected guidance and the tool wrappers share the same
+	// tri-state, so they can never contradict each other mid-run.
+	const mode = resolveGraphMode(ctx?.cwd ?? process.cwd());
+	const graphLine =
+		mode === "config-unavailable"
+			? `${graphBlockForExecutor(false)}\n[pi-plans: config unreadable this turn; graph features are off until .git/pi_plans/config.json is repaired]`
+			: graphBlockForExecutor(mode === "enabled");
 	const implementationItems = execution.implItems?.length
 		? `\nImplementation items: ${execution.implItems.map((item) => item.id).join(", ")}${execution.currentI ? `\nCurrent implementation item: \`${execution.currentI}\`` : ""}\nWhen beginning an implementation item, emit its current anchor exactly once as \`[I-###:current]\`; then use \`[I-###:implemented]\` or \`[I-###:validating]\` for progress.`
 		: "";

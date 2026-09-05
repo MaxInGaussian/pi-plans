@@ -11,7 +11,8 @@ import {
 	describeRuntimeIssues,
 	type RuntimeStatus,
 } from "../src/code-graph/runtime.ts";
-import { resolveCanonicalWorktree, WorktreePaths } from "../src/code-graph/paths.ts";
+import { resolveCanonicalWorktree } from "../src/code-graph/paths.ts";
+import type { WorktreePaths } from "../src/code-graph/paths.ts";
 import { Store } from "../src/code-graph/store.ts";
 import { makeBackend } from "../src/code-graph/parsers/javascript.ts";
 import { PythonBackend } from "../src/code-graph/parsers/python.ts";
@@ -47,7 +48,7 @@ const CodeGraphParams = Type.Object({
 	force: Type.Optional(Type.Boolean()),
 });
 
-type CodeGraphContext = Parameters<Parameters<ExtensionAPI["registerTool"]>[0]["execute"]>[4];
+export type CodeGraphContext = Parameters<Parameters<ExtensionAPI["registerTool"]>[0]["execute"]>[4];
 
 export interface RuntimeCacheEntry {
 	runtime: Awaited<ReturnType<typeof loadGraphRuntime>>["runtime"];
@@ -58,7 +59,7 @@ export interface RuntimeCacheEntry {
 
 let runtimeCache: RuntimeCacheEntry | null = null;
 
-async function ensureRuntime(workdir: string, ctx: CodeGraphContext): Promise<{ entry: RuntimeCacheEntry; status: RuntimeStatus } | null> {
+export async function ensureRuntime(workdir: string, ctx: CodeGraphContext): Promise<{ entry: RuntimeCacheEntry; status: RuntimeStatus } | null> {
 	const { runtime, status } = await loadGraphRuntime();
 	if (status.issues.length > 0 && !status.sqliteAvailable && !status.parserAvailable) {
 		ctx.ui?.notify?.(`code-graph unavailable: ${describeRuntimeIssues(status).join("; ")}`, "warning");

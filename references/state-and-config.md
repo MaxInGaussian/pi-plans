@@ -25,6 +25,7 @@ Bare repositories are refused with a clear error. A missing `git` executable is 
 ```text
 <git-common-dir>/pi_plans/
   config.json
+  pi-vcc-config.json
   active.json
   runs/
     <run-id>/
@@ -36,7 +37,7 @@ Bare repositories are refused with a clear error. A missing `git` executable is 
   cache/
 ```
 
-`config.json` is stable workspace preference state. `active.json` and `runs/` are run state. Large external references stay outside the repository by default under `~/.cache/pi-plans/refs/`, with metadata recorded in the run state and public artifacts.
+`config.json` is stable workspace preference state. `pi-vcc-config.json` is the repo-private compaction config used only by pi-plans' VCC-style compact hook. `active.json` and `runs/` are run state. Large external references stay outside the repository by default under `~/.cache/pi-plans/refs/`, with metadata recorded in the run state and public artifacts.
 
 ## Config Schema
 
@@ -76,6 +77,30 @@ Rules:
 - `artifact_root_updated_at` is the selection timestamp or `null` before confirmation.
 - There is intentionally no `effort` field: subagents inherit the dispatching session's model and thinking level unless an exact selector is stored. The real lever is the main session's thinking level at refine time.
 
+## VCC Compact Config
+
+`pi-vcc-config.json` is scaffolded under the resolved `<git-common-dir>/pi_plans/` state root when an active planning or execution compaction hook first needs it. It is independent from `config.json` so planning preferences, run state, and compact policy can evolve separately.
+
+Default values:
+
+```json
+{
+  "overrideDefaultCompaction": true,
+  "smartKeepTail": true,
+  "continueAfterThresholdCompact": true,
+  "debug": false
+}
+```
+
+Rules:
+
+- Only the repo-private file is read. Upstream global pi-vcc config such as `~/.pi/agent/pi-vcc-config.json` and `PI_VCC_CONFIG_PATH` are ignored.
+- Missing files are created with defaults; valid files keep user values and receive missing default keys; invalid JSON is never clobbered and the runtime falls back to defaults for that read.
+- `overrideDefaultCompaction:false` returns ordinary Pi manual/threshold/overflow compactions to Pi core. Explicit pi-plans internal compact hints can still use the VCC path.
+- `smartKeepTail:true` starts from the requested/default keep count and may retain more recent user turns when the retained tail remains within the safe token budget. Explicit `keep:N` is honored.
+- `continueAfterThresholdCompact:true` permits one hidden continuation after successful threshold/overflow compaction only on Pi versions that still need extension-driven resume behavior. Plain manual `/compact` never auto-continues, and `/compact <text>` sends the text once as the follow-up prompt.
+- `debug:false` writes no diagnostics; `debug:true` writes a best-effort `/tmp/pi-vcc-debug.json` snapshot for local troubleshooting.
+
 ## Language Setting
 
 Before the first product planning question, check the persisted config (`plans` action `show`). If `language.tag` is missing or invalid, ask exactly one `ask_choice` question:
@@ -90,11 +115,12 @@ Persist with `plans` (`set-language`, `languageSource: "user"`). Use the selecte
 
 ## Code Graph Enabled
 
-`graph_enabled` (`boolean | null`) records whether the workspace wants agents to prefer the code graph. `null` means the question was never asked: the first `plans` `init`/`show` in a workspace returns a `hint` instructing the agent to ask the user once via `ask_choice` (recommended: yes) and persist with the `plans` tool (`set-graph-enabled`, `enabled: true|false`). This question does not count against the planning-question limit. `/enable-graph` and `/disable-graph` toggle it later; disable refuses while graph drift is dirty.
+`graph_enabled` (`boolean | null`) records whether the workspace wants graph-aware read/write/edit wrappers and `code_graph` mutations for indexed source files. `null` means the question was never asked: the first `plans` `init`/`show` in a workspace returns a `hint` instructing the agent to ask the user once via `ask_choice` (recommended: yes) and persist with the `plans` tool (`set-graph-enabled`, `enabled: true|false`). This question does not count against the planning-question limit. `/enable-graph` and `/disable-graph` toggle it later; disable refuses while graph drift is dirty.
 
-When `true`: planner/refiner/executor prompts instruct graph reads (refiner subagents get the `code_graph` tool in their allowlist), and the executor loop runs DB-first (`code_graph` mutations → `/apply-graph` → `/graph-drift` → `plans final-commit` → `/init-graph`). When `false`: prompts fall back to raw `Read`/`grep`/`ls`.
+## `/config-pi-plans`
 
-## Planning Docs Location
+`/config-pi-plans` is an interactive workspace configuration wizard. It re-asks the workspace language, planning docs root, code graph toggle, reviewer mode/model, and criticizer mode/model, then writes the chosen defaults back to `.git/pi_plans/config.json`. When code graph is enabled, the extension also overrides built-in `read`/`write`/`edit` for indexed source files so graph-backed source reads and DB-first edits happen automatically. Model pickers can reuse the current session model, any available selector surfaced by `ctx.scopedModels` or the model registry, or a manually entered exact `provider/model` string. If a run is already active, only the workspace defaults change; the active run's `artifact_dir` and `language_tag` stay unchanged.
+
 
 Before the first product planning question, check the persisted config again. If `artifact_root_source` is missing or `unset`, ask exactly one `ask_choice` question:
 

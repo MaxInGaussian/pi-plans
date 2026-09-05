@@ -141,6 +141,7 @@ describe("ask_choice Auto-complete wiring", () => {
 		assert.match(indexSource, /autoCompleteStatus\(ctx\)/);
 		assert.match(indexSource, /restoreAutoCompleteFromSession/);
 		const execSource = fs.readFileSync(path.join(process.cwd(), "src", "exec.ts"), "utf8");
-		assert.match(execSource, /customType === AUTOCOMPLETE_ENTRY/);
+		assert.doesNotMatch(execSource, /customType === AUTOCOMPLETE_ENTRY/);
+		assert.match(execSource, /shouldTriggerPlanningCompaction\(_ctx: ExtensionContext\): boolean \{\n\s+return false;/);
 	});
 });

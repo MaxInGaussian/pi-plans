@@ -100,4 +100,15 @@ describe("refine tool wires target to the right builder", () => {
 		assert.match(source, /target\s*===\s*"implementation"/);
 		assert.match(source, /params\.target\s*\?\?\s*"plan"/);
 	});
+
+	it("criticizer spawn gets the graph tools and prompt like the reviewer", () => {
+		const source = fs.readFileSync(path.join(process.cwd(), "tools", "refine.ts"), "utf8");
+		const criticizerBlock = source.slice(
+			source.indexOf('params.role === "criticizer"'),
+			source.indexOf("const count = Math.min"),
+		);
+		assert.ok(criticizerBlock.length > 0, "criticizer block not found");
+		assert.match(criticizerBlock, /tools: subagentTools/);
+		assert.match(criticizerBlock, /graphPrompt/);
+	});
 });

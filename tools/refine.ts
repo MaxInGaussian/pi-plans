@@ -20,13 +20,6 @@ import { graphBlockForRefiner } from "../src/code-graph/prompts.ts";
 import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
 import { RefineOverlayController, refineOverlayContext } from "../src/refine-ui.ts";
 
-let retainedRefineOverlay: RefineOverlayController | undefined;
-
-async function closeRetainedRefineOverlay(): Promise<void> {
-	const previous = retainedRefineOverlay;
-	retainedRefineOverlay = undefined;
-	if (previous && !previous.isClosed()) await previous.close();
-}
 
 const RefineParams = Type.Object({
 	role: StringEnum(["reviewer", "criticizer"] as const, { description: "Refinement role to run" }),
@@ -67,6 +60,7 @@ function setupRefinementExecution(
 	parentSignal: AbortSignal | undefined,
 	role: "reviewer" | "criticizer",
 	lanes: Array<{ id: string; label?: string }>,
+	modelLabel?: string,
 ) {
 	const controller = new AbortController();
 	const relayAbort = () => controller.abort();
@@ -74,21 +68,13 @@ function setupRefinementExecution(
 	else parentSignal?.addEventListener("abort", relayAbort, { once: true });
 
 	const overlay = ctx.mode === "tui" ? new RefineOverlayController(role, lanes, relayAbort) : undefined;
-	overlay?.open(refineOverlayContext(ctx));
-	let retained = false;
+	overlay?.open(refineOverlayContext(ctx), modelLabel);
 
 	return {
 		signal: controller.signal,
 		overlay,
-		async retain() {
-			if (!overlay) return;
-			overlay.markFinished();
-			retained = true;
-			retainedRefineOverlay = overlay;
-			parentSignal?.removeEventListener("abort", relayAbort);
-		},
 		async close() {
-			if (!retained) await overlay?.close();
+			await overlay?.close();
 			parentSignal?.removeEventListener("abort", relayAbort);
 		},
 	};
@@ -161,6 +147,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 			const graphPrompt = graphBlockForRefiner(graphEnabled);
 			const inheritModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 			const model = roleConfig.model_selector ?? inheritModel;
+			const modelLabel = model ?? "inherit";
 
 			if (roleConfig.mode === "current-session") {
 				const task = pickTask(params.role, null);
@@ -176,20 +163,19 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 			}
 
 			if (params.role === "criticizer") {
-				await closeRetainedRefineOverlay();
 				const name = `${roleConfig.name_prefix}-criticizer-${Date.now().toString(36)}`;
-				const execution = setupRefinementExecution(ctx, signal, "criticizer", [{ id: name, label: "criticizer" }]);
+				const execution = setupRefinementExecution(ctx, signal, "criticizer", [{ id: name, label: "criticizer" }], modelLabel);
 				try {
 					const result = await runPiSubagent({
-						systemPrompt,
+						systemPrompt: `${systemPrompt}\n\n${graphPrompt}`,
 						task: pickTask("criticizer", null),
 						cwd: workdir,
 						model,
+						tools: subagentTools,
 						signal: execution.signal,
 						onProgress: (event) => execution.overlay?.update(name, event),
 					});
 					execution.overlay?.complete(name, result);
-					await execution.retain();
 					record(name, result.ok ? result.model ?? model : null);
 					if (!result.ok) {
 						throw new Error(
@@ -232,9 +218,8 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				signal,
 				"reviewer",
 				jobs.map((job) => ({ id: job.lane.id, label: job.lane.id })),
+				modelLabel,
 			);
-			let anySuccess = false;
-			await closeRetainedRefineOverlay();
 			try {
 				const results = await Promise.all(
 					jobs.map(async (job) => {
@@ -250,7 +235,6 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 							});
 							execution.overlay?.complete(job.lane.id, result);
 							record(job.name, result.ok ? result.model ?? model : null);
-							if (result.ok) anySuccess = true;
 							if (target === "implementation" && result.ok) {
 								try {
 									pi.appendEntry("pi-plans-ameliorate", {
@@ -304,9 +288,6 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				let text = truncation.content;
 				if (truncation.truncated) text += `\n\n[Output truncated; full outputs remain in this tool result's details.]`;
 
-				if (anySuccess) {
-					await execution.retain();
-				}
 				return {
 					content: [
 						{
@@ -324,7 +305,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 					},
 				};
 			} finally {
-				if (!anySuccess) await execution.close();
+				await execution.close();
 			}
 		},
 

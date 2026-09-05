@@ -6,7 +6,7 @@
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import { CURRENT_SCHEMA_VERSION, FUNCTION_RECORDS_VIEW, SCHEMA_STATEMENTS } from "./schema.ts";
 import { PathError } from "./paths.ts";
-import type { CodeGraphSnapshot, GraphMeta, Language } from "./types.ts";
+import type { CodeGraphSnapshot, GraphMeta } from "./types.ts";
 
 export interface StoreOptions {
 	dbPath: string;
@@ -275,16 +275,4 @@ export class Store {
 export async function openStore(opts: StoreOptions): Promise<Store> {
 	const sqlite = await import("node:sqlite");
 	return new Store(opts, sqlite);
-}
-
-export function normalizeLanguage(language: string): Language | null {
-	switch (language) {
-		case "javascript":
-		case "typescript":
-		case "tsx":
-		case "python":
-			return language;
-		default:
-			return null;
-	}
 }

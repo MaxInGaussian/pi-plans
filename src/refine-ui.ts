@@ -94,7 +94,8 @@ const OVERLAY_MIN_WIDTH = 72;
 const OVERLAY_MIN_HEIGHT = 18;
 const OVERLAY_MAX_HEIGHT = 32;
 const OVERLAY_HEIGHT_RATIO = 0.78;
-const OVERLAY_CHROME_LINES = 3; // top border + title/summary row + bottom border
+const STREAMING_PREVIEW_LINES = 3;
+const OVERLAY_CHROME_LINES = 4; // top border + title row + footer row + bottom border
 
 export function getTerminalRowCount(): number {
 	const raw = (process.stdout as { rows?: number }).rows;
@@ -164,12 +165,27 @@ function wrapTranscriptText(text: string, width: number): string[] {
 	return sourceLines.flatMap((line) => line ? wrapTextWithAnsi(line, Math.max(1, width)) : [""]);
 }
 
+function previewTranscriptText(entry: RefineTranscriptEntry, width: number): { lines: string[]; truncated: boolean } {
+	const lines = wrapTranscriptText(entry.text, Math.max(1, width));
+	if (!entry.streaming || entry.type === "thinking" || lines.length <= STREAMING_PREVIEW_LINES) {
+		return { lines, truncated: false };
+	}
+	return { lines: lines.slice(-STREAMING_PREVIEW_LINES), truncated: true };
+}
+
+function footerText(laneCount: number): string {
+	const parts = ["Esc 关闭", "↑/↓ 滚动", "PgUp/PgDn 翻页"];
+	if (laneCount > 1) parts.push("Tab & Shift + Tab 切换 lane");
+	return parts.join(" · ");
+}
+
 function buildTranscriptLines(entries: RefineTranscriptEntry[], theme: Theme, width: number): string[] {
 	const lines: string[] = [];
 	for (const entry of entries) {
 		lines.push(entryBadge(entry, theme));
-		const body = wrapTranscriptText(entry.text, Math.max(1, width - 2));
-		for (const line of body) {
+		const preview = previewTranscriptText(entry, Math.max(1, width - 2));
+		if (preview.truncated) lines.push(`  ${theme.fg("dim", "…")}`);
+		for (const line of preview.lines) {
 			const styled = entry.type === "thinking"
 				? theme.fg("warning", line)
 				: entry.type === "tool-result" && entry.isError
@@ -183,13 +199,14 @@ function buildTranscriptLines(entries: RefineTranscriptEntry[], theme: Theme, wi
 	return lines;
 }
 
-function summaryFor(role: RefineOverlayRole, lanes: RefineLaneState[]): string {
+function summaryFor(role: RefineOverlayRole, lanes: RefineLaneState[], modelLabel?: string): string {
 	const complete = lanes.filter((lane) => lane.status === "complete").length;
 	const terminal = lanes.filter((lane) => ["complete", "failed", "cancelled"].includes(lane.status)).length;
 	const running = lanes.filter((lane) => lane.status === "running").length;
 	const title = role === "reviewer" ? "Reviewer" : "Criticizer";
+	const visibleTitle = modelLabel ? `${title} (${modelLabel})` : title;
 	const state = terminal === lanes.length ? "done" : running > 0 ? `${running} running` : "queued";
-	return `${title} · ${complete}/${lanes.length} done · ${state}`;
+	return `${visibleTitle} · ${complete}/${lanes.length} done · ${state}`;
 }
 
 export class RefineOverlayComponent implements Component {
@@ -198,15 +215,17 @@ export class RefineOverlayComponent implements Component {
 	private readonly lanes: RefineLaneState[];
 	private readonly onCancel: () => void;
 	private readonly tui?: TUI;
+	private readonly modelLabel?: string;
 	private selectedLane = 0;
 	private disposed = false;
 
-	constructor(theme: Theme, role: RefineOverlayRole, lanes: RefineLaneState[], onCancel: () => void, tui?: TUI) {
+	constructor(theme: Theme, role: RefineOverlayRole, lanes: RefineLaneState[], onCancel: () => void, tui?: TUI, modelLabel?: string) {
 		this.theme = theme;
 		this.role = role;
 		this.lanes = lanes;
 		this.onCancel = onCancel;
 		this.tui = tui;
+		this.modelLabel = modelLabel;
 		this.tui?.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
 	}
 
@@ -254,9 +273,9 @@ export class RefineOverlayComponent implements Component {
 		const dialogHeight = pickOverlayHeight();
 		const laneCount = Math.max(1, this.lanes.length);
 		const paneHeight = Math.max(3, Math.floor((dialogHeight - OVERLAY_CHROME_LINES) / laneCount));
-		const title = summaryFor(this.role, this.lanes);
+		const title = summaryFor(this.role, this.lanes, this.modelLabel);
 		const lines: string[] = [renderBorderLine(this.theme, innerWidth, "top")];
-		lines.push(renderRow(this.theme, this.theme.fg("accent", this.theme.bold(title)), innerWidth, true));
+		lines.push(renderRow(this.theme, this.theme.fg("accent", this.theme.bold(title)), innerWidth, false));
 
 		if (this.lanes.length === 0) {
 			lines.push(renderRow(this.theme, this.theme.fg("dim", "No active lanes"), innerWidth));
@@ -265,6 +284,7 @@ export class RefineOverlayComponent implements Component {
 				lines.push(...this.renderPane(this.lanes[index]!, innerWidth, paneHeight, index === this.selectedLane));
 			}
 		}
+		lines.push(renderRow(this.theme, this.theme.fg("dim", footerText(this.lanes.length)), innerWidth));
 		lines.push(renderBorderLine(this.theme, innerWidth, "bottom"));
 		return lines.map((line) => fitLine(line, width));
 	}
@@ -314,7 +334,6 @@ export class RefineOverlayController {
 	private overlayPromise: Promise<void> | undefined;
 	private tui: TUI | undefined;
 	private closed = false;
-	private finished = false;
 
 	constructor(role: RefineOverlayRole, laneIds: Array<{ id: string; label?: string }>, onCancel: () => void) {
 		this.role = role;
@@ -333,7 +352,7 @@ export class RefineOverlayController {
 		}));
 	}
 
-	open(ctx: RefineOverlayContext): void {
+	open(ctx: RefineOverlayContext, modelLabel?: string): void {
 		if (!ctx.hasUI || this.overlayPromise) return;
 
 		this.overlayPromise = ctx.ui
@@ -341,7 +360,7 @@ export class RefineOverlayController {
 				(_tui, theme, _keybindings, done) => {
 					this.tui = _tui;
 					this.done = done;
-					this.component = new RefineOverlayComponent(theme, this.role, this.lanes, () => this.cancel(), _tui);
+					this.component = new RefineOverlayComponent(theme, this.role, this.lanes, () => this.cancel(), _tui, modelLabel);
 					if (this.closed) done(undefined);
 					return this.component;
 				},
@@ -382,12 +401,6 @@ export class RefineOverlayController {
 		}
 	}
 
-	markFinished(): void {
-		if (this.closed) return;
-		this.finished = true;
-		this.tui?.requestRender();
-	}
-
 	cancel(): void {
 		// Esc only closes the overlay; the refiner child keeps running to natural
 		// completion and its result still flows through the tool result path.
@@ -410,9 +423,6 @@ export class RefineOverlayController {
 		return this.closed;
 	}
 
-	isFinished(): boolean {
-		return this.finished;
-	}
 }
 
 export function refineOverlayContext(ctx: ExtensionContext | ExtensionCommandContext): RefineOverlayContext {

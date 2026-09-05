@@ -1,6 +1,6 @@
 /**
- * Slash-command handlers for /init-graph and /apply-graph. Both defer loading
- * the runtime and SQLite until invoked so other pi-plans tools stay usable
+ * Slash-command handlers for /init-graph, /update-graph, and /apply-graph.
+ * They defer loading the runtime and SQLite until invoked so other pi-plans tools stay usable
  * even when the graph feature is unavailable.
  */
 
@@ -39,14 +39,6 @@ interface CommandContext {
 	};
 	model?: unknown;
 	thinkingLevel?: string;
-}
-
-function parseFlags(args: string): Record<string, boolean> {
-	const flags: Record<string, boolean> = {};
-	for (const token of args.split(/\s+/)) {
-		if (token.startsWith("--")) flags[token.slice(2)] = true;
-	}
-	return flags;
 }
 
 async function buildParsers(runtime: Awaited<ReturnType<typeof loadGraphRuntime>>["runtime"]): Promise<Record<Language, ParserBackend>> {
@@ -102,6 +94,27 @@ function denyActivePlanning(ctx: CommandContext): boolean {
 
 export async function initGraphCommand(args: string, ctx: CommandContext): Promise<void> {
 	const flags = parseCommandArgs(args).flags;
+	const preflightPaths = resolveCanonicalWorktree(ctx.cwd);
+	const preferRebuild = flags.has("reindex") || !ctx.hasUI;
+	if (fs.existsSync(preflightPaths.codeGraphDb) && !preferRebuild) {
+		const rebuild = await ctx.ui.confirm(
+			"code-graph DB already exists",
+			`${preflightPaths.codeGraphDb}\n\nRebuild the graph with the current /init-graph flow, or sync changed paths via /update-graph?\n\nYes = rebuild the full graph\nNo = sync changed paths only`,
+		);
+		if (!rebuild) {
+			const bootstrapResult = await bootstrap(ctx, {});
+			if (!bootstrapResult) return;
+			const { store, paths, parsers } = bootstrapResult;
+			try {
+				await runChangedPathSync(args, ctx, store, paths, parsers);
+			} catch (error) {
+				ctx.ui.notify(`code-graph update failed: ${(error as Error).message}`, "error");
+			} finally {
+				store.close();
+			}
+			return;
+		}
+	}
 	const bootstrapResult = await bootstrap(ctx, { reindex: flags.has("reindex") });
 	if (!bootstrapResult) return;
 	const { store, paths, parsers, runtimeStatus } = bootstrapResult;
@@ -123,7 +136,7 @@ export async function initGraphCommand(args: string, ctx: CommandContext): Promi
 			`code-graph indexed ${report.functionsIndexed} function(s) in ${report.filesScanned} file(s) — ${report.edgesResolved} resolved, ${report.edgesUnresolved} unresolved`,
 			"info",
 		);
-		if (!flags["no-summary"] && ctx.hasUI && ctx.modelRegistry?.complete && ctx.model) {
+		if (!flags.has("no-summary") && ctx.hasUI && ctx.modelRegistry?.complete && ctx.model) {
 			const handle: CompletionHandle = {
 				complete: async (request) =>
 					await ctx.modelRegistry!.complete!(ctx.model, { messages: request.messages }, {}),
@@ -134,7 +147,7 @@ export async function initGraphCommand(args: string, ctx: CommandContext): Promi
 				notify: ctx.ui.notify,
 			};
 			try {
-				const summary: SummaryReport = await generateSummaries({ store, ctx: handle, skipConsent: flags.consent === true });
+				const summary: SummaryReport = await generateSummaries({ store, ctx: handle, skipConsent: flags.has("consent") });
 				ctx.ui.notify(
 					`code-graph summaries: ${summary.ok} ok, ${summary.failed} failed, ${summary.declined} declined`,
 					summary.failed > 0 ? "warning" : "info",
@@ -164,7 +177,7 @@ export async function applyGraphCommand(args: string, ctx: CommandContext): Prom
 		ctx.ui.notify("code-graph apply refused: a planning run is currently planning or accepted.", "error");
 		return;
 	}
-	const flags = parseFlags(args);
+	const flags = parseCommandArgs(args).flags;
 	const bootstrapResult = await bootstrap(ctx, {});
 	if (!bootstrapResult) return;
 	const { store, paths } = bootstrapResult;
@@ -209,7 +222,7 @@ export async function graphStatusCommand(_args: string, ctx: CommandContext): Pr
 // /update-graph, /graph-drift, /enable-graph, /disable-graph
 // ---------------------------------------------------------------------------
 
-import { gitAddAllAndCommit, gitHead, gitStatusPorcelain, parseCommandArgs } from "./git.ts";
+import { gitAddAllAndCommit, gitDiffNameOnly, gitHead, gitStatusPorcelain, parseCommandArgs } from "./git.ts";
 import { isIndexablePath } from "./discovery.ts";
 import { hashText } from "./parser.ts";
 import * as fs from "node:fs";
@@ -308,37 +321,47 @@ export function computeDrift(store: Store, worktreeRoot: string): DriftResult {
 	};
 }
 
-export async function updateGraphCommand(args: string, ctx: CommandContext): Promise<void> {
+async function runChangedPathSync(
+	args: string,
+	ctx: CommandContext,
+	store: Store,
+	paths: Bootstrap["paths"],
+	parsers: Record<Language, ParserBackend>,
+): Promise<void> {
 	const { flags, values } = parseCommandArgs(args);
+	const entries = gitStatusPorcelain(paths.worktreeRoot);
+	const renameOrigPaths = new Set(
+		entries.filter((entry) => entry.origPath !== null).map((entry) => toDbKey(entry.origPath!)),
+	);
+	const porcelainPaths = entries.map((entry) => toDbKey(entry.path));
+	// --base <commit>: union porcelain with diff-vs-base so pinned-base
+	// changes (possibly already committed) are included.
+	const basePath = values.get("base");
+	const basePaths = basePath
+		? gitDiffNameOnly(paths.worktreeRoot, basePath).map(toDbKey)
+		: [];
+	const candidates = [...new Set([...porcelainPaths, ...renameOrigPaths, ...basePaths])].filter(isIndexablePath);
+	if (candidates.length === 0) {
+		ctx.ui.notify("code-graph update: no changed indexable paths — nothing to do", "info");
+		return;
+	}
+	if (flags.has("dry-run")) {
+		ctx.ui.notify(`code-graph update (dry-run): would reindex ${candidates.length} path(s):\n${candidates.join("\n")}`, "info");
+		return;
+	}
+	const report = await runIndex({ store, worktreeRoot: paths.worktreeRoot, parsers, paths: candidates });
+	ctx.ui.notify(
+		`code-graph update: ${report.reindexedPaths.length} reindexed, ${report.purgedPaths.length} purged, ${report.functionsIndexed} function(s)`,
+		"info",
+	);
+}
+
+export async function updateGraphCommand(args: string, ctx: CommandContext): Promise<void> {
 	const bootstrapResult = await bootstrap(ctx, {});
 	if (!bootstrapResult) return;
 	const { store, paths, parsers } = bootstrapResult;
 	try {
-		const entries = gitStatusPorcelain(paths.worktreeRoot);
-		const renameOrigPaths = new Set(
-			entries.filter((entry) => entry.origPath !== null).map((entry) => toDbKey(entry.origPath!)),
-		);
-		const porcelainPaths = entries.map((entry) => toDbKey(entry.path));
-		// --base <commit>: union porcelain with diff-vs-base so pinned-base
-		// changes (possibly already committed) are included.
-		const basePath = values.get("base");
-		const basePaths = basePath
-			? gitDiffNameOnly(paths.worktreeRoot, basePath).map(toDbKey)
-			: [];
-		const candidates = [...new Set([...porcelainPaths, ...renameOrigPaths, ...basePaths])].filter(isIndexablePath);
-		if (candidates.length === 0) {
-			ctx.ui.notify("code-graph update: no changed indexable paths — nothing to do", "info");
-			return;
-		}
-		if (flags.has("dry-run")) {
-			ctx.ui.notify(`code-graph update (dry-run): would reindex ${candidates.length} path(s):\n${candidates.join("\n")}`, "info");
-			return;
-		}
-		const report = await runIndex({ store, worktreeRoot: paths.worktreeRoot, parsers, paths: candidates });
-		ctx.ui.notify(
-			`code-graph update: ${report.reindexedPaths.length} reindexed, ${report.purgedPaths.length} purged, ${report.functionsIndexed} function(s)`,
-			"info",
-		);
+		await runChangedPathSync(args, ctx, store, paths, parsers);
 	} catch (error) {
 		ctx.ui.notify(`code-graph update failed: ${(error as Error).message}`, "error");
 	} finally {
@@ -386,7 +409,7 @@ export async function graphDriftCommand(args: string, ctx: CommandContext): Prom
 
 export async function enableGraphCommand(_args: string, ctx: CommandContext): Promise<void> {
 	setGraphEnabled(ctx.cwd, true);
-	ctx.ui.notify("code-graph enabled: planner/refiner/executor prompts will prefer the graph. Run /init-graph to index.", "info");
+	ctx.ui.notify("code-graph enabled: agents will use graph-aware read/write/edit on indexed source files. Run /init-graph to index.", "info");
 }
 
 export async function disableGraphCommand(_args: string, ctx: CommandContext): Promise<void> {

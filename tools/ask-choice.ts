@@ -15,7 +15,117 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { disableAutoComplete, enableAutoComplete, isAutoCompleteEnabled, recordAskChoice } from "../src/autocomplete.ts";
+import { truncateToWidth, visibleWidth } from "../src/refine-ui-helpers.ts";
 import { normalizeWorkdir, readActive, recordDecision } from "../src/state.ts";
+
+// ---------------------------------------------------------------------------
+// Panel fitting: pi's ExtensionSelectorComponent renders each option as an
+// auto-wrapping Text with NO height cap — an oversized panel exceeds the
+// terminal rows and the TUI thrashes (flicker). These helpers sanitize and
+// shrink the question/labels before they reach ctx.ui.select.
+// ---------------------------------------------------------------------------
+
+export const STATUS_BAR_HEIGHT = 1;
+export const PANEL_SAFETY_MARGIN = 2;
+export const PANEL_CHROME_LINES = 9; // 8 measured in extension-selector.js (DynamicBorder×2 + Spacer×4 + title + keyHint) + 1 slack
+/** Each option renders in at most three wrapped lines (user-facing contract). */
+export const OPTION_MAX_LINES = 3;
+/**
+ * Per-row width overhead, pinned to extension-selector.js: DynamicBorder 1 +
+ * Text padding 1 + selected marker "→ " 2 = 4, plus 2 columns of slack for
+ * word-wrap inefficiency. Re-verify against that file if pi changes its layout.
+ */
+export const SELECTOR_WIDTH_OVERHEAD = 6;
+export const FALLBACK_COLUMNS = 100;
+export const FALLBACK_ROWS = 30;
+/** Minimal-form floor for tiny terminals (stage-3 width). */
+const MINIMAL_LINE_WIDTH = 20;
+/**
+ * Truncation floor for fixed tail labels (Other…/Auto-complete/Auto-refine
+ * loop): the longest magic prefix ("Auto-refine loop", 16 cols) plus slack.
+ * These labels drive startsWith() answer routing and must never lose it.
+ */
+const FIXED_LABEL_FLOOR = 18;
+
+export interface PanelItem {
+	/** Label without description (degradation stage 1+). */
+	core: string;
+	/** Full display label: core + description (degradation stage 0). */
+	display: string;
+	/** Fixed tail labels (Other…/Auto-complete/Auto-refine loop): truncation keeps at least the magic prefix. */
+	fixed?: boolean;
+}
+
+export interface FittedPanel {
+	question: string;
+	labels: string[];
+	/** True when even the minimal form exceeds the terminal budget. */
+	overflowWarned: boolean;
+}
+
+function sanitizeLine(text: string): string {
+	return text.replace(/\r\n|\n|\r/g, " ");
+}
+
+function truncateWithDotDot(text: string, budget: number): string {
+	if (visibleWidth(text) <= budget) return text;
+	return `${truncateToWidth(text, Math.max(0, budget - 2), "")}..`;
+}
+
+function truncateForItem(item: PanelItem, budget: number): string {
+	const effective = item.fixed ? Math.max(budget, FIXED_LABEL_FLOOR) : budget;
+	return truncateWithDotDot(item.display, effective);
+}
+
+function wrappedLineCount(text: string, lineWidth: number): number {
+	return Math.max(1, Math.ceil(visibleWidth(text) / lineWidth));
+}
+
+/**
+ * Sanitize and shrink the question/labels so the projected panel height stays
+ * under rows − statusBar − margin. Degradation order (D-001): per-label 3-line
+ * budget → strip descriptions → labels to one line → truncate the question →
+ * minimal 20-column form (overflowWarned; never fails closed).
+ */
+export function fitAskChoicePanel(question: string, items: PanelItem[], columns: number, rows: number): FittedPanel {
+	const cols = columns > 0 ? columns : FALLBACK_COLUMNS;
+	const termRows = rows > 0 ? rows : FALLBACK_ROWS;
+	const lineBudget = Math.max(20, cols - SELECTOR_WIDTH_OVERHEAD);
+	const rowBudget = Math.max(10, termRows - STATUS_BAR_HEIGHT - PANEL_SAFETY_MARGIN);
+
+	const cleanQuestion = sanitizeLine(question);
+	const clean = items.map((item) => ({ core: sanitizeLine(item.core), display: sanitizeLine(item.display), fixed: item.fixed === true }));
+
+	const projected = (q: string, ls: string[]) =>
+		PANEL_CHROME_LINES + wrappedLineCount(q, lineBudget) + ls.reduce((sum, l) => sum + wrappedLineCount(l, lineBudget), 0);
+
+	// Stage 0: full display labels, each within the 3-line budget.
+	// (Signature note: items carry {core, display} because D-001 stage 1 strips
+	// descriptions, which a plain string list cannot express.)
+	let currentQuestion = cleanQuestion;
+	let currentLabels = clean.map((item) => truncateForItem(item, OPTION_MAX_LINES * lineBudget));
+
+	if (projected(currentQuestion, currentLabels) >= rowBudget) {
+		// Stage 1: strip descriptions (core labels only).
+		currentLabels = clean.map((item) => truncateForItem({ ...item, display: item.core }, OPTION_MAX_LINES * lineBudget));
+	}
+	if (projected(currentQuestion, currentLabels) >= rowBudget) {
+		// Stage 2: labels to a single line.
+		currentLabels = clean.map((item) => truncateForItem({ ...item, display: item.core }, lineBudget));
+	}
+	if (projected(currentQuestion, currentLabels) >= rowBudget) {
+		// Stage 3: truncate the question too.
+		currentQuestion = truncateWithDotDot(currentQuestion, lineBudget);
+	}
+	let overflowWarned = false;
+	if (projected(currentQuestion, currentLabels) >= rowBudget) {
+		// Minimal form for tiny terminals: 20-column floor; still over → warn, never fail closed.
+		currentQuestion = truncateWithDotDot(cleanQuestion, MINIMAL_LINE_WIDTH);
+		currentLabels = clean.map((item) => truncateForItem({ ...item, display: item.core }, MINIMAL_LINE_WIDTH));
+		overflowWarned = projected(currentQuestion, currentLabels) >= rowBudget;
+	}
+	return { question: currentQuestion, labels: currentLabels, overflowWarned };
+}
 
 const Option = Type.Object({
 	label: Type.String({ description: "Option label" }),
@@ -131,17 +241,28 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 
 			const AUTO_REFINE_LOOP_LABEL =
 				"Auto-refine loop  (run refinement rounds until no high-severity finding or the 5-round cap)";
-			const displayLabels: string[] = options.map((option, index) => {
-				let label = `${index + 1}. ${option.label}`;
-				if (option === recommended) label += "  (recommended)";
-				if (option.description) label += ` — ${option.description}`;
-				return label;
+			const panelItems: PanelItem[] = options.map((option, index) => {
+				const core = `${index + 1}. ${option.label}${option === recommended ? "  (recommended)" : ""}`;
+				let display = `${index + 1}. ${option.label}`;
+				if (option === recommended) display += "  (recommended)";
+				if (option.description) display += ` — ${option.description}`;
+				return { core, display };
 			});
-			if (allowOther) displayLabels.push("Other…  (type your own answer)");
-			if (autoComplete) displayLabels.push("Auto-complete  (take the recommended option)");
-			else if (trailing) displayLabels.push(AUTO_REFINE_LOOP_LABEL);
+			if (allowOther) panelItems.push({ core: "Other…  (type your own answer)", display: "Other…  (type your own answer)", fixed: true });
+			if (autoComplete) panelItems.push({ core: "Auto-complete  (take the recommended option)", display: "Auto-complete  (take the recommended option)", fixed: true });
+			else if (trailing) panelItems.push({ core: AUTO_REFINE_LOOP_LABEL, display: AUTO_REFINE_LOOP_LABEL, fixed: true });
 
-			const selected = await ctx.ui.select(params.question, displayLabels);
+			const panel = fitAskChoicePanel(
+				params.question,
+				panelItems,
+				process.stdout.columns ?? 0,
+				process.stdout.rows ?? 0,
+			);
+			if (panel.overflowWarned) {
+				ctx.ui.notify?.("Terminal too small: the ask_choice panel may overflow even in its minimal form.", "warning");
+			}
+
+			const selected = await ctx.ui.select(panel.question, panel.labels);
 			if (selected === undefined) {
 				disableAutoComplete(ctx, "question cancelled");
 				return {
@@ -202,7 +323,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 				};
 			}
 
-			const index = displayLabels.indexOf(selected);
+			const index = panel.labels.indexOf(selected);
 			const option = index >= 0 && index < options.length ? options[index] : undefined;
 			if (!option) {
 				recordAskChoice(ctx, false);
