@@ -24,7 +24,10 @@ adheres to [Semantic Versioning](https://semver.org/).
   (`update-function`, `update-file`, `delete-file`, `list-pending`);
   planner/refiner/executor prompts
   hard-require function-level reads, and refiner/criticizer subagents get
-  `code_graph` in their allowlist.
+  `code_graph` in their allowlist. The tree-sitter parser packages are
+  optional: install them where pi runs (`npm i tree-sitter
+  tree-sitter-javascript tree-sitter-typescript tree-sitter-python`) to
+  enable the graph; without them everything else works unchanged.
 - **`/config-pi-plans`.** Interactive workspace configuration wizard that
   re-asks every pi-plans default: language, planning docs root, code graph
   toggle, and reviewer/criticizer mode and model. Model pickers aggregate

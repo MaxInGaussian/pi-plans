@@ -259,7 +259,11 @@ read, and each function retains its full UTF-8 source.
 Runtime requirements: the base extension still requires Node ≥ 22.6; the
 graph feature additionally requires Node ≥ 22.13 (or `--experimental-sqlite`)
 so that `node:sqlite` is available without flag. Pi's host currently ships
-Node ≥ 22.19, so a fresh install works out of the box. On unsupported
+Node ≥ 22.19, so a fresh install works out of the box. The code graph also
+needs the optional `tree-sitter` parser packages, which are **not** installed
+automatically — add them to the workspace (or global tree) where pi runs:
+`npm i tree-sitter tree-sitter-javascript tree-sitter-typescript tree-sitter-python`. Without them, planning and execution work normally and graph
+tools report which package is missing. On unsupported
 runtimes (Bun, missing parsers) graph commands fail locally without
 affecting the planning workflow.
 
