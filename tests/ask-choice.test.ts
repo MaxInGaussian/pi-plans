@@ -87,6 +87,7 @@ describe("ask_choice trailing option", () => {
 		const text = result.content[0].text as string;
 		assert.match(text, /User selected Auto-refine loop/);
 		assert.match(text, /until no high-severity finding \(hard cap 5 rounds\)/);
+		assert.match(text, /goal wait: continue until no unpassed VCs remain/);
 		assert.match(text, /refine \(role: "reviewer", target: "implementation"\)/);
 		assert.equal(result.details.source, "user");
 		assert.equal(result.details.answer, "Auto-refine loop");

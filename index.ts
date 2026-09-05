@@ -39,6 +39,8 @@ import {
 	refreshPlanningCompactionCooldown,
 	requestPlanningCompaction,
 	restoreFromSession,
+	resetGoalWaitTurnFlags,
+	resumeGoalWaitIfPaused,
 	stopExecution,
 	updateStatusWidget,
 	shouldTriggerPlanningCompaction,
@@ -247,6 +249,8 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	pi.on("before_agent_start", async (_event, ctx) => {
 		drainExecutionFlush(pi, ctx);
+		resetGoalWaitTurnFlags();
+		resumeGoalWaitIfPaused(pi, ctx);
 		const content = executionContextMessage(ctx);
 		if (!content) {
 			if (!getExecution() && shouldTriggerPlanningCompaction(ctx)) {

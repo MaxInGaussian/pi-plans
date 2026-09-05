@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
+	AMELIORATION_PROMPT_TEXT,
 	applyDoneMarkers,
 	applyImplMarkers,
 	applyCurrentIMarker,
@@ -19,6 +20,7 @@ import {
 	filterExecutionResumeMessages,
 	filterPlanningResumeMessages,
 	getExecution,
+	resumeGoalWaitIfPaused,
 	handleExecutionBeforeCompact,
 	handleExecutionCompact,
 	handleExecutionTurnCompaction,
@@ -35,6 +37,7 @@ import {
 	refreshPlanningCompactionCooldown,
 	requestPlanningCompaction,
 	restoreFromSession,
+	resetGoalWaitTurnFlags,
 	shouldTriggerPlanningCompaction,
 	startExecution,
 	recordExecutionTurn,
@@ -59,6 +62,7 @@ interface Recorded {
 	current: { provider: string; id: string } | null;
 	thinking: string | null;
 	userMessages: string[];
+	userMessageOptions: Array<Record<string, unknown> | null>;
 	compacts?: { customInstructions?: string }[];
 }
 
@@ -83,6 +87,7 @@ function makeHarness(workdir: string): Harness {
 		current: { provider: "p", id: "m" },
 		thinking: "high",
 		userMessages: [],
+		userMessageOptions: [],
 	};
 	let contextPercent: number | null = 0;
 	const registryModels = [
@@ -113,8 +118,9 @@ function makeHarness(workdir: string): Harness {
 		sendMessage: (message: { customType: string; content: string }, options?: { triggerTurn?: boolean }) => {
 			recorded.messages.push({ ...message, options });
 		},
-		sendUserMessage: async (content: string) => {
+		sendUserMessage: async (content: string, options?: Record<string, unknown>) => {
 			recorded.userMessages.push(content);
+			recorded.userMessageOptions.push(options ?? null);
 		},
 		setModel: async (model: { provider: string; id: string }) => {
 			recorded.models.push({ provider: model.provider, id: model.id });
@@ -269,7 +275,8 @@ describe("execution loop", () => {
 		const completeMessage = recorded.messages.find((message) => message.customType === "pi-plans-complete");
 		assert.ok(completeMessage);
 		assert.match(completeMessage.content, /Goal-running continuation/);
-		assert.match(completeMessage.content, /termination condition of the implementation-review loop/);
+		assert.match(completeMessage.content, /How should the implementation-review loop terminate\?/);
+		assert.match(completeMessage.content, /goal wait: continue until no unpassed VCs remain/);
 		assert.doesNotMatch(completeMessage.content, /Run a post-execution amelioration round/);
 		assert.equal(completeMessage.options?.triggerTurn, true);
 		const ameliorateEntry = recorded.entries.find((entry) => entry.customType === "pi-plans-ameliorate");
@@ -1451,3 +1458,139 @@ function makePreparation(reason: "manual" | "threshold" | "overflow", previousSu
 		settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
 	};
 }
+
+describe("execution goal-wait continuation", () => {
+	// Fresh per-turn continuation flags, mirroring the before_agent_start reset.
+	const setup = (workdir: string) => {
+		resetGoalWaitTurnFlags();
+		const harness = makeHarness(workdir);
+		registerExecutionTurnHandlers(harness.pi);
+		return harness;
+	};
+
+	it("sends a goal-wait followUp when a turn ends with unpassed VCs", async () => {
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-goal-wait-"));
+		const { pi, ctx, recorded, emit } = setup(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
+		recorded.userMessages.length = 0;
+		await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "still working" }] } });
+		assert.equal(recorded.userMessages.length, 1);
+		assert.match(recorded.userMessages[0], /Goal wait: 1\/1 verifier items still open/);
+		assert.match(recorded.userMessages[0], /\`VC-001\`/);
+		assert.equal(recorded.userMessageOptions.at(-1)?.deliverAs, "followUp");
+		assert.match(recorded.status ?? "", /goal-wait · 无进展 1\/3 · 等待 0\/6/);
+	});
+
+	it("sends the goal-wait followUp in headless sessions too", async () => {
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-goal-wait-"));
+		const { pi, ctx, recorded, emit } = setup(workdir);
+		(ctx as any).hasUI = false;
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
+		recorded.userMessages.length = 0;
+		await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "still working" }] } });
+		assert.equal(recorded.userMessages.length, 1);
+		assert.match(recorded.userMessages[0], /Goal wait: 1\/1 verifier items still open/);
+	});
+
+	it("does not goal-wait when every VC is done (completion path)", async () => {
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-goal-wait-"));
+		const { pi, ctx, recorded, emit } = setup(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
+		recorded.userMessages.length = 0;
+		await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "done [DONE:VC-001]" }] } });
+		assert.equal(recorded.userMessages.length, 0);
+		assert.ok(recorded.messages.some((message) => message.customType === "pi-plans-complete"));
+	});
+
+	it("skips goal-wait while any compaction continuation flag is active", async () => {
+		const variants = [
+			{ inFlight: true, resumeGuard: false, pendingFollowUpPrompt: null },
+			{ inFlight: false, resumeGuard: true, pendingFollowUpPrompt: null },
+			{ inFlight: false, resumeGuard: false, pendingFollowUpPrompt: "compaction follow-up" },
+		];
+		for (const flags of variants) {
+			const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-goal-wait-"));
+			const { pi, ctx, recorded, emit } = setup(workdir);
+			await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
+			(ctx.sessionManager as any).__executionCompaction = { ...flags, cooldownActive: false };
+			recorded.userMessages.length = 0;
+			await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "working" }] } });
+			assert.equal(recorded.userMessages.length, 0, `flags ${JSON.stringify(flags)} must skip goal-wait`);
+		}
+	});
+
+	it("pauses after 3 no-progress rounds and resumes on kick", async () => {
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-goal-wait-"));
+		const { pi, ctx, recorded, emit } = setup(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
+		recorded.userMessages.length = 0;
+		for (let round = 0; round < 3; round++) {
+			await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "still working" }] } });
+		}
+		assert.equal(getExecution()?.goalWait?.paused, true);
+		assert.equal(recorded.userMessages.length, 2, "third quiet round must not queue another followUp");
+		assert.ok(recorded.notifies.some((entry) => /goal-wait paused/.test(entry.message)));
+		assert.match(recorded.status ?? "", /⏸ goal-wait paused/);
+
+		resumeGoalWaitIfPaused(pi, ctx);
+		assert.equal(getExecution()?.goalWait?.paused, false);
+		await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "progress [DONE:VC-001]" }] } });
+		assert.match(recorded.userMessages.at(-1) ?? "", /Goal wait/);
+	});
+
+	it("waiting rounds are exempt until the sixth quiet waiting round", async () => {
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-goal-wait-"));
+		const { pi, ctx, recorded, emit } = setup(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
+		for (let round = 1; round <= 5; round++) {
+			await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: `waiting for CI (${round})` }] } });
+			assert.equal(getExecution()?.goalWait?.paused, false, `round ${round} must not pause`);
+		}
+		await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "waiting for CI (6)" }] } });
+		assert.equal(getExecution()?.goalWait?.paused, true);
+		assert.ok(recorded.notifies.some((entry) => /waiting without progress for 6 rounds/.test(entry.message)));
+	});
+
+	it("progress resets both guard counters", async () => {
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-goal-wait-"));
+		const { pi, ctx, emit } = makeHarness(workdir);
+		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001", "VC-002"));
+		await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "working" }] } });
+		await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "working" }] } });
+		await emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "progress [DONE:VC-001]" }] } });
+		assert.equal(getExecution()?.goalWait?.noProgressRounds, 0);
+		assert.equal(getExecution()?.goalWait?.waitRounds, 0);
+	});
+
+	it("keeps goal-wait counters across restore", async () => {
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-goal-wait-"));
+		const { pi, ctx } = setup(workdir);
+		const planPath = path.join(workdir, "PLAN_v1.md");
+		fs.writeFileSync(planPath, "# plan");
+		const snapshot = {
+			planPath,
+			items: items("VC-001"),
+			startedAt: "2026-08-25T00:00:00Z",
+			usage: { inToks: 0, outToks: 0 },
+			implItems: [],
+			implStatus: {},
+			goalWait: { noProgressRounds: 2, waitRounds: 1, lastMarkers: null, paused: false },
+		};
+		const entries = [
+			{ type: "custom", customType: "pi-plans-exec", data: snapshot },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "no new progress this turn" }] } },
+		];
+		await restoreFromSession(pi, ctx, entries as any);
+		// Replay advanced the marker snapshot past the persisted baseline → counters reset (D-010).
+		assert.equal(getExecution()?.goalWait?.noProgressRounds, 0);
+		assert.equal(getExecution()?.goalWait?.waitRounds, 0);
+	});
+});
+
+describe("amelioration termination prompt", () => {
+	it("recommends goal-wait first and keeps the round options", () => {
+		assert.match(AMELIORATION_PROMPT_TEXT, /goal wait: continue until no unpassed VCs remain/);
+		assert.match(AMELIORATION_PROMPT_TEXT, /until no high-severity finding \(hard cap 5 rounds\)/);
+		assert.match(AMELIORATION_PROMPT_TEXT, /How should the implementation-review loop terminate\?/);
+	});
+});

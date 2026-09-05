@@ -36,6 +36,7 @@ import {
 import { getRun, readActive, resolveStateRootOrNull, setRunStatus, utcNow } from "./state.ts";
 import { graphBlockForExecutor } from "./code-graph/prompts.ts";
 import { resolveGraphMode } from "./code-graph/mode.ts";
+import { TERMINATION_QUESTION, TERMINATION_OPTIONS, renderTerminationOptions } from "./termination-prompt.ts";
 import {
 	extractCoverage,
 	latestPlanVersion,
@@ -58,7 +59,20 @@ export interface ExecState {
 	implItems?: ImplItem[];
 	implStatus?: Record<string, ImplMarkerState>;
 	currentI?: string;
+	goalWait?: GoalWaitState;
 }
+
+export interface GoalWaitState {
+	noProgressRounds: number;
+	waitRounds: number;
+	/** Marker/progress snapshot of the last goal-wait round; null = baseline not set. */
+	lastMarkers: string | null;
+	paused: boolean;
+	pausedReason?: string;
+}
+
+const GOAL_WAIT_MAX_NO_PROGRESS = 3;
+const GOAL_WAIT_MAX_WAITING = 6;
 
 let execution: ExecState | null = null;
 
@@ -198,7 +212,14 @@ function formatToks(tokens: number): string {
 
 export function formatExecutionStatusLine(execution: ExecState): string {
 	const progress = computeExecutionProgress(execution);
-	return `⌛ plans ${progress.done}/${progress.total}: spent ${formatElapsed(execution.startedAt)} · ${formatToks(execution.usage.inToks)} in-toks · ${formatToks(execution.usage.outToks)} out-toks`;
+	let line = `⌛ plans ${progress.done}/${progress.total}: spent ${formatElapsed(execution.startedAt)} · ${formatToks(execution.usage.inToks)} in-toks · ${formatToks(execution.usage.outToks)} out-toks`;
+	const goalWait = execution.goalWait;
+	if (goalWait?.paused) {
+		line += ` · ⏸ goal-wait paused (${goalWait.pausedReason ?? "paused"})`;
+	} else if (goalWait && (goalWait.noProgressRounds > 0 || goalWait.waitRounds > 0)) {
+		line += ` · 🔁 goal-wait · 无进展 ${goalWait.noProgressRounds}/3 · 等待 ${goalWait.waitRounds}/6`;
+	}
+	return line;
 }
 
 export function updateStatusWidget(ctx: ExtensionContext): void {
@@ -250,6 +271,7 @@ function persist(pi: ExtensionAPI): void {
 		implItems: execution.implItems,
 		implStatus: execution.implStatus,
 		currentI: execution.currentI,
+		goalWait: execution.goalWait,
 	});
 }
 
@@ -260,7 +282,10 @@ export async function startExecution(
 	items: CheckItem[],
 	implItems?: ImplItem[],
 ): Promise<void> {
-	execution = { planPath, items, startedAt: utcNow(), usage: { inToks: 0, outToks: 0 }, implItems: implItems ?? [], implStatus: {} };
+	execution = { planPath, items, startedAt: utcNow(), usage: { inToks: 0, outToks: 0 }, implItems: implItems ?? [], implStatus: {}, goalWait: { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false } };
+	// Seed the marker baseline so the first quiet round is counted against a
+	// real snapshot instead of counting unconditionally (F-006).
+	if (execution.goalWait) execution.goalWait.lastMarkers = goalWaitSnapshot();
 	pendingExecutionFlush = false; // fresh run: no inherited flush debt
 	resetExecutionCompactionState(ctx);
 	persist(pi);
@@ -336,6 +361,8 @@ export function registerExecutionTurnHandlers(
 		}
 		if (getExecution() && isExecutionComplete()) {
 			await completeExecution(pi, ctx);
+		} else if (getExecution()) {
+			maybeGoalWaitFollowUp(pi, ctx, text);
 		}
 		await onTurnEnd?.(ctx);
 	});
@@ -465,6 +492,7 @@ export async function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionCon
 	if (!event.willRetry && stats) {
 		ctx.ui.notify(formatVccCompactionStats(stats), "info");
 		if (followUpPrompt) {
+			compactionFollowUpSentThisTurn = true;
 			await pi.sendUserMessage?.(followUpPrompt);
 		} else if ((event.reason === "threshold" || event.reason === "overflow") && shouldScheduleAutoContinue(continueAfterThresholdCompact, runtimePiVersion(ctx))) {
 			state.resumeGuard = true;
@@ -881,6 +909,109 @@ export function isExecutionComplete(): boolean {
 	return execution !== null && execution.items.length > 0 && execution.items.every((item) => item.done);
 }
 
+let compactionFollowUpSentThisTurn = false;
+
+/** Reset per-turn continuation flags at the start of a new agent turn. */
+export function resetGoalWaitTurnFlags(): void {
+	compactionFollowUpSentThisTurn = false;
+}
+
+function goalWaitSnapshot(): string {
+	if (!execution) return "";
+	return JSON.stringify({
+		done: execution.items
+			.filter((item) => item.done)
+			.map((item) => item.id)
+			.sort()
+			.join("|"),
+		implStatus: execution.implStatus ?? {},
+		currentI: execution.currentI ?? null,
+	});
+}
+
+function pauseGoalWait(pi: ExtensionAPI, ctx: ExtensionContext, reason: string): void {
+	const ex = getExecution();
+	if (!ex?.goalWait) return;
+	ex.goalWait.paused = true;
+	ex.goalWait.pausedReason = reason;
+	persist(pi);
+	ctx.ui.notify?.(
+		`pi-plans: goal-wait paused (${reason}). Send any message or run /plans-execute to resume.`,
+		"warning",
+	);
+	updateStatusWidget(ctx);
+}
+
+/**
+ * Goal-wait continuation: a turn that ends with unpassed VCs gets one light
+ * followUp so the worker keeps going (working, or polling an external event
+ * per the taught backoff rules). Skipped when the compaction machinery owns
+ * continuation for this turn, and paused entirely by the no-progress guard.
+ * Note: the tri-flag check here deliberately runs BEFORE index.ts's
+ * handleExecutionTurnCompaction consumes resumeGuard — checking after the
+ * one-shot consumption would never observe it.
+ */
+function maybeGoalWaitFollowUp(pi: ExtensionAPI, ctx: ExtensionContext, assistantText: string): void {
+	const ex = getExecution();
+	if (!ex) return;
+	ex.goalWait ??= { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false };
+	const goalWait = ex.goalWait;
+	if (goalWait.paused) {
+		updateStatusWidget(ctx);
+		return;
+	}
+	const compaction = executionCompactionState(ctx);
+	if (compaction && (compaction.inFlight || compaction.pendingFollowUpPrompt != null || compaction.resumeGuard)) {
+		updateStatusWidget(ctx);
+		return;
+	}
+	if (compactionFollowUpSentThisTurn) {
+		compactionFollowUpSentThisTurn = false; // the compaction path already queued a continuation
+		updateStatusWidget(ctx);
+		return;
+	}
+	const snapshot = goalWaitSnapshot();
+	const changed = goalWait.lastMarkers !== null && snapshot !== goalWait.lastMarkers;
+	goalWait.lastMarkers = snapshot;
+	if (!changed) {
+		if (/waiting for/i.test(assistantText)) {
+			goalWait.waitRounds += 1;
+		} else {
+			goalWait.noProgressRounds += 1;
+		}
+	} else {
+		goalWait.noProgressRounds = 0;
+		goalWait.waitRounds = 0;
+	}
+	if (goalWait.noProgressRounds >= GOAL_WAIT_MAX_NO_PROGRESS) {
+		pauseGoalWait(pi, ctx, `no progress in ${goalWait.noProgressRounds} rounds`);
+		return;
+	}
+	if (goalWait.waitRounds >= GOAL_WAIT_MAX_WAITING) {
+		pauseGoalWait(pi, ctx, `waiting without progress for ${goalWait.waitRounds} rounds`);
+		return;
+	}
+	const remaining = ex.items.filter((item) => !item.done);
+	const remainingIds = remaining.map((item) => `\`${item.id}\``).join(", ");
+	pi.sendUserMessage?.(
+		`Goal wait: ${remaining.length}/${ex.items.length} verifier items still open (${remainingIds}). Continue the plan — if blocked on an external event, keep waiting per the backoff rules; otherwise resolve the remaining items.`,
+		{ deliverAs: "followUp" },
+	);
+	updateStatusWidget(ctx);
+}
+
+/** Any external input re-kicks a paused goal-wait (clears pause and counters). */
+export function resumeGoalWaitIfPaused(pi: ExtensionAPI, ctx: ExtensionContext): void {
+	const ex = getExecution();
+	if (!ex?.goalWait?.paused) return;
+	ex.goalWait.paused = false;
+	ex.goalWait.pausedReason = undefined;
+	ex.goalWait.noProgressRounds = 0;
+	ex.goalWait.waitRounds = 0;
+	persist(pi);
+	updateStatusWidget(ctx);
+}
+
 export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
 	if (!execution) return;
 	resetExecutionCompactionState(ctx);
@@ -925,9 +1056,10 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 
 /** Instructions appended to the post-execution completion message in
  * interactive sessions, telling the agent to enter the goal-running
- * implementation-review loop. */
+ * implementation-review loop. Termination options are single-sourced from
+ * src/termination-prompt.ts (shared with the ask_choice trailing branch). */
 export const AMELIORATION_PROMPT_TEXT = `---
-Goal-running continuation: immediately ask the user now via ask_choice (autoComplete: false, in the session language) for the termination condition of the implementation-review loop: until no high-severity finding (hard cap 5 rounds, recommended) / 1 round / 2 rounds / 3 rounds. Then keep running the loop without asking whether to continue: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and repeats until the chosen termination condition or the 5-round cap.`;
+Goal-running continuation: immediately ask the user now via ask_choice (autoComplete: false, in the session language) the termination question: "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. Then keep running the implementation-review loop without asking whether to continue; the goal-wait option keeps the loop running until no unpassed VCs remain.`;
 
 /** Injection text for before_agent_start while executing. */
 export function executionContextMessage(ctx: ExtensionContext): string | null {
@@ -1015,6 +1147,9 @@ export async function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext
 		implItems: snapshot.implItems ?? [],
 		implStatus: { ...(snapshot.implStatus ?? {}) },
 		currentI: snapshot.currentI ?? inferCurrentI(snapshot.implItems, snapshot.items, snapshot.implStatus),
+		goalWait: snapshot.goalWait
+			? { ...snapshot.goalWait }
+			: { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false },
 	};
 	for (let i = snapshotIndex + 1; i < entries.length; i++) {
 		const entry = entries[i];
@@ -1034,6 +1169,16 @@ export async function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext
 		}
 	}
 	if (execution) {
+		// D-010: replay may have advanced progress past the persisted baseline.
+		// Recompute the goal-wait markers; new progress resets the guard counters.
+		if (execution.goalWait) {
+			const markerSnapshot = goalWaitSnapshot();
+			if (markerSnapshot !== execution.goalWait.lastMarkers) {
+				execution.goalWait.lastMarkers = markerSnapshot;
+				execution.goalWait.noProgressRounds = 0;
+				execution.goalWait.waitRounds = 0;
+			}
+		}
 		persist(pi); // refresh snapshot so the next resume has less to rescan
 		if (isExecutionComplete()) {
 			// Completed during the rescan: restore the planning model on the way out.

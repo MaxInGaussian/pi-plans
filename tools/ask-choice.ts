@@ -15,6 +15,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { disableAutoComplete, enableAutoComplete, isAutoCompleteEnabled, recordAskChoice } from "../src/autocomplete.ts";
+import { TERMINATION_QUESTION, TERMINATION_OPTIONS, renderTerminationOptions } from "../src/termination-prompt.ts";
 import { truncateToWidth, visibleWidth } from "../src/refine-ui-helpers.ts";
 import { normalizeWorkdir, readActive, recordDecision } from "../src/state.ts";
 
@@ -298,7 +299,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text",
-							text: `User selected Auto-refine loop. Immediately ask the follow-up with ask_choice (autoComplete: false, in the session language): how should the amelioration loop terminate? Options (recommended first): 1. until no high-severity finding (hard cap 5 rounds) 2. 1 round 3. 2 rounds 4. 3 rounds. Then run the loop per the completion instructions: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and continues until the termination condition or the 5-round cap.`,
+							text: `User selected Auto-refine loop. Immediately ask the follow-up with ask_choice (autoComplete: false, in the session language): "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. Then run the loop per the completion instructions: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and continues until the chosen termination condition — the goal-wait option keeps the loop running until no unpassed VCs remain.`,
 						},
 					],
 					details: details("Auto-refine loop", "user"),
