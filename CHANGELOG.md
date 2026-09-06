@@ -4,6 +4,33 @@ All notable changes to **pi-plans** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-09-06
+
+### Added
+
+- **Per-reference analysis subagents.** plan-with-refs now runs one
+  independent read-only subagent per downloaded reference (cwd = the ref's
+  own directory, batches of at most 3 under a `Refs` overlay) via the new
+  `analyze_refs` tool: it reuses the reviewer role gates and model, returns
+  structured per-reference sections (overview / mechanisms / adoptable
+  ideas / pitfalls / citations / coverage / gaps) for `REF_ANALYSIS.md`, and
+  records spawns best-effort in `subagents.jsonl`. Reference downloads are
+  config-driven: a new `refs_root` (asked once per workspace via
+  `plans set-refs-root` — recommended `.git/pi-plans/refs/`, second
+  `./refs/`, third `~/.cache/pi-plans/refs/`), honored by the planning write
+  guard, `/config-pi-plans`, and the plan-with-refs flow (manual structured
+  reads are replaced by the tool).
+- **Agent-side graph materialization.** The `code_graph` tool gains an
+  `apply` action that materializes DB-first staged edits into the worktree
+  without the TUI: same hard gates as `/apply-graph` (refused while the
+  active run is `planning`/`accepted`, plus a `PI_PLANS_REFINER` env-marker
+  refusal that keeps read-only refiner subagents write-free), a stable
+  three-state JSON result (`{ok:false,reason}` / `{ok:true,report:{counts,
+  files}}` with a post-apply drift summary), and no run-status side effects.
+  All agent-facing guidance now teaches the `staged → code_graph apply →
+  drift` loop; `/apply-graph` stays the user-facing command over the same
+  shared core.
+
 ## [0.3.0] - 2026-09-05
 
 ### Added

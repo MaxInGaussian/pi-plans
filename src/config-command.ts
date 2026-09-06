@@ -71,6 +71,11 @@ function parseArtifactRoot(input: string): string | null {
 	return value ? value : null;
 }
 
+function parseRefsRoot(input: string): string | null {
+	const value = input.trim();
+	return value ? value : null;
+}
+
 function parseModelSelector(input: string): string | null {
 	const value = input.trim();
 	if (!value) return null;
@@ -142,6 +147,24 @@ async function promptArtifactRoot(ctx: ConfigCommandContext, current: string): P
 		errorMessage: "Artifact root cannot be empty.",
 	});
 	return promptMenu(ctx, "Artifact root?", options);
+}
+
+async function promptRefsRoot(ctx: ConfigCommandContext, current: string | null): Promise<ChoiceResult<string>> {
+	const options: Array<MenuOption<string>> = [];
+	if (current) {
+		options.push({ label: `Keep current (${current})`, value: current });
+	}
+	for (const root of [".git/pi-plans/refs", "./refs", "~/.cache/pi-plans/refs"]) {
+		if (root === current) continue;
+		options.push({ label: root, value: root });
+	}
+	options.push({
+		label: "Other...",
+		parse: parseRefsRoot,
+		prompt: "Refs root:",
+		errorMessage: "Refs root cannot be empty.",
+	});
+	return promptMenu(ctx, "Refs root (plan-with-refs downloads)?", options);
 }
 
 async function promptGraphEnabled(ctx: ConfigCommandContext, current: boolean | null): Promise<ChoiceResult<boolean>> {
@@ -219,6 +242,7 @@ function summarizeConfig(config: PlansConfig): string[] {
 		"pi-plans config updated.",
 		`Language: ${config.language.tag ?? "(unset)"}`,
 		`Artifact root: ${config.artifact_root}`,
+		`Refs root: ${config.refs_root ?? "(unset)"}`,
 		`Code graph: ${config.graph_enabled === true ? "enabled" : config.graph_enabled === false ? "disabled" : "unset"}`,
 		`Reviewer: ${config.reviewer.mode} / ${config.reviewer.model_selector ?? "inherit"}`,
 		`Criticizer: ${config.criticizer.mode} / ${config.criticizer.model_selector ?? "inherit"}`,
@@ -246,6 +270,14 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 		const artifactRoot = await promptArtifactRoot(ctx, current.artifact_root);
 		if (artifactRoot.cancelled) {
 			if (artifactRoot.reason === "user") {
+				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
+			}
+			return;
+		}
+
+		const refsRoot = await promptRefsRoot(ctx, current.refs_root);
+		if (refsRoot.cancelled) {
+			if (refsRoot.reason === "user") {
 				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
 			}
 			return;
@@ -297,6 +329,9 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 			config.artifact_root = artifactRoot.value;
 			config.artifact_root_source = "user";
 			config.artifact_root_updated_at = now;
+			config.refs_root = refsRoot.value;
+			config.refs_root_source = "user";
+			config.refs_root_updated_at = now;
 			config.graph_enabled = graphEnabled.value;
 			config.graph_enabled_updated_at = now;
 			config.reviewer = {

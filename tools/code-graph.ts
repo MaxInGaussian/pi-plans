@@ -21,6 +21,8 @@ import { hashText } from "../src/code-graph/parser.ts";
 import type { Language } from "../src/code-graph/types.ts";
 import { screeningQuery } from "../src/code-graph/screening.ts";
 import { deleteFile, listPending, updateFile, updateFunction } from "../src/code-graph/mutations.ts";
+import { applyGraphCore } from "../src/code-graph/commands.ts";
+import { normalizeWorkdir } from "../src/state.ts";
 
 const CodeGraphParams = Type.Object({
 	action: StringEnum(
@@ -34,6 +36,7 @@ const CodeGraphParams = Type.Object({
 			"list-pending",
 			"reindex",
 			"manifest",
+			"apply",
 		] as const,
 		{ description: "Code graph action to perform" },
 	),
@@ -45,7 +48,6 @@ const CodeGraphParams = Type.Object({
 	fullCode: Type.Optional(Type.String({ description: "New function body text for update-function" })),
 	text: Type.Optional(Type.String({ description: "New whole-file text for update-file" })),
 	limit: Type.Optional(Type.Number()),
-	force: Type.Optional(Type.Boolean()),
 });
 
 export type CodeGraphContext = Parameters<Parameters<ExtensionAPI["registerTool"]>[0]["execute"]>[4];
@@ -96,11 +98,32 @@ export function registerCodeGraphTool(pi: ExtensionAPI): void {
 		name: "code_graph",
 		label: "Code Graph",
 		description:
-			"Read-only code-graph actions: status, screening (no full_code), function read, reindex guard, manifest summary. No agent mutation API in v1.",
+			"Code-graph actions: read-only queries (status, screening without full_code, function read, manifest summary) plus `apply` — safe non-force materialization of DB-first staged edits into the worktree (same gate as /apply-graph: refused during active planning/accepted runs and for read-only refiner subagents via PI_PLANS_REFINER; returns per-file report with counts and a post-apply drift summary; never changes run status). reindex stays user-only (/init-graph).",
 		promptSnippet: "Read-only code graph queries",
 		parameters: CodeGraphParams,
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const workdir = params.workdir ?? ctx.cwd;
+			if (params.action === "apply") {
+				if (process.env.PI_PLANS_REFINER === "1") {
+					return {
+						content: [{ type: "text", text: JSON.stringify({ ok: false, reason: "code-graph apply refused: read-only refiner subagents cannot materialize worktree edits (PI_PLANS_REFINER)" }) }],
+						details: {},
+					};
+				}
+				const core = await applyGraphCore(normalizeWorkdir(workdir));
+				if (core.refused || core.failed || !core.report) {
+					return {
+						content: [{ type: "text", text: JSON.stringify({ ok: false, reason: core.refused ?? core.failed ?? "unknown error" }) }],
+						details: {},
+					};
+				}
+				const counts: Record<string, number> = { ok: 0, deleted: 0, stale: 0, "skipped-missing": 0, error: 0 };
+				for (const file of core.report.files) counts[file.status] = (counts[file.status] ?? 0) + 1;
+				return {
+					content: [{ type: "text", text: JSON.stringify({ ok: true, report: { counts, files: core.report.files }, drift: core.drift ?? null }) }],
+					details: {},
+				};
+			}
 			const ensured = await ensureRuntime(workdir, ctx);
 			if (!ensured) {
 				return {

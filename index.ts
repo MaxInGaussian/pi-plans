@@ -72,6 +72,7 @@ import { registerAskChoiceTool } from "./tools/ask-choice.ts";
 import { executeHandoff, registerExecutePlanTool } from "./tools/execute-plan.ts";
 import { registerPlansTool } from "./tools/plans.ts";
 import { registerRefineTool } from "./tools/refine.ts";
+import { registerAnalyzeRefsTool } from "./tools/analyze-refs.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
 
@@ -117,6 +118,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	registerPlansTool(pi);
 	registerAskChoiceTool(pi);
 	registerRefineTool(pi, baseDir);
+	registerAnalyzeRefsTool(pi, baseDir);
 	registerExecutePlanTool(pi);
 	registerQueryInterviewHooks(pi, hasActivePlanningWorkflow);
 	registerCodeGraphTool(pi);
@@ -200,13 +202,13 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		}
 		if (!graphEnabled) return;
 		if (event.toolName === "edit" || event.toolName === "write") {
-			ctx.ui?.notify?.("code-graph: source edited directly — run /update-graph to sync the graph, or use code_graph mutations + /apply-graph for DB-first edits", "info");
+			ctx.ui?.notify?.("code-graph: source edited directly — run /update-graph to sync the graph, or use code_graph mutations + code_graph apply for DB-first edits", "info");
 			return;
 		}
 		if (event.toolName === "code_graph") {
 			const action = String((event.input as { action?: string }).action ?? "");
 			if (action === "update-function" || action === "update-file" || action === "delete-file") {
-				ctx.ui?.notify?.("code-graph: mutation staged — run /apply-graph to materialize, then /graph-drift to verify", "info");
+				ctx.ui?.notify?.("code-graph: mutation staged — run code_graph apply to materialize (its result includes the post-apply drift summary)", "info");
 			}
 		}
 	});

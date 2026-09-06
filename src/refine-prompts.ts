@@ -103,6 +103,65 @@ ${opts.planText}
 ---8<--- END PLAN CONTENT ---8<---`;
 }
 
+export interface RefAnalystTaskInput {
+	refId: string;
+	localPath: string;
+	title?: string;
+	url?: string;
+	kind?: string;
+	context?: string;
+	languageTag?: string | null;
+}
+
+const REF_ANALYST_SECTIONS = [
+	"Overview",
+	"Key Mechanisms And Design Tradeoffs",
+	"Adoptable Ideas For The Target Repo",
+	"Pitfalls And Anti-Patterns",
+	"Evidence Citations",
+	"Coverage",
+	"Evidence Gaps",
+] as const;
+
+export function refAnalystSections(): readonly string[] {
+	return REF_ANALYST_SECTIONS;
+}
+
+/** Task brief for the plan-with-refs per-reference analysis subagent. */
+export function buildRefAnalystTask(opts: RefAnalystTaskInput): string {
+	const titleLine = opts.title ? `\nTitle: ${opts.title}` : "";
+	const urlLine = opts.url ? `\nURL: ${opts.url}` : "";
+	const kindLine = opts.kind ? `\nKind: ${opts.kind}` : "";
+	const contextLine = opts.context ? `\n\nTarget repo context: ${opts.context}` : "";
+	const languageLine = opts.languageTag
+		? `\n\nWrite all prose in the language with BCP47 tag "${opts.languageTag}". Keep file paths, identifiers, and code snippets verbatim.`
+		: "";
+	const template = REF_ANALYST_SECTIONS.map((section) => `## ${section}`).join("\n\n(empty)\n\n");
+	return `Goal: deep-read this downloaded reference and extract what the target repository should adopt from it.
+
+Reference id: ${opts.refId}${titleLine}${urlLine}${kindLine}
+Local path (your working directory): ${opts.localPath}
+
+Authority boundary: read-only analysis only. Do not edit, write, delete, commit, push, or spawn subagents. Stay inside the reference directory.
+
+Evidence: inspect the reference with read, grep, find, and ls before judging it. Cite files as <relative-path>:<line> for every claim; quote only what you verified.${contextLine}${languageLine}
+
+Success criteria: a structured analysis the main agent can paste into REF_ANALYSIS.md and turn into adoption questions.
+
+Output: Markdown with exactly these seven top-level sections, in this order:
+
+${template}
+
+Section contracts:
+- Overview: what the reference is, its scope, maturity, and license (when discoverable).
+- Key Mechanisms And Design Tradeoffs: the mechanisms that make it work and the tradeoffs they embody.
+- Adoptable Ideas For The Target Repo: concrete, portable ideas ranked by expected value; name the target-repo surface each would touch.
+- Pitfalls And Anti-Patterns: what to avoid when borrowing; failure modes the reference itself documents or exhibits.
+- Evidence Citations: the file:line references backing the claims above.
+- Coverage: which parts of the reference you actually read versus skipped.
+- Evidence Gaps: what you could not determine from the reference alone.`;
+}
+
 export function buildImplementationCriticizerTask(opts: RefinePromptInput): string {
 	return `${buildImplementationSharedHeader("criticizer", opts)}
 

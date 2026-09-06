@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { planningWriteBlockReason } from "../src/guard.ts";
-import { initState, setRunStatus, startRun } from "../src/state.ts";
+import { initState, setRefsRoot, setRunStatus, startRun } from "../src/state.ts";
 
 let tmpRoot: string;
 
@@ -59,6 +59,32 @@ describe("planning write guard", () => {
 		// Once the run leaves planning/accepted, the guard lifts.
 		setRunStatus(workdir, run.run_id, "executing");
 		assert.equal(planningWriteBlockReason({ workdir, toolName: "write", rawPath: "src/main.ts" }), null);
+	});
+
+	it("allows writes under a configured refs_root and stays strict without one", () => {
+		const workdir = path.join(tmpRoot, "refs-root-guard");
+		fs.mkdirSync(workdir);
+		initState(workdir);
+		startRun(workdir, { topic: "refs guard", skill: "plan-with-refs", requestText: "x" });
+
+		// Without a configured refs_root, ./refs/ writes stay blocked.
+		assert.ok(planningWriteBlockReason({ workdir, toolName: "write", rawPath: "./refs/paper.md" }));
+
+		setRefsRoot(workdir, "./refs", "user");
+		assert.equal(planningWriteBlockReason({ workdir, toolName: "write", rawPath: "./refs/paper.md" }), null);
+		assert.equal(
+			planningWriteBlockReason({ workdir, toolName: "edit", rawPath: path.join(workdir, "refs", "notes.md") }),
+			null,
+		);
+		// The refs root does not open up the whole worktree.
+		assert.ok(planningWriteBlockReason({ workdir, toolName: "write", rawPath: "src/main.ts" }));
+
+		// The .git/pi-plans/refs (hyphenated) recommendation is covered by an absolute entry too.
+		setRefsRoot(workdir, ".git/pi-plans/refs", "user");
+		assert.equal(
+			planningWriteBlockReason({ workdir, toolName: "write", rawPath: ".git/pi-plans/refs/repo-a/" }),
+			null,
+		);
 	});
 
 	it("is inactive without an active run", () => {

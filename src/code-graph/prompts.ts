@@ -13,6 +13,6 @@ export function graphBlockForRefiner(enabled: boolean): string {
 
 export function graphBlockForExecutor(enabled: boolean): string {
 	return enabled
-		? "Code graph loop: indexed code files read as a function digest by default — never whole-file; drill in via offset/limit or code_graph get-function, full:true is the only whole-file exit. Edit via graph-aware edit (DB-first), then /apply-graph → /graph-drift → plans final-commit."
+		? "Code graph loop: indexed code files read as a function digest by default — never whole-file; drill in via offset/limit or code_graph get-function, full:true is the only whole-file exit. Edit via graph-aware edit (DB-first), then code_graph apply (its result includes the post-apply drift summary) → plans final-commit."
 		: "Code graph disabled: edit source files directly with edit/write.";
 }

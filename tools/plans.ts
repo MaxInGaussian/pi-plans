@@ -22,6 +22,7 @@ import {
 	setArtifactRoot,
 	setGraphEnabled,
 	setLanguage,
+	setRefsRoot,
 	setRunStatus,
 	setRole,
 	showConfig,
@@ -37,6 +38,7 @@ const PlansParams = Type.Object({
 			"show",
 			"set-language",
 			"set-artifact-root",
+			"set-refs-root",
 			"set-graph-enabled",
 			"set-role",
 			"start-run",
@@ -58,6 +60,8 @@ const PlansParams = Type.Object({
 	languageSource: Type.Optional(StringEnum(["user", "auto"] as const)),
 	artifactRoot: Type.Optional(Type.String({ description: "set-artifact-root: planning docs root, e.g. ./docs/pi-plans" })),
 	artifactRootSource: Type.Optional(StringEnum(["user", "auto"] as const)),
+	refsRoot: Type.Optional(Type.String({ description: "set-refs-root: reference downloads root, e.g. .git/pi-plans/refs" })),
+	refsRootSource: Type.Optional(StringEnum(["user", "auto"] as const)),
 	enabled: Type.Optional(Type.Boolean({ description: "set-graph-enabled: enable/disable the code graph" })),
 	message: Type.Optional(Type.String({ description: "final-commit: commit message body" })),
 	role: Type.Optional(StringEnum(["reviewer", "criticizer"] as const)),
@@ -98,7 +102,7 @@ const PlansParams = Type.Object({
 	),
 	subagent: Type.Optional(
 		Type.Object({
-			role: StringEnum(["reviewer", "criticizer"] as const),
+			role: StringEnum(["reviewer", "criticizer", "ref-analyst"] as const),
 			name: Type.String(),
 			model: Type.Optional(Type.String()),
 			sessionDir: Type.Optional(Type.String()),
@@ -172,7 +176,7 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 		name: "plans",
 		label: "Plans",
 		description:
-			"Manage pi-plans planning state in the target workspace: init/show config, set language and planning docs root plus reviewer/criticizer roles and the code-graph enabled flag, start planning runs, record decisions/refs/subagents, and update run status. State lives in .git/pi_plans/ inside the resolved git common dir. Actions: init, show, set-language, set-artifact-root, set-graph-enabled, set-role, start-run, set-status, final-commit, record-decision, record-ref, record-subagent.",
+			"Manage pi-plans planning state in the target workspace: init/show config, set language and planning docs root plus reviewer/criticizer roles and the code-graph enabled flag, start planning runs, record decisions/refs/subagents, and update run status. State lives in .git/pi_plans/ inside the resolved git common dir. Actions: init, show, set-language, set-artifact-root, set-refs-root, set-graph-enabled, set-role, start-run, set-status, final-commit, record-decision, record-ref, record-subagent.",
 		promptSnippet: "Manage pi-plans planning state, runs, and ledgers",
 		parameters: PlansParams,
 
@@ -225,6 +229,14 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 							throw new StateError("set-artifact-root requires artifactRoot and artifactRootSource");
 						}
 						const updated = setArtifactRoot(workdir, params.artifactRoot, params.artifactRootSource);
+						result = { config: updated.config, stateRoot: updated.stateRoot, notices: updated.notices };
+						break;
+					}
+					case "set-refs-root": {
+						if (!params.refsRoot || !params.refsRootSource) {
+							throw new StateError("set-refs-root requires refsRoot and refsRootSource");
+						}
+						const updated = setRefsRoot(workdir, params.refsRoot, params.refsRootSource);
 						result = { config: updated.config, stateRoot: updated.stateRoot, notices: updated.notices };
 						break;
 					}

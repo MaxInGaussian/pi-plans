@@ -127,6 +127,40 @@ describe("refine overlay viewport", () => {
 		assert.ok(lines.some((line) => line.includes("output")));
 	});
 
+	it("renders the Refs title for the refs role and keeps legacy titles distinct", () => {
+		const refs = new RefineOverlayComponent(
+			fakeTheme,
+			"refs",
+			[readyLane("ref-1", "ref-1", "analysis output")],
+			() => {},
+			undefined,
+			"zai/glm-5.3-flash:high",
+		);
+		const refLines = refs.render(120);
+		assert.ok(refLines.some((line) => line.includes("Refs (zai/glm-5.3-flash:high)")));
+		assert.ok(refLines.every((line) => !line.includes("Criticizer") && !line.includes("Reviewer")));
+
+		const reviewer = new RefineOverlayComponent(
+			fakeTheme,
+			"reviewer",
+			[readyLane("lane-1", "general", "ok")],
+			() => {},
+			undefined,
+			"m1",
+		);
+		assert.ok(reviewer.render(120).some((line) => line.includes("Reviewer (m1)")));
+
+		const criticizer = new RefineOverlayComponent(
+			fakeTheme,
+			"criticizer",
+			[readyLane("lane-1", "criticizer", "ok")],
+			() => {},
+			undefined,
+			"m2",
+		);
+		assert.ok(criticizer.render(120).some((line) => line.includes("Criticizer (m2)")));
+	});
+
 	it("renders model-aware titles and footer hints", () => {
 		const lanes = [
 			readyLane("lane-1", "correctness", "correctness output"),

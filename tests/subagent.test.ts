@@ -60,6 +60,28 @@ describe("subagent runner lifecycle", () => {
 		assert.equal(result.turns, 1);
 	});
 
+	it("marks refiner children with PI_PLANS_REFINER=1", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-fake-pi-env-"));
+		const script = path.join(dir, "fake-pi-env.mjs");
+		fs.writeFileSync(
+			script,
+			[
+				'const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");',
+				'emit({ type: "message_end", message: { role: "assistant", model: "fake/model", content: [{ type: "text", text: "marker=" + String(process.env.PI_PLANS_REFINER) }] } });',
+			].join("\n"),
+		);
+		const previousScript = process.argv[1];
+		process.argv[1] = script;
+		try {
+			const result = await runPiSubagent({ systemPrompt: "p", task: "env", cwd: process.cwd(), timeoutMs: 2000 });
+			assert.equal(result.ok, true);
+			assert.equal(result.output, "marker=1");
+		} finally {
+			process.argv[1] = previousScript;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("returns a cancelled result after aborting the child", async () => {
 		const abort = new AbortController();
 		const promise = withFakePi("slow", { signal: abort.signal, timeoutMs: 2000 });

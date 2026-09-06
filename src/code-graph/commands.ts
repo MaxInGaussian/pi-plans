@@ -17,7 +17,7 @@ import { makeBackend } from "./parsers/javascript.ts";
 import { PythonBackend } from "./parsers/python.ts";
 import type { ParserBackend } from "./parser.ts";
 import type { Language } from "./types.ts";
-import { materialize } from "./materialize.ts";
+import { materialize, type MaterializeReport } from "./materialize.ts";
 import { generateSummaries, type CompletionHandle, type SummaryReport } from "./summary.ts";
 import { readActive, getRun, setRunStatus } from "../state.ts";
 
@@ -84,12 +84,16 @@ async function bootstrap(ctx: CommandContext, opts: { reindex?: boolean }): Prom
 	return { store, paths, parsers, runtimeStatus: status };
 }
 
+function activePlanningRun(workdir: string): ActiveInfo | null {
+	const active = readActive(workdir);
+	if (!active) return null;
+	const run = getRun(workdir, active.run_id);
+	if (!run) return null;
+	return run.status === "planning" || run.status === "accepted" ? active : null;
+}
+
 function denyActivePlanning(ctx: CommandContext): boolean {
-	const active = readActive(ctx.cwd);
-	if (!active) return false;
-	const run = getRun(ctx.cwd, active.run_id);
-	if (!run) return false;
-	return run.status === "planning" || run.status === "accepted";
+	return activePlanningRun(ctx.cwd) !== null;
 }
 
 export async function initGraphCommand(args: string, ctx: CommandContext): Promise<void> {
@@ -172,33 +176,75 @@ export async function initGraphCommand(args: string, ctx: CommandContext): Promi
 	}
 }
 
+export interface ApplyGraphCoreResult {
+	refused?: string;
+	failed?: string;
+	report?: MaterializeReport;
+	drift?: { pending: number; ok: boolean } | null;
+}
+
+/**
+ * Shared core for /apply-graph and the code_graph "apply" tool action:
+ * gate (planning/accepted refusal) → bootstrap → materialize → drift summary.
+ * No notifications and no run-status side effects; callers own presentation
+ * and lifecycle transitions.
+ */
+export async function applyGraphCore(workdir: string, opts: { force?: boolean } = {}): Promise<ApplyGraphCoreResult> {
+	const planned = activePlanningRun(workdir);
+	if (planned) {
+		return { refused: `code-graph apply refused: a planning run is currently planning or accepted (run ${planned.run_id}).` };
+	}
+	let bootstrapFailure = "";
+	const bootstrapResult = await bootstrap(
+		{ cwd: workdir, hasUI: false, ui: { notify: (message: string) => { bootstrapFailure ||= message; }, confirm: async () => false } } as never,
+		{},
+	);
+	if (!bootstrapResult) return { failed: bootstrapFailure || "code-graph runtime unavailable" };
+	const { store, paths } = bootstrapResult;
+	try {
+		const report = materialize({ store, worktreeRoot: paths.worktreeRoot, force: opts.force ?? false });
+		let drift: ApplyGraphCoreResult["drift"] = null;
+		try {
+			const d = computeDrift(store, paths.worktreeRoot);
+			drift = { pending: d.pending.length, ok: d.ok };
+		} catch {
+			drift = null; // drift summary is best-effort; materialization already succeeded
+		}
+		return { report, drift };
+	} catch (error) {
+		return { failed: (error as Error).message };
+	} finally {
+		store.close();
+	}
+}
+
 export async function applyGraphCommand(args: string, ctx: CommandContext): Promise<void> {
 	if (denyActivePlanning(ctx)) {
 		ctx.ui.notify("code-graph apply refused: a planning run is currently planning or accepted.", "error");
 		return;
 	}
 	const flags = parseCommandArgs(args).flags;
-	const bootstrapResult = await bootstrap(ctx, {});
-	if (!bootstrapResult) return;
-	const { store, paths } = bootstrapResult;
-	try {
-		const report = materialize({ store, worktreeRoot: paths.worktreeRoot, force: flags.has("force") });
-		const stale = report.files.filter((file) => file.status === "stale").length;
-		const errors = report.files.filter((file) => file.status === "error").length;
-		const ok = report.files.filter((file) => file.status === "ok").length;
-		const deleted = report.files.filter((file) => file.status === "deleted").length;
-		const skipped = report.files.filter((file) => file.status === "skipped-missing").length;
-		ctx.ui.notify(
-			`code-graph apply: ${ok} ok, ${deleted} deleted, ${stale} stale, ${skipped} skipped-missing, ${errors} error`,
-			errors > 0 ? "error" : "info",
-		);
-		const active = readActive(ctx.cwd);
-		if (active) setRunStatus(ctx.cwd, active.run_id, "executing");
-	} catch (error) {
-		ctx.ui.notify(`code-graph apply failed: ${(error as Error).message}`, "error");
-	} finally {
-		store.close();
+	const core = await applyGraphCore(ctx.cwd, { force: flags.has("force") });
+	if (core.refused) {
+		ctx.ui.notify(core.refused, "error");
+		return;
 	}
+	if (core.failed || !core.report) {
+		ctx.ui.notify(`code-graph apply failed: ${core.failed ?? "unknown error"}`, "error");
+		return;
+	}
+	const report = core.report;
+	const stale = report.files.filter((file) => file.status === "stale").length;
+	const errors = report.files.filter((file) => file.status === "error").length;
+	const ok = report.files.filter((file) => file.status === "ok").length;
+	const deleted = report.files.filter((file) => file.status === "deleted").length;
+	const skipped = report.files.filter((file) => file.status === "skipped-missing").length;
+	ctx.ui.notify(
+		`code-graph apply: ${ok} ok, ${deleted} deleted, ${stale} stale, ${skipped} skipped-missing, ${errors} error`,
+		errors > 0 ? "error" : "info",
+	);
+	const active = readActive(ctx.cwd);
+	if (active) setRunStatus(ctx.cwd, active.run_id, "executing");
 }
 
 export async function graphStatusCommand(_args: string, ctx: CommandContext): Promise<void> {
@@ -309,7 +355,7 @@ export function computeDrift(store: Store, worktreeRoot: string): DriftResult {
 	const recommendation = needsUpdate
 		? "run /update-graph to reindex changed paths"
 		: needsApply
-			? "run /apply-graph to materialize pending DB edits"
+			? "run code_graph apply (or /apply-graph) to materialize pending DB edits"
 			: "in sync";
 	return {
 		ok: hashDrift.every((item) => item.kind !== "hash-mismatch") && unindexed.length === 0,

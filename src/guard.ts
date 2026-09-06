@@ -7,7 +7,7 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import { getRun, readActive, resolveStateRootOrNull } from "./state.ts";
+import { getRun, loadConfig, readActive, resolveStateRootOrNull } from "./state.ts";
 
 const GUARDED_TOOLS = new Set(["write", "edit"]);
 const GUARDED_STATUSES = new Set(["planning", "accepted"]);
@@ -31,6 +31,19 @@ export function planningWriteBlockReason(input: GuardInput): string | null {
 	const allowedRoots = [stateRoot, active.artifact_dir, path.join(os.homedir(), ".cache", "pi-plans")].filter(
 		(root): root is string => root !== null,
 	);
+	// A configured refs root (plan-with-refs downloads) is writable while planning.
+	if (stateRoot !== null) {
+		try {
+			const config = loadConfig(stateRoot);
+			if (config.refs_root) {
+				allowedRoots.push(
+					path.isAbsolute(config.refs_root) ? config.refs_root : path.resolve(input.workdir, config.refs_root),
+				);
+			}
+		} catch {
+			/* config read failed: no extra root */
+		}
+	}
 	const allowed = allowedRoots.some((root) => target === root || target.startsWith(`${root}${path.sep}`));
 	if (allowed) return null;
 

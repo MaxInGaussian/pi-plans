@@ -2,7 +2,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { buildCriticizerTask, buildImplementationCriticizerTask, buildImplementationReviewerTask, buildReviewerTask, reviewerLanes } from "../src/refine-prompts.ts";
+import { buildCriticizerTask, buildImplementationCriticizerTask, buildImplementationReviewerTask, buildRefAnalystTask, buildReviewerTask, refAnalystSections, reviewerLanes } from "../src/refine-prompts.ts";
 
 describe("reviewerLanes", () => {
 	it("uses stable lane ids for the big-plan fanout", () => {
@@ -31,6 +31,40 @@ describe("buildReviewerTask", () => {
 		assert.match(text, /Specific concerns from the main agent: check the checklist/);
 		assert.match(text, /Context: repo evidence/);
 		assert.match(text, /Surface at most five high-priority findings/);
+	});
+});
+
+describe("buildRefAnalystTask", () => {
+	it("carries the seven-section contract, ref metadata, and language instruction", () => {
+		const text = buildRefAnalystTask({
+			refId: "ref-1",
+			localPath: "/cache/refs/some-repo",
+			title: "Some Repo",
+			url: "https://github.com/x/some-repo",
+			kind: "project",
+			context: "pi-plans extension",
+			languageTag: "zh-Hans",
+		});
+
+		assert.match(text, /Reference id: ref-1/);
+		assert.match(text, /Title: Some Repo/);
+		assert.match(text, /URL: https:\/\/github\.com\/x\/some-repo/);
+		assert.match(text, /Local path \(your working directory\): \/cache\/refs\/some-repo/);
+		assert.match(text, /Authority boundary: read-only analysis only\./);
+		assert.match(text, /Target repo context: pi-plans extension/);
+		assert.match(text, /BCP47 tag "zh-Hans"/);
+		for (const section of refAnalystSections()) {
+			assert.ok(text.includes(`## ${section}`), `missing section: ${section}`);
+		}
+		assert.equal(refAnalystSections().length, 7);
+	});
+
+	it("omits optional lines when metadata is absent", () => {
+		const text = buildRefAnalystTask({ refId: "ref-2", localPath: "/tmp/r" });
+		assert.doesNotMatch(text, /Title:/);
+		assert.doesNotMatch(text, /URL:/);
+		assert.doesNotMatch(text, /Kind:/);
+		assert.doesNotMatch(text, /BCP47 tag/);
 	});
 });
 

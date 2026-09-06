@@ -21,6 +21,7 @@ const REQUIRED_TOOL_FILES = [
 	"tools/plans.ts",
 	"tools/ask-choice.ts",
 	"tools/refine.ts",
+	"tools/analyze-refs.ts",
 	"tools/execute-plan.ts",
 	"tools/code-graph.ts",
 	"src/state.ts",

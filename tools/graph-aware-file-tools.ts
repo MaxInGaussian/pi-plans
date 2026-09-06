@@ -302,7 +302,7 @@ function createGraphWriteTool(cwd: string) {
 				content: [
 					{
 						type: "text",
-						text: `code graph: staged ${mutation.created ? "new" : "updated"} file ${info.relativePath}; run /apply-graph to materialize`,
+						text: `code graph: staged ${mutation.created ? "new" : "updated"} file ${info.relativePath}; run code_graph apply to materialize`,
 					},
 				],
 				details: {},
@@ -363,7 +363,7 @@ function createGraphEditTool(cwd: string) {
 				content: [
 					{
 						type: "text",
-						text: `${textContent(result)} (staged in code graph; run /apply-graph to materialize)`,
+						text: `${textContent(result)} (staged in code graph; run code_graph apply to materialize)`,
 					},
 				],
 			};

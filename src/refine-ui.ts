@@ -203,7 +203,7 @@ function summaryFor(role: RefineOverlayRole, lanes: RefineLaneState[], modelLabe
 	const complete = lanes.filter((lane) => lane.status === "complete").length;
 	const terminal = lanes.filter((lane) => ["complete", "failed", "cancelled"].includes(lane.status)).length;
 	const running = lanes.filter((lane) => lane.status === "running").length;
-	const title = role === "reviewer" ? "Reviewer" : "Criticizer";
+	const title = role === "reviewer" ? "Reviewer" : role === "refs" ? "Refs" : "Criticizer";
 	const visibleTitle = modelLabel ? `${title} (${modelLabel})` : title;
 	const state = terminal === lanes.length ? "done" : running > 0 ? `${running} running` : "queued";
 	return `${visibleTitle} · ${complete}/${lanes.length} done · ${state}`;

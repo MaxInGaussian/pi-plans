@@ -114,7 +114,7 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 |---|---|
 | Planning router + five specialist skills | Start with `/skill:planning` to route to the narrowest matching specialist (`plan-small` → `plan-big`, `debug-and-plan`, `plan-with-refs`) |
 | Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run; choosing Auto-complete enables recommendation-only answers for later eligible questions in the current planning run, with `/plans-autocomplete-stop` available to take back control. After execution completes, the continuation prompt enters goal-running mode by default: it asks only for the implementation-review loop's termination condition and then keeps refining until the loop ends or the cap is reached. |
-| Refinement rounds | Read-only reviewer/criticizer Pi subagents consolidate findings into the next plan version; delegated runs have standalone `Reviewer`/`Criticizer` progress overlays that close before the tool result returns |
+| Refinement rounds | Read-only reviewer/criticizer Pi subagents consolidate findings into the next plan version; delegated runs have standalone `Reviewer`/`Criticizer` progress overlays that close before the tool result returns; `analyze_refs` shows the same kind of overlay titled `Refs` while per-reference analysis subagents run |
 | Workspace state | Config, runs, decisions, refs, and subagent ledgers in `.git/pi_plans/` (git common dir) |
 | VCC compact | Active planning/execution compaction uses deterministic, no-LLM VCC-style summaries when Pi core emits manual `/compact`, threshold, or overflow events. Summaries use five bracket sections plus a brief transcript, keep a smart recent tail, support `keep:N`, and write VCC details/stats without adding `/pi-vcc` commands. |
 | Visible Refiner overlay | Delegated reviewer/criticizer subagents surface as a named public overlay in the TUI — one `Reviewer`/`Criticizer` panel with per-lane tool progress, full streaming transcript with follow-bottom scroll, Tab-pane focus, retention until the user presses `Esc` after completion, and clean cancelled/timed-out vs completed states. `reviewers: 3` renders three equal-height panes inside the same overlay |
@@ -130,12 +130,13 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 
 | Tool / Command | Purpose |
 |---|---|
-| `plans` | State CLI: `init`, `show`, `set-language`, `set-artifact-root`, `set-role`, `start-run`, `set-status`, `record-decision`, `record-ref`, `record-subagent` |
+| `plans` | State CLI: `init`, `show`, `set-language`, `set-artifact-root`, `set-refs-root`, `set-role`, `start-run`, `set-status`, `record-decision`, `record-ref`, `record-subagent` |
 | `ask_choice` | Numbered choice prompt; `autoComplete: false` for the merged accept/execute question and external-state questions |
 | `refine` | Reviewer/criticizer round via standalone read-only subagents (`--mode json -p --no-session --tools read,grep,find,ls`, plus `code_graph` for both roles when the workspace has the code graph enabled); `target: "plan"` (default) reviews the plan, `target: "implementation"` reviews the implemented worktree against the plan; delegated TUI runs show one `Reviewer`/`Criticizer` overlay (78% width × 78% height, top-center, ≥72 cols) with per-lane transcript, follow-bottom scroll, Tab focus, and retention until `Esc`; `reviewers: 3` renders three equal-height panes; enforces role/model confirmation gates |
+| `analyze_refs` | plan-with-refs reference analysis: one independent read-only subagent per downloaded reference (cwd = the ref directory), reusing the reviewer role gates and the concurrent overlay (titled `Refs`); batches of at most 3 lanes run sequentially; returns structured per-reference sections for `REF_ANALYSIS.md` |
 | `execute_plan` | Execution handoff: re-confirms with the user and enters extension-managed execution mode |
 | `/plans` | Show config, active run, and execution progress |
-| `/config-pi-plans` | Re-ask workspace defaults for language, artifact root, code graph, reviewer mode/model, and criticizer mode/model |
+| `/config-pi-plans` | Re-ask workspace defaults for language, artifact root, refs root, code graph, reviewer mode/model, and criticizer mode/model |
 | `/plans-execute [plan.md]` | Manual execution handoff (defaults to highest `PLAN_vN.md`) |
 | `/update-plan [plan.md] [reason…]` | Interrupt-and-refine: stops execution (if any), returns the run to planning, and directs the agent to revise the plan into `PLAN_vN+1.md` while preserving verified work |
 | `/plans-autocomplete-stop` | Stop the current run's Auto-complete mode and return later planning questions to normal interaction |
@@ -156,7 +157,7 @@ Pi core remains the owner of compaction scheduling: manual `/compact`, threshold
 
 ## Visible Refiner overlay
 
-Delegated `refine` rounds (reviewer or criticizer) show their progress directly inside the Pi TUI instead of disappearing into the child process's terminal. The overlay is a public, named panel so users always know who is doing what:
+Delegated `refine` rounds (reviewer or criticizer) and `analyze_refs` rounds (titled `Refs`) show their progress directly inside the Pi TUI instead of disappearing into the child process's terminal. The overlay is a public, named panel so users always know who is doing what:
 
 - **Pi-btw-aligned geometry.** Each round uses `width: "78%"`, `minWidth: 72`, `maxHeight: "78%"`, `anchor: "top-center"`, and `{ top: 1, left: 2, right: 2 }` margins (no dependency on `pi-btw`; the renderer is built on Pi's public `pi-tui` primitives).
 - **Complete streaming transcript.** Assistant text, thinking blocks, tool calls, tool results, and stderr are merged per turn/content block into lane entries without overlay-facing truncation; only the viewport slices them. Final `message_end` / `tool_execution_end` overwrite the live snapshot with the authoritative content.
@@ -249,12 +250,17 @@ read, and each function retains its full UTF-8 source.
   config unreadable) are marked in the result; refiner and criticizer
   subagents get the `code_graph` tool in their allowlist (verified in headless
   no-session children); the executor loop
-  becomes DB-first: `code_graph` mutations → `/apply-graph` → `/graph-drift`
-  → `plans final-commit` → `/init-graph`.
+  becomes DB-first: `code_graph` mutations → `code_graph apply` (agent-side
+  materialization; its result carries counts and the post-apply drift
+  summary) → `plans final-commit` → `/init-graph`.
 - The `code_graph` tool provides read-only screening (`status`, `screening`,
   `get-function`, `manifest`), DB-first mutations (`update-function`,
   `update-file`, `delete-file` — all mark files `pending_materialization`
-  and append to `change_log`), and `list-pending` so agents can navigate and
+  and append to `change_log`), `list-pending`, and the agent-invokable
+  `apply` action (same planning/accepted gate as `/apply-graph`; also
+  refused for read-only refiner subagents via the `PI_PLANS_REFINER` env
+  marker; returns per-file counts plus a post-apply drift summary without
+  changing run status) so agents can navigate, stage, materialize, and
   edit the graph without pulling `full_code`.
 
 Runtime requirements: the base extension still requires Node ≥ 22.6; the
@@ -285,7 +291,7 @@ pi-plans/
 
 ## Safety model
 
-Before the approved handoff the workflow writes only `.git/pi_plans/` state, the run's artifact directory, and `~/.cache/pi-plans/` — the extension blocks `edit`/`write` elsewhere while a run is `planning`/`accepted` (bash stays discipline-bound: inspection, `git init`, downloads into the cache). Reviewer/criticizer subagents run with read-only tools. `Auto-complete` may answer planning and refinement questions only; it is never offered for execution, installs, publishing, deployment, merge, push, or credential use, and non-interactive sessions stop instead of auto-approving those.
+Before the approved handoff the workflow writes only `.git/pi_plans/` state, the run's artifact directory, `~/.cache/pi-plans/`, and the configured refs root (set via `plans set-refs-root` or `/config-pi-plans`; the recommended `.git/pi-plans/refs/` lives inside the git dir and needs no extra guard) — the extension blocks `edit`/`write` elsewhere while a run is `planning`/`accepted` (bash stays discipline-bound: inspection, `git init`, downloads into the cache). Reviewer/criticizer/ref-analyst subagents run with read-only tools. `Auto-complete` may answer planning and refinement questions only; it is never offered for execution, installs, publishing, deployment, merge, push, or credential use, and non-interactive sessions stop instead of auto-approving those.
 
 ## Verification
 
@@ -311,7 +317,7 @@ Planning and refinement choices only (the recommended option). Choosing Auto-com
 
 **Where does all the state live?**
 
-Preferences and run ledgers in `.git/pi_plans/` inside your workspace's git directory (never tracked, never published); plan artifacts under the configured artifact root (default `./docs/pi-plans/`); large downloaded references outside the repo under `~/.cache/pi-plans/`.
+Preferences and run ledgers in `.git/pi_plans/` inside your workspace's git directory (never tracked, never published); plan artifacts under the configured artifact root (default `./docs/pi-plans/`); reference downloads under the configured refs root — asked once per workspace (recommended `.git/pi-plans/refs/`), changeable via `plans set-refs-root` or `/config-pi-plans`.
 
 **How is this different from just prompting an AI to make changes?**
 

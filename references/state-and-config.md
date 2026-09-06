@@ -27,7 +27,7 @@ Bare repositories are refused with a clear error. A missing `git` executable is 
   config.json
   pi-vcc-config.json
   active.json
-  runs/
+  runs/            # note: the refs root is a sibling — .git/pi-plans/refs (hyphenated), not under pi_plans/
     <run-id>/
       run.json
       decisions.jsonl
@@ -37,7 +37,7 @@ Bare repositories are refused with a clear error. A missing `git` executable is 
   cache/
 ```
 
-`config.json` is stable workspace preference state. `pi-vcc-config.json` is the repo-private compaction config used only by pi-plans' VCC-style compact hook. `active.json` and `runs/` are run state. Large external references stay outside the repository by default under `~/.cache/pi-plans/refs/`, with metadata recorded in the run state and public artifacts.
+`config.json` is stable workspace preference state. `pi-vcc-config.json` is the repo-private compaction config used only by pi-plans' VCC-style compact hook. `active.json` and `runs/` are run state. Reference downloads go to the configured `refs_root` (asked once per workspace when unset; the recommended `.git/pi-plans/refs/` sits inside the git dir so git never tracks it), with metadata recorded in the run state and public artifacts.
 
 ## Config Schema
 
@@ -61,7 +61,10 @@ The default config is:
   },
   "artifact_root": "./docs/pi-plans",
   "artifact_root_source": "unset",
-  "artifact_root_updated_at": null
+  "artifact_root_updated_at": null,
+  "refs_root": null,
+  "refs_root_source": "unset",
+  "refs_root_updated_at": null
 }
 ```
 
@@ -75,6 +78,7 @@ Rules:
 - `artifact_root` is relative to the target workspace unless absolute.
 - `artifact_root_source` is `user`, `auto`, or `unset`.
 - `artifact_root_updated_at` is the selection timestamp or `null` before confirmation.
+- `refs_root` is where plan-with-refs downloads references, relative to the target workspace unless absolute, or `null` before selection; `refs_root_source` is `user`, `auto`, or `unset`; `refs_root_updated_at` is the selection timestamp or `null`.
 - There is intentionally no `effort` field: subagents inherit the dispatching session's model and thinking level unless an exact selector is stored. The real lever is the main session's thinking level at refine time.
 
 ## VCC Compact Config
@@ -115,11 +119,11 @@ Persist with `plans` (`set-language`, `languageSource: "user"`). Use the selecte
 
 ## Code Graph Enabled
 
-`graph_enabled` (`boolean | null`) records whether the workspace wants graph-aware read/write/edit wrappers and `code_graph` mutations for indexed source files. `null` means the question was never asked: the first `plans` `init`/`show` in a workspace returns a `hint` instructing the agent to ask the user once via `ask_choice` (recommended: yes) and persist with the `plans` tool (`set-graph-enabled`, `enabled: true|false`). This question does not count against the planning-question limit. `/enable-graph` and `/disable-graph` toggle it later; disable refuses while graph drift is dirty.
+`graph_enabled` (`boolean | null`) records whether the workspace wants graph-aware read/write/edit wrappers and `code_graph` mutations for indexed source files. `null` means the question was never asked: the first `plans` `init`/`show` in a workspace returns a `hint` instructing the agent to ask the user once via `ask_choice` (recommended: yes) and persist with the `plans` tool (`set-graph-enabled`, `enabled: true|false`). This question does not count against the planning-question limit. `/enable-graph` and `/disable-graph` toggle it later; disable refuses while graph drift is dirty. When enabled, DB-first staged edits are materialized agent-side via the `code_graph` tool's `apply` action (same planning/accepted gate as `/apply-graph`; refused for read-only refiner subagents via the `PI_PLANS_REFINER` env marker; the result carries per-file counts and a post-apply drift summary and never changes run status).
 
 ## `/config-pi-plans`
 
-`/config-pi-plans` is an interactive workspace configuration wizard. It re-asks the workspace language, planning docs root, code graph toggle, reviewer mode/model, and criticizer mode/model, then writes the chosen defaults back to `.git/pi_plans/config.json`. When code graph is enabled, the extension also overrides built-in `read`/`write`/`edit` for indexed source files so graph-backed source reads and DB-first edits happen automatically. Model pickers can reuse the current session model, any available selector surfaced by `ctx.scopedModels` or the model registry, or a manually entered exact `provider/model` string. If a run is already active, only the workspace defaults change; the active run's `artifact_dir` and `language_tag` stay unchanged.
+`/config-pi-plans` is an interactive workspace configuration wizard. It re-asks the workspace language, planning docs root, refs root, code graph toggle, reviewer mode/model, and criticizer mode/model, then writes the chosen defaults back to `.git/pi_plans/config.json`. When code graph is enabled, the extension also overrides built-in `read`/`write`/`edit` for indexed source files so graph-backed source reads and DB-first edits happen automatically. Model pickers can reuse the current session model, any available selector surfaced by `ctx.scopedModels` or the model registry, or a manually entered exact `provider/model` string. If a run is already active, only the workspace defaults change; the active run's `artifact_dir` and `language_tag` stay unchanged.
 
 
 Before the first product planning question, check the persisted config again. If `artifact_root_source` is missing or `unset`, ask exactly one `ask_choice` question:
@@ -130,6 +134,15 @@ Before the first product planning question, check the persisted config again. If
 4. `Auto-complete` — select the recommended path.
 
 Persist with `plans` (`set-artifact-root`, `artifactRoot: <selected path>`, `artifactRootSource: "user"` or `"auto"`). Use the selected path for the run's artifact directory root. This question does not count against the planning-question limit.
+
+Before downloading any reference in a plan-with-refs flow, check the persisted config. If `refs_root_source` is missing or `unset`, ask exactly one `ask_choice` question:
+
+1. `.git/pi-plans/refs` — recommended; inside the git dir so git never tracks the downloads.
+2. `./refs/` — inside the worktree; the planning write guard allows writes under the configured refs root.
+3. `~/.cache/pi-plans/refs/` — outside the repository; matches the historical default.
+4. `Other` / `Auto-complete` — select the recommended path.
+
+Persist with `plans` (`set-refs-root`, `refsRoot: <selected path>`, `refsRootSource: "user"` or `"auto"`). Download references under this root. This question does not count against the planning-question limit.
 
 
 Before running a `refine` round, read the role setting from the persisted config.
@@ -160,10 +173,12 @@ When `mode` is `delegated-subagent`, the `refine` tool spawns a read-only `pi` s
 
 The main agent consolidates the results, records dispositions, revises the plan, and asks the next merged accept/execute question — all in the same turn.
 
+The `analyze_refs` tool (plan-with-refs) uses the same spawning machinery with the **reviewer** role's gates (`mode` must be `delegated-subagent`; a confirmed `current-session` reviewer is refused with guidance to switch, since analysis is spawn-only) and the reviewer's model selector. Each downloaded reference gets one independent read-only subagent whose system prompt comes from `agents/ref-analyst.md` and whose working directory is that reference's own directory; lanes never get `code_graph`. Lanes run in sequential batches of at most 3 under a standalone overlay titled `Refs`; each batch's controller opens and closes exactly like a single refine round. Successful spawns are recorded best-effort in `subagents.jsonl` with role `ref-analyst` (skipped when no active run exists, e.g. adhoc calls). The structured per-reference sections come back as the tool result; the main agent owns `REF_ANALYSIS.md` and fills `coverage`/`gaps` in `refs.jsonl` via `plans` (`record-ref`).
+
 ## Run State
 
 One run directory per planning request: `<git-common-dir>/pi_plans/runs/<YYYYMMDDTHHMMSSZ-topic>/` (second-precision; `-2`, `-3` suffixes on collision).
 
 `run.json` includes: run ID; skill name; original request; target workspace; artifact directory; language tag; status (`planning` → `accepted` → `executing` → `done`, with `stopped`/`abandoned` as exits); timestamps.
 
-`decisions.jsonl` is appended automatically by `ask_choice` (question, options, answer, answer source). `subagents.jsonl` records reviewer/criticizer spawns. `refs.jsonl` records reference metadata via `plans` (`record-ref`).
+`decisions.jsonl` is appended automatically by `ask_choice` (question, options, answer, answer source). `subagents.jsonl` records reviewer/criticizer/ref-analyst spawns. `refs.jsonl` records reference metadata via `plans` (`record-ref`).

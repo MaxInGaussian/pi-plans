@@ -99,6 +99,7 @@ describe("config-pi-plans command", () => {
 			select: (question, labels) => {
 				if (question === "Language?") return labels.find((label) => label.includes("en"));
 				if (question === "Artifact root?") return labels.find((label) => label.includes("./.git/pi_plans/plans"));
+				if (question === "Refs root (plan-with-refs downloads)?") return labels.find((label) => label.includes(".git/pi-plans/refs"));
 				if (question === "Code graph?") return labels.find((label) => label.includes("Disable code graph"));
 				if (question === "Reviewer mode?") return labels.find((label) => label.includes("Switch to current-session"));
 				if (question === "Reviewer model?") return labels.find((label) => label.includes("Use current session model (live/pro)"));
@@ -120,6 +121,9 @@ describe("config-pi-plans command", () => {
 		assert.equal(config.language.source, "user");
 		assert.equal(config.artifact_root, "./.git/pi_plans/plans");
 		assert.equal(config.artifact_root_source, "user");
+		assert.equal(config.refs_root, ".git/pi-plans/refs");
+		assert.equal(config.refs_root_source, "user");
+		assert.ok(config.refs_root_updated_at);
 		assert.equal(config.graph_enabled, false);
 		assert.equal(config.reviewer.mode, "current-session");
 		assert.equal(config.reviewer.model_selector, "live/pro");
@@ -141,6 +145,7 @@ describe("config-pi-plans command", () => {
 			select: (question, labels) => {
 				if (question === "Language?") return labels[0];
 				if (question === "Artifact root?") return labels[0];
+				if (question === "Refs root (plan-with-refs downloads)?") return labels[0];
 				if (question === "Code graph?") return labels[0];
 				if (question === "Reviewer mode?") return labels[0];
 				if (question === "Reviewer model?") return labels[0];
@@ -170,6 +175,7 @@ describe("config-pi-plans command", () => {
 			select: (question, labels) => {
 				if (question === "Language?") return labels[0];
 				if (question === "Artifact root?") return labels[0];
+				if (question === "Refs root (plan-with-refs downloads)?") return labels[0];
 				if (question === "Code graph?") return labels[0];
 				if (question === "Reviewer mode?") return labels[0];
 				if (question === "Reviewer model?") return labels.find((label) => label.includes("Other..."));
@@ -207,6 +213,7 @@ describe("config-pi-plans command", () => {
 			select: (question, labels) => {
 				if (question === "Language?") return labels[0];
 				if (question === "Artifact root?") return labels[0];
+				if (question === "Refs root (plan-with-refs downloads)?") return labels[0];
 				if (question === "Code graph?") return labels[0];
 				if (question === "Reviewer mode?") return labels[0];
 				if (question === "Reviewer model?") return labels[0];
@@ -233,6 +240,7 @@ describe("config-pi-plans command", () => {
 			select: (question, labels) => {
 				if (question === "Language?") return labels.find((label) => label.includes("en"));
 				if (question === "Artifact root?") return labels.find((label) => label.includes("./.git/pi_plans/plans"));
+				if (question === "Refs root (plan-with-refs downloads)?") return labels.find((label) => label.includes(".git/pi-plans/refs"));
 				if (question === "Code graph?") return labels.find((label) => label.includes("Enable code graph"));
 				if (question === "Reviewer mode?") return labels.find((label) => label.includes("Keep delegated-subagent"));
 				if (question === "Reviewer model?") return labels[0];

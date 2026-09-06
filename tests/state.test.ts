@@ -13,6 +13,7 @@ import {
 	recordDecision,
 	setLanguage,
 	setArtifactRoot,
+	setRefsRoot,
 	setRole,
 	setRunStatus,
 	showConfig,
@@ -72,6 +73,37 @@ describe("init", () => {
 		assert.equal(config.artifact_root, "./docs/pi-plans");
 		assert.equal(config.artifact_root_source, "unset");
 		assert.equal(config.artifact_root_updated_at, null);
+		assert.equal(config.refs_root, null);
+		assert.equal(config.refs_root_source, "unset");
+		assert.equal(config.refs_root_updated_at, null);
+	});
+
+	it("normalizes old configs missing the refs_root trio", () => {
+		const workdir = mkWorkdir("refs-root-normalize");
+		initState(workdir);
+		const configPath = path.join(commonDir(workdir), "pi_plans", "config.json");
+		const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+		delete config.refs_root;
+		delete config.refs_root_source;
+		delete config.refs_root_updated_at;
+		fs.writeFileSync(configPath, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
+		const updated = initState(workdir);
+		assert.equal(updated.config.refs_root, null);
+		assert.equal(updated.config.refs_root_source, "unset");
+		assert.equal(updated.config.refs_root_updated_at, null);
+		assert.equal(readConfig(workdir).refs_root, null);
+	});
+
+	it("setRefsRoot persists the trio", () => {
+		const workdir = mkWorkdir("refs-root-set");
+		initState(workdir);
+		setRefsRoot(workdir, ".git/pi-plans/refs", "user");
+		assert.equal(readConfig(workdir).refs_root, ".git/pi-plans/refs");
+		assert.equal(readConfig(workdir).refs_root_source, "user");
+		assert.ok(typeof readConfig(workdir).refs_root_updated_at === "string");
+		const shown = showConfig(workdir);
+		assert.equal(shown.refs_root, ".git/pi-plans/refs");
+		assert.equal(shown.refs_root_source, "user");
 	});
 
 	it("migrates legacy artifact roots to ./docs/pi-plans", () => {

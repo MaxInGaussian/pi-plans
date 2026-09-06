@@ -34,4 +34,14 @@ describe("plans tool source", () => {
 		assert.doesNotMatch(source, /case "set-execution-model"/);
 		assert.match(source, /params\.artifactRootSource/);
 	});
+
+	it("declares refsRootSource and wires the set-refs-root action plus ref-analyst role", () => {
+		const source = readPlansSource();
+		assert.match(source, /refsRoot:\s*Type\.Optional/);
+		assert.match(source, /refsRootSource:\s*Type\.Optional/);
+		assert.match(source, /import \{[\s\S]*setRefsRoot,[\s\S]*\} from "\.\.\/src\/state\.ts";/);
+		assert.match(source, /case "set-refs-root"/);
+		assert.match(source, /params\.refsRootSource/);
+		assert.match(source, /"reviewer", "criticizer", "ref-analyst"/);
+	});
 });

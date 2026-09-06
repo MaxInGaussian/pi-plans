@@ -43,6 +43,10 @@ export interface PlansConfig {
 	artifact_root: string;
 	artifact_root_source: SettingSource;
 	artifact_root_updated_at: string | null;
+	/** null = never asked; plan-with-refs must ask once (three options) before downloading. */
+	refs_root: string | null;
+	refs_root_source: SettingSource;
+	refs_root_updated_at: string | null;
 	/** null = never asked; the plans tool surfaces a hint so the agent asks once. */
 	graph_enabled: boolean | null;
 	graph_enabled_updated_at: string | null;
@@ -83,6 +87,9 @@ export const DEFAULT_CONFIG: PlansConfig = {
 	artifact_root: DEFAULT_ARTIFACT_ROOT,
 	artifact_root_source: "unset",
 	artifact_root_updated_at: null,
+	refs_root: null,
+	refs_root_source: "unset",
+	refs_root_updated_at: null,
 	graph_enabled: null,
 	graph_enabled_updated_at: null,
 };
@@ -138,7 +145,7 @@ export interface RefEntry {
 }
 
 export interface SubagentEntry {
-	role: "reviewer" | "criticizer";
+	role: "reviewer" | "criticizer" | "ref-analyst";
 	name: string;
 	model?: string | null;
 	session_dir?: string;
@@ -326,6 +333,15 @@ export function setArtifactRoot(workdir: string, artifactRoot: string, source: "
 	config.artifact_root = artifactRoot;
 	config.artifact_root_source = source;
 	config.artifact_root_updated_at = utcNow();
+	atomicWriteJson(path.join(stateRoot, "config.json"), config);
+	return { config, stateRoot, notices };
+}
+
+export function setRefsRoot(workdir: string, refsRoot: string, source: "user" | "auto"): EnsureResult {
+	const { config, stateRoot, notices } = ensureState(workdir);
+	config.refs_root = refsRoot;
+	config.refs_root_source = source;
+	config.refs_root_updated_at = utcNow();
 	atomicWriteJson(path.join(stateRoot, "config.json"), config);
 	return { config, stateRoot, notices };
 }

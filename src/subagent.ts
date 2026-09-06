@@ -306,6 +306,7 @@ export async function runPiSubagent(options: SubagentOptions): Promise<SubagentR
 				cwd: options.cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				env: { ...process.env, PI_PLANS_REFINER: "1" },
 			});
 			let buffer = "";
 			let closed = false;
