@@ -8,6 +8,7 @@
  */
 
 import * as fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import type {
 	CompactionResult,
 	ExtensionAPI,
@@ -75,6 +76,32 @@ const GOAL_WAIT_MAX_NO_PROGRESS = 3;
 const GOAL_WAIT_MAX_WAITING = 6;
 
 let execution: ExecState | null = null;
+
+export const GOAL_WAIT_CUSTOM_TYPE = "pi-plans-goal-wait";
+
+interface GoalWaitRuntime {
+	owner: ExecState;
+	session: ExtensionContext["sessionManager"];
+	handled: boolean;
+	stopReason?: string;
+	text: string;
+	wakeId?: string;
+}
+
+// Dispatch identity belongs to a live session, never to a persisted checklist.
+let goalWaitRuntime: GoalWaitRuntime | null = null;
+
+function resetGoalWaitRuntime(ctx: ExtensionContext): void {
+	goalWaitRuntime = execution
+		? { owner: execution, session: ctx.sessionManager, handled: false, text: "" }
+		: null;
+}
+
+function currentGoalWaitRuntime(ctx: ExtensionContext): GoalWaitRuntime | null {
+	return goalWaitRuntime?.owner === execution && goalWaitRuntime.session === ctx.sessionManager
+		? goalWaitRuntime
+		: null;
+}
 
 // Execution-loop persistence is deferred until the agent settles so turn_end
 // never causes session writes during a streaming run.
@@ -286,6 +313,7 @@ export async function startExecution(
 	// Seed the marker baseline so the first quiet round is counted against a
 	// real snapshot instead of counting unconditionally (F-006).
 	if (execution.goalWait) execution.goalWait.lastMarkers = goalWaitSnapshot();
+	resetGoalWaitRuntime(ctx);
 	pendingExecutionFlush = false; // fresh run: no inherited flush debt
 	resetExecutionCompactionState(ctx);
 	persist(pi);
@@ -331,6 +359,30 @@ export function registerExecutionTurnHandlers(
 	// The turn_end projection does not carry usage; message_end delivers the
 	// full assistant message, so cache it here and consume it per turn.
 	let lastAssistantUsage: { input: number; output: number } | null = null;
+	pi.on("agent_start", async (_event, ctx) => {
+		const runtime = currentGoalWaitRuntime(ctx);
+		if (!runtime) return;
+		runtime.handled = false;
+		runtime.stopReason = undefined;
+		runtime.text = "";
+	});
+	pi.on("before_agent_start", async (_event, ctx) => {
+		const runtime = currentGoalWaitRuntime(ctx);
+		if (runtime) runtime.wakeId = undefined;
+	});
+	pi.on("input", async (event, ctx) => {
+		if (event.source === "interactive" || event.source === "rpc") resumeGoalWaitIfPaused(pi, ctx);
+	});
+	pi.on("agent_settled", async (_event, ctx) => {
+		drainExecutionFlush(pi, ctx);
+		maybeGoalWaitFollowUp(pi, ctx);
+	});
+	pi.on("session_shutdown", async (_event, ctx) => {
+		drainExecutionFlush(pi, ctx);
+		execution = null;
+		goalWaitRuntime = null;
+		lastAssistantUsage = null;
+	});
 	pi.on("message_end", async (event) => {
 		const message = event.message as { role?: string; usage?: { input?: number; output?: number } };
 		if (message?.role === "assistant" && message.usage) {
@@ -339,7 +391,7 @@ export function registerExecutionTurnHandlers(
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
-		const message = event.message as { role?: string; content?: Array<{ type: string; text?: string }> };
+		const message = event.message as { role?: string; stopReason?: string; content?: Array<{ type: string; text?: string }> };
 		if (!message || message.role !== "assistant") {
 			updateStatusWidget(ctx);
 			return;
@@ -348,6 +400,11 @@ export function registerExecutionTurnHandlers(
 			.filter((part) => part.type === "text")
 			.map((part) => part.text ?? "")
 			.join("\n");
+		const runtime = currentGoalWaitRuntime(ctx);
+		if (runtime) {
+			runtime.stopReason = message.stopReason;
+			runtime.text = text;
+		}
 		const changedIds = applyDoneMarkers(text);
 		const changedImpls = applyImplMarkers(text);
 		const changedCurrentI = applyCurrentIMarker(text);
@@ -361,8 +418,6 @@ export function registerExecutionTurnHandlers(
 		}
 		if (getExecution() && isExecutionComplete()) {
 			await completeExecution(pi, ctx);
-		} else if (getExecution()) {
-			maybeGoalWaitFollowUp(pi, ctx, text);
 		}
 		await onTurnEnd?.(ctx);
 	});
@@ -492,7 +547,6 @@ export async function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionCon
 	if (!event.willRetry && stats) {
 		ctx.ui.notify(formatVccCompactionStats(stats), "info");
 		if (followUpPrompt) {
-			compactionFollowUpSentThisTurn = true;
 			await pi.sendUserMessage?.(followUpPrompt);
 		} else if ((event.reason === "threshold" || event.reason === "overflow") && shouldScheduleAutoContinue(continueAfterThresholdCompact, runtimePiVersion(ctx))) {
 			state.resumeGuard = true;
@@ -843,6 +897,7 @@ export async function stopExecution(pi: ExtensionAPI, ctx: ExtensionContext, rea
 	pendingExecutionFlush = false;
 	persist(pi);
 	execution = null;
+	goalWaitRuntime = null;
 	pi.appendEntry("pi-plans-exec-cleared", { reason });
 	pi.sendMessage(
 		{
@@ -909,13 +964,6 @@ export function isExecutionComplete(): boolean {
 	return execution !== null && execution.items.length > 0 && execution.items.every((item) => item.done);
 }
 
-let compactionFollowUpSentThisTurn = false;
-
-/** Reset per-turn continuation flags at the start of a new agent turn. */
-export function resetGoalWaitTurnFlags(): void {
-	compactionFollowUpSentThisTurn = false;
-}
-
 function goalWaitSnapshot(): string {
 	if (!execution) return "";
 	return JSON.stringify({
@@ -942,46 +990,67 @@ function pauseGoalWait(pi: ExtensionAPI, ctx: ExtensionContext, reason: string):
 	updateStatusWidget(ctx);
 }
 
-/**
- * Goal-wait continuation: a turn that ends with unpassed VCs gets one light
- * followUp so the worker keeps going (working, or polling an external event
- * per the taught backoff rules). Skipped when the compaction machinery owns
- * continuation for this turn, and paused entirely by the no-progress guard.
- * Note: the tri-flag check here deliberately runs BEFORE index.ts's
- * handleExecutionTurnCompaction consumes resumeGuard — checking after the
- * one-shot consumption would never observe it.
- */
-function maybeGoalWaitFollowUp(pi: ExtensionAPI, ctx: ExtensionContext, assistantText: string): void {
-	const ex = getExecution();
-	if (!ex) return;
+function canWakeExecution(ctx: ExtensionContext, runtime: GoalWaitRuntime): boolean {
+	const compaction = executionCompactionState(ctx);
+	return currentGoalWaitRuntime(ctx) === runtime
+		&& (ctx.mode === "tui" || ctx.mode === "rpc")
+		&& !isExecutionComplete()
+		&& !runtime.owner.goalWait?.paused
+		&& ctx.isIdle()
+		&& !ctx.hasPendingMessages()
+		&& !ctx.signal?.aborted
+		&& !compactionInFlight(ctx, "execution")
+		&& !compaction?.inFlight
+		&& !compaction?.resumeGuard
+		&& compaction?.pendingFollowUpPrompt == null;
+}
+
+function sendGoalWaitWake(pi: ExtensionAPI, ctx: ExtensionContext, runtime: GoalWaitRuntime): boolean {
+	if (!canWakeExecution(ctx, runtime)) return false;
+	try {
+		// Custom messages bypass before_agent_start, so carry fresh execution rules.
+		const content = executionContextMessage(ctx);
+		if (!content) return false;
+		runtime.wakeId = randomUUID();
+		pi.sendMessage({
+			customType: GOAL_WAIT_CUSTOM_TYPE,
+			content,
+			display: false,
+			details: { wakeId: runtime.wakeId },
+		}, { triggerTurn: true });
+		return true;
+	} catch (error) {
+		runtime.wakeId = undefined;
+		pauseGoalWait(pi, ctx, `continuation failed: ${String(error)}`);
+		return false;
+	}
+}
+
+/** Only a fully settled agent run can need an extra wake, never a tool turn. */
+function maybeGoalWaitFollowUp(pi: ExtensionAPI, ctx: ExtensionContext): void {
+	const runtime = currentGoalWaitRuntime(ctx);
+	if (!runtime || runtime.handled || !ctx.isIdle()) return;
+	if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
+	if (runtime.stopReason === "error" || runtime.stopReason === "aborted" || ctx.signal?.aborted) {
+		runtime.handled = true;
+		pauseGoalWait(pi, ctx, runtime.stopReason === "error" ? "agent failed" : "agent interrupted");
+		return;
+	}
+	if (runtime.stopReason !== "stop" || !canWakeExecution(ctx, runtime)) return;
+	runtime.handled = true;
+	const ex = runtime.owner;
 	ex.goalWait ??= { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false };
 	const goalWait = ex.goalWait;
-	if (goalWait.paused) {
-		updateStatusWidget(ctx);
-		return;
-	}
-	const compaction = executionCompactionState(ctx);
-	if (compaction && (compaction.inFlight || compaction.pendingFollowUpPrompt != null || compaction.resumeGuard)) {
-		updateStatusWidget(ctx);
-		return;
-	}
-	if (compactionFollowUpSentThisTurn) {
-		compactionFollowUpSentThisTurn = false; // the compaction path already queued a continuation
-		updateStatusWidget(ctx);
-		return;
-	}
 	const snapshot = goalWaitSnapshot();
 	const changed = goalWait.lastMarkers !== null && snapshot !== goalWait.lastMarkers;
 	goalWait.lastMarkers = snapshot;
-	if (!changed) {
-		if (/waiting for/i.test(assistantText)) {
-			goalWait.waitRounds += 1;
-		} else {
-			goalWait.noProgressRounds += 1;
-		}
-	} else {
+	if (changed) {
 		goalWait.noProgressRounds = 0;
 		goalWait.waitRounds = 0;
+	} else if (/waiting for/i.test(runtime.text)) {
+		goalWait.waitRounds += 1;
+	} else {
+		goalWait.noProgressRounds += 1;
 	}
 	if (goalWait.noProgressRounds >= GOAL_WAIT_MAX_NO_PROGRESS) {
 		pauseGoalWait(pi, ctx, `no progress in ${goalWait.noProgressRounds} rounds`);
@@ -991,25 +1060,40 @@ function maybeGoalWaitFollowUp(pi: ExtensionAPI, ctx: ExtensionContext, assistan
 		pauseGoalWait(pi, ctx, `waiting without progress for ${goalWait.waitRounds} rounds`);
 		return;
 	}
-	const remaining = ex.items.filter((item) => !item.done);
-	const remainingIds = remaining.map((item) => `\`${item.id}\``).join(", ");
-	pi.sendUserMessage?.(
-		`Goal wait: ${remaining.length}/${ex.items.length} verifier items still open (${remainingIds}). Continue the plan — if blocked on an external event, keep waiting per the backoff rules; otherwise resolve the remaining items.`,
-		{ deliverAs: "followUp" },
-	);
+	persist(pi);
 	updateStatusWidget(ctx);
+	// No await between the live gate and dispatch: another input cannot interleave.
+	sendGoalWaitWake(pi, ctx, runtime);
 }
 
-/** Any external input re-kicks a paused goal-wait (clears pause and counters). */
-export function resumeGoalWaitIfPaused(pi: ExtensionAPI, ctx: ExtensionContext): void {
+export function filterGoalWaitMessages<T extends { customType?: string; details?: unknown }>(messages: T[]): T[] {
+	return messages.filter((message) => message.customType !== GOAL_WAIT_CUSTOM_TYPE
+		|| (goalWaitRuntime?.owner === execution && goalWaitRuntime?.wakeId !== undefined
+			&& (message.details as { wakeId?: unknown } | undefined)?.wakeId === goalWaitRuntime.wakeId));
+}
+
+/** Called only for genuine user input or an explicit same-execution resume. */
+export function resumeGoalWaitIfPaused(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
 	const ex = getExecution();
-	if (!ex?.goalWait?.paused) return;
+	if (!ex?.goalWait?.paused || !currentGoalWaitRuntime(ctx)) return false;
 	ex.goalWait.paused = false;
 	ex.goalWait.pausedReason = undefined;
 	ex.goalWait.noProgressRounds = 0;
 	ex.goalWait.waitRounds = 0;
+	ex.goalWait.lastMarkers = goalWaitSnapshot();
 	persist(pi);
 	updateStatusWidget(ctx);
+	return true;
+}
+
+export function resumeActiveExecution(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
+	if (!resumeGoalWaitIfPaused(pi, ctx)) return false;
+	const runtime = currentGoalWaitRuntime(ctx)!;
+	if (canWakeExecution(ctx, runtime)) {
+		runtime.handled = true;
+		sendGoalWaitWake(pi, ctx, runtime);
+	}
+	return true;
 }
 
 export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
@@ -1022,6 +1106,7 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 	const summary = execution.items.map((item) => `- ✅ \`${item.id}\` ${item.text.split(";")[0]}`).join("\n");
 	const planPath = execution.planPath;
 	execution = null;
+	goalWaitRuntime = null;
 	pi.appendEntry("pi-plans-exec-cleared", { reason: "complete" });
 	// Post-execution goal-running continuation: in interactive sessions, attach
 	// the continuation block and trigger a new turn so the agent immediately
@@ -1111,6 +1196,7 @@ interface SessionEntry {
  */
 export async function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext, entries: SessionEntry[]): Promise<void> {
 	pendingExecutionFlush = false; // no flush debt survives a restart
+	goalWaitRuntime = null;
 	resetExecutionCompactionState(ctx);
 	let snapshotIndex = -1;
 	let snapshot: ExecState | null = null;
@@ -1169,6 +1255,7 @@ export async function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext
 		}
 	}
 	if (execution) {
+		resetGoalWaitRuntime(ctx);
 		// D-010: replay may have advanced progress past the persisted baseline.
 		// Recompute the goal-wait markers; new progress resets the guard counters.
 		if (execution.goalWait) {

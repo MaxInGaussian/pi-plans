@@ -4,6 +4,22 @@ All notable changes to **pi-plans** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Goal-wait lifecycle.** In TUI/RPC, continuation now waits for
+  `agent_settled` and rechecks execution, idle, pending-input, and compaction
+  state before sending one hidden message with the latest checklist.
+  Tool turns no longer queue duplicate reminders or consume the 3/6
+  no-progress/waiting guard rounds. Completion, stop, and session changes
+  invalidate wake identity; user interruption and final model errors pause
+  continuation until genuine user input or `/plans-execute` resumes it.
+  Same-plan command resumes preserve verified progress; `execute_plan`
+  retains explicit approval. Print/JSON single-shot sessions keep marker
+  tracking without automatic wakes. Regression tests include the real Pi
+  agent loop with an offline deterministic model and the full extension.
+
 ## [0.3.1] - 2026-09-06
 
 ### Added

@@ -9,6 +9,8 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+	getExecution,
+	resumeActiveExecution,
 	startExecution,
 } from "../src/exec.ts";
 import { disableAutoComplete } from "../src/autocomplete.ts";
@@ -95,6 +97,22 @@ export async function executeHandoff(
 		itemCount: items.length,
 		message: `Execution approved. ${items.length} verifier item(s) queued; implement in dependency order and mark verified items with [DONE:VC-xxx].${scopeNote}`,
 	};
+}
+
+/** The user command may resume an approved execution; the tool always asks. */
+export async function executeCommand(ctx: ExtensionContext, planPathArg?: string): Promise<HandoffOutcome> {
+	const activeExecution = getExecution();
+	const planPath = planPathArg ? path.resolve(ctx.cwd, planPathArg.replace(/^@/, "")) : activeExecution?.planPath;
+	if (activeExecution && planPath && path.resolve(activeExecution.planPath) === path.resolve(planPath)) {
+		const resumed = resumeActiveExecution(getCurrentApi(), ctx);
+		return {
+			status: "executing",
+			planPath,
+			itemCount: activeExecution.items.length,
+			message: resumed ? "Execution resumed; verified progress preserved." : "This plan is already executing.",
+		};
+	}
+	return executeHandoff(ctx, planPathArg);
 }
 
 // The tool registers with the ExtensionAPI in scope; keep a module-level

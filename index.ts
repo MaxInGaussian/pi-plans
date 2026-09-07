@@ -23,6 +23,7 @@ import {
 	drainExecutionFlush,
 	executionContextMessage,
 	filterExecutionResumeMessages,
+	filterGoalWaitMessages,
 	filterPlanningResumeMessages,
 	getExecution,
 	handleExecutionBeforeCompact,
@@ -39,8 +40,6 @@ import {
 	refreshPlanningCompactionCooldown,
 	requestPlanningCompaction,
 	restoreFromSession,
-	resetGoalWaitTurnFlags,
-	resumeGoalWaitIfPaused,
 	stopExecution,
 	updateStatusWidget,
 	shouldTriggerPlanningCompaction,
@@ -69,7 +68,7 @@ import { latestPlanVersion, nextPlanVersionPath } from "./src/plan.ts";
 import { configPiPlansCommand } from "./src/config-command.ts";
 import { getRun, loadConfig, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
 import { registerAskChoiceTool } from "./tools/ask-choice.ts";
-import { executeHandoff, registerExecutePlanTool } from "./tools/execute-plan.ts";
+import { executeCommand, registerExecutePlanTool } from "./tools/execute-plan.ts";
 import { registerPlansTool } from "./tools/plans.ts";
 import { registerRefineTool } from "./tools/refine.ts";
 import { registerAnalyzeRefsTool } from "./tools/analyze-refs.ts";
@@ -215,7 +214,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 
 	pi.on("context", (event) => {
 		const filteredExecution = filterExecutionResumeMessages(event.messages as Array<{ customType?: string }>);
-		const messages = filterPlanningResumeMessages(filteredExecution);
+		const messages = filterGoalWaitMessages(filterPlanningResumeMessages(filteredExecution));
 		if (messages.length !== event.messages.length) {
 			return { messages };
 		}
@@ -238,21 +237,11 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		noteCompactionEnded(ctx, event.customInstructions);
 	});
 
-	// Flush points for deferred execution-loop writes: primary drain when the
-	// agent run fully settles, backstop drain at the next run's start (covers
-	// continuation paths that might not emit agent_settled), plus the forced
-	// synchronous flush inside stop/complete.
-	pi.on("agent_settled", async (_event, ctx) => {
-		drainExecutionFlush(pi, ctx);
-	});
-
 	// -----------------------------------------------------------------------
 	// Execution loop: inject remaining checklist each turn, track markers.
 	// -----------------------------------------------------------------------
 	pi.on("before_agent_start", async (_event, ctx) => {
 		drainExecutionFlush(pi, ctx);
-		resetGoalWaitTurnFlags();
-		resumeGoalWaitIfPaused(pi, ctx);
 		const content = executionContextMessage(ctx);
 		if (!content) {
 			if (!getExecution() && shouldTriggerPlanningCompaction(ctx)) {
@@ -388,7 +377,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		description: "Execute handoff: enter tracked execution mode for an accepted plan",
 		handler: async (args, ctx) => {
 			const planPath = args.trim() || undefined;
-			const outcome = await executeHandoff(ctx, planPath);
+			const outcome = await executeCommand(ctx, planPath);
 			ctx.ui.notify(outcome.message, outcome.status === "error" ? "error" : "info");
 		},
 	});
@@ -543,8 +532,11 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	// Session lifecycle
 	// -----------------------------------------------------------------------
+	pi.on("session_tree", async (_event, ctx) => {
+		await restoreFromSession(pi, ctx, ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreFromSession>[2]);
+	});
 	pi.on("session_start", async (_event, ctx) => {
-		await restoreFromSession(pi, ctx, ctx.sessionManager.getEntries() as unknown as Parameters<typeof restoreFromSession>[2]);
+		await restoreFromSession(pi, ctx, ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreFromSession>[2]);
 		restoreAutoCompleteFromSession(ctx, ctx.sessionManager.getEntries() as unknown as Parameters<typeof restoreAutoCompleteFromSession>[1]);
 	});
 }

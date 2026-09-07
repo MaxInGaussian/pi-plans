@@ -137,6 +137,27 @@ When the user picks `✓ Accept PLAN_vN and execute it now` in the merged questi
 
 If the user declines, stay in planning (or stop, per their choice). Never start implementation without the approved handoff.
 
+### Execution Goal-Wait
+
+In TUI/RPC, automatic goal-wait is evaluated only at `agent_settled`, after
+Pi has finished natural tool continuation, retries, and compaction. The
+extension rechecks that the same execution is active and incomplete, the
+session is idle, and neither pending input nor compaction owns continuation.
+Each eligible settled cycle can send at most one hidden custom message with
+the current execution rules and remaining VC checklist. Tool `turn_end`
+events only update progress; they never prequeue goal-wait reminders.
+
+No-progress and literal `waiting for` counters advance only on eligible
+settled cycles. Real marker progress resets both; thresholds remain 3 and 6.
+User interruption and final model errors also pause continuation. Genuine
+interactive/RPC user input or `/plans-execute` can resume a paused active
+execution without losing verified VCs; extension input cannot unpause it.
+New-plan handoffs and the `execute_plan` tool still require explicit approval.
+Completion, stop, and session replacement invalidate the extension's wake
+identity without clearing user or other-extension queues. Print/JSON
+single-shot sessions keep VC tracking and completion but never auto-wake;
+use RPC for persistent headless execution.
+
 ### Post-Execution Continuation
 
 When execution completes in an interactive session, the completion message attaches a goal-running continuation block and triggers a new agent turn so the model can enter the implementation-review loop immediately. The interactive-only trigger keeps headless sessions silent (no unconsented subagent cost). The same behavior applies on both completion call sites (the normal `turn_end` completion and the `restoreFromSession` recovery path).
