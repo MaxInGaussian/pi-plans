@@ -262,3 +262,116 @@ describe("ask_choice panel fitting", () => {
 		assert.ok(totalLines < rows - STATUS_BAR_HEIGHT - PANEL_SAFETY_MARGIN);
 	});
 });
+
+describe("ask_choice checkpoint question lifecycle (I-003)", () => {
+	it("records pending before the panel opens and the answer before it returns", async () => {
+		const { spawnSync } = await import("node:child_process");
+		const { initState, startRun } = await import("../src/state.ts");
+		const { createCheckpoint, loadCheckpoint } = await import("../src/workflow-state.ts");
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-ask-cp-"));
+		try {
+			spawnSync("git", ["init"], { cwd: workdir });
+			initState(workdir);
+			const { run } = startRun(workdir, { topic: "askcp", skill: "plan-small", requestText: "t" });
+			createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+
+			let pendingDuringPanel: unknown = null;
+			const tool = loadTool();
+			const ctx = makeCtx({
+				select: async (_question, labels) => {
+					pendingDuringPanel = loadCheckpoint(workdir, run.run_id);
+					return labels[0];
+				},
+			});
+			const result = await tool.execute("t1", {
+				question: "Scope ok?",
+				options: OPTIONS,
+				workdir,
+				questionId: "scope-confirm",
+				purpose: "scope",
+			}, undefined, undefined, ctx);
+			assert.match(result.content[0].text, /User selected: 1/);
+
+			// During the panel: the pending question is already durable.
+			const during = pendingDuringPanel as { status: string; checkpoint?: { pendingQuestion: unknown } };
+			assert.equal(during.status, "ok");
+			assert.ok(during.checkpoint?.pendingQuestion, "pending recorded before display");
+
+			// After the answer: cleared + answered with source user.
+			const after = loadCheckpoint(workdir, run.run_id);
+			assert.equal(after.status, "ok");
+			if (after.status === "ok") {
+				assert.equal(after.checkpoint.pendingQuestion, null);
+				assert.equal(after.checkpoint.answeredQuestions.length, 1);
+				assert.equal(after.checkpoint.answeredQuestions[0]?.questionId, "scope-confirm");
+				assert.equal(after.checkpoint.answeredQuestions[0]?.source, "user");
+			}
+		} finally {
+			fs.rmSync(workdir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the pending question when the user cancels", async () => {
+		const { spawnSync } = await import("node:child_process");
+		const { initState, startRun } = await import("../src/state.ts");
+		const { createCheckpoint, loadCheckpoint } = await import("../src/workflow-state.ts");
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-ask-cancel-"));
+		try {
+			spawnSync("git", ["init"], { cwd: workdir });
+			initState(workdir);
+			const { run } = startRun(workdir, { topic: "askcancel", skill: "plan-small", requestText: "t" });
+			createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+			const tool = loadTool();
+			const ctx = makeCtx({ select: async () => undefined });
+			const result = await tool.execute("t1", {
+				question: "Scope ok?",
+				options: OPTIONS,
+				workdir,
+				questionId: "scope-confirm",
+			}, undefined, undefined, ctx);
+			assert.match(result.content[0].text, /cancelled/i);
+			const loaded = loadCheckpoint(workdir, run.run_id);
+			if (loaded.status === "ok") {
+				assert.ok(loaded.checkpoint.pendingQuestion, "cancelled question stays pending for resume");
+				assert.equal(loaded.checkpoint.answeredQuestions.length, 0);
+			}
+		} finally {
+			fs.rmSync(workdir, { recursive: true, force: true });
+		}
+	});
+
+	it("skips checkpoint writes without questionId or without a checkpoint", async () => {
+		const { spawnSync } = await import("node:child_process");
+		const { initState, startRun } = await import("../src/state.ts");
+		const { createCheckpoint, loadCheckpoint } = await import("../src/workflow-state.ts");
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-ask-skip-"));
+		try {
+			spawnSync("git", ["init"], { cwd: workdir });
+			initState(workdir);
+			const withCp = startRun(workdir, { topic: "withcp", skill: "plan-small", requestText: "t" }).run;
+			createCheckpoint(workdir, { runId: withCp.run_id, originWorkdir: workdir, workdir });
+			const noCp = startRun(workdir, { topic: "nocp", skill: "plan-small", requestText: "t" }).run;
+
+			const tool = loadTool();
+			const ctx = makeCtx({ select: async (_question, labels) => labels[0] });
+			// No questionId → no checkpoint mutation.
+			await tool.execute("t1", { question: "Q?", options: OPTIONS, workdir }, undefined, undefined, ctx);
+			let loaded = loadCheckpoint(workdir, withCp.run_id);
+			if (loaded.status === "ok") {
+				assert.equal(loaded.checkpoint.pendingQuestion, null);
+				assert.equal(loaded.checkpoint.answeredQuestions.length, 0);
+			}
+			// questionId but the active run has no checkpoint → silent skip.
+			const result = await tool.execute("t2", {
+				question: "Q?",
+				options: OPTIONS,
+				workdir,
+				questionId: "q-no-cp",
+			}, undefined, undefined, ctx);
+			assert.match(result.content[0].text, /User selected/);
+			assert.equal(loadCheckpoint(workdir, noCp.run_id).status, "missing");
+		} finally {
+			fs.rmSync(workdir, { recursive: true, force: true });
+		}
+	});
+});

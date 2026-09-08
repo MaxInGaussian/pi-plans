@@ -17,6 +17,7 @@ import {
 	setRole,
 	setRunStatus,
 	showConfig,
+	runDirPath,
 	startRun,
 	StateError,
 	testHooks,
@@ -325,5 +326,20 @@ describe("set-role invariants", () => {
 		assert.ok(role.confirmed_at);
 
 		assert.throws(() => setRole(workdir, { role: "reviewer", confirmed: true, resetConfirmation: true }), StateError);
+	});
+});
+
+describe("runDirPath", () => {
+	it("resolves run directories read-only and returns null for unknown runs", () => {
+		const workdir = mkWorkdir("run-dir-path");
+		initState(workdir);
+		const { run } = startRun(workdir, { topic: "rdp", skill: "plan-small", requestText: "t" });
+		const dir = runDirPath(workdir, run.run_id);
+		assert.ok(dir);
+		assert.ok(fs.existsSync(path.join(dir, "run.json")));
+		assert.equal(runDirPath(workdir, "20990101T000000Z-nope"), null);
+		const notARepo = path.join(tmpRoot, "not-a-repo");
+		fs.mkdirSync(notARepo, { recursive: true });
+		assert.equal(runDirPath(notARepo, run.run_id), null);
 	});
 });

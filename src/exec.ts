@@ -8,6 +8,7 @@
  */
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type {
 	CompactionResult,
@@ -25,6 +26,7 @@ import {
 	entryCurrentIMarkers,
 	formatVccCompactionStats,
 	loadVccSettings,
+	PLANNING_PREPLAN_COMPACT_HINT,
 	scaffoldVccSettings,
 	shouldScheduleAutoContinue,
 	type CompactionEntryLike,
@@ -34,13 +36,35 @@ import {
 	type VccCompactionBuildResult,
 	type VccCompactionStats,
 } from "./compaction.ts";
-import { getRun, readActive, resolveStateRootOrNull, setRunStatus, utcNow } from "./state.ts";
+import { getRun, readActive, resolveStateRootOrNull, setRunStatus, StateError, utcNow } from "./state.ts";
+import { bindRun, resolveActiveRun } from "./run-context.ts";
+import { OwnershipError } from "./run-ownership.ts";
+import {
+	applyExecutionApproved,
+	applyExecutionCompleted,
+	applyExecutionHeadChanged,
+	applyExecutionProgress,
+	applyExecutionStopped,
+	applyQuestionAsked,
+	applyReviewRoundStarted,
+	createCheckpoint,
+	loadCheckpoint,
+	mutateCheckpoint,
+	StaleCheckpointError,
+	planIdentityOf,
+	resolveHeadAt,
+	resolveWorktreeRoot,
+	sha256File,
+	type ExecutionApproval,
+} from "./workflow-state.ts";
 import { graphBlockForExecutor } from "./code-graph/prompts.ts";
 import { resolveGraphMode } from "./code-graph/mode.ts";
-import { TERMINATION_QUESTION, TERMINATION_OPTIONS, renderTerminationOptions } from "./termination-prompt.ts";
+import { TERMINATION_QUESTION, TERMINATION_OPTIONS, TERMINATION_RECORDING_INSTRUCTIONS, renderTerminationOptions } from "./termination-prompt.ts";
 import {
 	extractCoverage,
 	latestPlanVersion,
+	parseChecklist,
+	parseImplItems,
 	resolveImplStatuses,
 	scanDoneMarkers,
 	scanImplMarkers,
@@ -129,6 +153,105 @@ export function drainExecutionFlush(pi: ExtensionAPI, ctx: ExtensionContext): vo
 
 export function getExecution(): ExecState | null {
 	return execution;
+}
+
+export interface CheckpointExecutionLoad {
+	status: "loaded" | "no-execution" | "plan-missing" | "plan-mismatch" | "no-checkpoint" | "corrupt";
+	planPath?: string;
+	doneVcIds?: string[];
+	reverifyAll?: boolean;
+	pausedReason?: string;
+	error?: string;
+}
+
+/**
+ * Shared restore primitive (I-005/I-006): load the executing state from a run
+ * checkpoint into THIS session. Authorization is kept only when the recorded
+ * approval matches the current plan digest; a HEAD change keeps the
+ * authorization but re-verifies previously verified VCs (D-011/F-001).
+ * F-002: the loaded state is persisted to the current session IMMEDIATELY so
+ * session_start/session_tree restore paths cannot silently clear it.
+ */
+export function loadExecutionFromCheckpoint(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	runId: string,
+): CheckpointExecutionLoad {
+	const load = loadCheckpoint(ctx.cwd, runId);
+	if (load.status === "missing") return { status: "no-checkpoint" };
+	if (load.status === "corrupt") return { status: "corrupt", error: load.error };
+	const cp = load.checkpoint;
+	if (!cp.execution || cp.phase !== "executing") return { status: "no-execution" };
+	const planPath = cp.plan?.path;
+	if (!planPath || !fs.existsSync(planPath)) {
+		return { status: "plan-missing", error: planPath ? `plan file vanished: ${planPath}` : "checkpoint has no plan identity" };
+	}
+	const planText = fs.readFileSync(planPath, "utf8");
+	// F-002 (implementation review): the recorded plan identity is over BYTES —
+	// an in-place edit at the same path must not inherit the authorization or
+	// the verified VCs. Refuse the load and require a fresh handoff.
+	if (sha256File(planPath) !== cp.plan.sha256) {
+		return {
+			status: "plan-mismatch" as const,
+			error: `plan file changed since the approval record (${planPath}); re-approve via /plans-execute before executing`,
+		};
+	}
+	const items = parseChecklist(planText);
+	if (items.length === 0) {
+		return { status: "plan-missing", error: `${planPath} has no parsable verifier checklist` };
+	}
+	const implItems = parseImplItems(planText);
+	const doneIds = new Set(cp.execution.doneVcIds);
+	// D-011/F-001: an unchanged plan digest keeps the recorded authorization;
+	// a changed HEAD under it forces re-verification of previously verified VCs.
+	// F-006 (implementation review): an approval without a resolvable HEAD
+	// recorded an unverifiable code state — re-verify instead of trusting.
+	const headNow = resolveHeadAt(ctx.cwd);
+	const headUnverifiable = cp.execution.approval === null || cp.execution.approval.headAtApproval === null;
+	const headChanged =
+		cp.execution.approval !== null &&
+		cp.execution.approval.headAtApproval !== null &&
+		cp.execution.approval.headAtApproval !== headNow;
+	const reverifyAll = cp.execution.reverifyAll === true || headChanged || headUnverifiable;
+	if (!reverifyAll) {
+		for (const item of items) {
+			if (doneIds.has(item.id)) item.done = true;
+		}
+	}
+	execution = {
+		planPath,
+		items,
+		startedAt: utcNow(),
+		usage: { inToks: cp.execution.usage.inToks, outToks: cp.execution.usage.outToks },
+		implItems,
+		implStatus: { ...cp.execution.implStatus },
+		currentI: cp.execution.currentI,
+		goalWait: {
+			noProgressRounds: 0,
+			waitRounds: 0,
+			lastMarkers: null,
+			paused: cp.execution.pausedReason !== undefined,
+			pausedReason: cp.execution.pausedReason,
+		},
+	};
+	executionRunId = runId;
+	bindRun(ctx.sessionManager, ctx.cwd, runId);
+	resetGoalWaitRuntime(ctx);
+	pendingExecutionFlush = false; // restored state: no inherited flush debt
+	resetExecutionCompactionState(ctx);
+	if (headChanged) {
+		withExecutionCheckpoint(ctx, (current) => applyExecutionHeadChanged(current));
+	}
+	if (execution.goalWait) execution.goalWait.lastMarkers = goalWaitSnapshot();
+	persist(pi); // F-002: immediate session snapshot
+	updateStatusWidget(ctx);
+	return {
+		status: "loaded",
+		planPath,
+		doneVcIds: [...doneIds],
+		reverifyAll,
+		pausedReason: cp.execution.pausedReason,
+	};
 }
 
 const EXECUTION_COMPACTION_RESUME_MESSAGE = "Continue execution.";
@@ -255,7 +378,7 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
 		return;
 	}
-	const active = readActive(ctx.cwd);
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (active) {
 		// Idle indicator depends on the run's lifecycle, not just its existence:
 		// done reads as finished, abandoned as closed, stopped/accepted as paused.
@@ -302,6 +425,24 @@ function persist(pi: ExtensionAPI): void {
 	});
 }
 
+/** Checkpoint bookkeeping for the executing run; best-effort for legacy runs
+ * without checkpoints (their cross-session resume degrades to R-008 rules). */
+function withExecutionCheckpoint(ctx: ExtensionContext, mutator: (cp: import("./workflow-state.ts").WorkflowCheckpoint) => import("./workflow-state.ts").WorkflowCheckpoint): void {
+	if (!execution) return;
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	if (!active || active.run_id !== executionRunId) return;
+	try {
+		mutateCheckpoint(ctx.cwd, active.run_id, mutator);
+	} catch (error) {
+		// F-005 (implementation review): ownership loss and revision staleness
+		// must stop the advance, not vanish into the catch block.
+		if (error instanceof OwnershipError || error instanceof StaleCheckpointError) throw error;
+		/* legacy run or corrupt checkpoint: session snapshot still carries the loop */
+	}
+}
+
+let executionRunId: string | null = null;
+
 export async function startExecution(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -317,8 +458,40 @@ export async function startExecution(
 	pendingExecutionFlush = false; // fresh run: no inherited flush debt
 	resetExecutionCompactionState(ctx);
 	persist(pi);
-	const active = readActive(ctx.cwd);
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	executionRunId = active?.run_id ?? null;
 	if (active) {
+		bindRun(ctx.sessionManager, ctx.cwd, active.run_id);
+		// I-005: durable approval evidence — run + plan digest + HEAD at
+		// approval (D-003/D-011). Sets phase executing via the state machine.
+		try {
+			const load = loadCheckpoint(ctx.cwd, active.run_id);
+			if (load.status === "missing") {
+				createCheckpoint(ctx.cwd, { runId: active.run_id, originWorkdir: ctx.cwd, workdir: ctx.cwd });
+			}
+			const approval: ExecutionApproval = {
+				plan: planIdentityOf(path.resolve(planPath), 1),
+				worktree: resolveWorktreeRoot(ctx.cwd) ?? path.resolve(ctx.cwd),
+				headAtApproval: resolveHeadAt(ctx.cwd),
+				approvedAt: utcNow(),
+			};
+			mutateCheckpoint(ctx.cwd, active.run_id, (cp) => {
+				// Plan refinement may not have recorded the plan identity yet.
+				const withPlan = cp.plan === null ? { ...cp, plan: approval.plan } : cp;
+				// The checkpoint may not carry accept-execute (legacy flow);
+				// approval here came from the explicit handoff confirmation.
+				const aligned = withPlan.nextAction === "accept-execute"
+					? withPlan
+					: { ...withPlan, nextAction: "accept-execute" as const };
+				return applyExecutionApproved(aligned, approval);
+			});
+		} catch (error) {
+			// F-002 (implementation review): a plan-digest mismatch between the
+			// recorded checkpoint plan and the approval must fail closed and
+			// visibly — never silently execute without durable approval.
+			if (error instanceof StateError && /does not match/.test(error.message)) throw error;
+			/* legacy/corrupt checkpoint: run status still transitions below */
+		}
 		try {
 			setRunStatus(ctx.cwd, active.run_id, "executing");
 		} catch {
@@ -348,8 +521,28 @@ export function recordExecutionTurn(
 		execution.usage.inToks += usage.input;
 		execution.usage.outToks += usage.output;
 	}
+	// I-005: mirror progress into the run checkpoint so a different session
+	// can resume with the verified VC/I set (R-004).
+	withExecutionCheckpoint(_ctx, (cp) =>
+		applyExecutionProgress(cp, {
+			doneVcIds: execution!.items.filter((item) => item.done).map((item) => item.id),
+			implStatus: implStatusSnapshot(),
+			currentI: execution!.currentI,
+			usage: usage ? { inToks: usage.input, outToks: usage.output } : undefined,
+		}),
+	);
 	requestExecutionFlush(pi, _ctx);
 	updateStatusWidget(_ctx);
+}
+
+function implStatusSnapshot(): Record<string, string> {
+	const snapshot: Record<string, string> = {};
+	if (!execution?.implItems) return snapshot;
+	for (const item of execution.implItems) {
+		const state = execution.implStatus?.[item.id];
+		if (state) snapshot[item.id] = state;
+	}
+	return snapshot;
 }
 
 export function registerExecutionTurnHandlers(
@@ -380,6 +573,7 @@ export function registerExecutionTurnHandlers(
 	pi.on("session_shutdown", async (_event, ctx) => {
 		drainExecutionFlush(pi, ctx);
 		execution = null;
+		executionRunId = null;
 		goalWaitRuntime = null;
 		lastAssistantUsage = null;
 	});
@@ -428,7 +622,7 @@ const EXECUTION_RESUME_CUSTOM_TYPE = "pi-plans-exec-resume";
 function activeVccSettings(ctx: ExtensionContext, phase: PiPlansCompactionPhase): { settings: PiPlansVccSettings; runId: string; artifactDir: string } | null {
 	const stateRoot = resolveStateRootOrNull(ctx.cwd);
 	if (!stateRoot) return null;
-	const active = readActive(ctx.cwd);
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (!active) return null;
 	const run = getRun(ctx.cwd, active.run_id);
 	if (!run) return null;
@@ -623,6 +817,49 @@ export const PLANNING_RUN_START_CUSTOM_TYPE = "pi-plans-run-start";
 export const PLANNING_PLAN_WRITTEN_CUSTOM_TYPE = "pi-plans-plan-written";
 const PLANNING_RESUME_CUSTOM_TYPE = "pi-plans-plan-resume";
 
+// ---------------------------------------------------------------------------
+// Pre-plan compaction: right after `plans start-run` creates a new planning
+// run, the extension triggers one VCC compaction so the new plan starts on a
+// lean context (LLM reasoning degrades with longer context; see PLAN
+// preplan-compact). The pending flag is session-scoped and opportunistic: it
+// is set by the start-run tool case and consumed by the plans tool_result
+// hook in index.ts, which requests the extension-context compact action and
+// resumes planning exactly once regardless of success or failure.
+// ---------------------------------------------------------------------------
+
+export { PLANNING_PREPLAN_COMPACT_HINT };
+export const PLANNING_PREPLAN_RESUME_CUSTOM_TYPE = "pi-plans-preplan-resume";
+
+interface PrePlanCompactPending {
+	runId: string;
+}
+
+export function markPrePlanCompactPending(ctx: ExtensionContext, runId: string): void {
+	const session = ctx.sessionManager as unknown as { __piPlansPrePlanCompact?: PrePlanCompactPending | null };
+	session.__piPlansPrePlanCompact = { runId };
+}
+
+export function consumePrePlanCompactPending(ctx: ExtensionContext): PrePlanCompactPending | null {
+	const session = ctx.sessionManager as unknown as { __piPlansPrePlanCompact?: PrePlanCompactPending | null };
+	const pending = session.__piPlansPrePlanCompact ?? null;
+	session.__piPlansPrePlanCompact = null;
+	return pending;
+}
+
+/** Hidden resume message after the pre-plan compaction settles (success or
+ *  failure): Pi's manual compaction never continues the aborted turn, so the
+ *  planning workflow is continued exactly once from here. */
+export function sendPrePlanCompactResume(pi: ExtensionAPI): void {
+	pi.sendMessage?.(
+		{
+			customType: PLANNING_PREPLAN_RESUME_CUSTOM_TYPE,
+			content: "Continue planning.",
+			display: false,
+		},
+		{ triggerTurn: true },
+	);
+}
+
 interface PlanningCompactionState {
 	inFlight: boolean;
 	resumeGuard: boolean;
@@ -752,8 +989,11 @@ export function refreshPlanningCompactionCooldown(_ctx: ExtensionContext): void 
 }
 
 export function requestPlanningCompaction(_ctx: ExtensionContext): void {
-	// Proactive pi-plans compaction is intentionally disabled. Manual,
+	// Generic proactive pi-plans compaction is intentionally disabled. Manual,
 	// threshold, and overflow compactions are handled by session_before_compact.
+	// The single exception is the pre-plan compaction: index.ts requests the
+	// extension-context compact action from the plans tool_result hook right
+	// after start-run (see PLANNING_PREPLAN_COMPACT_HINT).
 }
 
 function buildPlanningVccResult(event: SessionBeforeCompactEvent, ctx: ExtensionContext): VccCompactionBuildResult | null {
@@ -887,7 +1127,7 @@ export function handlePlanningCompactFailed(pi: ExtensionAPI, ctx: ExtensionCont
 }
 
 export function filterPlanningResumeMessages<T extends { customType?: string }>(messages: T[]): T[] {
-	return messages.filter((message) => message.customType !== PLANNING_RESUME_CUSTOM_TYPE);
+	return messages.filter((message) => message.customType !== PLANNING_RESUME_CUSTOM_TYPE && message.customType !== PLANNING_PREPLAN_RESUME_CUSTOM_TYPE);
 }
 
 export async function stopExecution(pi: ExtensionAPI, ctx: ExtensionContext, reason: string): Promise<void> {
@@ -896,7 +1136,10 @@ export async function stopExecution(pi: ExtensionAPI, ctx: ExtensionContext, rea
 	// Final synchronous write: drain any deferred flush and land the last snapshot.
 	pendingExecutionFlush = false;
 	persist(pi);
+	// Checkpoint first: withExecutionCheckpoint guards on the live execution.
+	withExecutionCheckpoint(ctx, (cp) => applyExecutionStopped(cp, reason));
 	execution = null;
+	executionRunId = null;
 	goalWaitRuntime = null;
 	pi.appendEntry("pi-plans-exec-cleared", { reason });
 	pi.sendMessage(
@@ -907,7 +1150,7 @@ export async function stopExecution(pi: ExtensionAPI, ctx: ExtensionContext, rea
 		},
 		{ triggerTurn: false },
 	);
-	const active = readActive(ctx.cwd);
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (active) {
 		try {
 			setRunStatus(ctx.cwd, active.run_id, "stopped");
@@ -1105,7 +1348,10 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 
 	const summary = execution.items.map((item) => `- ✅ \`${item.id}\` ${item.text.split(";")[0]}`).join("\n");
 	const planPath = execution.planPath;
+	// Checkpoint first (live-execution guard), then clear the session state.
+	withExecutionCheckpoint(ctx, (cp) => applyExecutionCompleted(cp));
 	execution = null;
+	executionRunId = null;
 	goalWaitRuntime = null;
 	pi.appendEntry("pi-plans-exec-cleared", { reason: "complete" });
 	// Post-execution goal-running continuation: in interactive sessions, attach
@@ -1128,7 +1374,7 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 	if (interactive) {
 		pi.appendEntry("pi-plans-ameliorate", { planPath, phase: "goal-started", rounds: null, currentRound: 0 });
 	}
-	const active = readActive(ctx.cwd);
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (active) {
 		try {
 			setRunStatus(ctx.cwd, active.run_id, "done");
@@ -1144,7 +1390,7 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
  * implementation-review loop. Termination options are single-sourced from
  * src/termination-prompt.ts (shared with the ask_choice trailing branch). */
 export const AMELIORATION_PROMPT_TEXT = `---
-Goal-running continuation: immediately ask the user now via ask_choice (autoComplete: false, in the session language) the termination question: "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. Then keep running the implementation-review loop without asking whether to continue; the goal-wait option keeps the loop running until no unpassed VCs remain.`;
+Goal-running continuation: immediately ask the user now via ask_choice (autoComplete: false, in the session language) the termination question: "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. ${TERMINATION_RECORDING_INSTRUCTIONS} Then keep running the implementation-review loop without asking whether to continue; the goal-wait option keeps the loop running until no unpassed VCs remain.`;
 
 /** Injection text for before_agent_start while executing. */
 export function executionContextMessage(ctx: ExtensionContext): string | null {

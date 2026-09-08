@@ -15,9 +15,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { disableAutoComplete, enableAutoComplete, isAutoCompleteEnabled, recordAskChoice } from "../src/autocomplete.ts";
-import { TERMINATION_QUESTION, TERMINATION_OPTIONS, renderTerminationOptions } from "../src/termination-prompt.ts";
+import { TERMINATION_QUESTION, TERMINATION_OPTIONS, TERMINATION_RECORDING_INSTRUCTIONS, renderTerminationOptions } from "../src/termination-prompt.ts";
 import { truncateToWidth, visibleWidth } from "../src/refine-ui-helpers.ts";
 import { normalizeWorkdir, readActive, recordDecision } from "../src/state.ts";
+import { resolveActiveRun } from "../src/run-context.ts";
+import { applyQuestionAnswered, applyQuestionAsked, loadCheckpoint, mutateCheckpoint } from "../src/workflow-state.ts";
 
 // ---------------------------------------------------------------------------
 // Panel fitting: pi's ExtensionSelectorComponent renders each option as an
@@ -144,6 +146,15 @@ const AskChoiceParams = Type.Object({
 				"Offer the Auto-complete option (default true). MUST be false for the execution handoff, install waivers, publishing, deployment, merge, push, credential use, or any external-state change.",
 		}),
 	),
+	questionId: Type.Optional(
+		Type.String({
+			description:
+				"Stable id for this question so cross-session resume can deduplicate (e.g. 'termination-condition'). Provide one for planning/refinement questions that gate progress.",
+		}),
+	),
+	purpose: Type.Optional(
+		Type.String({ description: "Short machine-readable purpose (e.g. 'scope', 'termination-condition')." }),
+	),
 	trailing: Type.Optional(
 		StringEnum(["auto-refine-loop"] as const, {
 			description:
@@ -176,6 +187,40 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const workdir = normalizeWorkdir(params.workdir ?? ctx.cwd);
 			const allowOther = params.allowOther ?? true;
+			// I-003: cross-session question durability. Pending is recorded
+			// before the panel opens; the answer is recorded before it returns.
+			// Runs without a checkpoint (adhoc, pre-start-run setup questions)
+			// skip silently — legacy behavior is unchanged.
+			const activeRun = resolveActiveRun(ctx.sessionManager, workdir);
+			const hasCheckpoint =
+				activeRun !== null && loadCheckpoint(workdir, activeRun.run_id).status === "ok";
+			const recordQuestionAsked = (): void => {
+				if (!hasCheckpoint || !activeRun || !params.questionId) return;
+				try {
+					mutateCheckpoint(workdir, activeRun.run_id, (cp) =>
+						applyQuestionAsked(cp, {
+							questionId: params.questionId!,
+							question: params.question,
+							options: options.map((option) => option.label),
+							purpose: params.purpose,
+							allowOther,
+							autoComplete,
+						}),
+					);
+				} catch {
+					/* checkpoint bookkeeping must not block the question itself */
+				}
+			};
+			const recordQuestionAnswered = (answer: string, source: "user" | "auto-complete" | "other"): void => {
+				if (!hasCheckpoint || !activeRun || !params.questionId) return;
+				try {
+					mutateCheckpoint(workdir, activeRun.run_id, (cp) =>
+						applyQuestionAnswered(cp, params.questionId!, answer, source),
+					);
+				} catch {
+					/* the decisions ledger already holds the answer; F-005 reconcile covers the gap */
+				}
+			};
 			// Param normalization: a trailing option replaces Auto-complete entirely,
 			// so an erroneously passed autoComplete flag is suppressed here.
 			const trailing = params.trailing;
@@ -185,7 +230,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			const recommended = options.find((option) => option.recommended) ?? options[0];
 
 			const record = (answer: string, source: AskChoiceDetails["source"]) => {
-				const active = readActive(workdir);
+				const active = resolveActiveRun(ctx.sessionManager, workdir);
 				if (!active) return;
 				try {
 					recordDecision(workdir, active.run_id, {
@@ -193,6 +238,10 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 						options: options.map((option) => option.label),
 						answer,
 						answer_source: source === "auto-complete" ? "auto-complete" : "user",
+						// F-005 reconcile (implementation review): the ledger
+						// carries the stable id so resume can drop stale pending
+						// questions after a crash between the two writes.
+						...(params.questionId ? { questionId: params.questionId } : {}),
 					});
 				} catch {
 					/* recording is best-effort; the question still gets answered */
@@ -211,6 +260,8 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			if (autoComplete && isAutoCompleteEnabled(ctx)) {
 				recordAskChoice(ctx, true);
 				record(recommended.label, "auto-complete");
+				recordQuestionAsked();
+				recordQuestionAnswered(recommended.label, "auto-complete");
 				return {
 					content: [{ type: "text", text: `Auto-complete selected the recommended option: ${recommended.label}` }],
 					details: details(recommended.label, "auto-complete"),
@@ -229,6 +280,8 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 				enableAutoComplete(ctx);
 				recordAskChoice(ctx, true);
 				record(recommended.label, "auto-complete");
+				recordQuestionAsked();
+				recordQuestionAnswered(recommended.label, "auto-complete");
 				return {
 					content: [
 						{
@@ -263,6 +316,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 				ctx.ui.notify?.("Terminal too small: the ask_choice panel may overflow even in its minimal form.", "warning");
 			}
 
+			recordQuestionAsked();
 			const selected = await ctx.ui.select(panel.question, panel.labels);
 			if (selected === undefined) {
 				disableAutoComplete(ctx, "question cancelled");
@@ -281,6 +335,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 				enableAutoComplete(ctx);
 				recordAskChoice(ctx, true);
 				record(recommended.label, "auto-complete");
+				recordQuestionAnswered(recommended.label, "auto-complete");
 				return {
 					content: [
 						{
@@ -299,7 +354,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text",
-							text: `User selected Auto-refine loop. Immediately ask the follow-up with ask_choice (autoComplete: false, in the session language): "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. Then run the loop per the completion instructions: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and continues until the chosen termination condition — the goal-wait option keeps the loop running until no unpassed VCs remain.`,
+							text: `User selected Auto-refine loop. Immediately ask the follow-up with ask_choice (autoComplete: false, in the session language): "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. ${TERMINATION_RECORDING_INSTRUCTIONS} Then run the loop per the completion instructions: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and continues until the chosen termination condition — the goal-wait option keeps the loop running until no unpassed VCs remain.`,
 						},
 					],
 					details: details("Auto-refine loop", "user"),
@@ -318,6 +373,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 				recordAskChoice(ctx, false);
 				const answer = typed.trim();
 				record(answer, "user");
+				recordQuestionAnswered(answer, "other");
 				return {
 					content: [{ type: "text", text: `User wrote: ${answer}` }],
 					details: details(answer, "other"),
@@ -328,6 +384,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			const option = index >= 0 && index < options.length ? options[index] : undefined;
 			if (!option) {
 				recordAskChoice(ctx, false);
+				recordQuestionAnswered(selected, "user");
 				return {
 					content: [{ type: "text", text: `User selected: ${selected}` }],
 					details: details(selected, "user"),
@@ -335,6 +392,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			}
 			recordAskChoice(ctx, false);
 			record(option.label, "user");
+			recordQuestionAnswered(option.label, "user");
 			return {
 				content: [{ type: "text", text: `User selected: ${index + 1}. ${option.label}` }],
 				details: details(option.label, "user"),

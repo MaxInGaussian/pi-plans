@@ -2,6 +2,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getRun, readActive } from "./state.ts";
+import { resolveActiveRun } from "./run-context.ts";
 
 export const AUTOCOMPLETE_ENTRY = "pi-plans-autocomplete";
 const AUTOCOMPLETE_CONTINUE = "Continue the current planning workflow. Raise the next relevant question with ask_choice; do not stop after an auto-completed answer.";
@@ -32,7 +33,7 @@ function sessionState(ctx: ExtensionContext): AutoCompleteState | undefined {
 }
 
 function activePlanningRun(ctx: ExtensionContext): { runId: string } | null {
-	const active = readActive(ctx.cwd);
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (!active) return null;
 	const run = getRun(ctx.cwd, active.run_id);
 	return run?.status === "planning" ? { runId: run.run_id } : null;

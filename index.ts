@@ -20,6 +20,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	consumePlanningCompactionResumeGuard,
+	consumePrePlanCompactPending,
 	drainExecutionFlush,
 	executionContextMessage,
 	filterExecutionResumeMessages,
@@ -36,6 +37,8 @@ import {
 	noteCompactionEnded,
 	noteCompactionStarted,
 	PLANNING_PLAN_WRITTEN_CUSTOM_TYPE,
+	PLANNING_PREPLAN_COMPACT_HINT,
+	sendPrePlanCompactResume,
 	registerExecutionTurnHandlers,
 	refreshPlanningCompactionCooldown,
 	requestPlanningCompaction,
@@ -66,7 +69,10 @@ import {
 } from "./src/code-graph/commands.ts";
 import { latestPlanVersion, nextPlanVersionPath } from "./src/plan.ts";
 import { configPiPlansCommand } from "./src/config-command.ts";
+import { resumePlansCommand } from "./src/resume-command.ts";
 import { getRun, loadConfig, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
+import { boundRunId, resolveActiveRun, restoreRunBindingFromSession } from "./src/run-context.ts";
+import { applyPlanWritten, mutateCheckpoint, planIdentityOf } from "./src/workflow-state.ts";
 import { registerAskChoiceTool } from "./tools/ask-choice.ts";
 import { executeCommand, registerExecutePlanTool } from "./tools/execute-plan.ts";
 import { registerPlansTool } from "./tools/plans.ts";
@@ -107,7 +113,7 @@ function extensionStalenessLine(): string {
 
 function hasActivePlanningWorkflow(ctx: Parameters<typeof updateStatusWidget>[0]): boolean {
 	if (getExecution()) return true;
-	const active = readActive(ctx.cwd);
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (!active) return false;
 	const status = getRun(ctx.cwd, active.run_id)?.status;
 	return status === "planning" || status === "accepted" || status === "executing";
@@ -166,12 +172,17 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		if (getExecution()) return;
 		const rawPath = String((event.input as { path?: string }).path ?? "");
 		if (!rawPath) return;
-		const reason = planningWriteBlockReason({ workdir: ctx.cwd, toolName: event.toolName, rawPath });
+		const reason = planningWriteBlockReason({
+			workdir: ctx.cwd,
+			toolName: event.toolName,
+			rawPath,
+			activeRunId: boundRunId(ctx.sessionManager, ctx.cwd),
+		});
 		if (reason) return { block: true, reason };
 		// Allowed write: if it lands exactly on the run's latest plan file, drop a
 		// marker entry so planning-phase compaction can anchor its cut point there.
 		if (event.toolName === "write" || event.toolName === "edit") {
-			const active = readActive(ctx.cwd);
+			const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 			if (active) {
 				const latest = latestPlanVersion(active.artifact_dir);
 				if (latest && path.resolve(ctx.cwd, rawPath) === path.resolve(ctx.cwd, latest.path)) {
@@ -184,6 +195,63 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			}
 		}
 		return;
+	});
+
+	// I-003: a successful write/edit that lands on the run's latest plan
+	// records the plan identity in the run checkpoint (post-execution, so the
+	// digest covers the NEW file bytes — unlike the pre-execution marker above).
+	pi.on("tool_result", async (event, ctx) => {
+		if (event.isError) return;
+		if (getExecution()) return;
+		if (event.toolName !== "write" && event.toolName !== "edit") return;
+		const rawPath = String((event.input as { path?: string }).path ?? "");
+		if (!rawPath) return;
+		const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+		if (!active) return;
+		const latest = latestPlanVersion(active.artifact_dir);
+		if (!latest) return;
+		if (path.resolve(ctx.cwd, rawPath.replace(/^@/, "")) !== path.resolve(ctx.cwd, latest.path)) return;
+		try {
+			const identity = planIdentityOf(path.resolve(ctx.cwd, latest.path), latest.version);
+			mutateCheckpoint(ctx.cwd, active.run_id, (cp) => applyPlanWritten(cp, identity));
+		} catch {
+			/* best-effort; the model can also call plans record-checkpoint explicitly */
+		}
+	});
+
+	// Pre-plan compaction: right after `plans start-run` creates a new planning
+	// run, trigger one VCC compaction (PLANNING_PREPLAN_COMPACT_HINT routes it
+	// through the planning session_before_compact path) so the new plan starts
+	// on a lean context. ctx.compact() aborts the current agent operation
+	// first, so it must fire here — after the tool result is appended, never
+	// inside the tool execute stack. Pi's manual compaction never continues the
+	// aborted turn, so resume planning exactly once on success AND failure.
+	pi.on("tool_result", async (event, ctx) => {
+		if (event.isError) return;
+		if (event.toolName !== "plans") return;
+		if (!consumePrePlanCompactPending(ctx)) return;
+		if (typeof ctx.compact !== "function") {
+			sendPrePlanCompactResume(pi);
+			return;
+		}
+		let resumed = false;
+		const resumeOnce = () => {
+			if (resumed) return;
+			resumed = true;
+			sendPrePlanCompactResume(pi);
+		};
+		ctx.compact({
+			customInstructions: PLANNING_PREPLAN_COMPACT_HINT,
+			onComplete: () => resumeOnce(),
+			onError: () => {
+				try {
+					ctx.ui?.notify?.("pi-plans: pre-plan compaction skipped; continuing planning.", "info");
+				} catch {
+					/* notify is best-effort */
+				}
+				resumeOnce();
+			},
+		});
 	});
 
 	// Bidirectional code-graph reminder hook: separate from the planning guard
@@ -333,7 +401,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		description: "Show pi-plans state: config, active run, and execution progress",
 		handler: async (_args, ctx) => {
 			const lines: string[] = [];
-			const active = readActive(ctx.cwd);
+			const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 			const run = active ? getRun(ctx.cwd, active.run_id) : null;
 			if (!run) {
 				lines.push("No active planning run.");
@@ -404,7 +472,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 				}
 			}
 
-			const active = readActive(ctx.cwd);
+			const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 			const execution = getExecution();
 			disableAutoComplete(ctx, "plan update");
 
@@ -501,10 +569,18 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("resume-plans", {
+		description:
+			"Resume the working plan in this repository: unfinished planning / reviewing / execution / implementation review, across sessions and linked worktrees, in the current session.",
+		handler: async (_args, ctx) => {
+			await resumePlansCommand(pi, ctx, baseDir);
+		},
+	});
+
 	pi.registerCommand("plans-abandon", {
 		description: "Abandon the active planning run (lifts the read-only guard; artifacts are kept)",
 		handler: async (_args, ctx) => {
-			const active = readActive(ctx.cwd);
+			const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 			if (!active) {
 				ctx.ui.notify("No active planning run.", "info");
 				return;
@@ -534,9 +610,19 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	pi.on("session_tree", async (_event, ctx) => {
 		await restoreFromSession(pi, ctx, ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreFromSession>[2]);
+		restoreRunBindingFromSession(
+			ctx.sessionManager,
+			ctx.cwd,
+			ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreRunBindingFromSession>[2],
+		);
 	});
 	pi.on("session_start", async (_event, ctx) => {
 		await restoreFromSession(pi, ctx, ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreFromSession>[2]);
 		restoreAutoCompleteFromSession(ctx, ctx.sessionManager.getEntries() as unknown as Parameters<typeof restoreAutoCompleteFromSession>[1]);
+		restoreRunBindingFromSession(
+			ctx.sessionManager,
+			ctx.cwd,
+			ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreRunBindingFromSession>[2],
+		);
 	});
 }

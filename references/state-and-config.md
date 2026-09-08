@@ -92,6 +92,7 @@ Default values:
   "overrideDefaultCompaction": true,
   "smartKeepTail": true,
   "continueAfterThresholdCompact": true,
+  "prePlanCompact": true,
   "debug": false
 }
 ```
@@ -103,6 +104,7 @@ Rules:
 - `overrideDefaultCompaction:false` returns ordinary Pi manual/threshold/overflow compactions to Pi core. Explicit pi-plans internal compact hints can still use the VCC path.
 - `smartKeepTail:true` starts from the requested/default keep count and may retain more recent user turns when the retained tail remains within the safe token budget. Explicit `keep:N` is honored.
 - `continueAfterThresholdCompact:true` permits one hidden continuation after successful threshold/overflow compaction only on Pi versions that still need extension-driven resume behavior. Plain manual `/compact` never auto-continues, and `/compact <text>` sends the text once as the follow-up prompt.
+- `prePlanCompact:true` requests one VCC planning compaction (internal hint `pi-plans planning pre-plan compact`) from the `plans` `tool_result` hook right after `plans start-run` creates a new run, before the first planning question, and resumes the planning turn with one hidden message on success and failure alike. Small sessions, already-compacted sessions, and aborts skip silently with an info notice. The trigger is disabled while an execution is active. `prePlanCompact:false` restores the old behavior.
 - `debug:false` writes no diagnostics; `debug:true` writes a best-effort `/tmp/pi-vcc-debug.json` snapshot for local troubleshooting.
 
 ## Language Setting
@@ -182,3 +184,20 @@ One run directory per planning request: `<git-common-dir>/pi_plans/runs/<YYYYMMD
 `run.json` includes: run ID; skill name; original request; target workspace; artifact directory; language tag; status (`planning` → `accepted` → `executing` → `done`, with `stopped`/`abandoned` as exits); timestamps.
 
 `decisions.jsonl` is appended automatically by `ask_choice` (question, options, answer, answer source). `subagents.jsonl` records reviewer/criticizer/ref-analyst spawns. `refs.jsonl` records reference metadata via `plans` (`record-ref`).
+
+## Workflow Checkpoints (`/resume-plans`)
+
+Each run may carry a `checkpoint.json` — the durable, cross-session workflow state that `/resume-plans` restores in the current session. It records: logical `phase` (`planning | reviewing | executing | implementation-review | completed`), `nextAction`, the exact plan identity (path + version + SHA-256), pending/answered questions (stable `questionId`), review rounds with per-lane status and result-file references, execution approval evidence (plan digest, worktree, `git rev-parse HEAD` at approval, verified VC/I set, usage), the implementation-review termination condition and completed-round count, and ownership metadata. Full review outputs live in separate `reviews/` files; the checkpoint keeps only validated references.
+
+Rules:
+
+- Validation is explicit: unknown schema versions, malformed shapes, and unexpected keys are rejected; missing and corrupt checkpoints are distinct, and corrupt files are never silently overwritten.
+- Writes are atomic with monotonic revisions; writers may require ownership (token + generation) or an expected revision.
+- Model-driven boundaries (plan written, review consolidated, termination condition recorded, implementation round finished, completed) go through the whitelisted `plans record-checkpoint` action, which enforces state-machine preconditions — it cannot set execution approval, mark VCs passed, or forge terminal states.
+- `ask_choice` accepts `questionId`/`purpose`; a pending question is durable before the panel opens and the answer before it returns. When a crash leaves a question both answered (ledger) and pending (checkpoint), the answered entry wins.
+- On execution resume, an unchanged plan digest with a changed HEAD keeps the authorization but re-verifies previously verified VCs first; loading execution from a checkpoint writes an immediate session snapshot so session restore cannot clear it.
+- Cross-worktree resumes copy artifacts without overwriting, reset approval and VC validity, keep the termination condition, and restart completed-round counts at 0 for the target worktree.
+
+## Run Ownership
+
+A run may be held by at most one live owner (`owner.json`: host, pid, process start time via `ps -o lstart=`, session id, random process token, generation). Acquisition is an atomic exclusive create; takeovers require proof the previous owner is dead (process gone, or pid alive with a different start time — PID reuse). Foreign hosts, corrupt records, and unverifiable liveness are conservatively refused; `/resume-plans` never queues or interrupts. Sessions bind to the run they start/execute/resume (restored from `pi-plans-run-start` entries on the current branch), and attribution (tools, write guard, autocomplete, execution bookkeeping, code-graph apply gate) prefers the binding over the shared `active.json` pointer.

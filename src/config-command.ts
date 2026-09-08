@@ -349,6 +349,8 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 			return config;
 		});
 
+		// Display-only consumer (F-006): deliberately keeps the shared active
+		// pointer — the wizard summarizes repo state, not session attribution.
 		const active = readActive(workdir);
 		const lines = summarizeConfig(updated.config);
 		if (active) {

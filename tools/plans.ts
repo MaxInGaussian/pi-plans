@@ -3,6 +3,21 @@
  * typed tool.
  */
 
+import { bindRun, boundRunId, resolveActiveRun } from "../src/run-context.ts";
+import { getExecution, markPrePlanCompactPending } from "../src/exec.ts";
+import { loadVccSettings, scaffoldVccSettings } from "../src/compaction.ts";
+import {
+	applyCompleted,
+	applyImplementationReviewConfigured,
+	applyImplementationRoundFinished,
+	applyPlanWritten,
+	applyReviewConsolidated,
+	createCheckpoint,
+	mutateCheckpoint,
+	planIdentityOf,
+	type WorkflowCheckpoint,
+} from "../src/workflow-state.ts";
+import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -47,6 +62,7 @@ const PlansParams = Type.Object({
 			"record-decision",
 			"record-ref",
 			"record-subagent",
+			"record-checkpoint",
 		] as const,
 		{ description: "State command to run" },
 	),
@@ -108,6 +124,29 @@ const PlansParams = Type.Object({
 			sessionDir: Type.Optional(Type.String()),
 		}),
 	),
+	checkpoint: Type.Optional(
+		Type.Object({
+			/** Whitelisted semantic transition (I-003). State-machine validated; approval cannot be forged here. */
+			transition: StringEnum(
+				[
+					"plan-written",
+					"review-consolidated",
+					"implementation-review-configured",
+					"implementation-round-finished",
+					"completed",
+				] as const,
+			),
+			/** plan-written: absolute or workdir-relative PLAN_vN.md path. */
+			planPath: Type.Optional(Type.String()),
+			/** review-consolidated: round id + optional disposition artifact (run-dir relative). */
+			roundId: Type.Optional(Type.String()),
+			dispositionArtifact: Type.Optional(Type.String()),
+			/** implementation-review-configured: the serialized termination condition chosen by the user. */
+			terminationCondition: Type.Optional(Type.String()),
+			/** completed: non-empty evidence that the termination condition is satisfied. */
+			evidence: Type.Optional(Type.String()),
+		}),
+	),
 });
 
 // Module-level reference so the start-run action can append a session entry
@@ -165,6 +204,59 @@ export async function finalCommit(
 		return { ok: true, committed: head, noop: false };
 	} finally {
 		store.close();
+	}
+}
+
+/** Whitelisted, state-machine-validated checkpoint transitions (I-003). */
+export function recordCheckpointTransition(
+	ctx: { sessionManager: unknown },
+	workdir: string,
+	runIdArg: string | undefined,
+	checkpoint: {
+		transition: "plan-written" | "review-consolidated" | "implementation-review-configured" | "implementation-round-finished" | "completed";
+		planPath?: string;
+		roundId?: string;
+		dispositionArtifact?: string;
+		terminationCondition?: string;
+		evidence?: string;
+	},
+): WorkflowCheckpoint {
+	const runId =
+		runIdArg ??
+		boundRunId(ctx.sessionManager, workdir) ??
+		resolveActiveRun(ctx.sessionManager, workdir)?.run_id ??
+		null;
+	if (!runId) throw new StateError("record-checkpoint requires runId (or an active/bound run)");
+	switch (checkpoint.transition) {
+		case "plan-written": {
+			if (!checkpoint.planPath) throw new StateError("plan-written requires planPath");
+			const planPath = path.isAbsolute(checkpoint.planPath)
+				? checkpoint.planPath
+				: path.resolve(workdir, checkpoint.planPath.replace(/^@/, ""));
+			const identity = planIdentityOf(planPath, 1);
+			return mutateCheckpoint(workdir, runId, (cp) => applyPlanWritten(cp, identity));
+		}
+		case "review-consolidated": {
+			if (!checkpoint.roundId) throw new StateError("review-consolidated requires roundId");
+			return mutateCheckpoint(workdir, runId, (cp) =>
+				applyReviewConsolidated(cp, checkpoint.roundId!, checkpoint.dispositionArtifact),
+			);
+		}
+		case "implementation-review-configured": {
+			if (!checkpoint.terminationCondition) {
+				throw new StateError("implementation-review-configured requires terminationCondition");
+			}
+			return mutateCheckpoint(workdir, runId, (cp) =>
+				applyImplementationReviewConfigured(cp, checkpoint.terminationCondition!),
+			);
+		}
+		case "implementation-round-finished": {
+			return mutateCheckpoint(workdir, runId, (cp) => applyImplementationRoundFinished(cp));
+		}
+		case "completed": {
+			if (!checkpoint.evidence) throw new StateError("completed requires evidence");
+			return mutateCheckpoint(workdir, runId, (cp) => applyCompleted(cp, checkpoint.evidence!));
+		}
 	}
 }
 
@@ -264,6 +356,28 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 								runStartAppender?.(run.run_id, run.artifact_dir);
 							},
 						});
+						// I-002: attribute this session's work to the run it started.
+						bindRun(ctx.sessionManager, workdir, result.run.run_id);
+						// I-003: durable cross-session state starts with the run.
+						createCheckpoint(workdir, {
+							runId: result.run.run_id,
+							originWorkdir: workdir,
+							workdir,
+						});
+						// Pre-plan compaction: mark the session so the plans tool_result
+						// hook compacts once with the VCC planning path before the first
+						// planning question. Opportunistic: never blocks run creation.
+						try {
+							const prePlanStateRoot = resolveStateRootOrNull(workdir);
+							if (prePlanStateRoot && !getExecution()) {
+								scaffoldVccSettings(prePlanStateRoot);
+								if (loadVccSettings(prePlanStateRoot).prePlanCompact) {
+									markPrePlanCompactPending(ctx, result.run.run_id);
+								}
+							}
+						} catch {
+							// best-effort: pre-plan compaction is an optimization only
+						}
 						break;
 					}
 					case "set-status": {
@@ -293,6 +407,11 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 							throw new StateError("record-subagent requires runId and subagent");
 						}
 						result = recordSubagent(workdir, params.runId, params.subagent);
+						break;
+					}
+					case "record-checkpoint": {
+						if (!params.checkpoint) throw new StateError("record-checkpoint requires checkpoint");
+						result = recordCheckpointTransition(ctx, workdir, params.runId, params.checkpoint);
 						break;
 					}
 				}

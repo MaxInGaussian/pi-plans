@@ -15,6 +15,7 @@ import {
 	completeExecution,
 	consumePendingExecutionFlush,
 	consumePlanningCompactionResumeGuard,
+	consumePrePlanCompactPending,
 	drainExecutionFlush,
 	executionContextMessage,
 	filterExecutionResumeMessages,
@@ -31,11 +32,15 @@ import {
 	handlePlanningCompact,
 	handlePlanningCompactFailed,
 	isExecutionComplete,
+	markPrePlanCompactPending,
 	PLANNING_PLAN_WRITTEN_CUSTOM_TYPE,
+	PLANNING_PREPLAN_COMPACT_HINT,
+	PLANNING_PREPLAN_RESUME_CUSTOM_TYPE,
 	PLANNING_RUN_START_CUSTOM_TYPE,
 	refreshPlanningCompactionCooldown,
 	requestPlanningCompaction,
 	restoreFromSession,
+	sendPrePlanCompactResume,
 	shouldTriggerPlanningCompaction,
 	startExecution,
 	recordExecutionTurn,
@@ -43,6 +48,7 @@ import {
 	stopExecution,
 	updateStatusWidget,
 } from "../src/exec.ts";
+import { buildPiPlansVccCompaction, loadVccSettings } from "../src/compaction.ts";
 import type { CheckItem } from "../src/plan.ts";
 import { initState, setGraphEnabled, setRunStatus, startRun } from "../src/state.ts";
 
@@ -1462,5 +1468,249 @@ describe("amelioration termination prompt", () => {
 		assert.match(AMELIORATION_PROMPT_TEXT, /goal wait: continue until no unpassed VCs remain/);
 		assert.match(AMELIORATION_PROMPT_TEXT, /until no high-severity finding \(hard cap 5 rounds\)/);
 		assert.match(AMELIORATION_PROMPT_TEXT, /How should the implementation-review loop terminate\?/);
+	});
+});
+
+describe("checkpoint-backed execution restore (I-005)", () => {
+	it("startExecution records approval (plan digest + HEAD) and progress in the checkpoint", async () => {
+		const { loadExecutionFromCheckpoint } = await import("../src/exec.ts");
+		const { createCheckpoint, loadCheckpoint } = await import("../src/workflow-state.ts");
+		const { resetRunBindingForTests } = await import("../src/run-context.ts");
+		resetRunBindingForTests();
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-exec-cp-"));
+		try {
+			const { spawnSync } = await import("node:child_process");
+			spawnSync("git", ["init"], { cwd: workdir });
+			spawnSync("git", ["config", "user.email", "t@e.com"], { cwd: workdir });
+			spawnSync("git", ["config", "user.name", "T"], { cwd: workdir });
+			initState(workdir);
+			const { run } = startRun(workdir, { topic: "exec-cp", skill: "plan-normal", requestText: "t" });
+			createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+			const artifactDir = run.artifact_dir;
+			fs.mkdirSync(artifactDir, { recursive: true });
+			const planPath = path.join(artifactDir, "PLAN_v1.md");
+			fs.writeFileSync(
+				planPath,
+				"# Plan\n\n## Verifier Checklist\n\n- [ ] `VC-001` covers `I-001`; pass condition: x.\n- [ ] `VC-002` covers `I-002`; pass condition: y.\n",
+				"utf8",
+			);
+			spawnSync("git", ["add", "-A"], { cwd: workdir });
+			spawnSync("git", ["commit", "-m", "init"], { cwd: workdir });
+
+			const harness = makeHarness(workdir);
+			const items: CheckItem[] = [
+				{ id: "VC-001", text: "covers I-001", done: false },
+				{ id: "VC-002", text: "covers I-002", done: false },
+			];
+			await startExecution(harness.pi, harness.ctx, planPath, items);
+
+			const loaded = loadCheckpoint(workdir, run.run_id);
+			assert.equal(loaded.status, "ok");
+			if (loaded.status === "ok") {
+				assert.equal(loaded.checkpoint.phase, "executing");
+				const approval = loaded.checkpoint.execution?.approval;
+				assert.ok(approval, "approval recorded");
+				assert.match(approval!.headAtApproval ?? "", /^[0-9a-f]{40}$/, "HEAD at approval");
+				assert.equal(approval!.plan.path, planPath);
+			}
+
+			// Progress lands in the checkpoint.
+			applyDoneMarkers("[DONE:VC-001]");
+			recordExecutionTurn(harness.pi, harness.ctx, ["VC-001"], { input: 5, output: 2 });
+			const afterProgress = loadCheckpoint(workdir, run.run_id);
+			if (afterProgress.status === "ok") {
+				assert.deepEqual(afterProgress.checkpoint.execution?.doneVcIds, ["VC-001"]);
+				assert.equal(afterProgress.checkpoint.execution?.usage.inToks, 5);
+			}
+
+			// Cross-session restore: fresh harness (new session), load from checkpoint.
+			resetRunBindingForTests();
+			const harness2 = makeHarness(workdir);
+			const restore = loadExecutionFromCheckpoint(harness2.pi, harness2.ctx, run.run_id);
+			assert.equal(restore.status, "loaded");
+			assert.deepEqual(restore.doneVcIds, ["VC-001"]);
+			assert.equal(restore.reverifyAll, false, "same HEAD keeps verified VCs");
+			assert.equal(getExecution()?.items.find((item) => item.id === "VC-001")?.done, true);
+			// F-002: an immediate session snapshot was appended.
+			const snapshots = harness2.recorded.entries.filter((entry) => entry.customType === "pi-plans-exec");
+			assert.ok(snapshots.length >= 1, "session snapshot written on load");
+
+			// Stop keeps progress with pausedReason (D-008).
+			await stopExecution(harness2.pi, harness2.ctx, "stopped by user");
+			const stopped = loadCheckpoint(workdir, run.run_id);
+			if (stopped.status === "ok") {
+				assert.equal(stopped.checkpoint.execution?.pausedReason, "stopped by user");
+				assert.deepEqual(stopped.checkpoint.execution?.doneVcIds, ["VC-001"]);
+			}
+		} finally {
+			fs.rmSync(workdir, { recursive: true, force: true });
+		}
+	});
+
+	it("HEAD change after approval keeps authorization but re-verifies VCs (D-011)", async () => {
+		const { loadExecutionFromCheckpoint } = await import("../src/exec.ts");
+		const { createCheckpoint, loadCheckpoint } = await import("../src/workflow-state.ts");
+		const { resetRunBindingForTests } = await import("../src/run-context.ts");
+		resetRunBindingForTests();
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-exec-head-"));
+		try {
+			const { spawnSync } = await import("node:child_process");
+			spawnSync("git", ["init"], { cwd: workdir });
+			spawnSync("git", ["config", "user.email", "t@e.com"], { cwd: workdir });
+			spawnSync("git", ["config", "user.name", "T"], { cwd: workdir });
+			initState(workdir);
+			const { run } = startRun(workdir, { topic: "exec-head", skill: "plan-normal", requestText: "t" });
+			createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+			fs.mkdirSync(run.artifact_dir, { recursive: true });
+			const planPath = path.join(run.artifact_dir, "PLAN_v1.md");
+			fs.writeFileSync(
+				planPath,
+				"# Plan\n\n## Verifier Checklist\n\n- [ ] `VC-001` covers `I-001`; pass condition: x.\n",
+				"utf8",
+			);
+			spawnSync("git", ["add", "-A"], { cwd: workdir });
+			spawnSync("git", ["commit", "-m", "one"], { cwd: workdir });
+
+			const harness = makeHarness(workdir);
+			await startExecution(harness.pi, harness.ctx, planPath, [
+				{ id: "VC-001", text: "covers I-001", done: false },
+			]);
+			applyDoneMarkers("[DONE:VC-001]");
+			recordExecutionTurn(harness.pi, harness.ctx, ["VC-001"]);
+
+			// Simulate a branch switch / reset under the unchanged plan.
+			spawnSync("git", ["commit", "--allow-empty", "-m", "two"], { cwd: workdir });
+
+			resetRunBindingForTests();
+			const harness2 = makeHarness(workdir);
+			const restore = loadExecutionFromCheckpoint(harness2.pi, harness2.ctx, run.run_id);
+			assert.equal(restore.status, "loaded");
+			assert.deepEqual(restore.doneVcIds, ["VC-001"], "historical evidence kept");
+			assert.equal(restore.reverifyAll, true, "HEAD change forces re-verification");
+			assert.equal(getExecution()?.items[0]?.done, false, "old VC not auto-passed");
+			// Authorization survives.
+			const cp = loadCheckpoint(workdir, run.run_id);
+			if (cp.status === "ok") {
+				assert.ok(cp.checkpoint.execution?.approval, "authorization kept");
+				assert.equal(cp.checkpoint.execution?.reverifyAll, true);
+			}
+		} finally {
+			fs.rmSync(workdir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("pre-plan compaction (start-run trigger)", () => {
+	let tmpRoot: string;
+	let counter = 0;
+
+	before(() => {
+		tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-preplan-"));
+	});
+
+	after(() => {
+		fs.rmSync(tmpRoot, { recursive: true, force: true });
+	});
+
+	async function preplanHarness() {
+		const piPlansExtension = (await import("../index.ts")).default;
+		const harness = makeHarness(path.join(tmpRoot, `ws-${++counter}`));
+		fs.mkdirSync(harness.ctx.cwd, { recursive: true });
+		piPlansExtension(harness.pi as never);
+		return harness;
+	}
+
+	it("routes the pre-plan hint through the planning VCC path for a fresh run", () => {
+		// Pure-builder assertion (order-independent): the getExecution() gate on
+		// buildPlanningCompactionResult is covered by the planning-hook tests.
+		const workdir = path.join(tmpRoot, `hint-${++counter}`);
+		fs.mkdirSync(workdir, { recursive: true });
+		initState(workdir);
+		const { run } = startRun(workdir, { topic: "preplan hint", skill: "plan-normal", requestText: "x" });
+		const built = buildPiPlansVccCompaction({
+			branchEntries: compactableBranchEntries(),
+			preparation: makePreparation("manual", null),
+			customInstructions: PLANNING_PREPLAN_COMPACT_HINT,
+			reason: "manual",
+			willRetry: false,
+			settings: loadVccSettings(path.join(workdir, ".git", "pi_plans")),
+			phaseContext: { phase: "planning", runId: run.run_id, artifactDir: run.artifact_dir },
+		});
+		assert.equal(built.kind, "compaction", "pre-plan hint must produce a VCC compaction, not a cancel/fallback");
+		if (built.kind !== "compaction") return;
+		assert.equal((built.compaction.details as { compactor: string }).compactor, "pi-vcc");
+		assert.equal((built.compaction.details as { phase: string }).phase, "planning");
+		assert.match(built.compaction.summary, /\[Session Goal\]/);
+	});
+
+	it("marks and consumes the pending flag exactly once", () => {
+		const harness = makeHarness(path.join(tmpRoot, `flag-${++counter}`));
+		assert.equal(consumePrePlanCompactPending(harness.ctx), null);
+		markPrePlanCompactPending(harness.ctx, "run-1");
+		assert.deepEqual(consumePrePlanCompactPending(harness.ctx), { runId: "run-1" });
+		assert.equal(consumePrePlanCompactPending(harness.ctx), null);
+	});
+
+	it("compacts once from the plans tool_result and resumes exactly once on success", async () => {
+		const harness = await preplanHarness();
+		const { ctx, recorded, emit } = harness;
+		markPrePlanCompactPending(ctx, "run-a");
+
+		// Non-plans tool results never consume the pending flag.
+		await emit("tool_result", { type: "tool_result", toolName: "edit", input: { path: "x" }, isError: false });
+		assert.equal(recorded.compacts?.length ?? 0, 0);
+		assert.equal(recorded.messages.length, 0);
+
+		await emit("tool_result", { type: "tool_result", toolName: "plans", input: { action: "start-run" }, isError: false });
+		assert.equal(recorded.compacts?.length, 1);
+		assert.equal(recorded.compacts?.[0]?.customInstructions, PLANNING_PREPLAN_COMPACT_HINT);
+		assert.equal(recorded.messages.length, 0, "no resume before the compaction settles");
+
+		recorded.compacts?.[0]?.onComplete?.({} as never);
+		assert.equal(recorded.messages.length, 1);
+		assert.equal(recorded.messages[0]?.customType, PLANNING_PREPLAN_RESUME_CUSTOM_TYPE);
+		assert.equal(recorded.messages[0]?.content, "Continue planning.");
+		assert.equal((recorded.messages[0] as { display?: boolean }).display, false);
+		assert.equal((recorded.messages[0] as { options?: { triggerTurn?: boolean } }).options?.triggerTurn, true);
+
+		// Pending flag consumed: a second plans result neither compacts nor resumes.
+		await emit("tool_result", { type: "tool_result", toolName: "plans", input: { action: "record-decision" }, isError: false });
+		assert.equal(recorded.compacts?.length, 1);
+		recorded.compacts?.[0]?.onComplete?.({} as never);
+		assert.equal(recorded.messages.length, 1);
+	});
+
+	it("resumes exactly once with an info notice when compaction fails", async () => {
+		const harness = await preplanHarness();
+		const { ctx, recorded } = harness;
+		(ctx as { compact?: unknown }).compact = (options: { onError?: (error: Error) => void }) => {
+			options.onError?.(new Error("Nothing to compact (session too small)"));
+		};
+		markPrePlanCompactPending(ctx, "run-b");
+		await harness.emit("tool_result", { type: "tool_result", toolName: "plans", input: { action: "start-run" }, isError: false });
+		assert.equal(recorded.messages.length, 1, "resume exactly once despite the failure");
+		assert.equal(recorded.messages[0]?.customType, PLANNING_PREPLAN_RESUME_CUSTOM_TYPE);
+		assert.deepEqual(recorded.notifies.at(-1), {
+			message: "pi-plans: pre-plan compaction skipped; continuing planning.",
+			severity: "info",
+		});
+	});
+
+	it("skips silently and still resumes when ctx.compact is unavailable (older Pi)", async () => {
+		const harness = await preplanHarness();
+		(harness.ctx as { compact?: unknown }).compact = undefined;
+		markPrePlanCompactPending(harness.ctx, "run-c");
+		await harness.emit("tool_result", { type: "tool_result", toolName: "plans", input: { action: "start-run" }, isError: false });
+		assert.equal(harness.recorded.messages.length, 1);
+		assert.equal(harness.recorded.messages[0]?.customType, PLANNING_PREPLAN_RESUME_CUSTOM_TYPE);
+	});
+
+	it("filters the pre-plan resume message out of the model context payload", () => {
+		const messages = [
+			{ customType: "user", content: "real prompt" },
+			{ customType: PLANNING_PREPLAN_RESUME_CUSTOM_TYPE, content: "Continue planning." },
+			{ customType: "assistant", content: "ok" },
+		];
+		assert.equal(filterPlanningResumeMessages(messages).length, 2);
 	});
 });

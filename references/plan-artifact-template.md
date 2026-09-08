@@ -72,6 +72,10 @@ Summarize the user's request in one paragraph.
 
 State anything the executor should know, including order of work, files to avoid, and verification commands. The merged accept/execute question still requires explicit user approval (ask_choice with `autoComplete: false`, then the `execute_plan` tool) and must never be auto-completed. Once approved, the extension-managed execution loop injects the remaining checklist every turn and completes when every `[DONE:VC-xxx]` marker has landed — keep this section concise enough to serve as the executor's brief.
 
+## Termination Recording (implementation review)
+
+When the post-execution implementation-review loop starts, the termination question is asked with `ask_choice` using `questionId: "termination-condition"` and persisted via `plans record-checkpoint` (`transition: "implementation-review-configured"`). Each disposed round records `implementation-round-finished`; the loop closes with `completed` plus evidence. These records make `/resume-plans` continue the loop with its original condition and round count.
+
 ## Revision Ledger
 
 - `PLAN_v1`: Initial plan from resolved questions and evidence.

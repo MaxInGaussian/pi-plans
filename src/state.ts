@@ -130,6 +130,8 @@ export interface DecisionEntry {
 	answer: string;
 	answer_source: "user" | "auto-complete";
 	artifact?: string;
+	/** Stable question id when the ask_choice call carried one (F-005 reconcile). */
+	questionId?: string;
 	recorded_at: string;
 }
 
@@ -247,7 +249,7 @@ export function resolveStateRootOrNull(workdir: string): string | null {
 // Config helpers
 // ---------------------------------------------------------------------------
 
-function atomicWriteJson(filePath: string, data: unknown): void {
+export function atomicWriteJson(filePath: string, data: unknown): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	const tmp = `${filePath}.tmp`;
 	writeFileSync(tmp, `${JSON.stringify(data, null, "\t")}\n`, "utf8");
@@ -500,6 +502,14 @@ function requireRunDir(workdir: string, runId: string): string {
 	return runDir;
 }
 
+/** Read-only run directory resolution; returns null when the run does not exist. */
+export function runDirPath(workdir: string, runId: string): string | null {
+	const stateRoot = resolveStateRootOrNull(workdir);
+	if (stateRoot === null) return null;
+	const runDir = path.join(stateRoot, "runs", runId);
+	return existsSync(runDir) ? runDir : null;
+}
+
 export function recordDecision(workdir: string, runId: string, entry: Omit<DecisionEntry, "recorded_at">): DecisionEntry {
 	const runDir = requireRunDir(workdir, runId);
 	const full: DecisionEntry = { ...entry, recorded_at: utcNow() };
@@ -519,6 +529,19 @@ export function recordSubagent(workdir: string, runId: string, entry: Omit<Subag
 	const full: SubagentEntry = { ...entry, recorded_at: utcNow() };
 	appendJsonl(path.join(runDir, "subagents.jsonl"), full);
 	return full;
+}
+
+/** Update a run's recorded workdir (cross-worktree migration, D-007). */
+export function updateRunWorkdir(workdir: string, runId: string, newWorkdir: string): RunInfo {
+	const stateRoot = resolveStateRootOrNull(workdir);
+	if (stateRoot === null) throw new StateError("no pi-plans state found; run init first");
+	const runPath = path.join(stateRoot, "runs", runId, "run.json");
+	if (!existsSync(runPath)) throw new StateError(`run does not exist: ${runId}`);
+	const run = JSON.parse(readFileSync(runPath, "utf8")) as RunInfo;
+	run.workdir = path.resolve(newWorkdir);
+	run.updated_at = utcNow();
+	atomicWriteJson(runPath, run);
+	return run;
 }
 
 export function setRunStatus(workdir: string, runId: string, status: string): RunInfo {

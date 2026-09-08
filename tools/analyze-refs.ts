@@ -18,6 +18,7 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadConfig, normalizeWorkdir, readActive, recordSubagent, resolveStateRootOrNull, StateError } from "../src/state.ts";
+import { resolveActiveRun } from "../src/run-context.ts";
 import { buildRefAnalystTask, type RefAnalystTaskInput } from "../src/refine-prompts.ts";
 import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
 import { RefineOverlayController, refineOverlayContext } from "../src/refine-ui.ts";
@@ -102,7 +103,7 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 
 			// Resolve refs and validate directories up front; missing ones become
 			// FAILED sections instead of aborting the whole batch.
-			const active = readActive(workdir);
+			const active = resolveActiveRun(ctx.sessionManager, workdir);
 			const jobs: AnalysisJob[] = params.refs.map((ref, index) => {
 				const dir = path.resolve(workdir, ref.localPath.replace(/^@/, ""));
 				const missing = fs.existsSync(dir) && fs.statSync(dir).isDirectory() ? null : `reference directory not found: ${dir}`;

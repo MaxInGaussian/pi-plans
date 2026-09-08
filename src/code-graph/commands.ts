@@ -19,7 +19,8 @@ import type { ParserBackend } from "./parser.ts";
 import type { Language } from "./types.ts";
 import { materialize, type MaterializeReport } from "./materialize.ts";
 import { generateSummaries, type CompletionHandle, type SummaryReport } from "./summary.ts";
-import { readActive, getRun, setRunStatus } from "../state.ts";
+import { readActive, getRun, setRunStatus, type ActiveInfo } from "../state.ts";
+import { boundRunId, resolveActiveRun } from "../run-context.ts";
 
 interface CommandContext {
 	cwd: string;
@@ -84,7 +85,15 @@ async function bootstrap(ctx: CommandContext, opts: { reindex?: boolean }): Prom
 	return { store, paths, parsers, runtimeStatus: status };
 }
 
-function activePlanningRun(workdir: string): ActiveInfo | null {
+function activePlanningRun(workdir: string, sessionRunId?: string | null): ActiveInfo | null {
+	// The session-bound run gates first: a planning run in THIS session must
+	// refuse apply even when the shared pointer moved to another run (I-002).
+	if (sessionRunId) {
+		const boundRun = getRun(workdir, sessionRunId);
+		if (boundRun && (boundRun.status === "planning" || boundRun.status === "accepted")) {
+			return { run_id: sessionRunId, run_dir: "", artifact_dir: boundRun.artifact_dir };
+		}
+	}
 	const active = readActive(workdir);
 	if (!active) return null;
 	const run = getRun(workdir, active.run_id);
@@ -189,8 +198,11 @@ export interface ApplyGraphCoreResult {
  * No notifications and no run-status side effects; callers own presentation
  * and lifecycle transitions.
  */
-export async function applyGraphCore(workdir: string, opts: { force?: boolean } = {}): Promise<ApplyGraphCoreResult> {
-	const planned = activePlanningRun(workdir);
+export async function applyGraphCore(
+	workdir: string,
+	opts: { force?: boolean; sessionRunId?: string | null } = {},
+): Promise<ApplyGraphCoreResult> {
+	const planned = activePlanningRun(workdir, opts.sessionRunId);
 	if (planned) {
 		return { refused: `code-graph apply refused: a planning run is currently planning or accepted (run ${planned.run_id}).` };
 	}
@@ -224,7 +236,10 @@ export async function applyGraphCommand(args: string, ctx: CommandContext): Prom
 		return;
 	}
 	const flags = parseCommandArgs(args).flags;
-	const core = await applyGraphCore(ctx.cwd, { force: flags.has("force") });
+	const core = await applyGraphCore(ctx.cwd, {
+		force: flags.has("force"),
+		sessionRunId: boundRunId(ctx.sessionManager, ctx.cwd),
+	});
 	if (core.refused) {
 		ctx.ui.notify(core.refused, "error");
 		return;
@@ -243,7 +258,7 @@ export async function applyGraphCommand(args: string, ctx: CommandContext): Prom
 		`code-graph apply: ${ok} ok, ${deleted} deleted, ${stale} stale, ${skipped} skipped-missing, ${errors} error`,
 		errors > 0 ? "error" : "info",
 	);
-	const active = readActive(ctx.cwd);
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (active) setRunStatus(ctx.cwd, active.run_id, "executing");
 }
 

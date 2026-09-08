@@ -22,6 +22,7 @@ import type { Language } from "../src/code-graph/types.ts";
 import { screeningQuery } from "../src/code-graph/screening.ts";
 import { deleteFile, listPending, updateFile, updateFunction } from "../src/code-graph/mutations.ts";
 import { applyGraphCore } from "../src/code-graph/commands.ts";
+import { boundRunId } from "../src/run-context.ts";
 import { normalizeWorkdir } from "../src/state.ts";
 
 const CodeGraphParams = Type.Object({
@@ -110,7 +111,10 @@ export function registerCodeGraphTool(pi: ExtensionAPI): void {
 						details: {},
 					};
 				}
-				const core = await applyGraphCore(normalizeWorkdir(workdir));
+				const resolvedWorkdir = normalizeWorkdir(workdir);
+				const core = await applyGraphCore(resolvedWorkdir, {
+					sessionRunId: boundRunId(ctx.sessionManager, resolvedWorkdir),
+				});
 				if (core.refused || core.failed || !core.report) {
 					return {
 						content: [{ type: "text", text: JSON.stringify({ ok: false, reason: core.refused ?? core.failed ?? "unknown error" }) }],

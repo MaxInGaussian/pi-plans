@@ -14,6 +14,8 @@ export interface PiPlansVccSettings {
 	overrideDefaultCompaction: boolean;
 	smartKeepTail: boolean;
 	continueAfterThresholdCompact: boolean;
+	/** Pre-plan compaction: trigger a VCC compaction right after `plans start-run`. */
+	prePlanCompact: boolean;
 	debug: boolean;
 }
 
@@ -21,6 +23,7 @@ export const DEFAULT_VCC_SETTINGS: PiPlansVccSettings = {
 	overrideDefaultCompaction: true,
 	smartKeepTail: true,
 	continueAfterThresholdCompact: true,
+	prePlanCompact: true,
 	debug: false,
 };
 
@@ -34,9 +37,15 @@ export const MAX_CHARS_PER_TOKEN = 6;
 export const PI_SELF_RESUME_VERSION: readonly [number, number, number] = [0, 84, 4];
 export const PI_VCC_COMPACT_INSTRUCTION = "__pi_vcc__";
 
+/** Internal hint for the pre-plan compaction requested right after start-run
+ *  (tools/plans.ts marks pending; index.ts requests the compact action).
+ *  Single source of truth: also referenced by exec.ts and the tests. */
+export const PLANNING_PREPLAN_COMPACT_HINT = "pi-plans planning pre-plan compact";
+
 const INTERNAL_COMPACT_INSTRUCTIONS = new Set([
 	"pi-plans execution auto compact",
 	"pi-plans planning auto compact",
+	PLANNING_PREPLAN_COMPACT_HINT,
 ]);
 
 export function vccSettingsPath(stateRoot: string): string {
@@ -95,6 +104,7 @@ export function loadVccSettings(stateRoot: string): PiPlansVccSettings {
 		overrideDefaultCompaction: typeof parsed.overrideDefaultCompaction === "boolean" ? parsed.overrideDefaultCompaction : DEFAULT_VCC_SETTINGS.overrideDefaultCompaction,
 		smartKeepTail: typeof parsed.smartKeepTail === "boolean" ? parsed.smartKeepTail : DEFAULT_VCC_SETTINGS.smartKeepTail,
 		continueAfterThresholdCompact: typeof parsed.continueAfterThresholdCompact === "boolean" ? parsed.continueAfterThresholdCompact : DEFAULT_VCC_SETTINGS.continueAfterThresholdCompact,
+		prePlanCompact: typeof parsed.prePlanCompact === "boolean" ? parsed.prePlanCompact : DEFAULT_VCC_SETTINGS.prePlanCompact,
 		debug: typeof parsed.debug === "boolean" ? parsed.debug : DEFAULT_VCC_SETTINGS.debug,
 	};
 }

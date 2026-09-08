@@ -10,6 +10,7 @@ import {
 	DEFAULT_VCC_SETTINGS,
 	loadVccSettings,
 	parseCompactionInstructions,
+	PLANNING_PREPLAN_COMPACT_HINT,
 	PI_VCC_COMPACT_INSTRUCTION,
 	scaffoldVccSettings,
 	shouldScheduleAutoContinue,
@@ -384,5 +385,43 @@ describe("pi-vcc compaction", () => {
 			if (previous === null) fs.rmSync(debugPath, { force: true });
 			else fs.writeFileSync(debugPath, previous, "utf8");
 		}
+	});
+});
+describe("pre-plan compaction settings and hint", () => {
+	let tmpRoot: string;
+
+	before(() => {
+		tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-preplan-vcc-"));
+	});
+
+	after(() => {
+		fs.rmSync(tmpRoot, { recursive: true, force: true });
+	});
+
+	it("parses the pre-plan compaction hint as an internal pi-plans instruction", () => {
+		assert.equal(DEFAULT_VCC_SETTINGS.prePlanCompact, true);
+		assert.deepEqual(parseCompactionInstructions(PLANNING_PREPLAN_COMPACT_HINT), {
+			isPiVcc: false,
+			isInternalPiPlans: true,
+			keepUserTurns: 1,
+			keepUserTurnsExplicit: false,
+			followUpPrompt: null,
+		});
+	});
+
+	it("fills a missing prePlanCompact key and honors an explicit false", () => {
+		const stateRoot = path.join(tmpRoot, "state");
+		fs.mkdirSync(stateRoot, { recursive: true });
+		fs.writeFileSync(vccSettingsPath(stateRoot), JSON.stringify({ debug: true }), "utf8");
+		scaffoldVccSettings(stateRoot);
+		assert.deepEqual(loadVccSettings(stateRoot), { ...DEFAULT_VCC_SETTINGS, debug: true });
+
+		fs.writeFileSync(
+			vccSettingsPath(stateRoot),
+			JSON.stringify({ ...DEFAULT_VCC_SETTINGS, prePlanCompact: false }),
+			"utf8",
+		);
+		scaffoldVccSettings(stateRoot);
+		assert.equal(loadVccSettings(stateRoot).prePlanCompact, false);
 	});
 });

@@ -94,3 +94,49 @@ describe("planning write guard", () => {
 		assert.equal(planningWriteBlockReason({ workdir, toolName: "write", rawPath: "src/main.ts" }), null);
 	});
 });
+
+describe("session-bound guard run (I-002)", () => {
+	it("activeRunId overrides the shared pointer; null falls back", () => {
+		const workdir = path.join(tmpRoot, "repo-bound");
+		fs.mkdirSync(workdir);
+		initState(workdir);
+		const first = startRun(workdir, { topic: "first run", skill: "plan-small", requestText: "x" }).run;
+		const second = startRun(workdir, { topic: "second run", skill: "plan-small", requestText: "x" }).run;
+
+		// Shared pointer names `second`; this session works on `first`.
+		const bound = planningWriteBlockReason({
+			workdir,
+			toolName: "write",
+			rawPath: path.relative(workdir, path.join(first.artifact_dir, "PLAN_v1.md")),
+			activeRunId: first.run_id,
+		});
+		assert.equal(bound, null, "bound run artifacts stay writable");
+
+		// The other run's artifacts are NOT writable for the bound session.
+		const other = planningWriteBlockReason({
+			workdir,
+			toolName: "write",
+			rawPath: path.relative(workdir, path.join(second.artifact_dir, "PLAN_v1.md")),
+			activeRunId: first.run_id,
+		});
+		assert.ok(other);
+
+		// null = no session binding → legacy shared-pointer behavior.
+		const shared = planningWriteBlockReason({
+			workdir,
+			toolName: "write",
+			rawPath: path.relative(workdir, path.join(first.artifact_dir, "PLAN_v1.md")),
+			activeRunId: null,
+		});
+		assert.ok(shared, "shared pointer names second; first is not writable");
+
+		// A binding to a missing run falls back to the shared pointer.
+		const vanished = planningWriteBlockReason({
+			workdir,
+			toolName: "write",
+			rawPath: path.relative(workdir, path.join(second.artifact_dir, "PLAN_v1.md")),
+			activeRunId: "20990101T000000Z-gone",
+		});
+		assert.equal(vanished, null);
+	});
+});

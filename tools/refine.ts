@@ -15,6 +15,14 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadConfig, normalizeWorkdir, readActive, recordSubagent, resolveStateRootOrNull, StateError, type RoleConfig } from "../src/state.ts";
+import { resolveActiveRun } from "../src/run-context.ts";
+import {
+	loadCheckpoint,
+	readReviewOutput,
+	recordLaneOutcome,
+	reusableLaneOutputs,
+	startReviewRound,
+} from "../src/workflow-state.ts";
 import { buildCriticizerTask, buildImplementationCriticizerTask, buildImplementationReviewerTask, buildReviewerTask, reviewerLanes } from "../src/refine-prompts.ts";
 import { graphBlockForRefiner } from "../src/code-graph/prompts.ts";
 import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
@@ -40,6 +48,12 @@ const RefineParams = Type.Object({
 	),
 	context: Type.Optional(
 		Type.String({ description: "Context for the subagents: user goals, repo evidence, constraints, open questions" }),
+	),
+	resumeRoundId: Type.Optional(
+		Type.String({
+			description:
+				'Round id to resume (I-004). Lanes already complete for this round in the run checkpoint are reused from their persisted outputs; only pending/failed/missing lanes run. Never reuse a round id across plan versions.',
+		}),
 	),
 	workdir: Type.Optional(Type.String({ description: "Target workspace; default current working directory" })),
 });
@@ -119,7 +133,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 			const planText = fs.readFileSync(planPath, "utf8");
 
 			// Record spawns against the active run when one exists.
-			const active = readActive(workdir);
+			const active = resolveActiveRun(ctx.sessionManager, workdir);
 			const record = (name: string, model?: string | null) => {
 				if (!active) return;
 				try {
@@ -130,6 +144,44 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 			};
 
 			const target = params.target ?? "plan";
+			// I-004: durable round bookkeeping. Rounds start (or resume) in the
+			// checkpoint BEFORE any lane spawns; successful outputs are persisted
+			// BEFORE the tool result returns (C-007).
+			const checkpointLoad = active ? loadCheckpoint(workdir, active.run_id) : null;
+			const useCheckpoint = checkpointLoad?.status === "ok" ? checkpointLoad.checkpoint : null;
+			const roundId =
+				params.resumeRoundId ?? `${target}-${params.role}-r${Date.now().toString(36)}`;
+			const roundReviewerCount = params.role === "reviewer" ? Math.min(3, Math.max(1, params.reviewers ?? 1)) : 1;
+			// F-001 (implementation review): the spec MUST carry lanes —
+			// reviewerLanes(count) for reviewer rounds, one lane for criticizer.
+			const roundLanes =
+				params.role === "reviewer"
+					? reviewerLanes(roundReviewerCount).map((lane) => ({ laneId: lane.id, lens: lane.lens ?? undefined }))
+					: [{ laneId: "criticizer" }];
+			const roundSpec = {
+				roundId,
+				role: params.role,
+				target,
+				reviewers: roundReviewerCount,
+				planPath,
+				focus: params.focus,
+				context: params.context,
+				lanes: roundLanes,
+			};
+			if (useCheckpoint) {
+				startReviewRound(workdir, active!.run_id, roundSpec);
+			}
+			const reusable = useCheckpoint
+				? Object.fromEntries(reusableLaneOutputs(useCheckpoint, roundId).map((entry) => [entry.laneId, entry.resultFile]))
+				: {};
+			const persistOutcome = (laneId: string, result: { ok: boolean; output?: string; error?: string }): void => {
+				if (!active || !useCheckpoint) return;
+				try {
+					recordLaneOutcome(workdir, active.run_id, roundId, laneId, result);
+				} catch {
+					/* the subagents ledger still records the spawn; resume treats the lane as unfinished */
+				}
+			};
 			const pickTask = (role: "reviewer" | "criticizer", lens: string | null): string => {
 				if (role === "reviewer") {
 					return target === "implementation"
@@ -163,6 +215,19 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 			}
 
 			if (params.role === "criticizer") {
+				const laneId = "criticizer";
+				const persisted = reusable[laneId];
+				if (persisted) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `${readReviewOutput(workdir, active!.run_id, persisted)}\n\n---\nReused the persisted criticizer result for round ${roundId} (no re-run). Ask each criticizer question with ask_choice (one call per question, in the configured language), record every answer, then revise the plan only after every question has an answer.`,
+							},
+						],
+						details: { mode: "delegated-subagent", role: params.role, planPath, target, roundId, reused: true },
+					};
+				}
 				const name = `${roleConfig.name_prefix}-criticizer-${Date.now().toString(36)}`;
 				const execution = setupRefinementExecution(ctx, signal, "criticizer", [{ id: name, label: "criticizer" }], modelLabel);
 				try {
@@ -177,6 +242,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 					});
 					execution.overlay?.complete(name, result);
 					record(name, result.ok ? result.model ?? model : null);
+					persistOutcome(laneId, result.ok ? { ok: true, output: result.output } : { ok: false, error: result.errorMessage });
 					if (!result.ok) {
 						throw new Error(
 							`criticizer subagent failed: ${result.errorMessage ?? "unknown error"}${result.stderr ? `\nstderr: ${result.stderr.slice(0, 2000)}` : ""}`,
@@ -186,10 +252,10 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 						content: [
 							{
 								type: "text",
-								text: `${result.output}\n\n---\nAsk each criticizer question with ask_choice (one call per question, in the configured language), record every answer, then revise the plan only after every question has an answer.`,
+								text: `${result.output}\n\n---\nAsk each criticizer question with ask_choice (one call per question, in the configured language, with a stable questionId per question), record every answer, then revise the plan only after every question has an answer. After the revision, record the boundary: plans record-checkpoint (checkpoint: { transition: "review-consolidated", roundId: "${roundId}" }).`,
 							},
 						],
-						details: { mode: "delegated-subagent", role: params.role, planPath, target, model: result.model ?? model },
+						details: { mode: "delegated-subagent", role: params.role, planPath, target, roundId, model: result.model ?? model },
 					};
 				} finally {
 					await execution.close();
@@ -213,16 +279,19 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				return round;
 			};
 
+			// Lane-level resume (F-007): completed lanes are reused from their
+			// persisted outputs; only pending/failed/missing lanes spawn.
+			const runnableJobs = jobs.filter((job) => reusable[job.lane.id] === undefined);
 			const execution = setupRefinementExecution(
 				ctx,
 				signal,
 				"reviewer",
-				jobs.map((job) => ({ id: job.lane.id, label: job.lane.id })),
+				runnableJobs.map((job) => ({ id: job.lane.id, label: job.lane.id })),
 				modelLabel,
 			);
 			try {
 				const results = await Promise.all(
-					jobs.map(async (job) => {
+					runnableJobs.map(async (job) => {
 						try {
 							const result = await runPiSubagent({
 								systemPrompt: `${systemPrompt}\n\n${graphPrompt}`,
@@ -235,6 +304,9 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 							});
 							execution.overlay?.complete(job.lane.id, result);
 							record(job.name, result.ok ? result.model ?? model : null);
+							// Persist BEFORE returning (C-007): a crash after this point
+							// still leaves the lane reusable.
+							persistOutcome(job.lane.id, result.ok ? { ok: true, output: result.output } : { ok: false, error: result.errorMessage });
 							if (target === "implementation" && result.ok) {
 								try {
 									pi.appendEntry("pi-plans-ameliorate", {
@@ -251,6 +323,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 						} catch (error) {
 							record(job.name, null);
 							const message = error instanceof Error ? error.message : String(error);
+							persistOutcome(job.lane.id, { ok: false, error: message });
 							const result = {
 								ok: false,
 								output: "",
@@ -267,6 +340,15 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 
 				const sections: string[] = [];
 				let failures = 0;
+				let reusedCount = 0;
+				// Reused lanes first (stable order): outputs come from the persisted files.
+				for (const job of jobs) {
+					const persisted = reusable[job.lane.id];
+					if (persisted === undefined) continue;
+					reusedCount += 1;
+					const title = job.lane.lens ? `${job.name} — ${job.lane.lens}` : job.name;
+					sections.push(`### ${title} — REUSED (round ${roundId}, no re-run)\n${readReviewOutput(workdir, active!.run_id, persisted)}`);
+				}
 				for (const { job, result } of results) {
 					const title = job.lane.lens ? `${job.name} — ${job.lane.lens}` : job.name;
 					if (!result.ok) {
@@ -276,7 +358,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 					}
 					sections.push(`### ${title}\n${result.output}`);
 				}
-				if (failures === results.length) {
+				if (failures === results.length && reusedCount === 0) {
 					const first = results[0];
 					throw new Error(
 						`all reviewer subagents failed: ${first?.result.errorMessage ?? "unknown error"}${first?.result.stderr ? `\nstderr: ${first.result.stderr.slice(0, 2000)}` : ""}${model ? `\nIf the model selector "${model}" is unavailable, reset the confirmation (plans set-role --reset-confirmation) and re-ask the model-confirmation question.` : ""}`,
@@ -292,13 +374,15 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 					content: [
 						{
 							type: "text",
-							text: `${text}\n\n---\nConsolidate: merge and dedupe findings into PLAN_vN_reviewer_comments.md${count === 3 ? " (one consolidated file; keep each finding's source reviewer, severity, evidence, and disposition)" : ""}, accept or reject each finding on repo/reference evidence, surface at most five high-priority findings to the user, then immediately ask the next refinement-mode question with ask_choice.`,
+							text: `${text}\n\n---\nConsolidate: merge and dedupe findings into PLAN_vN_reviewer_comments.md${count === 3 ? " (one consolidated file; keep each finding's source reviewer, severity, evidence, and disposition)" : ""}, accept or reject each finding on repo/reference evidence, surface at most five high-priority findings to the user, then immediately ask the next refinement-mode question with ask_choice. Then record the boundary: plans record-checkpoint (checkpoint: { transition: "review-consolidated", roundId: "${roundId}", dispositionArtifact: "<comments file, run-dir relative>" }).${target === "implementation" ? ' When the whole round is disposed, also record (checkpoint: { transition: "implementation-round-finished" }); when the termination condition is met, close with (checkpoint: { transition: "completed", evidence: "<why the condition is satisfied>" }).' : ""}`,
 						},
 					],
 					details: {
 						mode: "delegated-subagent",
 						role: "reviewer",
 						planPath,
+						roundId,
+						reusedLanes: Object.keys(reusable),
 						reviewers: count,
 						model,
 						outputs: results.map(({ job, result }) => ({ name: job.name, lane: job.lane.id, lens: job.lane.lens, ok: result.ok, output: result.output, stderr: result.stderr, turns: result.turns })),

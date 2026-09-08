@@ -20,3 +20,11 @@ export const TERMINATION_OPTIONS = [
 export function renderTerminationOptions(): string {
 	return TERMINATION_OPTIONS.map((option, index) => `${index + 1}. ${option}`).join("  ");
 }
+
+/** Stable question id for the termination question so cross-session resume
+ * can deduplicate it and link the answer to the checkpoint (I-004). */
+export const TERMINATION_QUESTION_ID = "termination-condition";
+
+/** Instruction appended wherever the termination question is requested. */
+export const TERMINATION_RECORDING_INSTRUCTIONS =
+	'Ask it with ask_choice using questionId: "termination-condition" (autoComplete: false). After the user answers, persist the loop configuration: plans record-checkpoint (checkpoint: { transition: "implementation-review-configured", terminationCondition: "<the chosen option>" }).';

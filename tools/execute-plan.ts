@@ -16,6 +16,7 @@ import {
 import { disableAutoComplete } from "../src/autocomplete.ts";
 import { latestPlanVersion, parseChecklist, parseImplItems } from "../src/plan.ts";
 import { normalizeWorkdir, readActive } from "../src/state.ts";
+import { resolveActiveRun } from "../src/run-context.ts";
 
 
 const ExecutePlanParams = Type.Object({
@@ -44,7 +45,7 @@ export async function executeHandoff(
 	if (planPathArg) {
 		planPath = path.resolve(workdir, planPathArg.replace(/^@/, ""));
 	} else {
-		const active = readActive(workdir);
+		const active = resolveActiveRun(ctx.sessionManager, workdir);
 		if (!active) {
 			return {
 				status: "error",

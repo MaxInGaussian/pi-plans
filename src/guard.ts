@@ -8,6 +8,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { getRun, loadConfig, readActive, resolveStateRootOrNull } from "./state.ts";
+import { activeInfoById } from "./run-context.ts";
 
 const GUARDED_TOOLS = new Set(["write", "edit"]);
 const GUARDED_STATUSES = new Set(["planning", "accepted"]);
@@ -16,12 +17,17 @@ export interface GuardInput {
 	workdir: string;
 	toolName: string;
 	rawPath: string;
+	/** Session-bound run id (I-002); when provided it overrides the shared active pointer. null = no binding. */
+	activeRunId?: string | null;
 }
 
 /** Returns a block reason when the write must be blocked, or null when allowed. */
 export function planningWriteBlockReason(input: GuardInput): string | null {
 	if (!GUARDED_TOOLS.has(input.toolName)) return null;
-	const active = readActive(input.workdir);
+	const active =
+		input.activeRunId !== undefined && input.activeRunId !== null
+			? activeInfoById(input.workdir, input.activeRunId)
+			: readActive(input.workdir);
 	if (!active) return null;
 	const run = getRun(input.workdir, active.run_id);
 	if (!run || !GUARDED_STATUSES.has(run.status)) return null;
