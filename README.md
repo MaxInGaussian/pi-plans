@@ -40,17 +40,16 @@ at <b>7.6× fewer tokens per solved task</b>.
 
 ## Contents
 
-- [Benchmarked results](#benchmarked-6-more-tasks-solved)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [What it does](#what-it-does)
 - [Interface overview](#interface-overview)
 - [Skills](#skills)
 - [Installation details](#installation-details)
+- [Benchmarks](#benchmarks)
 - [Layout](#layout)
 - [Safety model](#safety-model)
 - [Verification](#verification)
-- [Benchmarks](#benchmarks)
 - [FAQ](#faq)
 - [License](#license)
 
@@ -236,60 +235,29 @@ or register the absolute path in `~/.pi/agent/settings.json`:
 { "extensions": ["/absolute/path/to/pi-plans"] }
 ```
 
-## Code graph (v0.3+)
 
-`/init-graph` walks the worktree, parses JavaScript/TypeScript and Python
-files with Tree-sitter, and stores a normalized function graph in
-`.git/pi_plans/code_graph.db`. The DB is the canonical source for downstream
-agents: function rows expose a low-token `description`/`inputs`/`outputs`
-JSON view, call edges are normalized with `in_links`/`out_links` derived on
-read, and each function retains its full UTF-8 source.
+## Benchmarks
 
-- `/init-graph [--reindex] [--no-summary] [--no-commit]` — scan the worktree and write the graph; if `code_graph.db` already exists, it first asks whether to rebuild or sync changed paths via `/update-graph` (non-interactive runs and `--reindex` stay on the rebuild path). With `--reindex` it keeps the existing full-worktree reindex semantics on the rebuild path. Dirty trees get a `chore(code-graph): pre-init snapshot` commit first (`--no-commit` skips). After indexing it records a `code_graph_snapshot` (HEAD + uncommitted paths) that `/graph-drift` compares against. The parser dependencies are installed via npm (`tree-sitter`, grammars).
-- `/graph-status` — print function/file/edge counts.
-- `/update-graph [--dry-run] [--base <commit>]` — incrementally reindex only the paths `git status --porcelain` reports (including untracked and rename targets); deleted files' DB rows are purged, never resurrected. `/init-graph` uses this path when you choose the sync-changes branch.
-- `/graph-drift [--json] [--commit-aware]` — direction-aware convergence check:
-  (a) per-file hash match or a pending apply marker, (b) every uncommitted
-  indexable path is indexed, (c) snapshot vs current HEAD (informational).
-- `/apply-graph [--force]` — materialize DB edits back to source. Files with
-  `pending_kind='update'` are written (created when missing on disk);
-  `pending_kind='delete'` files are removed from disk and the DB; pending-null
-  missing files are skipped, never resurrected. Refuses when the active
-  planning run is `planning`/`accepted`.
-- `/enable-graph` / `/disable-graph` — toggle the `graph_enabled` config
-  flag (disable refuses while drift is dirty). When enabled, planner/refiner/
-  executor prompts hard-require function-level reads for indexed code, and the
-  built-in `read`/`write`/`edit` tools become graph-aware overrides for
-  indexed source files: `read` returns a capped function digest (≤50 lines,
-  synthetic anonymous entries folded) with `full: true` as the only whole-file
-  exit (small/zero-function files return full text); `write`/`edit` stage
-  DB-first mutations; unexpected fallbacks (not indexed / runtime unavailable /
-  config unreadable) are marked in the result; refiner and criticizer
-  subagents get the `code_graph` tool in their allowlist (verified in headless
-  no-session children); the executor loop
-  becomes DB-first: `code_graph` mutations → `code_graph apply` (agent-side
-  materialization; its result carries counts and the post-apply drift
-  summary) → `plans final-commit` → `/init-graph`.
-- The `code_graph` tool provides read-only screening (`status`, `screening`,
-  `get-function`, `manifest`), DB-first mutations (`update-function`,
-  `update-file`, `delete-file` — all mark files `pending_materialization`
-  and append to `change_log`), `list-pending`, and the agent-invokable
-  `apply` action (same planning/accepted gate as `/apply-graph`; also
-  refused for read-only refiner subagents via the `PI_PLANS_REFINER` env
-  marker; returns per-file counts plus a post-apply drift summary without
-  changing run status) so agents can navigate, stage, materialize, and
-  edit the graph without pulling `full_code`.
+First full A/B run complete (36-task stratified TB2.0 sample, GLM-5.3-Flash, seed 1) — headline numbers above; full methodology and disclosures in [`docs/benchmarks/tech-note.md`](docs/benchmarks/tech-note.md).
 
-Runtime requirements: the base extension still requires Node ≥ 22.6; the
-graph feature additionally requires Node ≥ 22.13 (or `--experimental-sqlite`)
-so that `node:sqlite` is available without flag. Pi's host currently ships
-Node ≥ 22.19, so a fresh install works out of the box. The code graph also
-needs the optional `tree-sitter` parser packages, which are **not** installed
-automatically — add them to the workspace (or global tree) where pi runs:
-`npm i tree-sitter tree-sitter-javascript tree-sitter-typescript tree-sitter-python`. Without them, planning and execution work normally and graph
-tools report which package is missing. On unsupported
-runtimes (Bun, missing parsers) graph commands fail locally without
-affecting the planning workflow.
+| Terminal-Bench 2.0 | GLM-5.3-Flash + Vanilla Pi | GLM-5.3-Flash + Pi with pi-plans (*/plan-big*) |
+|---|---|---|
+| Tasks solved (seed 1, n=36) | 3/36 (8.3%) | **18/36 (50.0%)** |
+| Tokens per solved task | 2,783,085 | **366,011** (7.6× fewer) |
+
+We evaluate pi-plans with a controlled A/B: **<a href="https://github.com/earendil-works/pi">vanilla pi</a>** vs **pi + pi-plans** (planning entry injected at the adapter level; task instructions verbatim in both arms) on [Terminal-Bench 2.0](https://www.tbench.ai/) (89 tasks) through the [harbor](https://github.com/laude-institute/harbor) framework, paired per task and analyzed with a pre-registered McNemar exact test plus paired bootstrap CIs. Cost accounting includes parent **and subagent** usage.
+
+**Scope of any published claim (strictly limited):** pi-plans (forced-`/plan-big` variant) on Terminal-Bench 2.0 / single model / single seed — an exploratory paired difference, **not** a general claim about pi-plans. Human-approval gates are bypassed by an eval-only `PI_PLANS_AUTO_APPROVE=1` env (lifecycle questions only, default off), so results do not represent the interactive experience.
+
+Reproduce:
+
+```bash
+node --experimental-strip-types scripts/bench/run-ab.ts --prepare
+node --experimental-strip-types scripts/bench/run-ab.ts --arm both --full   # requires docker + harbor
+node --experimental-strip-types scripts/bench/analyze.ts --results-dir scripts/bench/results/<date>
+```
+
+Methodology, preregistered statistics, and disclosures: [`docs/benchmarks/tech-note.md`](docs/benchmarks/tech-note.md).
 
 ## Layout
 
@@ -343,29 +311,6 @@ Prompts produce one-shot diffs with no recorded reasoning. pi-plans produces ver
 **Doesn't injecting execution rules every turn cost extra tokens?**
 
 The injected rule set is four compressed lines. It buys back more than it costs: the executor stops re-deriving discipline (no speculative abstractions, no compatibility detours, no reinvented helpers), so finished items converge in fewer turns and fewer tokens overall.
-
-## Benchmarks
-
-First full A/B run complete (36-task stratified TB2.0 sample, GLM-5.3-Flash, seed 1) — headline numbers above; full methodology and disclosures in [`docs/benchmarks/tech-note.md`](docs/benchmarks/tech-note.md).
-
-| | baseline (stock pi) | treatment (pi-plans) |
-|---|---|---|
-| Resolve rate (Terminal-Bench 2.0, n=36, seed 1) | 3/36 (8.3%) | 18/36 (50.0%) |
-| McNemar exact (paired, seed-1) | colspan: p = 0.0003 (16 treatment-only wins, 1 baseline-only) | |
-
-We evaluate pi-plans with a controlled A/B: **stock pi** vs **pi + pi-plans** (planning entry injected at the adapter level; task instructions verbatim in both arms) on [Terminal-Bench 2.0](https://www.tbench.ai/) (89 tasks) through the [harbor](https://github.com/laude-institute/harbor) framework, paired per task and analyzed with a pre-registered McNemar exact test plus paired bootstrap CIs. Cost accounting includes parent **and subagent** usage.
-
-**Scope of any published claim (strictly limited):** pi-plans (forced-`/plan-big` variant) on Terminal-Bench 2.0 / single model / single seed — an exploratory paired difference, **not** a general claim about pi-plans. Human-approval gates are bypassed by an eval-only `PI_PLANS_AUTO_APPROVE=1` env (lifecycle questions only, default off), so results do not represent the interactive experience.
-
-Reproduce:
-
-```bash
-node --experimental-strip-types scripts/bench/run-ab.ts --prepare
-node --experimental-strip-types scripts/bench/run-ab.ts --arm both --full   # requires docker + harbor
-node --experimental-strip-types scripts/bench/analyze.ts --results-dir scripts/bench/results/<date>
-```
-
-Methodology, preregistered statistics, and disclosures: [`docs/benchmarks/tech-note.md`](docs/benchmarks/tech-note.md).
 
 ## License
 
