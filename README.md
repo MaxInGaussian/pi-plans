@@ -30,7 +30,7 @@ On <b>Terminal-Bench 2.0</b> (36-task stratified sample, GLM-5.3-Flash), a paire
 <b>50.0%</b> of tasks solved with pi-plans vs <b>8.3%</b> with stock pi (McNemar exact <b>p = 0.0003</b>)<br>
 at <b>7.6× fewer tokens per solved task</b>.
 
-| | stock pi | pi-plans |
+| Terminal-Bench 2.0 | GLM-5.3-Flash + Vanilla Pi | GLM-5.3-Flash + Pi with pi-plans (*/plan-big*) |
 |---|---|---|
 | Tasks solved (seed 1, n=36) | 3/36 (8.3%) | **18/36 (50.0%)** |
 | Tokens per solved task | 2,783,085 | **366,011** (7.6× fewer) |
