@@ -26,7 +26,6 @@ A rough change request becomes a versioned Markdown plan instead of a surprise d
 
 ## Benchmarked: 6× more tasks solved
 
-<p align="center">
 On <b>Terminal-Bench 2.0</b> (36-task stratified sample, GLM-5.3-Flash), a paired A/B per task found:<br>
 <b>50.0%</b> of tasks solved with pi-plans vs <b>8.3%</b> with stock pi (McNemar exact <b>p = 0.0003</b>)<br>
 at <b>7.6× fewer tokens per solved task</b>.
@@ -35,7 +34,6 @@ at <b>7.6× fewer tokens per solved task</b>.
 |---|---|---|
 | Tasks solved (seed 1, n=36) | 3/36 (8.3%) | **18/36 (50.0%)** |
 | Tokens per solved task | 2,783,085 | **366,011** (7.6× fewer) |
-</p>
 
 > [!NOTE]
 > **Exploratory result**: single model, single seed, forced `/plan-big` variant, eval-only auto-approve. Full methodology and disclosures: [`docs/benchmarks/tech-note.md`](docs/benchmarks/tech-note.md).
