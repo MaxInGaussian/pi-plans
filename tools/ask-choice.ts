@@ -15,6 +15,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { disableAutoComplete, enableAutoComplete, isAutoCompleteEnabled, recordAskChoice } from "../src/autocomplete.ts";
+import { assertAutoApprovable, isAutoApproveEnabled } from "../src/auto-approve.ts";
 import { TERMINATION_QUESTION, TERMINATION_OPTIONS, TERMINATION_RECORDING_INSTRUCTIONS, renderTerminationOptions } from "../src/termination-prompt.ts";
 import { truncateToWidth, visibleWidth } from "../src/refine-ui-helpers.ts";
 import { normalizeWorkdir, readActive, recordDecision } from "../src/state.ts";
@@ -254,6 +255,37 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 				answer,
 				source,
 			});
+
+			// I-004/D-019: benchmark auto-approve (PI_PLANS_AUTO_APPROVE=1).
+			// The env short-circuits BEFORE any UI dispatch: lifecycle questions
+			// answer with the recommended option; external-state questions are
+			// hard-rejected (fail closed) even with the env set.
+			if (isAutoApproveEnabled()) {
+				assertAutoApprovable({
+					question: params.question,
+					purpose: params.purpose,
+					questionId: params.questionId,
+					optionLabels: options.map((option) => option.label),
+				});
+				// F-010/C-008: an unbounded auto-selected termination option
+				// (goal wait) would loop forever headlessly — pick the first
+				// bounded option instead.
+				const isTerminationQuestion = params.questionId === "termination-condition";
+				const boundedOption = options.find((o) => !/goal wait/i.test(o.label));
+				const chosen = isTerminationQuestion && boundedOption ? boundedOption : recommended;
+				record(chosen.label, "auto-complete");
+				recordQuestionAsked();
+				recordQuestionAnswered(chosen.label, "auto-complete");
+				return {
+					content: [
+						{
+							type: "text",
+							text: `[auto-approve] PI_PLANS_AUTO_APPROVE=1 answered: ${chosen.label}`,
+						},
+					],
+					details: details(chosen.label, "auto-complete"),
+				};
+			}
 
 			// Once enabled for this planning run, eligible questions answer with the
 			// recommendation without opening another UI prompt.

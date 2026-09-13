@@ -14,6 +14,7 @@ import {
 	startExecution,
 } from "../src/exec.ts";
 import { disableAutoComplete } from "../src/autocomplete.ts";
+import { isAutoApproveEnabled } from "../src/auto-approve.ts";
 import { latestPlanVersion, parseChecklist, parseImplItems } from "../src/plan.ts";
 import { normalizeWorkdir, readActive } from "../src/state.ts";
 import { resolveActiveRun } from "../src/run-context.ts";
@@ -73,7 +74,10 @@ export async function executeHandoff(
 	const implItems = parseImplItems(planText);
 
 	disableAutoComplete(ctx, "execution handoff");
-	if (!ctx.hasUI) {
+	// I-004/D-019: PI_PLANS_AUTO_APPROVE=1 short-circuits the confirm BEFORE
+	// any UI dispatch — the handoff is a plan-lifecycle gate (whitelisted).
+	const autoApprove = isAutoApproveEnabled();
+	if (!autoApprove && !ctx.hasUI) {
 		return {
 			status: "error",
 			message:
@@ -81,22 +85,28 @@ export async function executeHandoff(
 		};
 	}
 
-	const preview = items.map((item) => `- ${item.done ? "☑" : "☐"} ${item.id}`).join("\n");
-	const approved = await ctx.ui.confirm(
-		"Execute this plan now?",
-		`${planPath}\n${items.length} verifier item(s):\n${preview}\n\nExecution mode enables write access and tracks [DONE:VC-xxx] progress.`,
-	);
+	let approved: boolean;
+	if (autoApprove) {
+		approved = true;
+	} else {
+		const preview = items.map((item) => `- ${item.done ? "☑" : "☐"} ${item.id}`).join("\n");
+		approved = await ctx.ui.confirm(
+			"Execute this plan now?",
+			`${planPath}\n${items.length} verifier item(s):\n${preview}\n\nExecution mode enables write access and tracks [DONE:VC-xxx] progress.`,
+		);
+	}
 	if (!approved) {
 		return { status: "declined", message: "User declined execution. Stay in planning; ask how to proceed.", planPath };
 	}
 
 	await startExecution(getCurrentApi(), ctx, planPath, items, implItems);
 	const scopeNote = implItems.length ? ` Tracking ${implItems.length} implementation item(s).` : "";
+	const autoNote = autoApprove ? "[auto-approve] " : "";
 	return {
 		status: "executing",
 		planPath,
 		itemCount: items.length,
-		message: `Execution approved. ${items.length} verifier item(s) queued; implement in dependency order and mark verified items with [DONE:VC-xxx].${scopeNote}`,
+		message: `${autoNote}Execution approved. ${items.length} verifier item(s) queued; implement in dependency order and mark verified items with [DONE:VC-xxx].${scopeNote}`,
 	};
 }
 

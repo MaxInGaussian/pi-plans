@@ -18,6 +18,7 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadConfig, normalizeWorkdir, readActive, recordSubagent, resolveStateRootOrNull, StateError } from "../src/state.ts";
+import type { SubagentUsage } from "../src/subagent.ts";
 import { resolveActiveRun } from "../src/run-context.ts";
 import { buildRefAnalystTask, type RefAnalystTaskInput } from "../src/refine-prompts.ts";
 import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
@@ -131,10 +132,18 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 				}
 			}
 
-			const record = (name: string, okModel?: string | null) => {
+			const record = (name: string, okModel?: string | null, usage?: SubagentUsage) => {
 				if (!active) return;
 				try {
-					recordSubagent(workdir, active.run_id, { role: "ref-analyst", name, model: okModel ?? model ?? null });
+					recordSubagent(workdir, active.run_id, {
+						role: "ref-analyst",
+						name,
+						model: okModel ?? model ?? null,
+						// I-010: meter subagent token/cost for benchmark accounting.
+						usage: usage
+							? { input: usage.input, output: usage.output, cache_read: usage.cacheRead, cache_write: usage.cacheWrite, cost: usage.cost }
+							: null,
+					});
 				} catch {
 					/* best-effort: audit survives in the tool result */
 				}
@@ -155,7 +164,7 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 						onProgress: (event) => overlay?.update(job.laneId, event),
 					});
 					overlay?.complete(job.laneId, result);
-					record(job.name, result.ok ? result.model ?? model : null);
+					record(job.name, result.ok ? result.model ?? model : null, result.usage);
 					return result;
 				} catch (error) {
 					record(job.name, null);

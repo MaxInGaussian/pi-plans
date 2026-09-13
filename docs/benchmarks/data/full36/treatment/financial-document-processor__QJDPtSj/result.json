@@ -1,0 +1,104 @@
+{
+    "id": "f23d3ceb-a670-4395-a939-92fe0a577c00",
+    "task_name": "financial-document-processor",
+    "trial_name": "financial-document-processor__QJDPtSj",
+    "trial_uri": "file:///Users/zhuofan/Research/pi-plans/scripts/bench/vendor/harbor/scripts/bench/results/full36/treatment/2026-09-12__00-29-12/financial-document-processor__QJDPtSj",
+    "task_id": {
+        "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+        "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+        "path": "financial-document-processor"
+    },
+    "source": "terminal-bench",
+    "task_checksum": "e8ee9e8948d949d0abe46d431736d1cf04e8aab76d98fc9c819fb26960ab1352",
+    "config": {
+        "task": {
+            "path": "financial-document-processor",
+            "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+            "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench"
+        },
+        "trial_name": "financial-document-processor__QJDPtSj",
+        "trials_dir": "scripts/bench/results/full36/treatment/2026-09-12__00-29-12",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": 3.0,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": 4.0,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "pi_plans_bench:PiPlansBench",
+            "import_path": null,
+            "model_name": "zai/glm-5.3-flash:high",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "mcp_servers": []
+        },
+        "user_agent": null,
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "extra_instructions": [],
+        "job_id": "93b4e4d3-47b4-4887-a4d5-67e116abcc58",
+        "source_trial": null
+    },
+    "agent_info": {
+        "name": "pi-plans-bench",
+        "version": "pi-plans-bench/0.1.0",
+        "model_info": {
+            "name": "glm-5.3-flash:high",
+            "provider": "zai"
+        }
+    },
+    "agent_result": null,
+    "verifier_result": null,
+    "verifier_environment_mode": "shared",
+    "exception_info": {
+        "exception_type": "RuntimeError",
+        "exception_message": "Docker compose command failed for environment financial-document-processor. Command: docker compose --project-name financial-document-processor__qjdptsj__env --project-directory /Users/zhuofan/.cache/harbor/tasks/T9eC49XFCYopUM2bDKgar3/financial-document-processor/environment -f /private/var/folders/2b/0lrf48_93kxfd3s_brz03gr40000gn/T/tmp3wv5h5um/financial-document-processor__QJDPtSj__env-docker-compose-resources.json -f /Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /private/var/folders/2b/0lrf48_93kxfd3s_brz03gr40000gn/T/tmps6k4txlg/docker-compose-environment.json -f /private/var/folders/2b/0lrf48_93kxfd3s_brz03gr40000gn/T/tmpa185zntk/docker-compose-mounts.json up --detach --wait. Return code: 1. Stdout:  Network financial-document-processor__qjdptsj__env_default Creating \n Network financial-document-processor__qjdptsj__env_default Creating \n Network financial-document-processor__qjdptsj__env_default Error Error response from daemon: all predefined address pools have been fully subnetted\n network:default failed to create network financial-document-processor__qjdptsj__env_default: Error response from daemon: all predefined address pools have been fully subnetted \n Container financial-document-processor__qjdptsj__env-main-1 Creating \nfailed to create network financial-document-processor__qjdptsj__env_default: Error response from daemon: all predefined address pools have been fully subnetted\n. Stderr: None. ",
+        "exception_traceback": "Traceback (most recent call last):\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 406, in run\n    await self._prepare()\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 444, in _prepare\n    await self._setup_agent_environment()\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 1423, in _setup_agent_environment\n    await self._start_agent_environment()\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 1429, in _start_agent_environment\n    await asyncio.wait_for(\n  File \"/Users/zhuofan/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/asyncio/tasks.py\", line 520, in wait_for\n    return await fut\n           ^^^^^^^^^\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/environments/docker/docker.py\", line 1007, in start\n    await self._run_docker_compose_command([\"up\", *runtime.up_args])\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/environments/docker/docker.py\", line 704, in _run_docker_compose_command\n    raise RuntimeError(\nRuntimeError: Docker compose command failed for environment financial-document-processor. Command: docker compose --project-name financial-document-processor__qjdptsj__env --project-directory /Users/zhuofan/.cache/harbor/tasks/T9eC49XFCYopUM2bDKgar3/financial-document-processor/environment -f /private/var/folders/2b/0lrf48_93kxfd3s_brz03gr40000gn/T/tmp3wv5h5um/financial-document-processor__QJDPtSj__env-docker-compose-resources.json -f /Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /private/var/folders/2b/0lrf48_93kxfd3s_brz03gr40000gn/T/tmps6k4txlg/docker-compose-environment.json -f /private/var/folders/2b/0lrf48_93kxfd3s_brz03gr40000gn/T/tmpa185zntk/docker-compose-mounts.json up --detach --wait. Return code: 1. Stdout:  Network financial-document-processor__qjdptsj__env_default Creating \n Network financial-document-processor__qjdptsj__env_default Creating \n Network financial-document-processor__qjdptsj__env_default Error Error response from daemon: all predefined address pools have been fully subnetted\n network:default failed to create network financial-document-processor__qjdptsj__env_default: Error response from daemon: all predefined address pools have been fully subnetted \n Container financial-document-processor__qjdptsj__env-main-1 Creating \nfailed to create network financial-document-processor__qjdptsj__env_default: Error response from daemon: all predefined address pools have been fully subnetted\n. Stderr: None. \n",
+        "occurred_at": "2026-09-11T16:29:34.500500Z"
+    },
+    "started_at": "2026-09-11T16:29:34.350755Z",
+    "finished_at": "2026-09-11T16:29:34.880870Z",
+    "environment_setup": {
+        "started_at": "2026-09-11T16:29:34.354097Z",
+        "finished_at": "2026-09-11T16:29:34.499775Z"
+    },
+    "agent_setup": null,
+    "agent_execution": null,
+    "verifier": null,
+    "step_results": null
+}

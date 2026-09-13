@@ -328,6 +328,32 @@ Prompts produce one-shot diffs with no recorded reasoning. pi-plans produces ver
 
 The injected rule set is four compressed lines. It buys back more than it costs: the executor stops re-deriving discipline (no speculative abstractions, no compatibility detours, no reinvented helpers), so finished items converge in fewer turns and fewer tokens overall.
 
+## Benchmarks
+
+> Status: **first full run complete** (36-task stratified TB2.0 sample, GLM-5.3-Flash, seed 1) — full methodology and disclosures in [`docs/benchmarks/tech-note.md`](docs/benchmarks/tech-note.md).
+
+| | baseline (stock pi) | treatment (pi-plans) |
+|---|---|---|
+| Resolve rate (Terminal-Bench 2.0, n=36, seed 1) | 3/36 (8.3%) | 18/36 (50.0%) |
+| McNemar exact (paired, seed-1) | colspan: p = 0.0003 (16 treatment-only wins, 1 baseline-only) | |
+| **Sensitivity (3 seeds, discordant tasks)** | majority: baseline 8, tie 8 | majority: **treatment 1** |
+
+**Honest summary**: the dramatic seed-1 gap was **not stable across seeds** — on the 17 borderline tasks re-run at 3 seeds, only 1 treatment majority held (8 baseline, 8 ties). Robust conclusion at this sample: no stable improvement from forced plan-big on a flash model, at material added wall-time cost. Details and disclosures: [`docs/benchmarks/tech-note.md`](docs/benchmarks/tech-note.md).
+
+We evaluate pi-plans with a controlled A/B: **stock pi** vs **pi + pi-plans** (planning entry injected at the adapter level; task instructions verbatim in both arms) on [Terminal-Bench 2.0](https://www.tbench.ai/) (89 tasks) through the [harbor](https://github.com/laude-institute/harbor) framework, paired per task and analyzed with a pre-registered McNemar exact test plus paired bootstrap CIs. Cost accounting includes parent **and subagent** usage.
+
+**Scope of any published claim (strictly limited):** pi-plans (forced-`/plan-big` variant) on Terminal-Bench 2.0 / single model / single seed — an exploratory paired difference, **not** a general claim about pi-plans. Human-approval gates are bypassed by an eval-only `PI_PLANS_AUTO_APPROVE=1` env (lifecycle questions only, default off), so results do not represent the interactive experience.
+
+Reproduce:
+
+```bash
+node --experimental-strip-types scripts/bench/run-ab.ts --prepare
+node --experimental-strip-types scripts/bench/run-ab.ts --arm both --full   # requires docker + harbor
+node --experimental-strip-types scripts/bench/analyze.ts --results-dir scripts/bench/results/<date>
+```
+
+Methodology, preregistered statistics, and disclosures: [`docs/benchmarks/tech-note.md`](docs/benchmarks/tech-note.md).
+
 ## License
 
 MIT.

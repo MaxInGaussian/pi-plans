@@ -1,0 +1,136 @@
+{
+    "id": "4185d6a1-6931-4d21-b55f-9675cbb1344d",
+    "task_name": "custom-memory-heap-crash",
+    "trial_name": "custom-memory-heap-crash__bGw7Mmn",
+    "trial_uri": "file:///Users/zhuofan/Research/pi-plans/scripts/bench/vendor/harbor/scripts/bench/results/full36/baseline/2026-09-10__15-34-11/custom-memory-heap-crash__bGw7Mmn",
+    "task_id": {
+        "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+        "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+        "path": "custom-memory-heap-crash"
+    },
+    "source": "terminal-bench",
+    "task_checksum": "fba0e3be977223b1f8c182da8411663258f83b3563dd5dcd12beae87762ccabf",
+    "config": {
+        "task": {
+            "path": "custom-memory-heap-crash",
+            "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+            "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench"
+        },
+        "trial_name": "custom-memory-heap-crash__bGw7Mmn",
+        "trials_dir": "scripts/bench/results/full36/baseline/2026-09-10__15-34-11",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": 3.0,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "pi_plans_bench:PiPlansBench",
+            "import_path": null,
+            "model_name": "zai/glm-5.3-flash:high",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "mcp_servers": []
+        },
+        "user_agent": null,
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "extra_instructions": [],
+        "job_id": "cc51760d-cdd6-403c-a92f-bd67c6b2dc8a",
+        "source_trial": null
+    },
+    "agent_info": {
+        "name": "pi-plans-bench",
+        "version": "pi-plans-bench/0.1.0",
+        "model_info": {
+            "name": "glm-5.3-flash:high",
+            "provider": "zai"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 228360,
+        "n_cache_tokens": 199040,
+        "n_output_tokens": 21209,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": {
+            "pi_plans_arm": "baseline",
+            "pi_plans_driver": {
+                "turns": 20,
+                "settled": true,
+                "promptAccepted": true
+            },
+            "pi_plans_subagent_usage": {
+                "totals": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "cost": 0,
+                    "children": 0
+                }
+            }
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 1.0
+        }
+    },
+    "verifier_environment_mode": "shared",
+    "exception_info": null,
+    "started_at": "2026-09-10T08:34:27.279225Z",
+    "finished_at": "2026-09-10T09:05:50.567682Z",
+    "environment_setup": {
+        "started_at": "2026-09-10T08:34:27.280175Z",
+        "finished_at": "2026-09-10T08:34:55.229631Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-09-10T08:34:55.230188Z",
+        "finished_at": "2026-09-10T08:37:31.342301Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-09-10T08:37:31.344493Z",
+        "finished_at": "2026-09-10T08:49:20.562925Z"
+    },
+    "verifier": {
+        "started_at": "2026-09-10T08:49:21.089934Z",
+        "finished_at": "2026-09-10T09:05:38.839817Z"
+    },
+    "step_results": null
+}

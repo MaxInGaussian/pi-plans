@@ -1,1 +1,3 @@
-.DS_Store
+node_modules/
+scripts/bench/vendor/
+scripts/bench/results/

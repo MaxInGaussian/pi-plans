@@ -1,0 +1,10 @@
+{
+  "totals": {
+    "input": 10887,
+    "output": 3565,
+    "cacheRead": 12736,
+    "cacheWrite": 0,
+    "cost": 0,
+    "children": 1
+  }
+}

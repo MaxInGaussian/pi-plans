@@ -151,6 +151,8 @@ export interface SubagentEntry {
 	name: string;
 	model?: string | null;
 	session_dir?: string;
+	/** I-010: aggregated child usage (tokens/cost) recorded after the run. */
+	usage?: { input: number; output: number; cache_read: number; cache_write: number; cost: number } | null;
 	recorded_at: string;
 }
 

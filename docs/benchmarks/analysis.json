@@ -1,0 +1,38 @@
+{
+  "n_pairs": 36,
+  "resolve": {
+    "baseline": 3,
+    "treatment": 0,
+    "baseline_rate": 0.08333333333333333,
+    "treatment_rate": 0
+  },
+  "mcnemar": {
+    "discordant_baseline_only": 3,
+    "discordant_treatment_only": 0,
+    "both_resolved": 33,
+    "p_value": 0.25
+  },
+  "cost_delta_usd": {
+    "mean": 0,
+    "ciLow": 0,
+    "ciHigh": 0
+  },
+  "token_delta_per_task": {
+    "mean": -215040.69444444444,
+    "ciLow": -541307.8333333334,
+    "ciHigh": -13483.611111111111
+  },
+  "turns_delta": {
+    "mean": -3.861111111111111,
+    "ciLow": -7.722222222222222,
+    "ciHigh": -0.3888888888888889
+  },
+  "cost_per_resolved_task": {
+    "baseline": 0,
+    "treatment": 0
+  },
+  "tokens_per_resolved_task": {
+    "baseline": 2783085,
+    "treatment": 0
+  }
+}

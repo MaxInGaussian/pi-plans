@@ -1,0 +1,107 @@
+{
+    "id": "d2a20cac-fc65-4394-b272-b70c828bbac4",
+    "task_name": "constraints-scheduling",
+    "trial_name": "constraints-scheduling__qHZTguy",
+    "trial_uri": "file:///Users/zhuofan/Research/pi-plans/scripts/bench/vendor/harbor/scripts/bench/results/full36/baseline/2026-09-10__15-34-11/constraints-scheduling__qHZTguy",
+    "task_id": {
+        "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+        "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+        "path": "constraints-scheduling"
+    },
+    "source": "terminal-bench",
+    "task_checksum": "c69027b9099bb7ac63a753b310e31cfef9cc20dce2d1c6c88956c8a854d7ac16",
+    "config": {
+        "task": {
+            "path": "constraints-scheduling",
+            "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+            "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench"
+        },
+        "trial_name": "constraints-scheduling__qHZTguy",
+        "trials_dir": "scripts/bench/results/full36/baseline/2026-09-10__15-34-11",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": 3.0,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "pi_plans_bench:PiPlansBench",
+            "import_path": null,
+            "model_name": "zai/glm-5.3-flash:high",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "mcp_servers": []
+        },
+        "user_agent": null,
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "extra_instructions": [],
+        "job_id": "cc51760d-cdd6-403c-a92f-bd67c6b2dc8a",
+        "source_trial": null
+    },
+    "agent_info": {
+        "name": "pi-plans-bench",
+        "version": "pi-plans-bench/0.1.0",
+        "model_info": {
+            "name": "glm-5.3-flash:high",
+            "provider": "zai"
+        }
+    },
+    "agent_result": null,
+    "verifier_result": null,
+    "verifier_environment_mode": "shared",
+    "exception_info": {
+        "exception_type": "NetworkConnectionError",
+        "exception_message": "Command failed (exit 1): set -euo pipefail; curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | env -u NODE_VERSION bash && export NVM_DIR=\"$HOME/.nvm\" && \\. \"$NVM_DIR/nvm.sh\" || true && command -v nvm &>/dev/null || { echo 'Error: NVM failed to load' >&2; exit 1; } && nvm install 22 && nvm alias default 22 && npm -v && npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest && pi --version\nstdout:   % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n                                 Dload  Upload   Total   Spent    Left  Speed\n\r  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0\r  0     0    ... [8797 chars truncated] ...     0 --:--:--  0:01:52 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:53 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:54 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:55 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:56 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:57 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:58 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:59 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:02:00 --:--:--     0\ncurl: (56) Failure when receiving data from the peer\nError: NVM failed to load\n\nstderr: None",
+        "exception_traceback": "Traceback (most recent call last):\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 406, in run\n    await self._prepare()\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 450, in _prepare\n    await self._setup_agent()\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 1455, in _setup_agent\n    await asyncio.wait_for(\n  File \"/Users/zhuofan/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/asyncio/tasks.py\", line 520, in wait_for\n    return await fut\n           ^^^^^^^^^\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/agents/installed/base.py\", line 1050, in setup\n    await self.install(environment)\n  File \"/Users/zhuofan/Research/pi-plans/scripts/bench/pi-adapter/pi_plans_bench.py\", line 138, in install\n    await super().install(environment)\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/agents/installed/pi.py\", line 92, in install\n    await self.exec_as_agent(\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/agents/installed/base.py\", line 995, in exec_as_agent\n    return await self._exec(\n           ^^^^^^^^^^^^^^^^^\n  File \"/Users/zhuofan/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/agents/installed/base.py\", line 962, in _exec\n    raise self._classify_exec_error(command, result)\nharbor.agents.installed.base.NetworkConnectionError: Command failed (exit 1): set -euo pipefail; curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | env -u NODE_VERSION bash && export NVM_DIR=\"$HOME/.nvm\" && \\. \"$NVM_DIR/nvm.sh\" || true && command -v nvm &>/dev/null || { echo 'Error: NVM failed to load' >&2; exit 1; } && nvm install 22 && nvm alias default 22 && npm -v && npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest && pi --version\nstdout:   % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n                                 Dload  Upload   Total   Spent    Left  Speed\n\r  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0\r  0     0    ... [8797 chars truncated] ...     0 --:--:--  0:01:52 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:53 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:54 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:55 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:56 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:57 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:58 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:01:59 --:--:--     0\r  0     0    0     0    0     0      0      0 --:--:--  0:02:00 --:--:--     0\ncurl: (56) Failure when receiving data from the peer\nError: NVM failed to load\n\nstderr: None\n",
+        "occurred_at": "2026-09-10T10:46:30.724614Z"
+    },
+    "started_at": "2026-09-10T10:43:47.731702Z",
+    "finished_at": "2026-09-10T10:46:41.772811Z",
+    "environment_setup": {
+        "started_at": "2026-09-10T10:43:47.732920Z",
+        "finished_at": "2026-09-10T10:43:49.327734Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-09-10T10:43:49.327822Z",
+        "finished_at": "2026-09-10T10:46:30.723674Z"
+    },
+    "agent_execution": null,
+    "verifier": null,
+    "step_results": null
+}

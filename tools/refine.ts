@@ -15,6 +15,7 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadConfig, normalizeWorkdir, readActive, recordSubagent, resolveStateRootOrNull, StateError, type RoleConfig } from "../src/state.ts";
+import type { SubagentUsage } from "../src/subagent.ts";
 import { resolveActiveRun } from "../src/run-context.ts";
 import {
 	loadCheckpoint,
@@ -134,10 +135,18 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 
 			// Record spawns against the active run when one exists.
 			const active = resolveActiveRun(ctx.sessionManager, workdir);
-			const record = (name: string, model?: string | null) => {
+			const record = (name: string, model?: string | null, usage?: SubagentUsage) => {
 				if (!active) return;
 				try {
-					recordSubagent(workdir, active.run_id, { role: params.role, name, model: model ?? null });
+					recordSubagent(workdir, active.run_id, {
+						role: params.role,
+						name,
+						model: model ?? null,
+						// I-010: meter subagent token/cost for benchmark accounting.
+						usage: usage
+							? { input: usage.input, output: usage.output, cache_read: usage.cacheRead, cache_write: usage.cacheWrite, cost: usage.cost }
+							: null,
+					});
 				} catch {
 					/* best-effort */
 				}
@@ -241,7 +250,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 						onProgress: (event) => execution.overlay?.update(name, event),
 					});
 					execution.overlay?.complete(name, result);
-					record(name, result.ok ? result.model ?? model : null);
+					record(name, result.ok ? result.model ?? model : null, result.usage);
 					persistOutcome(laneId, result.ok ? { ok: true, output: result.output } : { ok: false, error: result.errorMessage });
 					if (!result.ok) {
 						throw new Error(
@@ -303,7 +312,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 								onProgress: (event) => execution.overlay?.update(job.lane.id, event),
 							});
 							execution.overlay?.complete(job.lane.id, result);
-							record(job.name, result.ok ? result.model ?? model : null);
+							record(job.name, result.ok ? result.model ?? model : null, result.usage);
 							// Persist BEFORE returning (C-007): a crash after this point
 							// still leaves the lane reusable.
 							persistOutcome(job.lane.id, result.ok ? { ok: true, output: result.output } : { ok: false, error: result.errorMessage });

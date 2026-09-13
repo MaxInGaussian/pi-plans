@@ -289,6 +289,22 @@ export async function runPiSubagent(options: SubagentOptions): Promise<SubagentR
 	const messages: MessageLike[] = [];
 	let stderr = "";
 	let termination: "abort" | "timeout" | null = null;
+	// I-010: aggregate usage from message_end assistant messages so the
+	// benchmark can meter parent + subagent cost (F-001/C-F001).
+	const usageTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+	let sawUsage = false;
+	const accumulateUsage = (message: MessageLike | undefined): void => {
+		const usage = (message as { usage?: Record<string, unknown> } | undefined)?.usage;
+		if (!usage || typeof usage !== "object") return;
+		const num = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+		usageTotals.input += num(usage.input);
+		usageTotals.output += num(usage.output);
+		usageTotals.cacheRead += num(usage.cacheRead);
+		usageTotals.cacheWrite += num(usage.cacheWrite);
+		const cost = usage.cost as { total?: unknown } | undefined;
+		usageTotals.cost += num(cost?.total);
+		sawUsage = true;
+	};
 
 	try {
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-subagent-"));
@@ -347,6 +363,7 @@ export async function runPiSubagent(options: SubagentOptions): Promise<SubagentR
 				if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
 					messages.push(event.message);
 				}
+				if (event.type === "message_end") accumulateUsage(event.message);
 			};
 
 			const killProc = () => {
@@ -396,17 +413,18 @@ export async function runPiSubagent(options: SubagentOptions): Promise<SubagentR
 
 		const turns = messages.filter((message) => message.role === "assistant").length;
 		const output = finalOutput(messages);
+		const usage = sawUsage ? usageTotals : undefined;
 		if (termination === "abort") {
-			return { ok: false, output, stderr, turns, cancelled: true, errorMessage: "Subagent was aborted" };
+			return { ok: false, output, stderr, turns, usage, cancelled: true, errorMessage: "Subagent was aborted" };
 		}
 		if (termination === "timeout") {
-			return { ok: false, output, stderr, turns, timedOut: true, errorMessage: "Subagent timed out" };
+			return { ok: false, output, stderr, turns, usage, timedOut: true, errorMessage: "Subagent timed out" };
 		}
 		if (exitCode !== 0) {
-			return { ok: false, output, stderr, turns, errorMessage: `pi exited with code ${exitCode}` };
+			return { ok: false, output, stderr, turns, usage, errorMessage: `pi exited with code ${exitCode}` };
 		}
 		if (!output) {
-			return { ok: false, output: "", stderr, turns, errorMessage: "subagent produced no final output" };
+			return { ok: false, output: "", stderr, turns, usage, errorMessage: "subagent produced no final output" };
 		}
 		return {
 			ok: true,
@@ -414,6 +432,7 @@ export async function runPiSubagent(options: SubagentOptions): Promise<SubagentR
 			model: [...messages].reverse().find((message) => message.role === "assistant" && message.model)?.model,
 			stderr,
 			turns,
+			usage,
 		};
 	} finally {
 		if (tmpDir) {

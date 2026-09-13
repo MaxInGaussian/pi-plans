@@ -1,0 +1,332 @@
+/**
+ * A/B benchmark orchestrator for pi-plans (I-002).
+ *
+ * PLAN_v3 run 20260909T103956Z-pi-plans-bench.
+ *
+ * Protocol: Terminal-Bench 2.0 (89 tasks) x 2 arms (baseline pi vs pi+pi-plans
+ * forced-plan-big) x 1 seed, executed through the harbor framework with the
+ * custom agent in `pi-adapter/pi_plans_bench.py`.
+ *
+ * Budget (D-016): main experiment $150 hard cap (incl. retries and the
+ * discordant-pair sensitivity rerun); SWE-bench second benchmark is a separate
+ * +$50 budget and degrades per R-009 if exceeded. Degradation order is
+ * pre-registered: (1) reduce refine concurrency (3 -> 1 reviewer, skip
+ * criticizer), (2) fall back to a stratified 40-task sample. The runner never
+ * degrades silently: it prints the step and requires an explicit --degrade ack.
+ *
+ * Usage:
+ *   node --experimental-strip-types scripts/bench/run-ab.ts --prepare
+ *   node --experimental-strip-types scripts/bench/run-ab.ts --dry-run
+ *   node --experimental-strip-types scripts/bench/run-ab.ts --arm both --smoke
+ *   node --experimental-strip-types scripts/bench/run-ab.ts --arm both --full
+ *   node --experimental-strip-types scripts/bench/run-ab.ts --rerun-discordant --results-dir <dir>
+ */
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { execSync, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+
+const REPO_ROOT = path.resolve(import.meta.dirname ?? ".", "../..");
+const BENCH_DIR = path.join(REPO_ROOT, "scripts", "bench");
+const ADAPTER_DIR = path.join(BENCH_DIR, "pi-adapter");
+const VENDOR_HARBOR = path.join(BENCH_DIR, "vendor", "harbor");
+const DEFAULT_RESULTS = path.join(BENCH_DIR, "results");
+
+const MODEL = process.env.BENCH_MODEL ?? "zai/glm-5.3-flash:high";
+const DATASET = process.env.BENCH_DATASET ?? "terminal-bench@2.0";
+const DATASET_REF = process.env.BENCH_DATASET_REF ?? "2.0"; // task-set lock (Risk-007)
+const MAIN_BUDGET_USD = Number(process.env.BENCH_MAIN_BUDGET_USD ?? 150);
+const SECOND_BUDGET_USD = Number(process.env.BENCH_SECOND_BUDGET_USD ?? 50);
+const TB_TASK_COUNT = 89; // Terminal-Bench 2.0 task count (tbench.ai)
+
+interface ArmPlan {
+	arm: "baseline" | "treatment";
+	jobDir: string;
+	env: Record<string, string>;
+}
+
+function parseArgs(argv: string[]): Record<string, string | boolean> {
+	const out: Record<string, string | boolean> = {};
+	for (let i = 2; i < argv.length; i++) {
+		const token = argv[i];
+		if (token.startsWith("--")) {
+			const key = token.replace(/^--/, "");
+			const next = argv[i + 1];
+			if (next !== undefined && !next.startsWith("--")) {
+				out[key] = next;
+				i++;
+			} else out[key] = true;
+		}
+	}
+	return out;
+}
+
+function harborBin(): string {
+	const resolved = spawnSync("bash", ["-lc", "command -v harbor"], { encoding: "utf8" });
+	const bin = resolved.stdout.trim();
+	if (!bin) {
+		console.error(
+			"harbor CLI not found. Install once: `uv tool install git+https://github.com/laude-institute/harbor` (or pip install from scripts/bench/vendor/harbor).",
+		);
+		process.exit(1);
+	}
+	return bin;
+}
+
+/** Build the pi-plans bundle uploaded into the container by the treatment arm. */
+function prepare(): void {
+	const rev = execSync("git rev-parse HEAD", { cwd: REPO_ROOT, encoding: "utf8" }).trim();
+	const bundle = path.join(ADAPTER_DIR, "pi-plans-bundle.tar.gz");
+	// Bundle the WORKING TREE (not HEAD) so freshly implemented, not-yet-committed
+	// code is what gets evaluated; record the base rev for provenance.
+	exSyncTar(bundle);
+	const size = fs.statSync(bundle).size;
+	console.log(`[prepare] pi-plans bundle (working tree, base rev ${rev}) -> ${bundle} (${(size / 1024).toFixed(0)} KB)`);
+}
+
+function exSyncTar(bundle: string): void {
+	const excludes = [
+		"--exclude=./.git",
+		"--exclude=./node_modules",
+		"--exclude=./scripts/bench/vendor",
+		"--exclude=./scripts/bench/results",
+		"--exclude=./scripts/bench/pi-adapter/pi-plans-bundle.tar.gz",
+		"--exclude=.DS_Store",
+		"--exclude=./docs/benchmarks",
+	];
+	execSync(`COPYFILE_DISABLE=1 tar -czf "${bundle}" ${excludes.join(" ")} .`, { cwd: REPO_ROOT });
+}
+
+function armEnv(arm: "baseline" | "treatment"): Record<string, string> {
+	// D-019: benchmark env vars are injected into the harbor process here and
+	// must never be exported into the host shell (checked by analyze/V-004).
+	const env: Record<string, string> = { PI_PLANS_BENCH_ARM: arm };
+	if (arm === "treatment") env.PI_PLANS_AUTO_APPROVE = "1";
+	return env;
+}
+
+function harborJobYaml(arm: "baseline" | "treatment", taskCount: number | null): string {
+	// Task-set lock: dataset ref pins the registry version; the resolved
+	// commit is recorded by harbor in the job lock (lock.json).
+	const taskBlock = `tasks:\n  - name: terminal-bench\n    ref: "${DATASET_REF}"`;
+	const agentBlock = [
+		"agents:",
+		"  - import_path: pi_plans_bench:PiPlansBench",
+		`    model_name: "${MODEL}"`,
+	].join("\n");
+	return [
+		"# generated by scripts/bench/run-ab.ts -- do not edit",
+		`# arm: ${arm}; dataset: ${DATASET}; model: ${MODEL}`,
+		taskBlock,
+		agentBlock,
+		taskCount === null ? "" : `# task filter applied via --task-ids at invocation time`,
+		"n_concurrent_trials: 4",
+		"" ,
+	].filter(Boolean).join("\n");
+}
+
+function writeJobConfigs(resultsDir: string, arms: Array<"baseline" | "treatment">): void {
+	for (const arm of arms) {
+		const jobDir = path.join(resultsDir, arm);
+		fs.mkdirSync(jobDir, { recursive: true });
+		fs.writeFileSync(path.join(jobDir, "job.yaml"), harborJobYaml(arm, null));
+		console.log(`[plan] ${arm} job config -> ${path.join(jobDir, "job.yaml")}`);
+	}
+}
+
+function dryRun(resultsDir: string): void {
+	const runs = TB_TASK_COUNT * 2;
+	console.log("=".repeat(64));
+	console.log(`A/B dry-run plan (zero model calls made)`);
+	console.log(`  dataset        : ${DATASET} (locked ref ${DATASET_REF})`);
+	console.log(`  model          : ${MODEL}`);
+	console.log(`  arms           : baseline (stock pi) vs treatment (pi-plans /plan-big + auto-approve)`);
+	console.log(`  protocol       : ${TB_TASK_COUNT} tasks x 2 arms x 1 seed = ${runs} runs`);
+	console.log(`  budget caps    : main $${MAIN_BUDGET_USD} + second benchmark $${SECOND_BUDGET_USD} (D-016)`);
+	console.log(`  degrade order  : (1) refine 3->1 reviewer, skip criticizer; (2) stratified 40-task sample`);
+	console.log(`  metrics        : resolve rate (oracle), $ (parent+subagent), turns, wall-time, plan rubric (treatment, descriptive)`);
+	console.log(`  stats (D-012)  : seed-1 McNemar exact + paired bootstrap CI; rerun = sensitivity (majority vote)`);
+	console.log("=".repeat(64));
+	writeJobConfigs(resultsDir, ["baseline", "treatment"]);
+	console.log("[dry-run] no harbor/model invocation performed.");
+}
+
+function runArm(arm: "baseline" | "treatment", resultsDir: string, extra: string[]): void {
+	const bin = harborBin();
+	const jobDir = path.join(resultsDir, arm);
+	fs.mkdirSync(jobDir, { recursive: true });
+	const env = { ...process.env, ...armEnv(arm), PYTHONPATH: `${ADAPTER_DIR}${process.env.PYTHONPATH ? ":" + process.env.PYTHONPATH : ""}` };
+	const args = [
+		"run",
+		"--dataset", DATASET,
+		"--agent", "pi_plans_bench:PiPlansBench",
+		"--model", MODEL,
+		"--jobs-dir", jobDir,
+		...extra,
+	];
+	console.log(`[run] arm=${arm}\n  cwd=${VENDOR_HARBOR}\n  harbor ${args.join(" ")}`);
+	const res = spawnSync(bin, args, { cwd: VENDOR_HARBOR, env, stdio: "inherit" });
+	if (res.status !== 0) {
+		console.error(`[run] harbor exited with ${res.status} for arm ${arm}`);
+		process.exit(res.status ?? 1);
+	}
+}
+
+function sumCost(resultsDir: string): number {
+	let total = 0;
+	const walk = (dir: string): void => {
+		if (!fs.existsSync(dir)) return;
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			const p = path.join(dir, entry.name);
+			if (entry.isDirectory()) walk(p);
+			else if (entry.name === "result.json") {
+				try {
+					const data = JSON.parse(fs.readFileSync(p, "utf8"));
+					total += Number(data?.agent_result?.cost_usd ?? data?.agent_context?.cost_usd ?? 0);
+				} catch { /* skip unreadable trial */ }
+			}
+		}
+	};
+	walk(resultsDir);
+	return total;
+}
+
+function sumTokens(resultsDir: string): number {
+	let total = 0;
+	const walk = (dir: string): void => {
+		if (!fs.existsSync(dir)) return;
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			const p = path.join(dir, entry.name);
+			if (entry.isDirectory()) walk(p);
+			else if (entry.name === "result.json") {
+				try {
+					const data = JSON.parse(fs.readFileSync(p, "utf8"));
+					const ctx = data?.agent_result ?? data?.agent_context ?? {};
+					total += Number(ctx?.n_input_tokens ?? 0) + Number(ctx?.n_output_tokens ?? 0);
+				} catch { /* skip */ }
+			}
+		}
+	};
+	walk(resultsDir);
+	return total;
+}
+
+function budgetGate(resultsDir: string, isSecondBenchmark: boolean): void {
+	const spent = sumCost(resultsDir);
+	const cap = isSecondBenchmark ? SECOND_BUDGET_USD : MAIN_BUDGET_USD;
+	// F-007: zai coding-plan pricing reports $0 — add a token-based gate so
+	// the budget control is operative on zero-$ providers.
+	const TOKEN_CAP = Number(process.env.BENCH_TOKEN_CAP ?? (isSecondBenchmark ? 25_000_000 : 75_000_000));
+	const tokens = sumTokens(resultsDir);
+	console.log(`[budget] tokens so far: ${tokens.toLocaleString()} / ${TOKEN_CAP.toLocaleString()} cap`);
+	if (tokens > TOKEN_CAP) {
+		console.error(`[budget] TOKEN CAP EXCEEDED — pre-registered degradation applies (--degrade to acknowledge)`);
+		if (!process.argv.includes("--degrade")) process.exit(2);
+	}
+	console.log(`[budget] spent so far: $${spent.toFixed(2)} / $${cap.toFixed(2)} (${isSecondBenchmark ? "second" : "main"} budget)`);
+	if (spent > cap) {
+		console.error(
+			`[budget] CAP EXCEEDED. Pre-registered degradation (D-016): ` +
+				(isSecondBenchmark
+					? "second benchmark exceeds its budget -> execute R-009 downgrade clause (record in tech note appendix)."
+					: "step 1: reduce refine concurrency (3->1 reviewer, skip criticizer); step 2: stratified 40-task sample. Re-run with --degrade to acknowledge."),
+		);
+		if (!process.argv.includes("--degrade")) process.exit(2);
+	}
+}
+
+/** I-005: discordant-pair sensitivity rerun (D-012). Re-runs the seed-1
+ * discordant tasks at 2 additional seeds, both arms, into
+ * <results-dir>/sensitivity/<seed>/<arm>. Analysis aggregates by per-task
+ * majority vote and reports SEPARATELY from the primary test. */
+async function rerunDiscordant(resultsDir: string): Promise<void> {
+	// import lazily to keep the runner dependency-light
+	const { collectTrials, pairTrials } = (await import(pathToFileURL(path.join(BENCH_DIR, "analyze.ts")).href)) as {
+		collectTrials: (dir: string) => Array<{ taskId: string; arm: string; seed: number; resolved: boolean }>;
+		pairTrials: (trials: any[]) => Array<{ taskId: string; baseline: { resolved: boolean }; treatment: { resolved: boolean } }>;
+	};
+	const trials = collectTrials(resultsDir);
+	const pairs = pairTrials(trials);
+	const discordant = pairs
+		.filter((p) => p.baseline.resolved !== p.treatment.resolved)
+		.map((p) => p.taskId);
+	if (discordant.length === 0) {
+		console.log("[sensitivity] no discordant pairs at seed 1 — nothing to rerun.");
+		return;
+	}
+	console.log(`[sensitivity] ${discordant.length} discordant pair(s): ${discordant.join(", ")}`);
+	const bin = harborBin();
+	for (const seed of [2, 3]) {
+		for (const arm of ["baseline", "treatment"] as const) {
+			const outDir = path.join(resultsDir, "sensitivity", `seed-${seed}`, arm);
+			fs.mkdirSync(outDir, { recursive: true });
+			const env = { ...process.env, ...armEnv(arm), PYTHONPATH: `${ADAPTER_DIR}${process.env.PYTHONPATH ? ":" + process.env.PYTHONPATH : ""}` };
+			const args = ["run", "--dataset", DATASET, "--agent", "pi_plans_bench:PiPlansBench", "--model", MODEL, "--jobs-dir", outDir, "--agent-timeout-multiplier", "3"];
+			for (const taskId of discordant) args.push("--include-task-name", taskId);
+			console.log(`[sensitivity] seed ${seed} arm ${arm} -> harbor ${args.slice(0, 8).join(" ")} ... (${discordant.length} tasks)`);
+			const res = spawnSync(bin, args, { cwd: VENDOR_HARBOR, env, stdio: "inherit" });
+			if (res.status !== 0) {
+				console.error(`[sensitivity] harbor exited ${res.status} (seed ${seed}, ${arm})`);
+				process.exit(res.status ?? 1);
+			}
+		}
+	}
+	console.log("[sensitivity] reruns complete; analyze.ts emits the majority-vote table.");
+}
+
+function main(): void {
+	const args = parseArgs(process.argv);
+	const resultsDir = (args["results-dir"] as string) ?? path.join(DEFAULT_RESULTS, new Date().toISOString().slice(0, 10));
+	fs.mkdirSync(resultsDir, { recursive: true });
+
+	if (args["prepare"]) {
+		prepare();
+		return;
+	}
+	if (args["rerun-discordant"]) {
+		void rerunDiscordant(resultsDir).catch((error) => {
+			console.error(String(error));
+			process.exit(1);
+		});
+		return;
+	}
+	if (args["dry-run"]) {
+		dryRun(resultsDir);
+		return;
+	}
+
+	const armArg = (args["arm"] as string) ?? "both";
+	const arms: Array<"baseline" | "treatment"> =
+		armArg === "both" ? ["baseline", "treatment"] : [armArg as "baseline" | "treatment"];
+
+	const extra: string[] = [];
+	if (args["smoke"]) {
+		// V-003 smoke set: hello-world (+ second task when supported).
+		extra.push("--include-task-name", process.env.BENCH_SMOKE_TASK ?? "bn-fit-modify");
+	} else if (args["task"]) {
+		extra.push("--task", String(args["task"]));
+	} else if (args["include-task-name"]) {
+		for (const name of String(args["include-task-name"]).split(",")) extra.push("--include-task-name", name.trim());
+	} else if (args["sample-file"]) {
+		// D-016 degrade step 2: stratified 40-task sample (one task per line).
+		const names = fs.readFileSync(String(args["sample-file"]), "utf8").split("\n").map((l) => l.trim()).filter(Boolean);
+		for (const name of names) extra.push("--include-task-name", name);
+		console.log(`[plan] sample-file: ${names.length} task(s)`);
+	}
+	if (args["n-concurrent"]) extra.push("--n-concurrent", String(args["n-concurrent"]));
+	// Forced-plan-big lifecycle (planning + criticizer + reviewer subagents +
+	// execution + refinement) routinely exceeds harbor's default 1h agent
+	// budget on flash-class models; 3x keeps the measurement honest instead of
+	// censoring the treatment at its own overhead.
+	extra.push("--agent-timeout-multiplier", String(args["agent-timeout-multiplier"] ?? "3"));
+	// Degraded-network headroom: nvm/npm/pi installs can exceed harbor's 360s
+	// setup cap when the VPN is slow (2026-09-11: 29 setup timeouts).
+	extra.push("--agent-setup-timeout-multiplier", String(args["agent-setup-timeout-multiplier"] ?? "4"));
+
+	prepare();
+	for (const arm of arms) runArm(arm, resultsDir, extra);
+	budgetGate(resultsDir, args["second-benchmark"] === true);
+	console.log(`[done] results in ${resultsDir}; analyze with scripts/bench/analyze.ts`);
+}
+
+main();
