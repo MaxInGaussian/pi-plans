@@ -18,6 +18,7 @@ import { disableAutoComplete, enableAutoComplete, isAutoCompleteEnabled, recordA
 import { assertAutoApprovable, isAutoApproveEnabled } from "../src/auto-approve.ts";
 import { TERMINATION_QUESTION, TERMINATION_OPTIONS, TERMINATION_RECORDING_INSTRUCTIONS, renderTerminationOptions } from "../src/termination-prompt.ts";
 import { truncateToWidth, visibleWidth } from "../src/refine-ui-helpers.ts";
+import { stripRecommendedMarker } from "../src/ask-form.ts";
 import {
 	FORM_QUESTION_MAX,
 	formAnswers,
@@ -144,7 +145,7 @@ export function fitAskChoicePanel(question: string, items: PanelItem[], columns:
 const Option = Type.Object({
 	label: Type.String({ description: "Option label" }),
 	description: Type.Optional(Type.String({ description: "Short tradeoff that matters, shown to the user" })),
-	recommended: Type.Optional(Type.Boolean({ description: "Mark exactly one recommended option; put it first" })),
+	recommended: Type.Optional(Type.Boolean({ description: "Mark exactly one recommended option; put it first. Never embed (推荐)/(recommended) text in labels — the UI renders the ★ marker automatically" })),
 });
 
 const BatchQuestionParams = Type.Object({
@@ -435,7 +436,8 @@ async function executeAskChoiceBatch(
 		let cancelled = false;
 		for (const q of formQuestions) {
 			const panelItems: PanelItem[] = q.options.map((option, index) => {
-				const core = `${index + 1}. ${option.label}${option.recommended ? "  (recommended)" : ""}`;
+				const label = stripRecommendedMarker(option.label);
+				const core = `${index + 1}. ${label}${option.recommended ? "  ★" : ""}`;
 				const display = core + (option.description ? ` — ${option.description}` : "");
 				return { core, display };
 			});
@@ -711,9 +713,11 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			const AUTO_REFINE_LOOP_LABEL =
 				"Auto-refine loop  (run refinement rounds until no high-severity finding or the 5-round cap)";
 			const panelItems: PanelItem[] = options.map((option, index) => {
-				const core = `${index + 1}. ${option.label}${option === recommended ? "  (recommended)" : ""}`;
-				let display = `${index + 1}. ${option.label}`;
-				if (option === recommended) display += "  (recommended)";
+				const label = stripRecommendedMarker(option.label);
+				const isRec = option === recommended;
+				const core = `${index + 1}. ${label}${isRec ? "  ★" : ""}`;
+				let display = `${index + 1}. ${label}`;
+				if (isRec) display += "  ★";
 				if (option.description) display += ` — ${option.description}`;
 				return { core, display };
 			});
