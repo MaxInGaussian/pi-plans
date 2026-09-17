@@ -4,6 +4,12 @@ All notable changes to **pi-plans** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-09-17
+
+### Fixed
+
+- **No more duplicated （推荐） markers in the batch form.** Agents sometimes authored option labels that already ended with `（推荐）`/`(recommended)`; the renderer then appended its own marker and the option displayed the tag twice. Labels are now normalized (`stripRecommendedMarker`) wherever they render — form options, submit page, transcript `renderCall`, and both sequential-select fallbacks — and the recommended indicator is a single colored `★` (pi-goal-x alignment) instead of a `(推荐)` text suffix. `formAnswers` strips the marker from recommended answers so the returned label stays clean; the tool schema now tells agents never to embed the marker in labels.
+- **Themed batch form aligned with pi-goal-x.** `formRender` accepts an optional theme (the host already injects the pi Theme into the custom-dialog factory; it was previously ignored). With it, the question tab renders the pi-goal-x frame: accent top/bottom borders, a tabs row whose active chip gets the `selectedBg` background (■ answered / □ pending, ✓ 提交 dims until every question is answered), the question line in accent, selected options in accent with `→ `, unselected in text, `★` in success color, and dim key hints. The submit page uses an accent bold header with warning/success status, the editing page an accent header. The F-001 rows-budget degradation is preserved and extends to the new frame: descriptions strip first, then blank separators, then the borders (the selectedBg chips row survives), then the question text; options are only capped behind a `… +N more` indicator as a last resort and the footer always survives. All lines stay width-safe under real ANSI styling (visibleWidth skips escape sequences).
 ## [0.4.0] - 2026-09-17
 
 ### Added
