@@ -187,6 +187,41 @@ describe("form render fit", () => {
 	});
 });
 
+describe("form rows budget (F-001)", () => {
+	it("caps the question tab behind an overflow indicator and keeps the footer on short terminals", () => {
+		const q = {
+			question: "Short terminal?",
+			options: Array.from({ length: 9 }, (_, i) => ({ label: `O${i}`, recommended: i === 0 })),
+			allowOther: true,
+			questionId: "q",
+			autoComplete: true,
+		};
+		const state = createFormState([q]);
+		const lines = formRender(state, 60, 8);
+		assert.ok(lines.length <= 8, `rows budget respected (${lines.length})`);
+		assert.ok(lines.some((l) => l.includes("+5 more")), "overflow indicator present");
+		assert.match(lines.at(-1)!, /Tab/, "key-hint footer survives");
+	});
+
+	it("degrades to compact options before capping rows", () => {
+		const q = {
+			question: "Desc?",
+			options: [
+				{ label: "A", recommended: true, description: "long description that would widen rows" },
+				{ label: "B", description: "another" },
+				{ label: "C" },
+			],
+			allowOther: false,
+			questionId: "q",
+			autoComplete: true,
+		};
+		const state = createFormState([q]);
+		const lines = formRender(state, 80, 8);
+		assert.ok(lines.length <= 8);
+		assert.ok(!lines.join("\n").includes("description"), "descriptions stripped under budget");
+	});
+});
+
 describe("FORM_QUESTION_MAX", () => {
 	it("covers the batch contract of 2..8 questions", () => {
 		assert.equal(FORM_QUESTION_MAX, 8);

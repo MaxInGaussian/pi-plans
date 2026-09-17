@@ -212,7 +212,7 @@ interface AskChoiceDetails {
 /** Question ids reserved for single-question flows (R-013b/D-025): scope
  *  confirmation and the execution handoff must never ride inside a batch,
  *  where auto-complete could answer them without explicit user approval. */
-const FORBIDDEN_BATCH_QUESTION_IDS = new Set(["termination-condition", "scope-confirm-handoff"]);
+const FORBIDDEN_BATCH_QUESTION_IDS = new Set(["termination-condition", "scope-confirm", "scope-confirm-handoff"]);
 
 interface BatchRuntime {
 	workdir: string;
@@ -558,7 +558,15 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			// 0.4.0 batch mode: one tabbed form for a whole round of questions
 			// (2-8). The single-question path below is untouched (C-004).
+			// F-005 (impl review r1): ambiguous shapes fail loudly instead of
+			// silently preferring one parameter set.
 			if (params.questions !== undefined && params.questions.length > 0) {
+				if (params.question !== undefined || params.options !== undefined) {
+					throw new Error("ask_choice accepts either question+options or questions, not both");
+				}
+				if (params.trailing !== undefined) {
+					throw new Error("ask_choice batch mode does not support trailing (single-question only)");
+				}
 				return executeAskChoiceBatch({ questions: params.questions, workdir: params.workdir }, ctx);
 			}
 			const workdir = normalizeWorkdir(params.workdir ?? ctx.cwd);

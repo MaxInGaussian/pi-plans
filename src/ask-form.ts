@@ -214,10 +214,21 @@ function optionRows(q: FormQuestion, selected: number, width: number): string[] 
 	return rows;
 }
 
-/** Render the current tab. Deterministic row counts for golden tests. */
-export function formRender(state: FormState, width: number): string[] {
+/** Frame reserve for the custom dialog (editor chrome + status + slack). */
+export const FORM_ROWS_RESERVE = 4;
+export const FORM_FALLBACK_ROWS = 30;
+
+/**
+ * Render the current tab. Deterministic row counts for golden tests. With a
+ * `rows` budget the layout degrades options-first (F-001): descriptions are
+ * stripped, blank separators dropped, the question truncated to one short
+ * line — and only as a last resort option rows are capped behind a
+ * "… +N more" indicator; the key-hint footer line always survives.
+ */
+export function formRender(state: FormState, width: number, rows?: number): string[] {
 	const w = Math.max(12, width);
 	const n = state.questions.length;
+	if (rows !== undefined && rows < 5) rows = 5; // minimal viable form
 	if (state.editing) {
 		const q = state.questions[state.tab];
 		return [
@@ -260,13 +271,28 @@ export function formRender(state: FormState, width: number): string[] {
 	const tabs = Array.from({ length: n + 1 }, (_, i) => (i === state.tab ? `●${i + 1}` : `○${i + 1}`))
 		.join(" ")
 		.concat(" 提交");
-	return [
-		fit(`Q${state.tab + 1}/${n} · ${q.question}`, w),
-		"",
-		...optionRows(q, state.selection[state.tab], w),
-		"",
-		fit(`${tabs}  [↑/↓] 选择  [Enter] 选定  [Tab] 下一题  [Esc] 取消`, w),
-	];
+	const footer = fit(`${tabs}  [↑/↓] 选择  [Enter] 选定  [Tab] 下一题  [Esc] 取消`, w);
+	const questionLine = fit(`Q${state.tab + 1}/${n} · ${q.question}`, w);
+	if (rows === undefined) {
+		return [questionLine, "", ...optionRows(q, state.selection[state.tab], w), "", footer];
+	}
+	// Rows-budget degradation (F-001): options-first fit.
+	const compact = optionRows(
+		{ ...q, options: q.options.map((o) => ({ ...o, description: undefined })) },
+		state.selection[state.tab],
+		w,
+	);
+	const withBlanks = [questionLine, "", ...compact, "", footer];
+	if (withBlanks.length <= rows) return withBlanks;
+	const noBlanks = [questionLine, ...compact, footer];
+	if (noBlanks.length <= rows) return noBlanks;
+	const shortQuestion = fit(`Q${state.tab + 1}/${n}`, w);
+	const withShort = [shortQuestion, ...compact, footer];
+	if (withShort.length <= rows) return withShort;
+	// Last resort: cap option rows behind an overflow indicator; keep footer.
+	const keep = Math.max(0, rows - 3); // question + overflow line + footer
+	const hidden = compact.length - keep;
+	return [shortQuestion, ...compact.slice(0, keep), fit(`… +${hidden} more`, w), footer];
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +340,8 @@ export async function runQuestionForm(
 			return {
 				render(width: number) {
 					syncCursor(state.editing);
-					return formRender(state, width);
+					const rows = Math.max(5, (process.stdout.rows ?? FORM_FALLBACK_ROWS) - FORM_ROWS_RESERVE);
+					return formRender(state, width, rows);
 				},
 				handleInput(data: string) {
 					const event = formHandleKey(state, data);

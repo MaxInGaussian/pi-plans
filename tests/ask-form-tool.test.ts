@@ -130,6 +130,28 @@ describe("ask_choice batch validation (R-013b/D-025)", () => {
 		);
 	});
 
+	it("rejects ambiguous call shapes loudly (F-005)", async () => {
+		const tool = loadTool();
+		const ctx = makeCtx(freshWorkdir());
+		await assert.rejects(
+			() => tool.execute("t", { question: "single?", options: [{ label: "A" }], questions: [Q1, Q2] }, undefined, undefined, ctx),
+			/not both/,
+		);
+		await assert.rejects(
+			() => tool.execute("t", { questions: [Q1, Q2], trailing: "auto-refine-loop" }, undefined, undefined, ctx),
+			/trailing/,
+		);
+	});
+
+	it("rejects the canonical scope-confirm id in batches (F-003)", async () => {
+		const tool = loadTool();
+		const ctx = makeCtx(freshWorkdir());
+		await assert.rejects(
+			() => tool.execute("t", { questions: [{ ...Q1, questionId: "scope-confirm" }, Q2] }, undefined, undefined, ctx),
+			/reserved questionId/,
+		);
+	});
+
 	it("rejects duplicate questionIds", async () => {
 		const tool = loadTool();
 		const ctx = makeCtx(freshWorkdir());

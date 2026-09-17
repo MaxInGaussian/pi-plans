@@ -420,7 +420,6 @@ function updatePanelWidget(ctx: ExtensionContext): void {
 		}
 		return;
 	}
-	const topic = panelTopic(ctx);
 	if (!panelRegistered) {
 		ctx.ui.setWidget(
 			PANEL_WIDGET_KEY,
@@ -429,7 +428,10 @@ function updatePanelWidget(ctx: ExtensionContext): void {
 					const theme = (ui as { theme?: { fg(color: string, text: string): string } }).theme ?? _theme;
 					const current = execution;
 					if (!current) return [];
-					const model = derivePanelModel(current, topic, executionIsWaiting(current));
+					// F-004 (impl review r1): recompute the topic per render so a
+					// cross-run restart without an intervening unregister cannot
+					// show a stale box header.
+					const model = derivePanelModel(current, panelTopic(ctx), executionIsWaiting(current));
 					const lines = renderPanelLines(model, width);
 					return lines.map((line, index) => {
 						// Box chrome stays muted; brand + status content get accents.
@@ -1499,14 +1501,18 @@ export function executionContextMessage(ctx: ExtensionContext): string | null {
 		mode === "config-unavailable"
 			? `${graphBlockForExecutor(false)}\n[pi-plans: config unreadable this turn; graph features are off until .git/pi_plans/config.json is repaired]`
 			: graphBlockForExecutor(mode === "enabled");
+	// F-002 (impl review r1): the next-action line is hoisted out of the
+	// implItems ternary so plans without implementation items get the same
+	// same-source guidance the panel shows.
+	const nextActionLine = `\nSuggested next action (displayed in the pi-plans panel): ${deriveNextAction(execution, executionIsWaiting(execution), resolveImplStatuses(execution.implItems ?? [], execution.items, execution.implStatus), remaining, execution.currentI)}`;
 	const implementationItems = execution.implItems?.length
-		? `\nImplementation items: ${execution.implItems.map((item) => item.id).join(", ")}${execution.currentI ? `\nCurrent implementation item: \`${execution.currentI}\`` : ""}\nWhen beginning an implementation item, emit its current anchor exactly once as \`[I-###:current]\`; then use \`[I-###:implemented]\` or \`[I-###:validating]\` for progress.\nSuggested next action (displayed in the pi-plans panel): ${deriveNextAction(execution, executionIsWaiting(execution), resolveImplStatuses(execution.implItems ?? [], execution.items, execution.implStatus), remaining, execution.currentI)}`
+		? `\nImplementation items: ${execution.implItems.map((item) => item.id).join(", ")}${execution.currentI ? `\nCurrent implementation item: \`${execution.currentI}\`` : ""}\nWhen beginning an implementation item, emit its current anchor exactly once as \`[I-###:current]\`; then use \`[I-###:implemented]\` or \`[I-###:validating]\` for progress.`
 		: "";
 	return `[PI-PLANS EXECUTION — write access enabled]
 Implement the accepted plan at ${execution.planPath} (${execution.items.length - remaining.length}/${execution.items.length} verifier items done).
 
 Remaining verifier items:
-${list}${implementationItems}
+${list}${implementationItems}${nextActionLine}
 
 ${graphLine}
 
