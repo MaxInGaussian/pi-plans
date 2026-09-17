@@ -9,7 +9,7 @@ Use this skill for problem or failure inputs that need diagnosis before planning
 
 ## Pi Setup
 
-Read `../../references/pi-planning-workflow.md` and `../../references/state-and-config.md` — both normative — and follow their setup, state, `language`, and reviewer/criticizer rules. Initialize workspace state with the `plans` tool (`action: "init"`); state lives in `.git/pi_plans/`. Ask every question with the `ask_choice` tool; run refinement rounds with the `refine` tool.
+Read `../../references/pi-planning-workflow.md` and `../../references/state-and-config.md` — both normative — and follow their setup, state, `language`, and reviewer/criticizer rules. Initialize workspace state with the `plans` tool (`action: "init"`); state lives in `.git/pi_plans/`. Ask every question with the `ask_choice` tool (batch related questions into one `questions: [...]` form call, 2-8 items; scope/handoff stays single-question with `autoComplete: false`); run refinement rounds with the `refine` tool.
 
 ## Diagnostic Workflow
 

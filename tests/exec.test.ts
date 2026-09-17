@@ -234,9 +234,9 @@ describe("execution loop", () => {
 		const { pi, ctx, recorded } = makeHarness(workdir);
 		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001", "VC-002"));
 
-		assert.match(recorded.status ?? "", /⌛ plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
-		assert.match(recorded.status ?? "", /in-toks/);
-		assert.match(recorded.status ?? "", /out-toks/);
+		assert.match(recorded.status ?? "", /plans: .* ▸ exec/);
+		assert.match(recorded.status ?? "", /VC 0\/2/);
+		assert.match(recorded.status ?? "", /next: Verify VC-001/);
 
 		assert.ok(getExecution());
 		const rules = executionContextMessage(ctx)!;
@@ -415,7 +415,8 @@ describe("execution loop", () => {
 
 		assert.deepEqual(recorded.models, []);
 		assert.equal(recorded.thinking, "high");
-		assert.match(recorded.status ?? "", /⌛ plans 0\/1/);
+		assert.match(recorded.status ?? "", /plans: .* ▸ exec/);
+		assert.match(recorded.status ?? "", /VC 0\/1/);
 
 		await stopExecution(pi, ctx, "restore-check");
 		assert.deepEqual(recorded.models, []);
@@ -429,8 +430,8 @@ describe("execution loop", () => {
 
 		// Bottom status bar carries the count — the same layer as ⛔/⌛ — so both
 		// execution states read from one consistent place.
-		assert.match(recorded.status ?? "", /⌛ plans 0\/2: spent \d{2}:\d{2}:\d{2}/);
-		assert.match(recorded.status ?? "", /in-toks/);
+		assert.match(recorded.status ?? "", /plans: .* ▸ exec/);
+		assert.match(recorded.status ?? "", /VC 0\/2/);
 
 		const start = recorded.messages.find((message) => message.customType === "pi-plans-exec-start");
 		assert.ok(start);
@@ -490,8 +491,8 @@ describe("execution loop", () => {
 		updateStatusWidget(ctx);
 		assert.equal(getExecution()?.usage.inToks, 100);
 		assert.equal(getExecution()?.usage.outToks, 40);
-		assert.match(recorded.status ?? "", /100 in-toks/);
-		assert.match(recorded.status ?? "", /40 out-toks/);
+		assert.match(recorded.status ?? "", /plans: .* ▸ exec/);
+		assert.match(recorded.status ?? "", /VC 0\/2/);
 
 		assert.deepEqual(applyDoneMarkers("[DONE:VC-001]"), ["VC-001"]);
 		recordExecutionTurn(pi, ctx, ["VC-001"], { input: 20, output: 10 });
@@ -499,8 +500,7 @@ describe("execution loop", () => {
 		assert.equal(getExecution()?.usage.inToks, 120);
 		assert.equal(getExecution()?.usage.outToks, 50);
 		assert.equal(getExecution()?.items[0].done, true);
-		assert.match(recorded.status ?? "", /120 in-toks/);
-		assert.match(recorded.status ?? "", /50 out-toks/);
+		assert.match(recorded.status ?? "", /plans: .* ▸ exec/);
 
 		await stopExecution(pi, ctx, "test-done");
 		assert.equal(getExecution(), null);
@@ -883,7 +883,7 @@ describe("execution loop", () => {
 		});
 		assert.equal(snapshotCount(), baseline, "turn_end wrote session entries despite deferral");
 		// Status line stays real-time while the write is deferred.
-		assert.match(recorded.status ?? "", /10 in-toks/);
+		assert.match(recorded.status ?? "", /plans: .* ▸ exec/);
 
 		drainExecutionFlush(pi, ctx);
 		assert.equal(snapshotCount(), baseline + 1, "settle flush did not write exactly one snapshot");
@@ -934,8 +934,9 @@ describe("execution loop", () => {
 
 		recordExecutionTurn(pi, ctx, [], { input: 33, output: 11 });
 		// Real-time: status line already reflects the turn's usage...
-		assert.match(recorded.status ?? "", /33 in-toks/);
-		assert.match(recorded.status ?? "", /⌛ plans 0\/2: spent/);
+		assert.match(recorded.status ?? "", /plans: .* ▸ exec/);
+		assert.match(recorded.status ?? "", /I 0\/2/);
+		assert.match(recorded.status ?? "", /VC 0\/2/);
 		// ...without any session write (anti-jitter preserved).
 		assert.equal(snapshotCount(), baseline);
 
@@ -960,8 +961,8 @@ describe("execution loop", () => {
 		await emit("turn_end", {
 			message: { role: "assistant", content: [{ type: "text", text: "verified [DONE:VC-001]" }] },
 		});
-		assert.match(recorded.status ?? "", /⌛ plans 1\/3: spent/);
-		assert.match(recorded.status ?? "", /12 in-toks/);
+		assert.match(recorded.status ?? "", /VC 1\/3/);
+		assert.match(recorded.status ?? "", /next: Verify VC-002/);
 
 		await emit("message_end", {
 			message: { role: "assistant", usage: { input: 8, output: 3 } },
@@ -969,8 +970,7 @@ describe("execution loop", () => {
 		await emit("turn_end", {
 			message: { role: "assistant", content: [{ type: "text", text: "verified [DONE:VC-002]" }] },
 		});
-		assert.match(recorded.status ?? "", /⌛ plans 2\/3: spent/);
-		assert.match(recorded.status ?? "", /20 in-toks/);
+		assert.match(recorded.status ?? "", /VC 2\/3/);
 
 		await stopExecution(pi, ctx, "event-chain-test");
 	});
@@ -1002,7 +1002,8 @@ describe("execution loop", () => {
 		await emit("turn_end", {
 			message: { role: "assistant", content: [{ type: "text", text: "starting [I-003:current]" }] },
 		});
-		assert.match(recorded.status ?? "", /⌛ plans 2\/3: spent/);
+		assert.match(recorded.status ?? "", /I 0\/3/);
+		assert.match(recorded.status ?? "", /next: Implement I-003/);
 		assert.equal(getExecution()?.currentI, "I-003");
 		drainExecutionFlush(pi, ctx);
 		const snapshot = recorded.entries.filter((entry) => entry.customType === "pi-plans-exec").at(-1)?.data as { currentI?: string };

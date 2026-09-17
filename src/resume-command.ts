@@ -379,6 +379,13 @@ async function buildBrief(
 			`PENDING question (re-ask exactly this via ask_choice with the same questionId): [${cp.pendingQuestion.questionId}] ${cp.pendingQuestion.question} Options: ${cp.pendingQuestion.options.join(" / ")}`,
 		);
 	}
+	if (cp.pendingQuestions.length > 0) {
+		lines.push(
+			`PENDING batch (${cp.pendingQuestions.length} questions; re-ask via one ask_choice call with the same questions[] and questionIds): ${cp.pendingQuestions
+				.map((q) => `[${q.questionId}] ${q.question}`)
+				.join(" / ")}`,
+		);
+	}
 	for (const round of cp.reviewRounds) {
 		if (round.consolidated) continue;
 		const done = round.lanes.filter((lane) => lane.status === "complete").map((lane) => lane.laneId);

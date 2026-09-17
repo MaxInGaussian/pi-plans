@@ -173,6 +173,10 @@ export interface WorkflowCheckpoint {
 	commonDir: string;
 	plan: PlanIdentity | null;
 	pendingQuestion: PendingQuestion | null;
+	/** Batch-form pending questions (D-021): written before a multi-question
+	 *  form opens, answered one per row and pruned as they land. The single
+	 *  `pendingQuestion` field remains authoritative for single-question asks. */
+	pendingQuestions: PendingQuestion[];
 	answeredQuestions: AnsweredQuestionRef[];
 	reviewRounds: ReviewRoundState[];
 	implementationReview?: ImplementationReviewState;
@@ -484,7 +488,7 @@ export function validateCheckpoint(data: unknown): WorkflowCheckpoint {
 	const allowed = new Set([
 		"schema", "runId", "revision", "generation", "updatedAt", "phase", "nextAction",
 		"originWorkdir", "workdir", "worktreeRoot", "commonDir", "plan", "pendingQuestion",
-		"answeredQuestions", "reviewRounds", "implementationReview", "execution",
+		"pendingQuestions", "answeredQuestions", "reviewRounds", "implementationReview", "execution",
 		"autoComplete", "owner", "migration",
 	]);
 	rejectExtraKeys(record, allowed, "checkpoint");
@@ -511,6 +515,9 @@ export function validateCheckpoint(data: unknown): WorkflowCheckpoint {
 			record.pendingQuestion === null || record.pendingQuestion === undefined
 				? null
 				: asPendingQuestion(record.pendingQuestion, "checkpoint.pendingQuestion"),
+		pendingQuestions: Array.isArray(record.pendingQuestions)
+			? record.pendingQuestions.map((entry, i) => asPendingQuestion(entry, `checkpoint.pendingQuestions[${i}]`))
+			: [],
 		answeredQuestions: Array.isArray(record.answeredQuestions)
 			? record.answeredQuestions.map((entry, i) => asAnsweredQuestion(entry, `checkpoint.answeredQuestions[${i}]`))
 			: [],
@@ -677,6 +684,7 @@ export function createCheckpoint(workdir: string, input: CreateCheckpointInput):
 		commonDir,
 		plan: null,
 		pendingQuestion: null,
+		pendingQuestions: [],
 		answeredQuestions: [],
 		reviewRounds: [],
 	};
@@ -780,9 +788,15 @@ function questionPhases(cp: WorkflowCheckpoint): boolean {
 
 /** F-005: an answered ledger entry always wins over a same-id pending question. */
 export function reconcilePendingWithAnswered(cp: WorkflowCheckpoint): WorkflowCheckpoint {
-	if (cp.pendingQuestion === null) return cp;
-	if (cp.answeredQuestions.some((entry) => entry.questionId === cp.pendingQuestion?.questionId)) {
-		return { ...cp, pendingQuestion: null };
+	if (cp.pendingQuestion !== null && cp.answeredQuestions.some((entry) => entry.questionId === cp.pendingQuestion?.questionId)) {
+		cp = { ...cp, pendingQuestion: null };
+	}
+	if (cp.pendingQuestions.length > 0) {
+		const answered = new Set(cp.answeredQuestions.map((entry) => entry.questionId));
+		const remaining = cp.pendingQuestions.filter((q) => !answered.has(q.questionId));
+		if (remaining.length !== cp.pendingQuestions.length) {
+			cp = { ...cp, pendingQuestions: remaining };
+		}
 	}
 	return cp;
 }
@@ -818,6 +832,62 @@ export function applyQuestionAnswered(
 			...cp.answeredQuestions,
 			{ questionId, answer, source, answeredAt: utcNow() },
 		],
+	};
+}
+
+/**
+ * Batch-form persistence (D-021): record the whole batch as pending before the
+ * form opens. Every question must be unanswered; ids must be unique. The
+ * single `pendingQuestion` field is left untouched — batch and single asks
+ * never interleave (the ask_choice tool routes by call shape).
+ */
+export function applyQuestionsAsked(
+	cp: WorkflowCheckpoint,
+	questions: Array<Omit<PendingQuestion, "askedAt">>,
+): WorkflowCheckpoint {
+	if (!questionPhases(cp)) throw new StateError(`cannot ask a question in phase "${cp.phase}"`);
+	if (questions.length === 0) throw new StateError("applyQuestionsAsked requires at least one question");
+	const ids = new Set<string>();
+	for (const q of questions) {
+		if (ids.has(q.questionId)) throw new StateError(`duplicate question id in batch: ${q.questionId}`);
+		ids.add(q.questionId);
+		if (cp.answeredQuestions.some((entry) => entry.questionId === q.questionId)) {
+			throw new StateError(`question ${q.questionId} is already answered; do not re-ask`);
+		}
+	}
+	return {
+		...cp,
+		pendingQuestions: questions.map((q) => ({ ...q, askedAt: utcNow() })),
+		nextAction: "ask-question",
+	};
+}
+
+/**
+ * Batch-form answer (D-021/D-024): idempotent per id — re-answering an
+ * already-answered batch question is a no-op (the ledger is the final word).
+ * Answers with unknown ids are rejected (crash-recovery replay must resend
+ * exactly the pending set). When the last pending row lands the batch closes.
+ */
+export function applyQuestionsAnswered(
+	cp: WorkflowCheckpoint,
+	questionId: string,
+	answer: string,
+	source: QuestionSource,
+): WorkflowCheckpoint {
+	if (!cp.pendingQuestions.some((q) => q.questionId === questionId)) {
+		throw new StateError(`no pending batch question ${questionId}`);
+	}
+	if (cp.answeredQuestions.some((entry) => entry.questionId === questionId)) {
+		return cp;
+	}
+	return {
+		...cp,
+		pendingQuestions: cp.pendingQuestions.filter((q) => q.questionId !== questionId),
+		answeredQuestions: [
+			...cp.answeredQuestions,
+			{ questionId, answer, source, answeredAt: utcNow() },
+		],
+		nextAction: cp.pendingQuestions.length === 1 ? "continue-planning" : cp.nextAction,
 	};
 }
 

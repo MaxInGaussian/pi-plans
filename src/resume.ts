@@ -170,21 +170,27 @@ export function reconcileCheckpointWithLedger(workdir: string, runId: string, ch
 	const answeredIds = new Set(
 		ledger.filter((entry) => typeof entry.questionId === "string").map((entry) => entry.questionId),
 	);
-	if (checkpoint.pendingQuestion === null || !answeredIds.has(checkpoint.pendingQuestion.questionId)) {
+	// D-021: batch-pending rows are pruned per answered id as well.
+	const pruneBatch = (cp: WorkflowCheckpoint) => {
+		const remaining = cp.pendingQuestions.filter((q) => !answeredIds.has(q.questionId));
+		const pendingPruned =
+			cp.pendingQuestion !== null && answeredIds.has(cp.pendingQuestion.questionId)
+				? { ...cp, pendingQuestion: null, pendingQuestions: remaining }
+				: { ...cp, pendingQuestions: remaining };
+		return pendingPruned;
+	};
+	const missing = checkpoint.pendingQuestions.some((q) => !answeredIds.has(q.questionId));
+	if (checkpoint.pendingQuestion === null && !missing) {
 		return checkpoint;
 	}
 	// The ledger (not the checkpoint) carries the answer: drop the stale
-	// pending entry directly and persist the reconciled state.
+	// pending entries directly and persist the reconciled state.
 	try {
-		mutateCheckpoint(workdir, runId, (cp) =>
-			cp.pendingQuestion !== null && answeredIds.has(cp.pendingQuestion.questionId)
-				? { ...cp, pendingQuestion: null }
-				: cp,
-		);
+		mutateCheckpoint(workdir, runId, (cp) => pruneBatch(cp));
 	} catch {
 		/* corrupt/missing checkpoints are handled by the caller */
 	}
-	return { ...checkpoint, pendingQuestion: null };
+	return pruneBatch(checkpoint);
 }
 
 /** Read a legacy run's decision ledger for the resume brief (R-008). */

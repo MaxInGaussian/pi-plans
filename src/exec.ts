@@ -58,6 +58,13 @@ import {
 	type ExecutionApproval,
 } from "./workflow-state.ts";
 import { graphBlockForExecutor } from "./code-graph/prompts.ts";
+import {
+	PANEL_WIDGET_KEY,
+	derivePanelModel,
+	deriveNextAction,
+	formatPanelSummaryLine,
+	renderPanelLines,
+} from "./panel.ts";
 import { resolveGraphMode } from "./code-graph/mode.ts";
 import { TERMINATION_QUESTION, TERMINATION_OPTIONS, TERMINATION_RECORDING_INSTRUCTIONS, renderTerminationOptions } from "./termination-prompt.ts";
 import {
@@ -372,9 +379,96 @@ export function formatExecutionStatusLine(execution: ExecState): string {
 	return line;
 }
 
+/** Approximation for "a subprocess is pending" (matches the exec loop's
+ *  `/waiting for/` backoff heuristic; F-008). Passed explicitly into the
+ *  shared model so the panel, status line and injection text agree. */
+export function executionIsWaiting(execution: ExecState): boolean {
+	const gw = execution.goalWait;
+	return gw !== undefined && !gw.paused && gw.waitRounds > 0;
+}
+
+/** Resolve the run topic for panel headers (falls back to the run id). */
+function panelTopic(ctx: ExtensionContext): string {
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	if (active) {
+		const run = getRun(ctx.cwd, active.run_id);
+		if (run?.topic) return run.topic;
+		return active.run_id;
+	}
+	return "pi-plans";
+}
+
+let panelRegistered = false;
+
+/**
+ * Register/update the fixed tasks' status panel (aboveEditor widget) for the
+ * current execution, or unregister it when execution is gone. The panel and
+ * the bottom status line share the same pure model (D-003/D-014/D-015). The
+ * widget uses the factory form and reads the LIVE theme via `ui.theme` inside
+ * render(width) — per-line width math happens on plain text first, then the
+ * current theme is applied, so theme hot-swaps and resize never produce stale
+ * colors or wrapped rows (F-004).
+ */
+function updatePanelWidget(ctx: ExtensionContext): void {
+	// Capability guard: older Pi hosts and test harness mocks may not expose
+	// setWidget (the panel is a UI nicety, never a correctness dependency).
+	if (!ctx.hasUI || typeof ctx.ui.setWidget !== "function") return;
+	if (!execution) {
+		if (panelRegistered) {
+			ctx.ui.setWidget(PANEL_WIDGET_KEY, undefined);
+			panelRegistered = false;
+		}
+		return;
+	}
+	const topic = panelTopic(ctx);
+	if (!panelRegistered) {
+		ctx.ui.setWidget(
+			PANEL_WIDGET_KEY,
+			(ui, _theme) => ({
+				render(width: number) {
+					const theme = (ui as { theme?: { fg(color: string, text: string): string } }).theme ?? _theme;
+					const current = execution;
+					if (!current) return [];
+					const model = derivePanelModel(current, topic, executionIsWaiting(current));
+					const lines = renderPanelLines(model, width);
+					return lines.map((line, index) => {
+						// Box chrome stays muted; brand + status content get accents.
+						if (index === 0) {
+							const brandIndex = line.indexOf("pi-plans");
+							if (brandIndex >= 0 && theme) {
+								return (
+									theme.fg("muted", line.slice(0, brandIndex)) +
+									theme.fg("accent", "pi-plans") +
+									theme.fg("muted", line.slice(brandIndex + "pi-plans".length))
+								);
+							}
+							return theme ? theme.fg("muted", line) : line;
+						}
+						if (index === 2) return theme ? theme.fg("accent", line) : line;
+						if (index === 4) return theme ? theme.fg("success", line) : line;
+						if (index === 1 && model.phase !== "executing") return theme ? theme.fg("warning", line) : line;
+						return theme ? theme.fg("muted", line) : line;
+					});
+				},
+			}),
+			{ placement: "aboveEditor" },
+		);
+		panelRegistered = true;
+	} else {
+		// Factory components are re-created on every registration; content
+		// updates flow through the closure reads at render time, so a no-op
+		// re-set is unnecessary. Trigger one re-render via a cheap status
+		// touch is NOT used — event-driven flush only (D-013).
+	}
+}
+
 export function updateStatusWidget(ctx: ExtensionContext): void {
+	updatePanelWidget(ctx);
 	if (execution) {
-		const line = formatExecutionStatusLine(execution);
+		// D-015: the status line derives from the same panel model.
+		const line = formatPanelSummaryLine(
+			derivePanelModel(execution, panelTopic(ctx), executionIsWaiting(execution)),
+		);
 		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
 		return;
 	}
@@ -1406,7 +1500,7 @@ export function executionContextMessage(ctx: ExtensionContext): string | null {
 			? `${graphBlockForExecutor(false)}\n[pi-plans: config unreadable this turn; graph features are off until .git/pi_plans/config.json is repaired]`
 			: graphBlockForExecutor(mode === "enabled");
 	const implementationItems = execution.implItems?.length
-		? `\nImplementation items: ${execution.implItems.map((item) => item.id).join(", ")}${execution.currentI ? `\nCurrent implementation item: \`${execution.currentI}\`` : ""}\nWhen beginning an implementation item, emit its current anchor exactly once as \`[I-###:current]\`; then use \`[I-###:implemented]\` or \`[I-###:validating]\` for progress.`
+		? `\nImplementation items: ${execution.implItems.map((item) => item.id).join(", ")}${execution.currentI ? `\nCurrent implementation item: \`${execution.currentI}\`` : ""}\nWhen beginning an implementation item, emit its current anchor exactly once as \`[I-###:current]\`; then use \`[I-###:implemented]\` or \`[I-###:validating]\` for progress.\nSuggested next action (displayed in the pi-plans panel): ${deriveNextAction(execution, executionIsWaiting(execution), resolveImplStatuses(execution.implItems ?? [], execution.items, execution.implStatus), remaining, execution.currentI)}`
 		: "";
 	return `[PI-PLANS EXECUTION — write access enabled]
 Implement the accepted plan at ${execution.planPath} (${execution.items.length - remaining.length}/${execution.items.length} verifier items done).

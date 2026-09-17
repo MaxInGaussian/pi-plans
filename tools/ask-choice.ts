@@ -18,9 +18,19 @@ import { disableAutoComplete, enableAutoComplete, isAutoCompleteEnabled, recordA
 import { assertAutoApprovable, isAutoApproveEnabled } from "../src/auto-approve.ts";
 import { TERMINATION_QUESTION, TERMINATION_OPTIONS, TERMINATION_RECORDING_INSTRUCTIONS, renderTerminationOptions } from "../src/termination-prompt.ts";
 import { truncateToWidth, visibleWidth } from "../src/refine-ui-helpers.ts";
+import {
+	FORM_QUESTION_MAX,
+	formAnswers,
+	createFormState,
+	formHandleKey,
+	type FormQuestion,
+	type FormResult,
+	renderFormCall,
+	runQuestionForm,
+} from "../src/ask-form.ts";
 import { normalizeWorkdir, readActive, recordDecision } from "../src/state.ts";
 import { resolveActiveRun } from "../src/run-context.ts";
-import { applyQuestionAnswered, applyQuestionAsked, loadCheckpoint, mutateCheckpoint } from "../src/workflow-state.ts";
+import { applyQuestionAnswered, applyQuestionAsked, applyQuestionsAnswered, applyQuestionsAsked, loadCheckpoint, mutateCheckpoint } from "../src/workflow-state.ts";
 
 // ---------------------------------------------------------------------------
 // Panel fitting: pi's ExtensionSelectorComponent renders each option as an
@@ -137,9 +147,29 @@ const Option = Type.Object({
 	recommended: Type.Optional(Type.Boolean({ description: "Mark exactly one recommended option; put it first" })),
 });
 
-const AskChoiceParams = Type.Object({
+const BatchQuestionParams = Type.Object({
 	question: Type.String({ description: "The question to ask, in the configured language" }),
 	options: Type.Array(Option, { description: "Ordered options: recommended first, alternatives next. Do not include Other or Auto-complete yourself." }),
+	allowOther: Type.Optional(Type.Boolean({ description: "Offer free-form input for this question (default true)" })),
+	autoComplete: Type.Optional(
+		Type.Boolean({
+			description:
+				"Batches accept only autoComplete: true (or omitted) items — scope/handoff questions MUST stay single-question calls with autoComplete: false.",
+		}),
+	),
+	questionId: Type.Optional(Type.String({ description: "Stable id for cross-session dedupe (unique within the batch)." })),
+	purpose: Type.Optional(Type.String({ description: "Short machine-readable purpose." })),
+});
+
+const AskChoiceParams = Type.Object({
+	question: Type.Optional(Type.String({ description: "The single question to ask, in the configured language (mutually exclusive with questions)." })),
+	options: Type.Optional(Type.Array(Option, { description: "Ordered options (single-question form): recommended first, alternatives next. Do not include Other or Auto-complete yourself." })),
+	questions: Type.Optional(
+		Type.Array(BatchQuestionParams, {
+			description:
+				"Batch mode (2-8 questions): opens ONE tabbed multiple-choice form with a submit page instead of asking one question at a time. After the batch, think about the answers and follow up in later calls — phased questioning stays agent-driven. Not allowed for scope confirmation or execution handoff (those must stay single-question with autoComplete: false).",
+		}),
+	),
 	allowOther: Type.Optional(Type.Boolean({ description: "Offer free-form input (default true)" })),
 	autoComplete: Type.Optional(
 		Type.Boolean({
@@ -170,22 +200,367 @@ interface AskChoiceDetails {
 	options: string[];
 	answer: string | null;
 	source: "user" | "auto-complete" | "other" | "cancelled";
+	/** Batch mode: one entry per answered/recorded question. */
+	batch?: Array<{
+		question: string;
+		options: string[];
+		answer: string | null;
+		source: "user" | "auto-complete" | "other" | "cancelled";
+	}>;
 }
+
+/** Question ids reserved for single-question flows (R-013b/D-025): scope
+ *  confirmation and the execution handoff must never ride inside a batch,
+ *  where auto-complete could answer them without explicit user approval. */
+const FORBIDDEN_BATCH_QUESTION_IDS = new Set(["termination-condition", "scope-confirm-handoff"]);
+
+interface BatchRuntime {
+	workdir: string;
+	activeRun: ReturnType<typeof resolveActiveRun>;
+	hasCheckpoint: boolean;
+	recordDecision(entry: {
+		question: string;
+		options: string[];
+		answer: string;
+		answer_source: "user" | "auto-complete";
+		questionId?: string;
+		purpose?: string;
+	}): void;
+	markAsked(qs: Array<{ question: string; options: string[]; questionId?: string; purpose?: string }>): void;
+	markAnswered(questionId: string, answer: string, source: "user" | "auto-complete" | "other"): void;
+}
+
+function buildBatchRuntime(params: { workdir?: string }, ctx: ExtensionContext): BatchRuntime {
+	const workdir = normalizeWorkdir(params.workdir ?? ctx.cwd);
+	const activeRun = resolveActiveRun(ctx.sessionManager, workdir);
+	const hasCheckpoint = activeRun !== null && loadCheckpoint(workdir, activeRun.run_id).status === "ok";
+	const recordEntry = (entry: {
+		question: string;
+		options: string[];
+		answer: string;
+		answer_source: "user" | "auto-complete";
+		questionId?: string;
+		purpose?: string;
+	}): void => {
+		const active = resolveActiveRun(ctx.sessionManager, workdir);
+		if (!active) return;
+		try {
+			recordDecision(workdir, active.run_id, {
+				question: entry.question,
+				options: entry.options,
+				answer: entry.answer,
+				answer_source: entry.answer_source,
+				...(entry.questionId ? { questionId: entry.questionId } : {}),
+			});
+		} catch {
+			/* recording is best-effort; the question still gets answered */
+		}
+	};
+	return {
+		workdir,
+		activeRun,
+		hasCheckpoint,
+		recordEntry,
+		markAsked(qs) {
+			if (!hasCheckpoint || !activeRun) return;
+			const withIds = qs.filter((q) => q.questionId);
+			if (withIds.length === 0) return;
+			try {
+				mutateCheckpoint(workdir, activeRun.run_id, (cp) =>
+					applyQuestionsAsked(
+						cp,
+						withIds.map((q) => ({
+							questionId: q.questionId!,
+							question: q.question,
+							options: q.options.map((o) => (typeof o === "string" ? o : o.label)),
+							purpose: q.purpose,
+						})),
+					),
+				);
+			} catch {
+				/* checkpoint bookkeeping must not block the form itself */
+			}
+		},
+		markAnswered(questionId, answer, source) {
+			if (!hasCheckpoint || !activeRun || !questionId) return;
+			try {
+				mutateCheckpoint(workdir, activeRun.run_id, (cp) =>
+					applyQuestionsAnswered(cp, questionId, answer, source),
+				);
+			} catch {
+				/* the decisions ledger already holds the answer; reconcile covers the gap */
+			}
+		},
+	};
+}
+
+/** Recommended-option short circuit shared by auto-approve / auto-complete /
+ *  no-UI paths. Records every question of the batch (D-022: whole-batch
+ *  gate — batches never contain autoComplete:false items per R-013b). */
+function shortCircuitBatch(
+	runtime: BatchRuntime,
+	qs: Array<{ question: string; options: Array<{ label: string; description?: string; recommended?: boolean }>; questionId?: string; purpose?: string }>,
+): AskChoiceDetails {
+	const answered = qs.map((q, index) => {
+		const recommended = q.options.find((option) => option.recommended) ?? q.options[0];
+		runtime.recordEntry({
+			question: q.question,
+			options: q.options.map((option) => option.label),
+			answer: recommended.label,
+			answer_source: "auto-complete",
+			...(q.questionId ? { questionId: q.questionId } : {}),
+			...(q.purpose ? { purpose: q.purpose } : {}),
+		});
+		runtime.markAnswered(q.questionId ?? "", recommended.label, "auto-complete");
+		return {
+			question: q.question,
+			options: q.options.map((option) => option.label),
+			answer: recommended.label,
+			source: "auto-complete" as const,
+			index: index + 1,
+		};
+	});
+	return {
+		question: `[batch of ${qs.length}]`,
+		options: [],
+		answer: answered.map((a) => a.answer).join(" | "),
+		source: "auto-complete",
+		batch: answered.map(({ index: _index, ...rest }) => rest),
+	};
+}
+
+async function executeAskChoiceBatch(
+	params: {
+		questions: Array<{
+			question: string;
+			options: Array<{ label: string; description?: string; recommended?: boolean }>;
+			allowOther?: boolean;
+			autoComplete?: boolean;
+			questionId?: string;
+			purpose?: string;
+		}>;
+		workdir?: string;
+	},
+	ctx: ExtensionContext,
+): Promise<{ content: { type: string; text: string }[]; details: AskChoiceDetails }> {
+	const qs = params.questions;
+	const runtime = buildBatchRuntime(params, ctx);
+
+	// --- Validation layer (D-007/D-022/D-025/R-013b) ---------------------
+	const allowed = FORBIDDEN_BATCH_QUESTION_IDS;
+	for (const q of qs as Array<{ options: unknown[]; question: string; questionId?: string; autoComplete?: boolean }>) {
+		if (q.options.length === 0) throw new Error(`ask_choice batch question needs options: ${q.question}`);
+		// R-013b/D-025 safety red line: batches never carry questions that
+		// must not be auto-completed (scope confirmation, execution handoff).
+		if (q.autoComplete === false) {
+			throw new Error(
+				`ask_choice batch cannot carry autoComplete: false ("${q.question}") — ask it as a single question.`,
+			);
+		}
+		if (q.questionId && allowed.has(q.questionId)) {
+			throw new Error(
+				`ask_choice batch cannot carry reserved questionId "${q.questionId}" — ask scope confirmation / execution handoff as a single question (autoComplete: false).`,
+			);
+		}
+	}
+	const seen = new Set<string>();
+	for (const q of qs) {
+		if (q.questionId) {
+			if (seen.has(q.questionId)) throw new Error(`duplicate questionId in batch: ${q.questionId}`);
+			seen.add(q.questionId);
+		}
+	}
+	if (qs.length > FORM_QUESTION_MAX) {
+		throw new Error(
+			`ask_choice batch supports at most ${FORM_QUESTION_MAX} questions per call (got ${qs.length}) — split into sequential batches and follow up after each one.`,
+		);
+	}
+
+	// --- Gates (D-022: whole-batch; R-005: fail-closed before any record) ---
+	if (isAutoApproveEnabled()) {
+		for (const q of qs) {
+			assertAutoApprovable({
+				question: q.question,
+				purpose: q.purpose,
+				questionId: q.questionId,
+				optionLabels: q.options.map((option) => option.label),
+			});
+		}
+		const details = shortCircuitBatch(runtime, qs);
+		return {
+			content: [{ type: "text", text: `[auto-approve] PI_PLANS_AUTO_APPROVE=1 answered ${qs.length} questions with their recommended options.` }],
+			details,
+		};
+	}
+	if (isAutoCompleteEnabled(ctx)) {
+		recordAskChoice(ctx, true);
+		const details = shortCircuitBatch(runtime, qs);
+		return {
+			content: [{ type: "text", text: `Auto-complete selected the recommended option for all ${qs.length} questions.` }],
+			details,
+		};
+	}
+	if (!ctx.hasUI) {
+		enableAutoComplete(ctx);
+		recordAskChoice(ctx, true);
+		const details = shortCircuitBatch(runtime, qs);
+		return {
+			content: [
+				{ type: "text", text: `No UI available. Auto-complete selected the recommended option for all ${qs.length} questions.` },
+			],
+			details,
+		};
+	}
+
+	// --- Live batch form ---------------------------------------------------
+	runtime.markAsked(qs);
+	const formQuestions: FormQuestion[] = qs.map((q) => ({
+		question: q.question,
+		options: q.options,
+		allowOther: q.allowOther ?? true,
+		questionId: q.questionId ?? "",
+		purpose: q.purpose,
+		autoComplete: true,
+	}));
+	let result: FormResult;
+	try {
+		result = await runQuestionForm(ctx.ui, formQuestions);
+	} catch (error) {
+		// Host threw while opening the custom dialog (e.g. RPC without custom
+		// support): degrade to one sequential select per question.
+		result = { answers: [], cancelled: false, unavailable: true };
+	}
+	if (result.unavailable) {
+		const batch: AskChoiceDetails["batch"] = [];
+		let cancelled = false;
+		for (const q of formQuestions) {
+			const panelItems: PanelItem[] = q.options.map((option, index) => {
+				const core = `${index + 1}. ${option.label}${option.recommended ? "  (recommended)" : ""}`;
+				const display = core + (option.description ? ` — ${option.description}` : "");
+				return { core, display };
+			});
+			if (q.allowOther) panelItems.push({ core: "Other…  (type your own answer)", display: "Other…  (type your own answer)", fixed: true });
+			const panel = fitAskChoicePanel(q.question, panelItems, process.stdout.columns ?? 0, process.stdout.rows ?? 0);
+			const selected = await ctx.ui.select(panel.question, panel.labels);
+			if (selected === undefined) {
+				cancelled = true;
+				break;
+			}
+			let answer = selected;
+			let source: "user" | "other" = "user";
+			if (q.allowOther && selected.startsWith("Other…")) {
+				const typed = await ctx.ui.input(`${q.question} — your answer:`);
+				if (typed === undefined || !typed.trim()) {
+					cancelled = true;
+					break;
+				}
+				answer = typed.trim();
+				source = "other";
+			}
+			runtime.recordEntry({
+				question: q.question,
+				options: q.options.map((o) => o.label),
+				answer,
+				answer_source: "user",
+				questionId: q.questionId || undefined,
+				purpose: q.purpose,
+			});
+			if (q.questionId) runtime.markAnswered(q.questionId, answer, source);
+			batch.push({ question: q.question, options: q.options.map((o) => o.label), answer, source });
+		}
+		if (cancelled) {
+			disableAutoComplete(ctx, "batch question cancelled");
+			return {
+				content: [
+					{
+						type: "text",
+						text: `User cancelled mid-batch after ${batch.length}/${qs.length} questions. Use the answered subset and do not treat the rest as approved.`,
+					},
+				],
+				details: { question: `[batch of ${qs.length}, cancelled at ${batch.length}]`, options: [], answer: null, source: "cancelled", batch },
+			};
+		}
+		recordAskChoice(ctx, false);
+		return {
+			content: [{ type: "text", text: formatBatchAnswers(batch) }],
+			details: { question: `[batch of ${qs.length}]`, options: [], answer: batch.map((b) => b.answer ?? "").join(" | "), source: "user", batch },
+		};
+	}
+
+	const answers = result.answers;
+	const batch: AskChoiceDetails["batch"] = answers.map((a) => {
+		const q = qs[a.index];
+		runtime.recordEntry({
+			question: q.question,
+			options: q.options.map((o) => o.label),
+			answer: a.answer,
+			answer_source: "user",
+			questionId: a.questionId,
+			purpose: q.purpose,
+		});
+		if (a.questionId) runtime.markAnswered(a.questionId, a.answer, a.source);
+		return {
+			question: q.question,
+			options: q.options.map((o) => o.label),
+			answer: a.answer,
+			source: a.source,
+		};
+	});
+	if (result.cancelled) {
+		// D-009: partial answers come back; the batch-level state marks the
+		// gap so resume drops only unanswered rows. Auto-complete is disabled
+		// for the session just like the single-question cancel path.
+		disableAutoComplete(ctx, "batch question cancelled");
+		runtime.recordEntry({
+			question: `[batch cancelled: ${batch.length}/${qs.length} answered]`,
+			options: qs.map((q) => q.question),
+			answer: batch.length > 0 ? batch.map((b) => `${b.question} → ${b.answer}`).join(" | ") : "(none answered)",
+			answer_source: "user",
+		});
+		return {
+			content: [
+				{
+					type: "text",
+					text: `User cancelled the batch after ${batch.length}/${qs.length} questions answered. Answers so far: ${formatBatchAnswers(batch)}. Do not treat unanswered questions as approved — re-ask them (or proceed with what you have) after thinking.`,
+				},
+			],
+			details: { question: `[batch of ${qs.length}, cancelled at ${batch.length}]`, options: [], answer: null, source: "cancelled", batch },
+		};
+	}
+	recordAskChoice(ctx, false);
+	return {
+		content: [{ type: "text", text: formatBatchAnswers(batch) }],
+		details: { question: `[batch of ${qs.length}]`, options: [], answer: batch.map((b) => b.answer ?? "").join(" | "), source: "user", batch },
+	};
+}
+
+function formatBatchAnswers(batch: NonNullable<AskChoiceDetails["batch"]>): string {
+	return batch
+		.map((b, i) => `${i + 1}. ${b.question}${NL}   ↳ ${b.source === "other" ? "[custom] " : ""}${b.answer}`)
+		.join(NL);
+}
+const NL = "\n";
 
 export function registerAskChoiceTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "ask_choice",
 		label: "Ask Choice",
 		description:
-			"Ask the user one planning or refinement question as a numbered choice prompt: recommended option first, alternatives next, then Other and Auto-complete. One question per call. Use for every user-facing planning question, the final scope confirmation, refinement-mode questions, language/role/model settings, and the execution handoff (with autoComplete: false). The optional trailing parameter swaps the trailing option to Auto-refine loop for the post-execution amelioration prompt.",
-		promptSnippet: "Ask structured planning questions with recommended/Other/Auto-complete ordering",
+			"Ask the user planning or refinement questions as numbered choice prompts: recommended option first, alternatives next, then Other and Auto-complete. Two shapes: questions: [...] (2-8 questions) opens ONE tabbed multiple-choice form with a submit page — use it to batch a round of questions (≤8), then think about the answers and follow up in later calls (phased questioning stays agent-driven); question + options asks one question at a time (classic flow). Use ask_choice for every user-facing planning question, the final scope confirmation, refinement-mode questions, language/role/model settings, and the execution handoff. Scope confirmation and the execution handoff MUST stay single-question calls (autoComplete: false); batches reject autoComplete: false items and the termination/questionIds reserved for handoff. The optional trailing parameter swaps the trailing Auto-complete option to Auto-refine loop for the post-execution amelioration prompt.",
+		promptSnippet: "Ask structured planning questions with recommended/Other/Auto-complete ordering; batch ≤8 questions per form",
 		promptGuidelines: [
 			"Use ask_choice for every pi-plans question to the user instead of plain-text questions; it enforces option ordering and records decisions.",
+			"Batch a round's questions into one ask_choice call (questions: [...], 2-8 items) instead of asking one at a time, then think after the answers and follow up with later calls. Scope confirmation and execution handoff are always separate single-question calls (autoComplete: false).",
 		],
 		parameters: AskChoiceParams,
 		executionMode: "sequential",
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// 0.4.0 batch mode: one tabbed form for a whole round of questions
+			// (2-8). The single-question path below is untouched (C-004).
+			if (params.questions !== undefined && params.questions.length > 0) {
+				return executeAskChoiceBatch({ questions: params.questions, workdir: params.workdir }, ctx);
+			}
 			const workdir = normalizeWorkdir(params.workdir ?? ctx.cwd);
 			const allowOther = params.allowOther ?? true;
 			// I-003: cross-session question durability. Pending is recorded
@@ -432,6 +807,22 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 		},
 
 		renderCall(args, theme) {
+			if (Array.isArray(args.questions) && args.questions.length > 0) {
+				return new Text(
+					renderFormCall(
+						args.questions.map((q: { question: string; options: Array<{ label: string; description?: string; recommended?: boolean }> }) => ({
+							question: q.question,
+							options: q.options,
+							allowOther: true,
+							questionId: "",
+							autoComplete: true,
+						})),
+						theme,
+					),
+					0,
+					0,
+				);
+			}
 			let text = theme.fg("toolTitle", theme.bold("ask_choice ")) + theme.fg("muted", args.question);
 			const labels = (args.options ?? []).map((option: { label: string }, i: number) => `${i + 1}. ${option.label}`);
 			if (labels.length) text += `\n${theme.fg("dim", `  Options: ${labels.join(", ")}`)}`;
@@ -443,6 +834,18 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			if (!details) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);
+			}
+			if (details.batch && details.batch.length > 0) {
+				const lines = details.batch.map((b) => {
+					const prefix =
+						b.source === "auto-complete"
+							? theme.fg("muted", "✓ (auto) ")
+							: b.source === "other"
+								? theme.fg("muted", "✓ (wrote) ")
+								: theme.fg("success", "✓ ");
+					return `${prefix}${theme.fg("accent", b.question)} ${theme.fg("muted", "→")} ${theme.fg("accent", b.answer ?? "")}`;
+				});
+				return new Text(lines.join("\n"), 0, 0);
 			}
 			if (details.answer === null || details.source === "cancelled") {
 				return new Text(theme.fg("warning", "✗ cancelled"), 0, 0);
