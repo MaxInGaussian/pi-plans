@@ -11,6 +11,9 @@ import {
 	type RuntimeStatus,
 } from "./runtime.ts";
 import { resolveCanonicalWorktree } from "./paths.ts";
+import { generateGraphReport } from "./community.ts";
+import { reindexRelativePaths } from "./freshness.ts";
+import { startGraphWatcher, stopGraphWatcher, watchStatus } from "./watch.ts";
 import { Store } from "./store.ts";
 import { runIndex } from "./indexer.ts";
 import { makeBackend } from "./parsers/javascript.ts";
@@ -149,6 +152,16 @@ export async function initGraphCommand(args: string, ctx: CommandContext): Promi
 			`code-graph indexed ${report.functionsIndexed} function(s) in ${report.filesScanned} file(s) — ${report.edgesResolved} resolved, ${report.edgesUnresolved} unresolved`,
 			"info",
 		);
+		try {
+			const reportPath = generateGraphReport(store, `${paths.gitCommonDir}/pi_plans/graph`, {
+				files: report.filesScanned,
+				functions: report.functionsIndexed,
+				ms: report.durationMs,
+			});
+			ctx.ui.notify(`code-graph report: ${reportPath}`, "info");
+		} catch {
+			/* report generation is best-effort */
+		}
 		if (!flags.has("no-summary") && ctx.hasUI && ctx.modelRegistry?.complete && ctx.model) {
 			const handle: CompletionHandle = {
 				complete: async (request) =>
@@ -212,9 +225,21 @@ export async function applyGraphCore(
 		{},
 	);
 	if (!bootstrapResult) return { failed: bootstrapFailure || "code-graph runtime unavailable" };
-	const { store, paths } = bootstrapResult;
+	const { store, paths, parsers } = bootstrapResult;
 	try {
 		const report = materialize({ store, worktreeRoot: paths.worktreeRoot, force: opts.force ?? false });
+		// Freshness trigger 1 (plan R-006): apply just changed the disk —
+		// reindex the materialized set so the next read is fresh.
+		const changed = report.files
+			.filter((f) => f.status === "ok" || f.status === "deleted")
+			.map((f) => (f.fileDir === "." ? f.fileName : `${f.fileDir}/${f.fileName}`));
+		if (changed.length > 0) {
+			try {
+				await reindexRelativePaths({ store, paths, parsers }, changed);
+			} catch {
+				/* freshness is best-effort; /update-graph remains the fallback */
+			}
+		}
 		let drift: ApplyGraphCoreResult["drift"] = null;
 		try {
 			const d = computeDrift(store, paths.worktreeRoot);
@@ -415,6 +440,15 @@ async function runChangedPathSync(
 		`code-graph update: ${report.reindexedPaths.length} reindexed, ${report.purgedPaths.length} purged, ${report.functionsIndexed} function(s)`,
 		"info",
 	);
+	try {
+		generateGraphReport(store, `${paths.gitCommonDir}/pi_plans/graph`, {
+			files: report.filesScanned,
+			functions: report.functionsIndexed,
+			ms: report.durationMs,
+		});
+	} catch {
+		/* report generation is best-effort */
+	}
 }
 
 export async function updateGraphCommand(args: string, ctx: CommandContext): Promise<void> {
@@ -468,6 +502,45 @@ export async function graphDriftCommand(args: string, ctx: CommandContext): Prom
 	}
 }
 
+type DisableWatcher = (workdir: string) => void;
+let disableWatcherHook: DisableWatcher | null = null;
+/** index.ts injects the watch.ts stop hook here (avoids a commands→watch cycle). */
+export function setDisableWatcherHook(hook: DisableWatcher | null): void {
+	disableWatcherHook = hook;
+}
+function disableWatcherSafe(workdir: string): void {
+	try {
+		(disableWatcherHook ?? (() => {}))(workdir);
+	} catch {
+		/* stopping the watcher must never fail disable */
+	}
+}
+
+export async function watchGraphCommand(_args: string, ctx: CommandContext): Promise<void> {
+	if (process.env.PI_PLANS_REFINER === "1") {
+		ctx.ui.notify("code-graph watch refused: read-only refiner subagents cannot start watchers (PI_PLANS_REFINER)", "error");
+		return;
+	}
+	const paths = resolveCanonicalWorktree(ctx.cwd);
+	const status = watchStatus(paths);
+	if (status.active) {
+		ctx.ui.notify(`code-graph watch already active (pid ${status.pid})`, "info");
+		return;
+	}
+	const result = await startGraphWatcher(ctx.cwd);
+	ctx.ui.notify(
+		result.started
+			? `code-graph watch started: 300ms debounced incremental reindex on .ts/.tsx/.js/.jsx/.mjs/.cjs/.py changes (stops on session shutdown; /unwatch-graph to stop)`
+			: `code-graph watch failed: ${result.reason ?? "unknown error"}`,
+		result.started ? "info" : "error",
+	);
+}
+
+export async function unwatchGraphCommand(_args: string, ctx: CommandContext): Promise<void> {
+	stopGraphWatcher(ctx.cwd);
+	ctx.ui.notify("code-graph watch stopped", "info");
+}
+
 export async function enableGraphCommand(_args: string, ctx: CommandContext): Promise<void> {
 	setGraphEnabled(ctx.cwd, true);
 	ctx.ui.notify("code-graph enabled: agents will use graph-aware read/write/edit on indexed source files. Run /init-graph to index.", "info");
@@ -493,6 +566,7 @@ export async function disableGraphCommand(_args: string, ctx: CommandContext): P
 			}
 		}
 	}
+	disableWatcherSafe(ctx.cwd);
 	setGraphEnabled(ctx.cwd, false);
 	ctx.ui.notify("code-graph disabled: agents fall back to Read/grep/ls. Re-enable anytime with /enable-graph.", "info");
 }

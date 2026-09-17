@@ -155,6 +155,12 @@ Planning artifacts live under `./docs/pi-plans/YYYY-MM-DD-<topic>/` by default (
 | `/plans-execute [plan.md]` | Resume a paused active execution without losing verified progress; otherwise enter the explicit execution handoff (defaults to highest `PLAN_vN.md`) |
 | `/update-plan [plan.md] [reason…]` | Interrupt-and-refine: stops execution (if any), returns the run to planning, and directs the agent to revise the plan into `PLAN_vN+1.md` while preserving verified work |
 | `/plans-autocomplete-stop` | Stop the current run's Auto-complete mode and return later planning questions to normal interaction |
+| `/init-graph` | Build the code graph: tree-sitter function index + cross-file call/import edges (EXTRACTED vs INFERRED confidence) + label-propagation communities; writes `.git/pi_plans/graph/GRAPH_REPORT.md` (subsystems, god nodes, edge stats) |
+| `/update-graph` | Incrementally reindex changed files (shared path used by apply/final-commit triggers and the watcher) |
+| `/apply-graph` | Materialize DB-first staged edits to the worktree; auto-reindexes the materialized set afterward |
+| `/graph-status` `/graph-drift` | Graph inventory and DB↔source convergence |
+| `/watch-graph` `/unwatch-graph` | 300ms-debounced filesystem watcher feeding incremental reindex; single-writer per worktree (PID+heartbeat lock), stops on session shutdown, auto-restarts when enabled |
+| `code_graph` actions | Read-only: `status`, `screening`, `get-function`, `query` (keyword→BFS/DFS with token budget), `path A B` (shortest call path), `explain <fn>` (community/degrees/neighbors), `impact <fn>` (reverse call closure); write path: DB-first staged edits + `apply` |
 | `/plans-stop` | Stop execution mode |
 | `/plans-abandon` | Abandon the active run (lifts the write guard; artifacts stay) |
 | Status bar (lifecycle) | 💬 Q&A → 📝 draft written (planning sub-phases) → ⌛ executing `x/y · spent · in/out-toks` in the bottom status bar → ⛔ stopped / 🎯 done / 🚫 abandoned |

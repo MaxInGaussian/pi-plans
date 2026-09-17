@@ -21,7 +21,9 @@ import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { computeDrift } from "../src/code-graph/commands.ts";
+import { computeDrift, toDbKey } from "../src/code-graph/commands.ts";
+import { buildParsersFromRuntime, reindexRelativePaths } from "../src/code-graph/freshness.ts";
+import { gitStatusPorcelain } from "../src/code-graph/git.ts";
 import { gitAddAllAndCommit } from "../src/code-graph/git.ts";
 import { loadGraphRuntime } from "../src/code-graph/runtime.ts";
 import { resolveCanonicalWorktree } from "../src/code-graph/paths.ts";
@@ -197,9 +199,28 @@ export async function finalCommit(
 				drift,
 			};
 		}
+		// Freshness trigger 2 (plan R-006): snapshot the dirty set before the
+		// commit so the graph can catch up to the new HEAD right after it.
+		let dirtyPaths: string[] = [];
+		try {
+			dirtyPaths = gitStatusPorcelain(paths.worktreeRoot)
+				.filter((e) => !e.status.includes("D"))
+				.map((e) => toDbKey(e.path))
+				.filter((key) => /\.(ts|tsx|js|jsx|mjs|cjs|py)$/.test(key));
+		} catch {
+			dirtyPaths = [];
+		}
 		const head = gitAddAllAndCommit(paths.worktreeRoot, message);
 		if (!head) {
 			return { ok: true, committed: null, noop: true, reason: "nothing to commit — tree already clean" };
+		}
+		if (dirtyPaths.length > 0) {
+			try {
+				const parsers = await buildParsersFromRuntime(runtime.runtime);
+				await reindexRelativePaths({ store, paths, parsers }, dirtyPaths);
+			} catch {
+				/* freshness is best-effort; /update-graph remains the fallback */
+			}
 		}
 		return { ok: true, committed: head, noop: false };
 	} finally {

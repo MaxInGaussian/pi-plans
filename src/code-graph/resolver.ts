@@ -12,6 +12,10 @@ export interface CallSite {
 	calleeText: string;
 	kind: "call" | "definition" | "import";
 	resolution: "resolved" | "ambiguous" | "unresolved";
+	/** Provenance (plan R-003): EXTRACTED = intra-file/direct binding or an
+	 *  explicit import statement; INFERRED = target bound via cross-file
+	 *  symbol resolution (default-export mapping, barrel re-export, ...). */
+	confidence?: "EXTRACTED" | "INFERRED";
 	target?: { fileDir: string; fileName: string; functionName: string };
 	reason?: string;
 	provenance: SourceLocation;

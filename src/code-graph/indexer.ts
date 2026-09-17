@@ -11,7 +11,9 @@ import { Store } from "./store.ts";
 import type { ParserBackend } from "./parser.ts";
 import { hashText } from "./parser.ts";
 import type { Language } from "./types.ts";
-import { resolveCalls, type CallSite } from "./resolver.ts";
+import type { CallSite } from "./resolver.ts";
+import { buildModuleGraph, extractEdges, type ModuleKey } from "./edges.ts";
+import { computeCommunities } from "./community.ts";
 import { assertUniqueFunctionKeys, normalizeFunctionIdentities } from "./identity.ts";
 
 export interface IndexerOptions {
@@ -33,6 +35,165 @@ export interface IndexReport {
 	durationMs: number;
 	reindexedPaths: string[];
 	purgedPaths: string[];
+}
+
+/**
+ * Replace the function/entry/edge rows for one file from a fresh parse.
+ * Shared by runIndex and the staged-text parse-merge (plan R-006/F-003):
+ * callers own the transaction and — for parse-merge — deliberately do NOT
+ * touch files.source_text / pending_kind.
+ */
+export function writeFunctionRows(
+	store: Store,
+	file: DiscoveredFile,
+	parsed: ReturnType<ParserBackend["parse"]>,
+	calls: CallSite[],
+	counters: { functionsIndexed: number; resolved: number; unresolved: number },
+): void {
+	store
+		.prepare("delete_functions", `DELETE FROM functions WHERE file_dir = ? AND file_name = ?`)
+		.run(file.fileDir, file.fileName);
+	store
+		.prepare("delete_entries", `DELETE FROM file_entries WHERE file_dir = ? AND file_name = ?`)
+		.run(file.fileDir, file.fileName);
+	store
+		.prepare("delete_edges", `DELETE FROM call_edges WHERE from_file_dir = ? AND from_file_name = ?`)
+		.run(file.fileDir, file.fileName);
+	const insertFn = store.prepare(
+		"insert_function",
+		`INSERT INTO functions (
+			file_dir, file_name, function_name, language, kind,
+			full_code, full_code_hash, render_code, render_code_hash,
+			parent, container, move_supported, is_primary, overload_signatures,
+			provenance_start_byte, provenance_end_byte,
+			provenance_start_line, provenance_start_col,
+			provenance_end_line, provenance_end_col,
+			summary_description, summary_inputs, summary_outputs,
+			summary_status, summary_model, summary_schema_version,
+			summary_effective_effort, summary_error, summary_updated_at,
+			version
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	);
+	for (const fn of parsed.functions) {
+		const summary = fn.summary;
+		insertFn.run(
+			fn.fileDir,
+			fn.fileName,
+			fn.functionName,
+			fn.language,
+			fn.kind,
+			fn.fullCode,
+			fn.fullCodeHash,
+			fn.renderCode,
+			fn.renderCodeHash,
+			fn.parent ?? null,
+			fn.container ?? null,
+			fn.moveSupported ? 1 : 0,
+			fn.isPrimary ? 1 : 0,
+			fn.overloadSignatures ? JSON.stringify(fn.overloadSignatures) : null,
+			fn.provenance.startByte,
+			fn.provenance.endByte,
+			fn.provenance.startLine,
+			fn.provenance.startColumn,
+			fn.provenance.endLine,
+			fn.provenance.endColumn,
+			summary?.description ?? null,
+			summary ? JSON.stringify(summary.inputs) : null,
+			summary ? JSON.stringify(summary.outputs) : null,
+			summary?.status ?? null,
+			summary?.model ?? null,
+			summary?.schemaVersion ?? null,
+			summary?.effectiveEffort ?? null,
+			summary?.errorMessage ?? null,
+			summary?.updatedAt ?? null,
+			fn.version,
+		);
+		counters.functionsIndexed++;
+	}
+	let ordinal = 0;
+	const insertEntry = store.prepare(
+		"insert_entry",
+		`INSERT INTO file_entries (file_dir, file_name, ordinal, kind, function_name, start_byte, end_byte, text)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	);
+	for (const unit of parsed.renderUnits) {
+		insertEntry.run(
+			file.fileDir,
+			file.fileName,
+			ordinal,
+			unit.kind,
+			unit.label ?? null,
+			unit.startByte,
+			unit.endByte,
+			unit.text ?? "",
+		);
+		ordinal++;
+	}
+	const insertEdge = store.prepare(
+		"insert_edge",
+		`INSERT INTO call_edges (
+			from_file_dir, from_file_name, from_function,
+			to_file_dir, to_file_name, to_function,
+			to_callee_text, kind, resolution, reason, confidence,
+			provenance_start_byte, provenance_end_byte,
+			provenance_start_line, provenance_start_col,
+			provenance_end_line, provenance_end_col
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	);
+	for (const call of calls) {
+		insertEdge.run(
+			file.fileDir,
+			file.fileName,
+			call.fromFunction,
+			call.target?.fileDir ?? null,
+			call.target?.fileName ?? null,
+			call.target?.functionName ?? null,
+			call.calleeText,
+			call.kind,
+			call.resolution,
+			call.reason ?? null,
+			call.confidence ?? "EXTRACTED",
+			call.provenance.startByte,
+			call.provenance.endByte,
+			call.provenance.startLine,
+			call.provenance.startColumn,
+			call.provenance.endLine,
+			call.provenance.endColumn,
+		);
+		if (call.resolution === "resolved") counters.resolved++;
+		else counters.unresolved++;
+	}
+}
+
+/**
+ * Parse-merge for DB-first staged edits (plan R-006 trigger 3, F-003):
+ * refresh functions/file_entries/call_edges for the STAGED text without
+ * touching files.source_text or pending_kind — the staged edit itself stays
+ * intact until apply materializes it.
+ */
+export function reindexStagedText(
+	store: Store,
+	parsers: Record<Language, ParserBackend>,
+	fileDir: string,
+	fileName: string,
+	language: Language,
+	text: string,
+): void {
+	const backend = parsers[language];
+	if (!backend) return;
+	let parsed = backend.parse(text);
+	parsed = normalizeFunctionIdentities(parsed);
+	parsed.functions.forEach((fn) => {
+		fn.fileDir = fileDir;
+		fn.fileName = fileName;
+	});
+	const rel = fileDir === "." ? fileName : `${fileDir}/${fileName}`;
+	const file = { absolutePath: "", fileDir, fileName, language } as DiscoveredFile;
+	const graph = buildModuleGraph(store, new Map([[rel, { text, key: { fileDir, fileName, language } }]]));
+	const calls = extractEdges(file, text, parsed.functions, graph);
+	store.tx(() => {
+		writeFunctionRows(store, file, parsed, calls, { functionsIndexed: parsed.functions.length, resolved: 0, unresolved: 0 });
+	});
 }
 
 export async function runIndex(opts: IndexerOptions): Promise<IndexReport> {
@@ -95,12 +256,26 @@ export async function runIndex(opts: IndexerOptions): Promise<IndexReport> {
 			fn.fileName = file.fileName;
 		});
 		assertUniqueFunctionKeys(parsed.functions, file.fileDir, file.fileName);
-		const calls: CallSite[] = [];
-		for (const fn of parsed.functions) {
-			const fromText = fn.fullCode;
-			resolveCalls(fn.functionName, fromText, file, calls);
+		staged.push({ file, parsed, calls: [], sourceText, sourceHash, exists: true });
+	}
+	// Cross-file edge extraction (plan I-002): the module graph is built from
+	// DB snapshots plus the fresh in-batch texts, then every staged file's
+	// calls/imports are resolved against it in one pass.
+	{
+		const overrides = new Map<string, { text: string; key: ModuleKey }>();
+		for (const entry of staged) {
+			if (!entry.exists) continue;
+			const rel = entry.file.fileDir === "." ? entry.file.fileName : `${entry.file.fileDir}/${entry.file.fileName}`;
+			overrides.set(rel, {
+				text: entry.sourceText,
+				key: { fileDir: entry.file.fileDir, fileName: entry.file.fileName, language: entry.file.language },
+			});
 		}
-		staged.push({ file, parsed, calls, sourceText, sourceHash, exists: true });
+		const graph = buildModuleGraph(opts.store, overrides);
+		for (const entry of staged) {
+			if (!entry.exists) continue;
+			entry.calls = extractEdges(entry.file, entry.sourceText, entry.parsed.functions, graph);
+		}
 	}
 	const now = new Date().toISOString();
 	const report: IndexReport = {
@@ -135,15 +310,28 @@ export async function runIndex(opts: IndexerOptions): Promise<IndexReport> {
 				report.reindexedPaths.push(`${file.fileDir}/${file.fileName}`);
 				const stmt = opts.store.prepare(
 					"insert_file",
-					`INSERT INTO files (file_dir, file_name, language, source_hash, source_text, updated_at)
-					 VALUES (?, ?, ?, ?, ?, ?)
+					`INSERT INTO files (file_dir, file_name, language, source_hash, source_text, updated_at, last_size, last_mtime)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 					 ON CONFLICT(file_dir, file_name) DO UPDATE SET
 						language = excluded.language,
 						source_hash = excluded.source_hash,
 						source_text = excluded.source_text,
-						updated_at = excluded.updated_at`,
+						updated_at = excluded.updated_at,
+						last_size = excluded.last_size,
+						last_mtime = excluded.last_mtime`,
 				);
-				stmt.run(file.fileDir, file.fileName, file.language, sourceHash, sourceText, now);
+				// Freshness fast path (plan R-001/F-006): stat mtime+size so
+				// read-time validation can skip the full-content hash.
+				let lastSize: number | null = null;
+				let lastMtime: number | null = null;
+				try {
+					const st = fs.statSync(file.absolutePath);
+					lastSize = st.size;
+					lastMtime = st.mtimeMs;
+				} catch {
+					/* file vanished mid-index; hash remains the truth */
+				}
+				stmt.run(file.fileDir, file.fileName, file.language, sourceHash, sourceText, now, lastSize, lastMtime);
 				const oldHash = existingByFile.get(`${file.fileDir}/${file.fileName}`)?.sourceHash;
 				if (opts.reindex && oldHash && oldHash !== sourceHash) {
 					opts.store
@@ -155,118 +343,7 @@ export async function runIndex(opts: IndexerOptions): Promise<IndexReport> {
 						.run(file.fileDir, file.fileName, "external-change", `was ${oldHash}, now ${sourceHash}`, now);
 					report.conflicts++;
 				}
-				opts.store
-					.prepare("delete_functions", `DELETE FROM functions WHERE file_dir = ? AND file_name = ?`)
-					.run(file.fileDir, file.fileName);
-				opts.store
-					.prepare("delete_entries", `DELETE FROM file_entries WHERE file_dir = ? AND file_name = ?`)
-					.run(file.fileDir, file.fileName);
-				opts.store
-					.prepare("delete_edges", `DELETE FROM call_edges WHERE from_file_dir = ? AND from_file_name = ?`)
-					.run(file.fileDir, file.fileName);
-				const insertFn = opts.store.prepare(
-					"insert_function",
-					`INSERT INTO functions (
-						file_dir, file_name, function_name, language, kind,
-						full_code, full_code_hash, render_code, render_code_hash,
-						parent, container, move_supported, is_primary, overload_signatures,
-						provenance_start_byte, provenance_end_byte,
-						provenance_start_line, provenance_start_col,
-						provenance_end_line, provenance_end_col,
-						summary_description, summary_inputs, summary_outputs,
-						summary_status, summary_model, summary_schema_version,
-						summary_effective_effort, summary_error, summary_updated_at,
-						version
-					) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-				);
-				for (const fn of parsed.functions) {
-					const summary = fn.summary;
-					insertFn.run(
-						fn.fileDir,
-						fn.fileName,
-						fn.functionName,
-						fn.language,
-						fn.kind,
-						fn.fullCode,
-						fn.fullCodeHash,
-						fn.renderCode,
-						fn.renderCodeHash,
-						fn.parent ?? null,
-						fn.container ?? null,
-						fn.moveSupported ? 1 : 0,
-						fn.isPrimary ? 1 : 0,
-						fn.overloadSignatures ? JSON.stringify(fn.overloadSignatures) : null,
-						fn.provenance.startByte,
-						fn.provenance.endByte,
-						fn.provenance.startLine,
-						fn.provenance.startColumn,
-						fn.provenance.endLine,
-						fn.provenance.endColumn,
-						summary?.description ?? null,
-						summary ? JSON.stringify(summary.inputs) : null,
-						summary ? JSON.stringify(summary.outputs) : null,
-						summary?.status ?? null,
-						summary?.model ?? null,
-						summary?.schemaVersion ?? null,
-						summary?.effectiveEffort ?? null,
-						summary?.errorMessage ?? null,
-						summary?.updatedAt ?? null,
-						fn.version,
-					);
-					report.functionsIndexed++;
-				}
-				let ordinal = 0;
-				const insertEntry = opts.store.prepare(
-					"insert_entry",
-					`INSERT INTO file_entries (file_dir, file_name, ordinal, kind, function_name, start_byte, end_byte, text)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-				);
-				for (const unit of parsed.renderUnits) {
-					insertEntry.run(
-						file.fileDir,
-						file.fileName,
-						ordinal,
-						unit.kind,
-						unit.label ?? null,
-						unit.startByte,
-						unit.endByte,
-						unit.text ?? "",
-					);
-					ordinal++;
-				}
-				const insertEdge = opts.store.prepare(
-					"insert_edge",
-					`INSERT INTO call_edges (
-						from_file_dir, from_file_name, from_function,
-						to_file_dir, to_file_name, to_function,
-						to_callee_text, kind, resolution, reason,
-						provenance_start_byte, provenance_end_byte,
-						provenance_start_line, provenance_start_col,
-						provenance_end_line, provenance_end_col
-					) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-				);
-				for (const call of calls) {
-					insertEdge.run(
-						file.fileDir,
-						file.fileName,
-						call.fromFunction,
-						call.target?.fileDir ?? null,
-						call.target?.fileName ?? null,
-						call.target?.functionName ?? null,
-						call.calleeText,
-						call.kind,
-						call.resolution,
-						call.reason ?? null,
-						call.provenance.startByte,
-						call.provenance.endByte,
-						call.provenance.startLine,
-						call.provenance.startColumn,
-						call.provenance.endLine,
-						call.provenance.endColumn,
-					);
-					if (call.resolution === "resolved") report.edgesResolved++;
-					else report.edgesUnresolved++;
-				}
+				writeFunctionRows(opts.store, file, parsed, calls, report);
 			}
 		});
 	} catch (error) {
@@ -277,5 +354,12 @@ export async function runIndex(opts: IndexerOptions): Promise<IndexReport> {
 	}
 	report.durationMs = Date.now() - started;
 	report.conflicts += preflightConflict;
+	// Community detection runs after the write transaction commits (plan
+	// I-003): failures must never fail the index itself.
+	try {
+		computeCommunities(opts.store);
+	} catch {
+		/* communities are derived data; /graph-drift will surface inconsistencies */
+	}
 	return report;
 }
