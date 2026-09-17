@@ -66,7 +66,11 @@ import {
 	graphDriftCommand,
 	enableGraphCommand,
 	disableGraphCommand,
+	watchGraphCommand,
+	unwatchGraphCommand,
+	setDisableWatcherHook,
 } from "./src/code-graph/commands.ts";
+import { restartWatcherIfEnabled, stopGraphWatcher, disableWatcher } from "./src/code-graph/watch.ts";
 import { latestPlanVersion, nextPlanVersionPath } from "./src/plan.ts";
 import { configPiPlansCommand } from "./src/config-command.ts";
 import { resumePlansCommand } from "./src/resume-command.ts";
@@ -130,6 +134,21 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	registerGraphAwareFileTools(pi);
 
 	// Contribute the router skill plus the five specialist planning skills.
+	// Watch-mode lifecycle (plan I-007, F-004): stop on every session
+	// shutdown path (quit/reload/new/resume/fork), restart when the enabled
+	// marker survives. The disable-graph hook stops watching too.
+	setDisableWatcherHook(disableWatcher);
+	try {
+		pi.on("session_start", () => {
+			void restartWatcherIfEnabled(process.cwd());
+		});
+		pi.on("session_shutdown", () => {
+			stopGraphWatcher(process.cwd());
+		});
+	} catch {
+		/* hosts without session events simply run watchers until unload */
+	}
+
 	pi.on("resources_discover", () => ({
 		skillPaths: [
 			join(baseDir, "skills", "planning"),
@@ -387,6 +406,20 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		description: "Enable the code graph: agents prefer graph reads and DB-first edits.",
 		handler: async (_args, ctx) => {
 			await enableGraphCommand(_args, ctx);
+		},
+	});
+
+	pi.registerCommand("watch-graph", {
+		description: "Watch the worktree and incrementally reindex .ts/.tsx/.js/.jsx/.mjs/.cjs/.py changes (300ms debounce). Auto-restarts on session start after the first run; stops on session shutdown.",
+		handler: async (_args, ctx) => {
+			await watchGraphCommand(_args, ctx);
+		},
+	});
+
+	pi.registerCommand("unwatch-graph", {
+		description: "Stop the code-graph watcher for this worktree.",
+		handler: async (_args, ctx) => {
+			await unwatchGraphCommand(_args, ctx);
 		},
 	});
 

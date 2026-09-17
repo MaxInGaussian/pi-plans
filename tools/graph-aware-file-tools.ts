@@ -15,6 +15,8 @@ import { normalizeRelative, PathError } from "../src/code-graph/paths.ts";
 import { updateFile } from "../src/code-graph/mutations.ts";
 import type { Language } from "../src/code-graph/types.ts";
 import { ensureRuntime, type CodeGraphContext, type RuntimeCacheEntry } from "./code-graph.ts";
+import { loadValidatedSnapshot } from "../src/code-graph/freshness.ts";
+import { reindexStagedText } from "../src/code-graph/indexer.ts";
 
 interface GraphPathInfo {
 	absolutePath: string;
@@ -24,9 +26,10 @@ interface GraphPathInfo {
 	language: Language;
 }
 
-interface GraphSnapshot {
-	info: GraphPathInfo;
-	text: string;
+interface LinkRef {
+	file_dir: string;
+	file_name: string;
+	function_name: string;
 }
 
 interface FunctionRow {
@@ -37,6 +40,37 @@ interface FunctionRow {
 	provenance_start_byte: number | null;
 	provenance_end_byte: number | null;
 	summary_description: string | null;
+	in_links_json: string | null;
+	out_links_json: string | null;
+	community_label: string | null;
+}
+
+/** Top-3 + "+N" list rendering (plan R-002/F-007). */
+function topList(names: string[], prefix: string): string {
+	if (names.length === 0) return "";
+	const shown = names.slice(0, 3).join(", ");
+	const more = names.length > 3 ? ` +${names.length - 3}` : "";
+	return ` ${prefix}[${shown}${more}]`;
+}
+
+function digestLinks(row: FunctionRow): string {
+	let out = "";
+	try {
+		const outLinks = row.out_links_json ? (JSON.parse(row.out_links_json) as Array<{ function_name: string }>) : [];
+		const callees = [...new Set(outLinks.map((l) => l.function_name))];
+		out += topList(callees, "→calls:");
+	} catch {
+		/* links are derived; malformed JSON is skipped */
+	}
+	try {
+		const inLinks = row.in_links_json ? (JSON.parse(row.in_links_json) as Array<{ function_name: string }>) : [];
+		const callers = [...new Set(inLinks.map((l) => l.function_name))];
+		out += topList(callers, "←called-by:");
+	} catch {
+		/* links are derived; malformed JSON is skipped */
+	}
+	if (row.community_label) out += ` §${row.community_label}`;
+	return out;
 }
 
 type GraphToolSet = ReturnType<typeof createGraphAwareFileTools>;
@@ -118,26 +152,19 @@ function textContent(result: { content: Array<{ type: string; text?: string }> }
 	return part?.text ?? "";
 }
 
-function loadGraphSnapshot(entry: RuntimeCacheEntry, info: GraphPathInfo): GraphSnapshot | null {
-	const row = entry.store.read(() =>
-		entry.store.db
-			.prepare(`SELECT source_text, pending_kind FROM files WHERE file_dir = ? AND file_name = ?`)
-			.get(info.fileDir, info.fileName),
-	) as { source_text: string; pending_kind: string | null } | undefined;
-	if (!row || row.pending_kind === "delete") return null;
-	return {
-		info,
-		text: row.source_text,
-	};
-}
-
 function loadFunctionRows(entry: RuntimeCacheEntry, info: GraphPathInfo): FunctionRow[] {
+	// The function_records view (schema v3) carries resolved in/out links with
+	// callee + confidence; the communities join supplies the §community tag.
 	return entry.store.read(() =>
 		entry.store.db
 			.prepare(
-				`SELECT function_name, is_primary, provenance_start_line, provenance_end_line,
-					provenance_start_byte, provenance_end_byte, summary_description
-				 FROM functions WHERE file_dir = ? AND file_name = ?`,
+				`SELECT v.function_name, v.is_primary, v.provenance_start_line, v.provenance_end_line,
+					v.provenance_start_byte, v.provenance_end_byte, v.summary_description,
+					v.in_links_json, v.out_links_json, c.label AS community_label
+				 FROM function_records v
+				 LEFT JOIN communities c
+				 ON c.file_dir = v.file_dir AND c.file_name = v.file_name AND c.function_name = v.function_name
+				 WHERE v.file_dir = ? AND v.file_name = ?`,
 			)
 			.all(info.fileDir, info.fileName),
 	) as FunctionRow[];
@@ -216,7 +243,7 @@ function buildDigest(info: GraphPathInfo, text: string, rows: FunctionRow[]) {
 		const description = (row.summary_description ?? "").trim() || describeSlice(text, row.provenance_start_byte, row.provenance_end_byte);
 		const range =
 			row.provenance_start_line && row.provenance_end_line ? ` (${row.provenance_start_line}-${row.provenance_end_line})` : "";
-		lines.push(`${row.function_name}${range}${description ? ` ${description}` : ""}`);
+		lines.push(`${row.function_name}${range}${description ? ` ${description}` : ""}${digestLinks(row)}`);
 	}
 	const hidden = named.length - (lines.length - 1);
 	if (hidden > 0) {
@@ -256,15 +283,31 @@ function createGraphReadTool(cwd: string) {
 			if (!ensured) return native("runtime unavailable");
 			const info = resolveGraphPath(ctx.cwd, ensured.entry.paths.worktreeRoot, params.path);
 			if (!info) return native(null); // not an indexable source file: native by design
-			const snapshot = loadGraphSnapshot(ensured.entry, info);
+			// Read-time validation (plan R-001): pending files serve staged DB
+			// text with a marker; genuinely stale files fall back to the disk
+			// buffer, are marked, and self-heal synchronously (refiner
+			// subagents validate but never rebuild).
+			const snapshot = await loadValidatedSnapshot(ensured.entry, info, {
+				selfHeal: process.env.PI_PLANS_REFINER !== "1",
+			});
 			if (!snapshot) return native("not indexed");
+			const mark = (result: { content: Array<{ type: string; text?: string }>; details: Record<string, unknown> }) =>
+				snapshot.marker
+					? {
+							...result,
+							content: [
+								{ type: "text", text: `${snapshot.marker}\n${textContent(result)}` },
+							],
+							details: { ...result.details, freshness: snapshot.origin },
+						}
+					: { ...result, details: { ...result.details, freshness: snapshot.origin } };
 			const wantsFull = params.full === true || params.offset !== undefined || params.limit !== undefined;
-			if (wantsFull) return fullTextResult(snapshot.text, params.offset, params.limit);
+			if (wantsFull) return mark(fullTextResult(snapshot.text, params.offset, params.limit));
 			const rows = loadFunctionRows(ensured.entry, info);
 			if (countLines(snapshot.text) < FULL_FILE_MAX_LINES || rows.length === 0) {
-				return fullTextResult(snapshot.text, params.offset, params.limit);
+				return mark(fullTextResult(snapshot.text, params.offset, params.limit));
 			}
-			return buildDigest(info, snapshot.text, rows);
+			return mark(buildDigest(info, snapshot.text, rows));
 		},
 	};
 }
@@ -297,6 +340,13 @@ function createGraphWriteTool(cwd: string) {
 			});
 			if (!mutation.ok) {
 				throw new Error(`code graph write failed: ${mutation.reason ?? "unknown error"}`);
+			}
+			// Parse-merge (plan R-006 trigger 3, F-003): refresh derived rows
+			// for the staged text without touching source_text/pending_kind.
+			try {
+				reindexStagedText(ensured.entry.store, ensured.entry.parsers, info.fileDir, info.fileName, info.language, params.content);
+			} catch {
+				/* derived rows lag until apply; harmless */
 			}
 			return {
 				content: [
@@ -331,7 +381,11 @@ function createGraphEditTool(cwd: string) {
 			if (!ensured) return stage("runtime unavailable");
 			const info = resolveGraphPath(ctx.cwd, ensured.entry.paths.worktreeRoot, params.path);
 			if (!info) return stage(null);
-			const snapshot = loadGraphSnapshot(ensured.entry, info);
+			// Validated base text (plan R-001): stale files self-heal first so the
+			// edit runs against current truth; pending files edit the staged text.
+			const snapshot = await loadValidatedSnapshot(ensured.entry, info, {
+				selfHeal: process.env.PI_PLANS_REFINER !== "1",
+			});
 			if (!snapshot) {
 				throw new Error(`code graph: ${info.relativePath} is not indexed; run /update-graph or /init-graph first`);
 			}
@@ -357,6 +411,13 @@ function createGraphEditTool(cwd: string) {
 			});
 			if (!mutation.ok) {
 				throw new Error(`code graph edit failed: ${mutation.reason ?? "unknown error"}`);
+			}
+			// Parse-merge (plan R-006 trigger 3, F-003): refresh derived rows
+			// for the staged text without touching source_text/pending_kind.
+			try {
+				reindexStagedText(ensured.entry.store, ensured.entry.parsers, info.fileDir, info.fileName, info.language, stagedText);
+			} catch {
+				/* derived rows lag until apply; harmless */
 			}
 			return {
 				...result,

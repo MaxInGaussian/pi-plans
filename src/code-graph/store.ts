@@ -4,7 +4,12 @@
  */
 
 import type { DatabaseSync, StatementSync } from "node:sqlite";
-import { CURRENT_SCHEMA_VERSION, FUNCTION_RECORDS_VIEW, SCHEMA_STATEMENTS } from "./schema.ts";
+import {
+	CURRENT_SCHEMA_VERSION,
+	FUNCTION_RECORDS_VIEW,
+	RESOLVED_ADJACENCY_VIEW,
+	SCHEMA_STATEMENTS,
+} from "./schema.ts";
 import { PathError } from "./paths.ts";
 import type { CodeGraphSnapshot, GraphMeta } from "./types.ts";
 
@@ -76,6 +81,10 @@ export class Store {
 	 *  all steps complete. */
 	private applyIncrementalMigrations(fromVersion: number, opts: StoreOptions): void {
 		this.tx(() => {
+			// Base shapes first: every statement is IF NOT EXISTS, so legacy
+			// databases missing whole tables (e.g. a v1 DB without call_edges)
+			// gain them here before targeted column backfills run.
+			for (const stmt of SCHEMA_STATEMENTS) this.db.exec(stmt);
 			if (fromVersion < 2) {
 				const snapshotTable = this.db
 					.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='code_graph_snapshot'")
@@ -106,6 +115,46 @@ export class Store {
 						.run("", "[]", new Date().toISOString());
 				}
 			}
+			if (fromVersion < 3) {
+				// v3 (plan I-001): edge confidence, per-file freshness fast path,
+				// communities, and the resolved-adjacency traversal view.
+				const edgeColumns = this.db.prepare("PRAGMA table_info(call_edges)").all() as Array<{ name: string }>;
+				if (!edgeColumns.some((column) => column.name === "confidence")) {
+					this.db.exec(
+						"ALTER TABLE call_edges ADD COLUMN confidence TEXT NOT NULL DEFAULT 'EXTRACTED'",
+					);
+				}
+				const fileColumns = this.db.prepare("PRAGMA table_info(files)").all() as Array<{ name: string }>;
+				if (!fileColumns.some((column) => column.name === "last_size")) {
+					this.db.exec("ALTER TABLE files ADD COLUMN last_size INTEGER");
+				}
+				if (!fileColumns.some((column) => column.name === "last_mtime")) {
+					this.db.exec("ALTER TABLE files ADD COLUMN last_mtime REAL");
+				}
+				const communitiesTable = this.db
+					.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='communities'")
+					.get();
+				if (!communitiesTable) {
+					this.db.exec(
+						`CREATE TABLE communities (
+						community_id INTEGER NOT NULL,
+						file_dir TEXT NOT NULL,
+						file_name TEXT NOT NULL,
+						function_name TEXT NOT NULL,
+						label TEXT NOT NULL,
+						degree INTEGER NOT NULL,
+						PRIMARY KEY (file_dir, file_name, function_name)
+					)`,
+					);
+					this.db.exec("CREATE INDEX IF NOT EXISTS idx_communities_id ON communities (community_id)");
+				}
+				// The view definition changed in v3 (callee + confidence in
+				// out_links_json): replace it unconditionally.
+				this.db.exec("DROP VIEW IF EXISTS function_records");
+				this.db.exec(FUNCTION_RECORDS_VIEW);
+				this.db.exec("DROP VIEW IF EXISTS resolved_call_adjacency");
+				this.db.exec(RESOLVED_ADJACENCY_VIEW);
+			}
 			void opts;
 		});
 	}
@@ -113,6 +162,7 @@ export class Store {
 	private applyMigrations(): void {
 		for (const stmt of SCHEMA_STATEMENTS) this.db.exec(stmt);
 		this.db.exec(FUNCTION_RECORDS_VIEW);
+		this.db.exec(RESOLVED_ADJACENCY_VIEW);
 		this.db
 			.prepare(
 				`INSERT INTO graph_meta (schema_version, worktree_root, git_common_dir, parser_versions, updated_at)

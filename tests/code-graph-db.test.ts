@@ -70,16 +70,28 @@ test("v1 database upgrades to v2 with initial snapshot and re-entrant migration"
 	const worktreeRoot = fs.realpathSync(os.tmpdir());
 	const store = new Store({ dbPath, worktreeRoot, gitCommonDir: worktreeRoot }, sqlite);
 	try {
-		assert.equal(store.readMeta()?.schemaVersion, 2, "v1 DB must upgrade to v2 on open");
+		assert.equal(store.readMeta()?.schemaVersion, 3, "v1 DB must upgrade to v3 on open");
 		const columns = store.db.prepare("PRAGMA table_info(files)").all() as Array<{ name: string }>;
 		assert.ok(columns.some((column) => column.name === "pending_kind"));
+		assert.ok(columns.some((column) => column.name === "last_size"), "v3 freshness fast-path column");
+		assert.ok(columns.some((column) => column.name === "last_mtime"), "v3 freshness fast-path column");
+		const edgeColumns = store.db.prepare("PRAGMA table_info(call_edges)").all() as Array<{ name: string }>;
+		assert.ok(edgeColumns.some((column) => column.name === "confidence"), "v3 edge confidence column");
+		const communities = store.db.prepare(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='communities'",
+		).get();
+		assert.ok(communities, "v3 communities table");
+		const adjacency = store.db.prepare(
+			"SELECT name FROM sqlite_master WHERE type='view' AND name='resolved_call_adjacency'",
+		).get();
+		assert.ok(adjacency, "v3 resolved_call_adjacency view");
 		const snapshot = store.readLatestSnapshot();
 		assert.ok(snapshot, "initial snapshot row must exist after migration");
 		assert.deepEqual(snapshot.uncommittedPaths, []);
 		// Re-open again: migration must be a safe no-op (step-idempotent).
 		store.close();
 		const reopened = new Store({ dbPath, worktreeRoot, gitCommonDir: worktreeRoot }, sqlite);
-		assert.equal(reopened.readMeta()?.schemaVersion, 2);
+		assert.equal(reopened.readMeta()?.schemaVersion, 3);
 		assert.ok(reopened.readLatestSnapshot(), "snapshot survives re-open");
 		const snapshots = reopened.read(() => reopened.db.prepare("SELECT COUNT(*) AS c FROM code_graph_snapshot").get()) as { c: number };
 		assert.equal(snapshots.c, 1, "no duplicate snapshot rows on re-entry");

@@ -405,7 +405,8 @@ test("digest descriptions decode multibyte slices and degrade across all three l
 	// Level 1: summary_description wins over the byte slice.
 	assert.match(digest, /求和 .*求和函数：返回两数之和/);
 	// Level 3: NULL provenance bytes → name + line range, empty description.
-	assert.match(digest, /noProvenance \(6-8\)\n/);
+	// (0.5.0: digest lines may append →calls/←called-by/§community suffixes.)
+	assert.match(digest, /noProvenance \(6-8\)[^\n]*\n/);
 	// Level 2 sanity: no mojibake from byte-offset slicing on CJK sources.
 	assert.doesNotMatch(digest, /\uFFFD/);
 });

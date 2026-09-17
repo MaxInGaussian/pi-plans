@@ -65,6 +65,7 @@ export function normalizeRelative(worktreeRoot: string, target: string): { fileD
 export function isIgnoredDir(name: string): boolean {
 	const ignored = new Set([
 		"node_modules",
+		"vendor",
 		"dist",
 		"build",
 		".next",

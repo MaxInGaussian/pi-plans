@@ -4,6 +4,20 @@ All notable changes to **pi-plans** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-09-17
+
+### Added
+
+- **Trust: read-time validation and self-healing.** Every graph read (digest, get-function, screening) validates the owning file against the disk first — stat fast path (v3 `files.last_size/last_mtime`), full-hash fallback, and the already-read disk buffer is served directly. Genuinely stale files return the fresh disk text with a `[graph: stale — fell back to disk read; reindexed]` marker and synchronously rebuild that one file (single-flight; read-only refiner sessions validate but never rebuild). Files with staged DB-first edits (the intentional "DB ahead" state) serve the staged text with a pending marker instead — no fallback, no rebuild, staged edits are never destroyed.
+- **Cross-file call/import edges with confidence labels.** The v1 regex resolver (everything unresolved) is replaced by a two-phase extractor: a module graph over DB snapshots + in-batch overrides (exports, imports per language), then per-function resolution — same-file calls are `EXTRACTED`, cross-file bindings are `INFERRED`, ambiguous imports stay `ambiguous`, and unresolvable heads on external modules plus JS/Python builtins are dropped as noise (unresolved dangling edges dropped from 22,291 to ~4,300 on this repo). Import edges resolve relative specifiers with extension probing (`EXTRACTED`) and barrel probing (`INFERRED`). Edge data lives in the existing `call_edges` table (schema v3 adds `confidence`; the `function_records` view and screening filters are updated, old DBs migrate in place).
+- **Graph query actions.** `code_graph` gains `query` (keywords → node match → BFS/DFS expansion under a chars/4 token budget, deterministic expansion order), `path A B` (shortest call path, exactly two selectors), `explain <fn>` (location, community, in/out degrees, typed neighbor lists), and `impact <fn>` (reverse call closure with affected files). All pure-algorithm, resolved-edges-only by default (`includeUnresolved` opts in), each answering in <100ms at this repo's scale.
+- **Communities, god nodes, and GRAPH_REPORT.md.** Label propagation (deterministic iteration order, ≤20 rounds) runs after every index; community labels derive from the dominant directory segment; god nodes are the top-10 by resolved degree. `/init-graph` and `/update-graph` write `.git/pi_plans/graph/GRAPH_REPORT.md` (edge stats by confidence/resolution, community table, god nodes, suggested queries).
+- **Richer digests.** Function digests now carry signature slices plus `→calls:`/`←called-by:` lists (top-3 + `+N`, resolved edges only) and a `§community` tag — the summary carries both directions of the call graph so whole-file `full:true` escapes are needed less often.
+- **Freshness automation.** Three triggers feed one shared incremental reindex: `apply` (materialized set), `plans final-commit` (pre-commit dirty snapshot), and graph-aware edit/write (parse-merge of the staged text — derived rows refresh without touching `source_text`/`pending_kind`). `/watch-graph` adds a 300ms-debounced recursive watcher (PID+heartbeat single-writer lock per worktree, pending files skipped, refiners refused) that stops on `session_shutdown` and auto-restarts on `session_start` when previously enabled; `/unwatch-graph` and `disable-graph` stop it.
+
+### Changed
+
+- `vendor/` directories are excluded from discovery (this repo's vendored benchmark tree was 90% of the old index); schema version 3 with idempotent step migrations for legacy databases; graph prompt blocks teach the new semantics (self-healing reads, digest link tags, query actions before grepping).
 ## [0.4.1] - 2026-09-17
 
 ### Fixed
