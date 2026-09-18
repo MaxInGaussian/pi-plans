@@ -177,7 +177,16 @@ export function queryGraph(
 			if (!seen.has(nb.to)) queue.push(nb.to);
 		}
 	}
-	return { lines, visited, edges: edgeCount, truncated: budget.state.truncated, seeds: sortedSeeds };
+	const totalReached = seen.size + queue.filter((k) => !seen.has(k)).length;
+	return {
+		lines,
+		visited,
+		edges: edgeCount,
+		truncated: budget.state.truncated,
+		shown: lines.length,
+		omitted: Math.max(0, totalReached - lines.length),
+		seeds: sortedSeeds,
+	};
 }
 
 export interface PathResult {
@@ -281,5 +290,12 @@ export function impactOf(index: GraphIndex, key: string, opts?: { budgetTokens?:
 			queue.push(nb.from);
 		}
 	}
-	return { affected, files: [...files].sort(), truncated: budget.state.truncated, root };
+	return {
+		affected,
+		files: [...files].sort(),
+		truncated: budget.state.truncated,
+		shown: affected.length,
+		omitted: Math.max(0, visited.size - 1 - affected.length),
+		root,
+	};
 }

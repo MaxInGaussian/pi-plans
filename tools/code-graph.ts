@@ -63,7 +63,7 @@ const CodeGraphParams = Type.Object({
 	impactName: Type.Optional(Type.String({ description: "impact action: node whose reverse call closure is computed" })),
 	mode: Type.Optional(StringEnum(["bfs", "dfs"] as const, { description: "query traversal mode (default bfs)" })),
 	budgetTokens: Type.Optional(Type.Number({ description: "query/impact output budget in ~tokens (chars/4, default 1500)" })),
-	includeUnresolved: Type.Optional(Type.Boolean({ description: "include dangling/ambiguous edges in traversal (default false)" })),
+	includeUnresolved: Type.Optional(Type.Boolean({ description: "also traverse edges whose target row is present but unresolved/ambiguous (target-less dangling edges never enter traversal)" })),
 	workdir: Type.Optional(Type.String({ description: "Target workspace directory" })),
 	language: Type.Optional(StringEnum(["javascript", "typescript", "tsx", "python"] as const)),
 	functionName: Type.Optional(Type.String()),
@@ -171,7 +171,15 @@ export function registerCodeGraphTool(pi: ExtensionAPI): void {
 			}
 			const { entry } = ensured;
 			switch (params.action) {
-				case "status":
+				case "status": {
+					// AC-003: edge count + confidence×resolution distribution on
+					// the status surface itself (impl-review F-E).
+					const edgeDist = entry.store.read(() =>
+						entry.store.db
+							.prepare(`SELECT kind, resolution, confidence, COUNT(*) AS n FROM call_edges GROUP BY kind, resolution, confidence`)
+							.all(),
+					);
+					const edgeCount = entry.store.read(() => entry.store.db.prepare(`SELECT COUNT(*) AS c FROM call_edges`).get()) as { c: number };
 					return {
 						content: [
 							{
@@ -182,11 +190,14 @@ export function registerCodeGraphTool(pi: ExtensionAPI): void {
 									worktreeRoot: entry.paths.worktreeRoot,
 									files: entry.store.read(() => entry.store.db.prepare("SELECT COUNT(*) AS c FROM files").get()) as { c: number } | undefined,
 									functions: entry.store.read(() => entry.store.db.prepare("SELECT COUNT(*) AS c FROM functions").get()) as { c: number } | undefined,
+									edges: edgeCount.c,
+									edgeDistribution: edgeDist,
 								}),
 							},
 						],
 						details: {},
 					};
+				}
 				case "screening": {
 					const raw = screeningQuery({
 						store: entry.store,

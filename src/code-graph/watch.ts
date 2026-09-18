@@ -63,13 +63,15 @@ function readLock(paths: WorktreePaths): { pid: number; heartbeat: number } | nu
 }
 
 function isPending(store: Store, fileDir: string, fileName: string): boolean {
+	// Fail CLOSED (impl-review F-F): a read error must not let a watch event
+	// fall through to a reindex that could clobber a staged edit.
 	try {
 		const row = store.read(() =>
 			store.db.prepare(`SELECT pending_kind FROM files WHERE file_dir = ? AND file_name = ?`).get(fileDir, fileName),
 		) as { pending_kind: string | null } | undefined;
 		return row?.pending_kind !== null && row?.pending_kind !== undefined;
 	} catch {
-		return false;
+		return true;
 	}
 }
 
@@ -105,16 +107,41 @@ export async function startGraphWatcher(workdir: string): Promise<StartResult> {
 	if (lock && pidAlive(lock.pid) && Date.now() - lock.heartbeat < LOCK_STALE_MS && lock.pid !== process.pid) {
 		return { started: false, reason: `another pi session (pid ${lock.pid}) is already watching this worktree` };
 	}
-	const runtime = await openRuntime(paths);
+	let runtime: FreshnessRuntime | null = null;
+	try {
+		runtime = await openRuntime(paths);
+	} catch {
+		return { started: false, reason: "code-graph runtime unavailable" };
+	}
 	if (!runtime) return { started: false, reason: "code-graph runtime unavailable" };
 
 	fs.mkdirSync(graphDir(paths), { recursive: true });
-	fs.writeFileSync(lockPath(paths), JSON.stringify({ pid: process.pid, heartbeat: Date.now() }), "utf8");
+	// O_EXCL-style claim: a concurrent session that already holds a live lock
+	// makes this create fail and loses cleanly (impl-review F-F TOCTOU). A
+	// stale lock (dead pid / expired heartbeat) is removed first.
+	const preLock = readLock(paths);
+	if (preLock && (!pidAlive(preLock.pid) || Date.now() - preLock.heartbeat >= LOCK_STALE_MS)) {
+		try {
+			fs.unlinkSync(lockPath(paths));
+		} catch {
+			/* ignore */
+		}
+	}
+	try {
+		fs.writeFileSync(lockPath(paths), JSON.stringify({ pid: process.pid, heartbeat: Date.now() }), { flag: "wx" });
+	} catch {
+		runtime.store.close();
+		const lock = readLock(paths);
+		return { started: false, reason: `another session claimed the watch lock (pid ${lock?.pid ?? "?"})` };
+	}
 	fs.writeFileSync(markerPath(paths), new Date().toISOString(), "utf8");
 
 	let closed = false;
+	let failureCount = 0;
+	const MAX_EVENT_FAILURES = 10;
 	const timers = new Map<string, ReturnType<typeof setTimeout>>();
 	let watcher: ReturnType<typeof fs.watch> | null = null;
+	let stopFn: () => void = () => {};
 	try {
 		watcher = fs.watch(paths.worktreeRoot, { recursive: true }, (_event, filename) => {
 			if (closed || typeof filename !== "string") return;
@@ -131,6 +158,7 @@ export async function startGraphWatcher(workdir: string): Promise<StartResult> {
 					timers.delete(rel);
 					void reindexRelativePaths(runtime, [rel])
 						.then(() => {
+							failureCount = 0;
 							try {
 								fs.writeFileSync(lockPath(paths), JSON.stringify({ pid: process.pid, heartbeat: Date.now() }), "utf8");
 							} catch {
@@ -138,7 +166,22 @@ export async function startGraphWatcher(workdir: string): Promise<StartResult> {
 							}
 						})
 						.catch(() => {
-							/* per-event failures are retried on the next change */
+							// Retry-cap with a user-visible hint (plan R-006):
+							// after repeated failures, stop and defer to
+							// /update-graph instead of spinning silently.
+							failureCount++;
+							if (failureCount >= MAX_EVENT_FAILURES) {
+								try {
+									fs.writeFileSync(
+										path.join(graphDir(paths), "watch.failed"),
+										`watcher stopped after ${failureCount} reindex failures at ${new Date().toISOString()}; run /update-graph`,
+										"utf8",
+									);
+								} catch {
+									/* best-effort */
+								}
+								stopFn();
+							}
 						});
 				}, WATCH_DEBOUNCE_MS),
 			);
@@ -147,11 +190,26 @@ export async function startGraphWatcher(workdir: string): Promise<StartResult> {
 		runtime.store.close();
 		try {
 			fs.unlinkSync(lockPath(paths));
+			fs.unlinkSync(markerPath(paths));
 		} catch {
 			/* ignore */
 		}
 		return { started: false, reason: "fs.watch recursive unavailable on this platform; use /update-graph instead" };
 	}
+	// An fs.watch 'error' event (watched tree deleted, EMFILE, permissions)
+	// must never crash the host process: stop cleanly and surface a hint.
+	watcher?.on?.("error", () => {
+		try {
+			fs.writeFileSync(
+				path.join(graphDir(paths), "watch.failed"),
+				`watcher stopped by fs.watch error at ${new Date().toISOString()}; run /update-graph or /watch-graph again`,
+				"utf8",
+			);
+		} catch {
+			/* best-effort */
+		}
+		stopFn();
+	});
 
 	const heartbeat = setInterval(() => {
 		if (closed) return;
@@ -174,13 +232,19 @@ export async function startGraphWatcher(workdir: string): Promise<StartResult> {
 			/* ignore */
 		}
 		runtime.store.close();
-		try {
-			fs.unlinkSync(lockPath(paths));
-		} catch {
-			/* already gone */
+		// Only remove a lock we still own: a successor session that took over
+		// after our heartbeat went stale must not lose its lock (impl-review F-F).
+		const lock = readLock(paths);
+		if (!lock || lock.pid === process.pid) {
+			try {
+				fs.unlinkSync(lockPath(paths));
+			} catch {
+				/* already gone */
+			}
 		}
 		activeWatchers.delete(paths.worktreeRoot);
 	};
+	stopFn = stop;
 	activeWatchers.set(paths.worktreeRoot, { stop, root: paths.worktreeRoot });
 	return { started: true };
 }

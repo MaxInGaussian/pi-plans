@@ -11,7 +11,7 @@ import * as path from "node:path";
 import { Store } from "../src/code-graph/store.ts";
 import { runIndex, reindexStagedText } from "../src/code-graph/indexer.ts";
 import { loadValidatedSnapshot, checkFreshness, reindexRelativePaths } from "../src/code-graph/freshness.ts";
-import { updateFile } from "../src/code-graph/mutations.ts";
+import { updateFile, deleteFile } from "../src/code-graph/mutations.ts";
 import {
 	loadGraphIndex,
 	queryGraph,
