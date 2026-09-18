@@ -236,6 +236,8 @@ describe("activity line (0.5.2 legend dedupe)", () => {
 
 	it("formatActivityTime formats a valid ISO stamp as MM-DD HH:mm", () => {
 		assert.equal(formatActivityTime("2026-09-18T15:02:00Z"), "09-18 15:02");
+		// UTC boundary: zero-padded hour + local-date roll (F-003, impl-review r1).
+		assert.equal(formatActivityTime("2026-10-01T00:00:30Z"), "10-01 00:00");
 	});
 
 	it("formatActivityTime degrades empty and invalid input to --", () => {

@@ -166,6 +166,32 @@ describe("exec panel lifecycle", () => {
 		await stopExecution(h.pi, h.ctx, "done");
 	});
 
+	it("activity row degrades to the phase word when the active pointer moves to another run", async () => {
+		const workdir = freshWorkdir();
+		startRun(workdir, { topic: "first-run", skill: "plan-small", requestText: "x" });
+		const h = makeHarness(workdir);
+		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_vC.md"), items("VC-001", "VC-002"), [
+			{ id: "I-001", text: "First item." },
+		]);
+		const before = renderWidget(lastWidget(h), 100);
+		assert.match(before[5] ?? "", /executing · since \d{2}-\d{2} \d{2}:\d{2}/, "activity resolves while the pointer agrees");
+		// A second run claims the shared disk pointer mid-execution, and the
+		// session is replaced (binding identity mismatch → resolve falls to the
+		// disk pointer): the activity row must degrade instead of mixing the
+		// new run's topic with the old run's status (impl-review r1 F-001).
+		startRun(workdir, { topic: "second-run", skill: "plan-small", requestText: "y" });
+		const prevSessionManager = (h.ctx as { sessionManager: unknown }).sessionManager;
+		(h.ctx as { sessionManager: unknown }).sessionManager = {};
+		try {
+			const after = renderWidget(lastWidget(h), 100);
+			assert.match(after[5] ?? "", /executing/);
+			assert.ok(!(after[5] ?? "").includes("since"), "no mixed-run status when the pointer moved");
+		} finally {
+			(h.ctx as { sessionManager: unknown }).sessionManager = prevSessionManager;
+		}
+		await stopExecution(h.pi, h.ctx, "done");
+	});
+
 	it("refreshes panel content from marker updates without re-registering", async () => {
 		const workdir = freshWorkdir();
 		const h = makeHarness(workdir);
