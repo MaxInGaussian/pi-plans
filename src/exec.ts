@@ -409,6 +409,12 @@ function panelTopic(ctx: ExtensionContext): string {
  *  status. */
 function panelRunInfo(ctx: ExtensionContext): { status: string; created_at: string; updated_at: string } | null {
 	if (!executionRunId) return null;
+	// D-005 pointer-consistency: if the workdir's active pointer has moved to
+	// another run (second session / external CLI mutation) while this
+	// execution is live, the activity row degrades to the phase word rather
+	// than mixing the new active run's topic (header) with the old run's
+	// status (impl-review r1 F-001).
+	if (resolveActiveRun(ctx.sessionManager, ctx.cwd)?.run_id !== executionRunId) return null;
 	const run = getRun(ctx.cwd, executionRunId);
 	if (!run) return null;
 	return { status: run.status, created_at: run.created_at, updated_at: run.updated_at };
