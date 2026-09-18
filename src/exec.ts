@@ -403,6 +403,17 @@ function panelTopic(ctx: ExtensionContext): string {
 	return "pi-plans";
 }
 
+/** Run info for the panel activity line (CQ1/D-005). Read by the in-flight
+ *  executionRunId so a stale/missing run record degrades to null (the model
+ *  then falls back to the bare phase word) instead of showing another run's
+ *  status. */
+function panelRunInfo(ctx: ExtensionContext): { status: string; created_at: string; updated_at: string } | null {
+	if (!executionRunId) return null;
+	const run = getRun(ctx.cwd, executionRunId);
+	if (!run) return null;
+	return { status: run.status, created_at: run.created_at, updated_at: run.updated_at };
+}
+
 let panelRegistered = false;
 
 /**
@@ -436,7 +447,7 @@ function updatePanelWidget(ctx: ExtensionContext): void {
 					// F-004 (impl review r1): recompute the topic per render so a
 					// cross-run restart without an intervening unregister cannot
 					// show a stale box header.
-					const model = derivePanelModel(current, panelTopic(ctx), executionIsWaiting(current));
+					const model = derivePanelModel(current, panelTopic(ctx), executionIsWaiting(current), panelRunInfo(ctx));
 					const lines = renderPanelLines(model, width);
 					// Uniform-gray frame: │ borders never inherit the line color;
 					// accents live between the borders only (themePanelLines).
@@ -459,7 +470,7 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 	if (execution) {
 		// D-015: the status line derives from the same panel model.
 		const line = formatPanelSummaryLine(
-			derivePanelModel(execution, panelTopic(ctx), executionIsWaiting(execution)),
+			derivePanelModel(execution, panelTopic(ctx), executionIsWaiting(execution), panelRunInfo(ctx)),
 		);
 		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
 		return;
@@ -1625,6 +1636,12 @@ export async function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext
 	}
 	if (execution) {
 		resetGoalWaitRuntime(ctx);
+		// Rebind the run identity after a restart so the panel's activity row
+		// (and any run-status mirroring) resolves to the active run instead of
+		// staying null until the next startExecution (CQ1/D-005 wiring gap).
+		const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+		executionRunId = active?.run_id ?? null;
+		if (active) bindRun(ctx.sessionManager, ctx.cwd, active.run_id);
 		// D-010: replay may have advanced progress past the persisted baseline.
 		// Recompute the goal-wait markers; new progress resets the guard counters.
 		if (execution.goalWait) {

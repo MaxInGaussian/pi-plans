@@ -4,6 +4,28 @@ All notable changes to **pi-plans** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] - 2026-09-18
+
+### Fixed
+
+- **执行面板末两行图例去重**：0.4.0 照搬 pi-goal-x 的 boxFooter 内嵌图例与自有 `markers:` 内容行语义撞车（同源提交 `676cbce`，且无内容级断言盯防），三个 I 状态 marker 各显示两遍。现在 marker 语法唯一由执行注入提示教学（`exec.ts` 原有文本，零损失），底边框回归纯 `╰───╯` 装饰（与窄模式分支对齐）。
+- **`restoreFromSession` 重绑 run 身份**：恢复执行快照后 `executionRunId` 保持 null 直到下一次 `startExecution`——面板活动行无法解析 run.json。恢复路径现在通过 `resolveActiveRun` + `bindRun` 重绑（CQ1 指出的接线缺口）。
+
+### Changed
+
+- **第 6 行改活动行**：`markers:` 图例行替换为 `<status> · since MM-DD HH:mm`（如 `executing · since 09-18 15:02`），由 `RunInfo.status` + `updated_at` 派生。诚实语义：`updated_at` 是状态变更时间（执行 turn 只写 checkpoint 不写 run.json），故标注 `since` 而非"最近活动"；run 记录缺失时回退纯 phase 词，永不 `undefined`。新增 `formatActivityTime`（空/非法 ISO → `--`）。
+- `PanelModel.activity` 为必填字符串（回退收敛在 `derivePanelModel` 内部）；测试新增内容级断言（活动行三态、末行无 `▸`/`[I-`、整面板无 `markers:`）防止图例回流。
+
+## [0.5.1] - 2026-09-18
+
+### Fixed
+
+- **Execution panel no longer shows a fake "I 0/0"** (goal-x aligned: counts always come from real parsed state). `parseImplItems` now accepts top-level `` `I-00N` `` items with a half-width colon, full-width colon, or plain-space separator (indented child bullets and `- [ ] VC-…` checklist lines never match); a new `lintImplItems` returns a warning when the Implementation Items section exists but parses to zero items.
+- **Durable plan-lint notices.** `RunInfo.notices` persists in `run.json` (legacy files without the field read as `[]`; `appendRunNotice` dedupes by source+text). The lint runs at three entries — `plans record-checkpoint` (plan-written), the execute handoff, and the automatic plan-written path after a plan write.
+- **Panel format-warning line.** When the lint hits, the I-count row is replaced by an explicit `⚠ plan 格式：Implementation Items 解析 0 项` line (7-line envelope and narrow 3-line badge preserved); the warning is derived on the live handoff path and persisted in the exec snapshot, and both restore paths (checkpoint and session) re-parse + re-lint from the plan file so a stale empty snapshot self-heals instead of freezing the fake count.
+- **Batch question form no longer shows fake-answered chips.** `FormState.confirmed` separates the cursor from the answer: chips read `□` until the user presses Enter (or commits a custom answer), moving the cursor un-confirms the tab, Esc mid-edit keeps prior answers, the submit page labels unconfirmed rows `(未作答)` and blocks submit, and `formAnswers` returns confirmed-only answers — a pre-positioned recommended option is never auto-submitted.
+- **Uniform-gray frame borders.** The exec widget now themes only the span between the `│` borders (new `themePanelLines`; borders and box chrome stay muted gray on every line, wide and narrow modes) and the question form's `─` borders are muted; every rendered line asserts SGR open/close parity so no border inherits a dangling line color.
+
 ## [0.5.0] - 2026-09-17
 
 ### Added
