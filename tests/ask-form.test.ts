@@ -33,10 +33,13 @@ function qs(n = 2): FormQuestion[] {
 }
 
 describe("form state machine", () => {
-	it("preselects the recommended option per question", () => {
+	it("preselects the recommended option as cursor without marking it answered", () => {
 		const state = createFormState(qs(2));
 		assert.deepEqual(state.selection, [0, 0]);
-		assert.equal(allAnswered(state), true);
+		// goal-x semantics: a pre-positioned cursor is NOT an answer — chips
+		// stay □ until the user presses Enter (or commits a custom answer).
+		assert.equal(allAnswered(state), false);
+		assert.deepEqual(state.confirmed, [false, false]);
 	});
 
 	it("navigates tabs with Tab and right arrow, wrapping around", () => {
@@ -83,21 +86,31 @@ describe("form state machine", () => {
 		assert.equal(state.editing, false);
 	});
 
-	it("submits only when every question is answered and returns partial answers on Esc", () => {
+	it("submits only when every question is confirmed and returns partial answers on Esc", () => {
+		// Fresh form: nothing confirmed → submit page Enter is blocked.
+		const state0 = createFormState(qs(2));
+		state0.tab = 2;
+		assert.equal(formHandleKey(state0, "\r"), "render");
+		assert.equal(allAnswered(state0), false);
+
+		// Confirm Q1 (Enter on the preselected option) → advance; confirm Q2.
 		const state = createFormState(qs(2));
-		state.tab = 2;
+		assert.equal(formHandleKey(state, "\r"), "render");
+		assert.equal(state.tab, 1);
+		assert.equal(formHandleKey(state, "\r"), "render");
+		assert.equal(state.tab, 2); // submit page
 		assert.equal(formHandleKey(state, "\r"), "submit");
 		assert.equal(formAnswers(state).length, 2);
 
-		// One unanswered question blocks the submit page.
+		// One unconfirmed question blocks the submit page; Esc returns the
+		// confirmed subset only.
 		const state2 = createFormState(qs(2));
-		state2.selection[1] = -1;
-		state2.custom[1] = null;
+		assert.equal(formHandleKey(state2, "\r"), "render"); // confirm Q1
 		state2.tab = 2;
 		assert.equal(formHandleKey(state2, "\r"), "render");
 		assert.equal(allAnswered(state2), false);
 		assert.equal(formHandleKey(state2, "\x1b"), "cancel");
-		assert.equal(formAnswers(state2).length, 1, "Esc returns the answered subset");
+		assert.equal(formAnswers(state2).length, 1, "Esc returns the confirmed subset");
 	});
 
 	it("renders deterministic row shapes for question tab, submit page and editing", () => {
@@ -108,9 +121,17 @@ describe("form state machine", () => {
 		assert.ok(tabLines.at(-1)!.includes("Tab"));
 
 		state.tab = 2;
+		const freshSubmit = formRender(state, 80);
+		assert.ok(freshSubmit[0].includes("提交"));
+		assert.ok(freshSubmit.some((l) => l.includes("(未作答)")), "unconfirmed rows show (未作答)");
+
+		state.tab = 0;
+		formHandleKey(state, "\r"); // confirm Q1 (advances to tab 1)
+		state.tab = 2;
 		const submitLines = formRender(state, 80);
 		assert.ok(submitLines[0].includes("提交"));
 		assert.ok(submitLines.some((l) => l.includes("↳ Opt A1")));
+		assert.ok(submitLines.some((l) => l.includes("(未作答)")), "Q2 still unconfirmed");
 
 		state.tab = 0;
 		state.editing = true;
@@ -266,6 +287,9 @@ describe("recommended marker hygiene (0.4.1)", () => {
 				allowOther: false,
 			},
 		]);
+		const answers0 = formAnswers(state);
+		assert.equal(answers0.length, 0, "unconfirmed preselection returns no answer");
+		formHandleKey(state, "\r"); // confirm the recommended row
 		const answers = formAnswers(state);
 		assert.equal(answers[0]?.answer, "信任+能力并举");
 		// Non-recommended labels keep their verbatim text (agent-authored).
@@ -281,6 +305,9 @@ describe("recommended marker hygiene (0.4.1)", () => {
 			},
 		]);
 		state2.selection[0] = 1;
+		assert.equal(formAnswers(state2).length, 0, "still unconfirmed");
+		state2.tab = 0;
+		formHandleKey(state2, "\r"); // confirm the moved cursor
 		assert.equal(formAnswers(state2)[0]?.answer, "只修 adoption（推荐）");
 	});
 });
@@ -297,15 +324,15 @@ describe("themed question frame (pi-goal-x alignment, 0.4.1)", () => {
 		const lines = formRender(state, 80, undefined, T);
 		// frame: border, tabs, blank, question, blank, 3 option rows (2 opts + Other), blank, footer, border
 		assert.equal(lines.length, 11);
-		assert.match(lines[0]!, /^⟪accent⟩─+⟪\/⟫$/);
+		assert.match(lines[0]!, /^⟪muted⟩─+⟪\/⟫$/);
 		assert.ok(lines[1]!.includes("⟦selectedBg⟧"), `active chip lacks selectedBg: ${lines[1]}`);
-		assert.ok(lines[1]!.includes("■Q1") && lines[1]!.includes("■Q2") && lines[1]!.includes("✓ 提交"));
+		assert.ok(lines[1]!.includes("□Q1") && lines[1]!.includes("□Q2") && lines[1]!.includes("✓ 提交"));
 		assert.ok(lines[3]!.includes("⟪accent⟩") && lines[3]!.includes("Question 1?"), `question not accented: ${lines[3]}`);
 		const optLine = lines[5]!;
 		assert.ok(optLine.includes(T.fg("accent", "→ ")) && optLine.includes("1. Opt A1"), `selected option not accented: ${optLine}`);
 		assert.ok(optLine.includes(T.fg("success", " ★")), `recommended star missing: ${optLine}`);
 		assert.ok(lines[9]!.includes("⟪dim⟩") && lines[9]!.includes("[Esc] 取消"));
-		assert.match(lines[10]!, /^⟪accent⟩─+⟪\/⟫$/);
+		assert.match(lines[10]!, /^⟪muted⟩─+⟪\/⟫$/);
 		// Width safety with real (zero-width) ANSI styling, as the host theme emits.
 		const TANSI: FormTheme = {
 			fg: (_c, t) => `\u001b[3m${t}\u001b[23m`,

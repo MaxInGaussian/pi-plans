@@ -45,6 +45,8 @@ export interface PanelModel {
 	/** Implementation items not yet vc-passed. */
 	remainingI: number;
 	totalI: number;
+	/** Plan-format warning replaces the I-count line (never a fake "I 0/0"). */
+	implWarning: boolean;
 	/** Resolved current I (marker-backed or inferred; inferred is display-only). */
 	currentI?: string;
 	/** Short one-line description of the current I (display-only). */
@@ -116,6 +118,10 @@ export function derivePanelModel(
 		implStatus?: Record<string, ImplMarkerStateLike>;
 		currentI?: string;
 		goalWait?: { paused?: boolean; pausedReason?: string; noProgressRounds?: number; waitRounds?: number } | null;
+		/** Plan-lint warning (Implementation Items section parsed to zero
+		 * items). Non-null ⇒ implItems is empty — the panel must show the
+		 * warning instead of a fake "I 0/0" count (pi-goal-x semantics). */
+		implWarning?: string | null;
 	},
 	topic: string,
 	waiting: boolean,
@@ -184,6 +190,7 @@ export function derivePanelModel(
 		vcTotal,
 		remainingI,
 		totalI: Math.max(0, implItems.length),
+		implWarning: (execution.implWarning ?? null) !== null,
 		currentI,
 		currentIText,
 		currentState,
@@ -255,7 +262,9 @@ export function renderProgressBar(done: number, total: number, width: number): s
 export function renderPanelLines(model: PanelModel, width: number): string[] {
 	const w = Math.max(4, Math.floor(width));
 	if (w < MIN_PANEL_WIDTH) {
-		const status = `${model.topic} · I ${model.totalI - model.remainingI}/${model.totalI} · VC ${model.vcDone}/${model.vcTotal}`;
+		const status = model.implWarning
+			? `${model.topic} · ⚠ I 解析 0 项 · VC ${model.vcDone}/${model.vcTotal}`
+			: `${model.topic} · I ${model.totalI - model.remainingI}/${model.totalI} · VC ${model.vcDone}/${model.vcTotal}`;
 		return [
 			boxLine(BORDER_LEFT, ` pi-plans ${HORIZ} ${fit(model.topic, Math.max(4, w - 14))}`, HORIZ, w, BORDER_RIGHT),
 			renderPanelLine(status, w),
@@ -274,7 +283,9 @@ export function renderPanelLines(model: PanelModel, width: number): string[] {
 		? `phase: ${model.phase}`
 		: statusLine;
 
-	const progressContent = `I items ${model.totalI - model.remainingI}/${model.totalI} · ${renderProgressBar(model.totalI - model.remainingI, model.totalI, w)} · VC ${model.vcDone}/${model.vcTotal}`;
+	const progressContent = model.implWarning
+		? `⚠ plan 格式：Implementation Items 解析 0 项（面板无法计 I 进度）`
+		: `I items ${model.totalI - model.remainingI}/${model.totalI} · ${renderProgressBar(model.totalI - model.remainingI, model.totalI, w)} · VC ${model.vcDone}/${model.vcTotal}`;
 
 	// Narrow degradation level 3: current-I line keeps only the id.
 	const currentLabel =
@@ -302,9 +313,55 @@ export function renderPanelLines(model: PanelModel, width: number): string[] {
 
 /** Bottom status-bar summary line, derived from the same model (D-015). */
 export function formatPanelSummaryLine(model: PanelModel): string {
+	if (model.implWarning) {
+		return `plans: ${model.topic} ▸ ⚠ Implementation Items 解析 0 项 · VC ${model.vcDone}/${model.vcTotal} · next: ${model.nextAction}`;
+	}
 	const i = model.totalI > 0 ? ` · I ${model.totalI - model.remainingI}/${model.totalI}` : "";
 	const phase =
 		model.phase === "executing" ? "exec" : model.phase === "paused" ? "goal-wait paused" : model.phase;
 	const paused = model.goalWait?.paused ? ` (${model.goalWait.pausedReason ?? "paused"})` : "";
 	return `plans: ${model.topic} ▸ ${phase}${paused}${i} · VC ${model.vcDone}/${model.vcTotal} · next: ${model.nextAction}`;
+}
+
+/** Minimal theme surface the panel needs (pi's theme.fg). */
+export interface PanelTheme {
+	fg(color: string, text: string): string;
+}
+
+/** Per-line theme mapping for the panel widget. Vertical borders (│) and box
+ * chrome stay uniformly MUTED GRAY; only the content between the borders
+ * takes the line's accent color — │ never inherits the line color
+ * (user-requested uniform-gray frame). Pure: the widget just forwards. */
+export function themePanelLines(lines: string[], model: PanelModel, theme: PanelTheme): string[] {
+	return lines.map((line, index) => {
+		if (index === 0) {
+			const brandIndex = line.indexOf("pi-plans");
+			if (brandIndex >= 0) {
+				return (
+					theme.fg("muted", line.slice(0, brandIndex)) +
+					theme.fg("accent", "pi-plans") +
+					theme.fg("muted", line.slice(brandIndex + "pi-plans".length))
+				);
+			}
+			return theme.fg("muted", line);
+		}
+		const color =
+			index === 2
+				? (model.implWarning ? "warning" : "accent")
+				: index === 4
+					? "success"
+					: index === 1 && model.phase !== "executing"
+						? "warning"
+						: "muted";
+		// Border-aware coloring: content lines are │…│ — color only the inner
+		// span so both │ glyphs keep the uniform muted gray.
+		if (line.length >= 2 && line.startsWith(BORDER_V) && line.endsWith(BORDER_V)) {
+			return (
+				theme.fg("muted", BORDER_V) +
+				theme.fg(color, line.slice(1, -1)) +
+				theme.fg("muted", BORDER_V)
+			);
+		}
+		return theme.fg("muted", line);
+	});
 }

@@ -4,6 +4,7 @@
  */
 
 import { bindRun, boundRunId, resolveActiveRun } from "../src/run-context.ts";
+import { lintPlanIntoNotices } from "../src/state.ts";
 import { getExecution, markPrePlanCompactPending } from "../src/exec.ts";
 import { loadVccSettings, scaffoldVccSettings } from "../src/compaction.ts";
 import {
@@ -255,7 +256,9 @@ export function recordCheckpointTransition(
 				? checkpoint.planPath
 				: path.resolve(workdir, checkpoint.planPath.replace(/^@/, ""));
 			const identity = planIdentityOf(planPath, 1);
-			return mutateCheckpoint(workdir, runId, (cp) => applyPlanWritten(cp, identity));
+			const cp = mutateCheckpoint(workdir, runId, (inner) => applyPlanWritten(inner, identity));
+			lintPlanIntoNotices(workdir, runId, planPath);
+			return cp;
 		}
 		case "review-consolidated": {
 			if (!checkpoint.roundId) throw new StateError("review-consolidated requires roundId");

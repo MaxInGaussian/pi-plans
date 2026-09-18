@@ -62,6 +62,10 @@ export interface FormState {
 	selection: number[];
 	/** Custom-answer text per question (null = not custom). */
 	custom: (string | null)[];
+	/** Whether the user explicitly confirmed an answer on tab i (Enter on an
+	 * option row or a committed custom answer). The cursor `selection` alone
+	 * never flips this — goal-x aligned ■/□ chips read this field. */
+	confirmed: boolean[];
 	/** Current tab: 0..N-1 = question tabs, N = submit page. */
 	tab: number;
 	editing: boolean;
@@ -71,7 +75,12 @@ export interface FormState {
 export function createFormState(questions: FormQuestion[]): FormState {
 	return {
 		questions,
+		// Cursor position per tab: pre-positioned on the recommended option
+		// where present. This is ONLY the highlight — an answer counts only
+		// after the user confirms it (Enter/custom submit), tracked in
+		// `confirmed` (pi-goal-x semantics: chips show □ until answered).
 		selection: questions.map((q) => q.options.findIndex((o) => o.recommended === true)),
+		confirmed: questions.map(() => false),
 		custom: questions.map(() => null),
 		tab: 0,
 		editing: false,
@@ -79,11 +88,15 @@ export function createFormState(questions: FormQuestion[]): FormState {
 	};
 }
 
+/** A question counts as answered only via an explicit confirm: a committed
+ * custom answer or an Enter-confirmed option row. A mere cursor highlight
+ * (including the initial recommended pre-position) is NOT an answer. */
+export function isAnswered(state: FormState, i: number): boolean {
+	return state.custom[i] !== null || state.confirmed[i] === true;
+}
+
 export function allAnswered(state: FormState): boolean {
-	return state.questions.every(
-		(q, i) =>
-			state.custom[i] !== null || (state.selection[i] >= 0 && state.selection[i] < q.options.length),
-	);
+	return state.questions.every((_, i) => isAnswered(state, i));
 }
 
 export type FormKeyEvent =
@@ -147,6 +160,9 @@ export function formHandleKey(state: FormState, data: string): FormKeyEvent {
 		const delta = data === "\x1b[A" ? -1 : 1;
 		const row = state.selection[state.tab];
 		state.selection[state.tab] = total === 0 ? -1 : (row + delta + total + 1) % (total + 1);
+		// Moving the cursor off a confirmed row invalidates the confirm: the
+		// tab flips back to □ until Enter re-confirms the new row.
+		if (state.selection[state.tab] !== row) state.confirmed[state.tab] = false;
 		return "render";
 	}
 	if (data === "\r" || data === "\n") {
@@ -157,6 +173,7 @@ export function formHandleKey(state: FormState, data: string): FormKeyEvent {
 			return "start-editing";
 		}
 		if (row >= 0 && row < q.options.length) {
+			state.confirmed[state.tab] = true;
 			state.tab = Math.min(n, state.tab + 1);
 			return "render"; // confirmed → advance
 		}
@@ -169,6 +186,7 @@ function confirmBuffer(state: FormState): FormKeyEvent {
 	const text = state.buffer.trim();
 	if (!text) return "noop";
 	state.custom[state.tab] = text;
+	state.confirmed[state.tab] = true;
 	state.editing = false;
 	state.buffer = "";
 	state.tab = Math.min(state.questions.length, state.tab + 1);
@@ -184,7 +202,9 @@ export function formAnswers(state: FormState): FormAnswer[] {
 			return;
 		}
 		const opt = state.selection[i];
-		if (opt >= 0 && opt < q.options.length) {
+		// Only explicitly confirmed selections count as answers (Q5: an
+		// unconfirmed recommended pre-position must never be auto-submitted).
+		if (state.confirmed[i] && opt >= 0 && opt < q.options.length) {
 			// Recommended labels render as ★; strip an agent-embedded marker so
 			// the returned answer stays the clean label text.
 			const chosen = q.options[opt];
@@ -262,17 +282,15 @@ function themedQuestionFrame(
 	theme: FormTheme,
 ): string[] {
 	const n = state.questions.length;
-	const border = theme.fg("accent", "─".repeat(w));
-	const allAnswered = state.questions.every(
-		(_, i) => state.custom[i] !== null || (state.selection[i] ?? -1) >= 0,
-	);
+	const border = theme.fg("muted", "─".repeat(w));
+	const allAns = state.questions.every((_, i) => isAnswered(state, i));
 	const chips: string[] = [];
 	for (let i = 0; i <= n; i++) {
 		const isSubmit = i === n;
-		const answered = state.custom[i] !== null || (state.selection[i] ?? -1) >= 0;
+		const answered = isAnswered(state, i);
 		const raw = isSubmit ? " ✓ 提交 " : ` ${answered ? "■" : "□"}Q${i + 1} `;
 		if (i === state.tab) chips.push(theme.bg("selectedBg", theme.fg("text", raw)));
-		else if (isSubmit) chips.push(theme.fg(allAnswered ? "success" : "dim", raw));
+		else if (isSubmit) chips.push(theme.fg(allAns ? "success" : "dim", raw));
 		else chips.push(theme.fg(answered ? "success" : "muted", raw));
 	}
 	const tabsRow = fit(` ← ${chips.join(" ")} →`, w);
@@ -327,14 +345,13 @@ export function formRender(state: FormState, width: number, rows?: number, theme
 	}
 	if (state.tab === n) {
 		const missing: number[] = [];
-		state.questions.forEach((q, i) => {
-			if (state.custom[i] === null && !(state.selection[i] >= 0 && state.selection[i] < q.options.length)) {
-				missing.push(i);
-			}
+		state.questions.forEach((_, i) => {
+			if (!isAnswered(state, i)) missing.push(i);
 		});
 		const answerFor = (i: number): string => {
 			const custom = state.custom[i];
 			if (custom !== null) return custom;
+			if (!state.confirmed[i]) return "(未作答)";
 			const sel = state.selection[i];
 			return sel >= 0 && sel < state.questions[i].options.length
 				? state.questions[i].options[sel].label

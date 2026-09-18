@@ -36,7 +36,7 @@ import {
 	type VccCompactionBuildResult,
 	type VccCompactionStats,
 } from "./compaction.ts";
-import { getRun, readActive, resolveStateRootOrNull, setRunStatus, StateError, utcNow } from "./state.ts";
+import { getRun, lintPlanIntoNotices, readActive, resolveStateRootOrNull, setRunStatus, StateError, utcNow } from "./state.ts";
 import { bindRun, resolveActiveRun } from "./run-context.ts";
 import { OwnershipError } from "./run-ownership.ts";
 import {
@@ -64,6 +64,7 @@ import {
 	deriveNextAction,
 	formatPanelSummaryLine,
 	renderPanelLines,
+	themePanelLines,
 } from "./panel.ts";
 import { resolveGraphMode } from "./code-graph/mode.ts";
 import { TERMINATION_QUESTION, TERMINATION_OPTIONS, TERMINATION_RECORDING_INSTRUCTIONS, renderTerminationOptions } from "./termination-prompt.ts";
@@ -78,6 +79,7 @@ import {
 	scanCurrentIMarkers,
 	resolveCurrentI,
 	inferCurrentI,
+	lintImplItems,
 	type CheckItem,
 	type ImplItem,
 	type ImplMarkerState,
@@ -90,6 +92,8 @@ export interface ExecState {
 	usage: { inToks: number; outToks: number };
 	implItems?: ImplItem[];
 	implStatus?: Record<string, ImplMarkerState>;
+	/** Plan-lint warning backing the panel's implWarning line. */
+	implWarning?: string | null;
 	currentI?: string;
 	goalWait?: GoalWaitState;
 }
@@ -232,6 +236,7 @@ export function loadExecutionFromCheckpoint(
 		usage: { inToks: cp.execution.usage.inToks, outToks: cp.execution.usage.outToks },
 		implItems,
 		implStatus: { ...cp.execution.implStatus },
+		implWarning: lintImplItems(planText),
 		currentI: cp.execution.currentI,
 		goalWait: {
 			noProgressRounds: 0,
@@ -433,24 +438,9 @@ function updatePanelWidget(ctx: ExtensionContext): void {
 					// show a stale box header.
 					const model = derivePanelModel(current, panelTopic(ctx), executionIsWaiting(current));
 					const lines = renderPanelLines(model, width);
-					return lines.map((line, index) => {
-						// Box chrome stays muted; brand + status content get accents.
-						if (index === 0) {
-							const brandIndex = line.indexOf("pi-plans");
-							if (brandIndex >= 0 && theme) {
-								return (
-									theme.fg("muted", line.slice(0, brandIndex)) +
-									theme.fg("accent", "pi-plans") +
-									theme.fg("muted", line.slice(brandIndex + "pi-plans".length))
-								);
-							}
-							return theme ? theme.fg("muted", line) : line;
-						}
-						if (index === 2) return theme ? theme.fg("accent", line) : line;
-						if (index === 4) return theme ? theme.fg("success", line) : line;
-						if (index === 1 && model.phase !== "executing") return theme ? theme.fg("warning", line) : line;
-						return theme ? theme.fg("muted", line) : line;
-					});
+					// Uniform-gray frame: │ borders never inherit the line color;
+					// accents live between the borders only (themePanelLines).
+					return theme ? themePanelLines(lines, model, theme) : lines;
 				},
 			}),
 			{ placement: "aboveEditor" },
@@ -516,6 +506,7 @@ function persist(pi: ExtensionAPI): void {
 		usage: execution.usage,
 		implItems: execution.implItems,
 		implStatus: execution.implStatus,
+		implWarning: execution.implWarning ?? null,
 		currentI: execution.currentI,
 		goalWait: execution.goalWait,
 	});
@@ -546,7 +537,25 @@ export async function startExecution(
 	items: CheckItem[],
 	implItems?: ImplItem[],
 ): Promise<void> {
-	execution = { planPath, items, startedAt: utcNow(), usage: { inToks: 0, outToks: 0 }, implItems: implItems ?? [], implStatus: {}, goalWait: { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false } };
+	execution = {
+		planPath,
+		items,
+		startedAt: utcNow(),
+		usage: { inToks: 0, outToks: 0 },
+		implItems: implItems ?? [],
+		implStatus: {},
+		// F-001 (impl review r1): derive the plan-lint warning on the live
+		// handoff path too, so the panel shows the ⚠ line immediately for a
+		// zero-parse section instead of only after a checkpoint restore.
+		implWarning: (() => {
+			try {
+				return lintImplItems(fs.readFileSync(planPath, "utf8"));
+			} catch {
+				return null;
+			}
+		})(),
+		goalWait: { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false },
+	};
 	// Seed the marker baseline so the first quiet round is counted against a
 	// real snapshot instead of counting unconditionally (F-006).
 	if (execution.goalWait) execution.goalWait.lastMarkers = goalWaitSnapshot();
@@ -581,6 +590,10 @@ export async function startExecution(
 					: { ...withPlan, nextAction: "accept-execute" as const };
 				return applyExecutionApproved(aligned, approval);
 			});
+			// Plan-lint entry point (execute handoff): a plan whose Implementation
+			// Items section parses to zero items gets a durable run notice so the
+			// execution panel's warning is backed by persisted evidence.
+			lintPlanIntoNotices(ctx.cwd, active.run_id, path.resolve(planPath));
 		} catch (error) {
 			// F-002 (implementation review): a plan-digest mismatch between the
 			// recorded checkpoint plan and the approval must fail closed and
@@ -1583,6 +1596,16 @@ export async function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext
 			? { ...snapshot.goalWait }
 			: { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false },
 	};
+	// Distrust the snapshot's implItems: re-parse + re-lint from the plan
+	// file so a stale empty list (older parse or format drift at snapshot
+	// time) cannot freeze a fake "I 0/0" panel after a restart.
+	try {
+		const planText = fs.readFileSync(snapshot.planPath, "utf8");
+		execution.implItems = parseImplItems(planText);
+		execution.implWarning = lintImplItems(planText);
+	} catch {
+		/* plan file unreadable mid-restore: keep the snapshot values */
+	}
 	for (let i = snapshotIndex + 1; i < entries.length; i++) {
 		const entry = entries[i];
 		if (entry.type === "custom" && entry.customType === "pi-plans-exec-cleared") {

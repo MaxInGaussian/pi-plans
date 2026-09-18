@@ -1021,7 +1021,9 @@ describe("execution loop", () => {
 			implItems: [{ id: "I-001", text: "First item." }],
 			implStatus: {},
 		};
-		fs.writeFileSync(snapshot.planPath, "# plan");
+		// The restore path re-parses the plan file (stale-snapshot distrust), so
+		// the file must actually carry the Implementation Items section.
+		fs.writeFileSync(snapshot.planPath, "# plan\n\n## Implementation Items\n\n- `I-001`: First item.\n");
 		const entries = [
 			{ type: "custom", customType: "pi-plans-exec", data: snapshot },
 			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "work done [I-001:implemented]" }] } },
