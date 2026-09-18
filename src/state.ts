@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { lintImplItems } from "./plan.ts";
 
 export const STATE_DIRNAME = "pi_plans";
 const GIT_ENV_SCRUB = ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"];
@@ -104,6 +105,15 @@ export const VALID_RUN_STATUSES = new Set([
 	"done",
 ]);
 
+export interface RunNotice {
+	/** Notice category, e.g. "plan-lint". */
+	kind: string;
+	/** Stable producer id used for dedupe, e.g. "lint-impl-items". */
+	source: string;
+	text: string;
+	created_at: string;
+}
+
 export interface RunInfo {
 	schema: number;
 	run_id: string;
@@ -116,6 +126,9 @@ export interface RunInfo {
 	status: string;
 	created_at: string;
 	updated_at: string;
+	/** Durable run-level notices (plan lint warnings etc.). Absent on older
+	 * run.json files — read as []. */
+	notices?: RunNotice[];
 }
 
 export interface ActiveInfo {
@@ -544,6 +557,42 @@ export function updateRunWorkdir(workdir: string, runId: string, newWorkdir: str
 	run.updated_at = utcNow();
 	atomicWriteJson(runPath, run);
 	return run;
+}
+
+/** Append a durable run notice (dedupe by source+text); advisory, never
+ * throws — notices are diagnostics, not control flow. Returns the run when a
+ * notice was written or already present. */
+export function appendRunNotice(workdir: string, runId: string, notice: Omit<RunNotice, "created_at">): RunInfo | null {
+	const stateRoot = resolveStateRootOrNull(workdir);
+	if (stateRoot === null) return null;
+	const runPath = path.join(stateRoot, "runs", runId, "run.json");
+	if (!existsSync(runPath)) return null;
+	try {
+		const run = JSON.parse(readFileSync(runPath, "utf8")) as RunInfo;
+		const notices = run.notices ?? [];
+		if (notices.some((n) => n.source === notice.source && n.text === notice.text)) return run;
+		run.notices = [...notices, { ...notice, created_at: utcNow() }];
+		run.updated_at = utcNow();
+		atomicWriteJson(runPath, run);
+		return run;
+	} catch {
+		return null;
+	}
+}
+
+/** Lint a plan file's Implementation Items and persist a warning notice on
+ * the run when the section parses to zero items. Shared by the three lint
+ * entry points (plan-written checkpoint, execute handoff, auto apply). */
+export function lintPlanIntoNotices(workdir: string, runId: string, planPath: string): string | null {
+	let text: string | null = null;
+	try {
+		text = lintImplItems(readFileSync(planPath, "utf8"));
+	} catch {
+		return null;
+	}
+	if (text === null) return null;
+	appendRunNotice(workdir, runId, { kind: "plan-lint", source: "lint-impl-items", text });
+	return text;
 }
 
 export function setRunStatus(workdir: string, runId: string, status: string): RunInfo {

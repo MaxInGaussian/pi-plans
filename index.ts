@@ -55,6 +55,7 @@ import {
 	restoreAutoCompleteFromSession,
 } from "./src/autocomplete.ts";
 import { planningWriteBlockReason } from "./src/guard.ts";
+import { lintPlanIntoNotices } from "./src/state.ts";
 import { registerQueryInterviewHooks } from "./src/query-hook.ts";
 import { registerCodeGraphTool } from "./tools/code-graph.ts";
 import { registerGraphAwareFileTools } from "./tools/graph-aware-file-tools.ts";
@@ -233,6 +234,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		try {
 			const identity = planIdentityOf(path.resolve(ctx.cwd, latest.path), latest.version);
 			mutateCheckpoint(ctx.cwd, active.run_id, (cp) => applyPlanWritten(cp, identity));
+			lintPlanIntoNotices(ctx.cwd, active.run_id, path.resolve(ctx.cwd, latest.path));
 		} catch {
 			/* best-effort; the model can also call plans record-checkpoint explicitly */
 		}

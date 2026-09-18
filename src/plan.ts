@@ -93,9 +93,11 @@ export interface ImplItem {
 }
 
 /**
- * Parse the `## Implementation Items` section of a PLAN_vN.md. Strict grammar:
- * top-level `- `I-001`: text` single lines only; multi-line bodies and nested
- * sub-bullets are ignored (text stops at end of the first line).
+ * Parse the `## Implementation Items` section of a PLAN_vN.md. Tolerant
+ * grammar: TOP-LEVEL bullets only (no leading indentation — nested
+ * sub-lists are ignored) with the backticked id followed by a half-width
+ * `:`, a full-width `：`, or at least one space of plain separation.
+ * Multi-line bodies are ignored (text stops at end of the first line).
  */
 export function parseImplItems(planText: string): ImplItem[] {
 	const lines = planText.split("\n");
@@ -106,7 +108,7 @@ export function parseImplItems(planText: string): ImplItem[] {
 	for (let i = headerIndex + 1; i < lines.length; i++) {
 		const line = lines[i];
 		if (/^##\s/.test(line.trim())) break; // next section ends the items
-		const match = line.match(/^\s*-\s+`(I-\d+)`\s*:\s+(.*)$/);
+		const match = line.match(/^-\s+`(I-\d+)`(?:\s*[:：]\s*|\s+)(.*)$/);
 		if (!match) continue;
 		const id = match[1];
 		if (seen.has(id)) continue;
@@ -114,6 +116,20 @@ export function parseImplItems(planText: string): ImplItem[] {
 		items.push({ id, text: match[2].trim() });
 	}
 	return items;
+}
+
+/** Lint the Implementation Items section: returns a warning string when the
+ * section header exists but zero items parse (format drift), null otherwise.
+ * Plans without the section are fine (older artifacts). */
+export function lintImplItems(planText: string): string | null {
+	const lines = planText.split("\n");
+	const headerIndex = lines.findIndex((line) => /^##\s+Implementation Items\s*$/.test(line.trim()));
+	if (headerIndex < 0) return null;
+	if (parseImplItems(planText).length > 0) return null;
+	return (
+		"Implementation Items 节存在但解析出 0 项：条目需为顶层无缩进行，形如 " +
+		"`- `I-00N`: 描述`（冒号半角/全角可省，但 id 与描述间至少一个分隔）"
+	);
 }
 
 /**
