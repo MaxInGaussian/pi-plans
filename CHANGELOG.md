@@ -17,7 +17,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- `vendor/` directories are excluded from discovery (this repo's vendored benchmark tree was 90% of the old index); schema version 3 with idempotent step migrations for legacy databases; graph prompt blocks teach the new semantics (self-healing reads, digest link tags, query actions before grepping).
+- `vendor/` directories are excluded from discovery (this repo's vendored benchmark tree was 90% of the old index); schema version 3 with idempotent step migrations for legacy databases (legacy edge rows survive populated migrations); graph prompt blocks teach the new semantics (self-healing reads, digest link tags, query actions before grepping).
+
+### Fixed
+
+- **Edge-matrix hardening (implementation review r1).** `export { x } from` and `export * from` now resolve through to the DEFINING module (transitive barrels included — call edges target real function nodes, never phantom barrel entries); same-name exports across modules classify as `ambiguous` instead of unresolvable noise; dynamic `import('./x')` emits an import edge (resolved for in-repo targets, dangling for externals); `const { a } = require('./x')` binds the NAMED export (only brace-less require binds the default); import bindings are consulted before the same-name method heuristic and that heuristic is demoted to `INFERRED` (a local `readFile` can no longer hijack `fs.readFile(...)`); Python `import x.y` binds the head module and `from . import x` resolves the package `__init__`.
+- **Full-rebuild pending guard.** `runIndex` fails closed: a full rebuild (`/init-graph`) skips files with staged DB-first edits instead of overwriting them — staged text survives until `apply` materializes it.
+- **Watch hardening.** An `fs.watch` error event stops the watcher cleanly (with a `watch.failed` hint) instead of crashing the host; the lock is claimed atomically (`wx`) with stale-lock cleanup and ownership-checked release; repeated reindex failures (10+) stop the watcher and point at `/update-graph`; pending-file detection fails closed on store read errors.
+- **`code_graph status` surface.** Now reports the total edge count and the kind × resolution × confidence distribution (AC-003); `query`/`impact` results carry `shown`/`omitted` counts alongside `truncated`; `includeUnresolved`'s description states its actual semantics (target-less dangling edges never enter traversal).
 ## [0.4.1] - 2026-09-17
 
 ### Fixed
