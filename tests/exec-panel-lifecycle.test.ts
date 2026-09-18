@@ -129,6 +129,43 @@ describe("exec panel lifecycle", () => {
 		await stopExecution(h.pi, h.ctx, "done");
 	});
 
+	it("activity row shows run status · since-time on live execution", async () => {
+		const workdir = freshWorkdir();
+		startRun(workdir, { topic: "live-activity", skill: "plan-small", requestText: "x" });
+		const h = makeHarness(workdir);
+		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_vA.md"), items("VC-001", "VC-002"), [
+			{ id: "I-001", text: "First item." },
+		]);
+		const lines = renderWidget(lastWidget(h), 100);
+		assert.equal(lines.length, 7);
+		assert.match(lines[5] ?? "", /executing · since \d{2}-\d{2} \d{2}:\d{2}/, "activity row wired from run.json");
+		assert.ok((lines[6] ?? "").startsWith("╰"));
+		assert.ok(!lines.join("\n").includes("markers:"), "no duplicated legend rows");
+		await stopExecution(h.pi, h.ctx, "done");
+	});
+
+	it("activity row falls back to the phase word when the run record is missing", async () => {
+		const workdir = freshWorkdir();
+		startRun(workdir, { topic: "missing-activity", skill: "plan-small", requestText: "x" });
+		const h = makeHarness(workdir);
+		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_vB.md"), items("VC-001", "VC-002"), [
+			{ id: "I-001", text: "First item." },
+		]);
+		// Simulate a lost/stale run record: stash run.json, render, restore.
+		const runsDir = path.join(workdir, ".git", "pi_plans", "runs");
+		const stash = path.join(os.tmpdir(), `pi-plans-runs-stash-${Date.now()}-${counter}`);
+		fs.renameSync(runsDir, stash);
+		try {
+			const lines = renderWidget(lastWidget(h), 100);
+			assert.match(lines[5] ?? "", /executing/);
+			assert.ok(!(lines[5] ?? "").includes("since"), "no fabricated since-time without a run record");
+			assert.ok(!(lines[5] ?? "").includes("undefined"));
+		} finally {
+			fs.renameSync(stash, runsDir);
+		}
+		await stopExecution(h.pi, h.ctx, "done");
+	});
+
 	it("refreshes panel content from marker updates without re-registering", async () => {
 		const workdir = freshWorkdir();
 		const h = makeHarness(workdir);
@@ -180,6 +217,7 @@ describe("exec panel lifecycle", () => {
 		const lines = renderWidget(lastWidget(h), 100);
 		assert.equal(lines.length, 7, "panel rebuilt after restore");
 		assert.match(h.recorded.status ?? "", /plans: restore-topic ▸ exec/);
+		assert.match(lines[5] ?? "", /· since \d{2}-\d{2} \d{2}:\d{2}/, "restored panel rebinds the activity row to run.json");
 		await stopExecution(h.pi, h.ctx, "done");
 	});
 

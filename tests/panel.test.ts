@@ -4,7 +4,7 @@
  * status-bar summary line and the execution injection text (D-014/R-011).
  */
 
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -14,6 +14,7 @@ import {
 	PANEL_ROW_COUNT,
 	deriveNextAction,
 	derivePanelModel,
+	formatActivityTime,
 	formatPanelSummaryLine,
 	renderPanelLines,
 } from "../src/panel.ts";
@@ -220,6 +221,76 @@ describe("deriveNextAction", () => {
 			goalWait: undefined,
 		};
 		assert.match(deriveNextAction(none, false, { "I-001": "vc-passed" }, []), /Report completion/);
+	});
+});
+
+describe("activity line (0.5.2 legend dedupe)", () => {
+	const origTZ = process.env.TZ;
+	before(() => {
+		process.env.TZ = "UTC";
+	});
+	after(() => {
+		if (origTZ === undefined) delete process.env.TZ;
+		else process.env.TZ = origTZ;
+	});
+
+	it("formatActivityTime formats a valid ISO stamp as MM-DD HH:mm", () => {
+		assert.equal(formatActivityTime("2026-09-18T15:02:00Z"), "09-18 15:02");
+	});
+
+	it("formatActivityTime degrades empty and invalid input to --", () => {
+		assert.equal(formatActivityTime(null), "--");
+		assert.equal(formatActivityTime(undefined), "--");
+		assert.equal(formatActivityTime(""), "--");
+		assert.equal(formatActivityTime("not-a-timestamp"), "--");
+	});
+
+	it("derives activity from the run record (status · since time)", () => {
+		const model = derivePanelModel(exec(), "t", false, {
+			status: "executing",
+			created_at: "2026-09-18T10:00:00Z",
+			updated_at: "2026-09-18T15:02:00Z",
+		});
+		assert.equal(model.activity, "executing · since 09-18 15:02");
+	});
+
+	it("falls back to created_at when updated_at is empty", () => {
+		const model = derivePanelModel(exec(), "t", false, {
+			status: "executing",
+			created_at: "2026-09-18T10:00:00Z",
+			updated_at: "",
+		});
+		assert.equal(model.activity, "executing · since 09-18 10:00");
+	});
+
+	it("falls back to the phase word without a run record", () => {
+		assert.equal(derivePanelModel(exec(), "t", false, null).activity, "executing");
+		assert.equal(derivePanelModel(exec(), "t", false, undefined).activity, "executing");
+		const paused = derivePanelModel(
+			{ items: [], goalWait: { paused: true, pausedReason: "waiting for user" } },
+			"t",
+			false,
+			null,
+		);
+		assert.equal(paused.activity, "paused");
+	});
+
+	it("renders the activity row plus a legend-free pure bottom border", () => {
+		const model = derivePanelModel(exec(), "t", false, {
+			status: "executing",
+			created_at: "2026-09-18T10:00:00Z",
+			updated_at: "2026-09-18T15:02:00Z",
+		});
+		const lines = renderPanelLines(model, 100);
+		assert.equal(lines.length, PANEL_ROW_COUNT);
+		assert.match(lines[5]!, /executing · since 09-18 15:02/);
+		const last = lines[6]!;
+		assert.ok(last.startsWith("╰"), "bottom border preserved");
+		assert.ok(!last.includes("▸"), "no embedded I-state legend");
+		assert.ok(!last.includes("[I-"), "no marker syntax in the border");
+		const all = lines.join("\n");
+		assert.ok(!all.includes("markers:"), "markers legend row removed");
+		assert.ok(!all.includes("[DONE:VC-"), "DONE marker legend removed from the panel");
 	});
 });
 

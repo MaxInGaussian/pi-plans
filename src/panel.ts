@@ -40,6 +40,9 @@ export interface PanelModel {
 	phase: string;
 	/** Extra phase annotation, e.g. "⏸ paused". */
 	phaseNote?: string;
+	/** Activity line (footer content row): run status + since-time, or the
+	 *  phase word when the run record is unavailable. Always a string (CQ4). */
+	activity: string;
 	vcDone: number;
 	vcTotal: number;
 	/** Implementation items not yet vc-passed. */
@@ -125,6 +128,7 @@ export function derivePanelModel(
 	},
 	topic: string,
 	waiting: boolean,
+	run?: { status: string; created_at: string; updated_at: string } | null,
 ): PanelModel {
 	const items = execution.items;
 	const vcDone = items.filter((item) => item.done).length;
@@ -182,10 +186,18 @@ export function derivePanelModel(
 		phaseNote = `waiting for subprocess (round ${goalWait?.waitRounds ?? 0}/6)`;
 	}
 
+	// Activity line: honest "since" semantics — RunInfo.updated_at is the
+	// status-change time (execution turns only write the checkpoint, not
+	// run.json), so we label it `since`, never "last activity" (CQ2/D-002).
+	const activity = run
+		? `${run.status} · since ${formatActivityTime(run.updated_at || run.created_at)}`
+		: phase;
+
 	return {
 		topic,
 		phase,
 		phaseNote,
+		activity,
 		vcDone,
 		vcTotal,
 		remainingI,
@@ -240,8 +252,17 @@ export function renderPanelLine(content: string, width: number): string {
 }
 
 export function renderPanelFooter(width: number): string {
-	const note = ` [I-###:current] ▸ [I-###:implemented] ▸ [I-###:validating] `;
-	return boxLine(BORDER_BOTTOM_LEFT, note, HORIZ, width, BORDER_BOTTOM_RIGHT);
+	return boxLine(BORDER_BOTTOM_LEFT, "", HORIZ, width, BORDER_BOTTOM_RIGHT);
+}
+
+/** Format a run timestamp as local `MM-DD HH:mm` for the activity line.
+ *  Empty/invalid input degrades to `--` (never throws, never "undefined"). */
+export function formatActivityTime(iso: string | null | undefined): string {
+	if (!iso) return "--";
+	const d = new Date(iso);
+	if (Number.isNaN(d.getTime())) return "--";
+	const p2 = (n: number) => String(n).padStart(2, "0");
+	return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
 }
 
 /** Progress bar (10 cells) for the I items: filled = vc-passed count. */
@@ -298,15 +319,13 @@ export function renderPanelLines(model: PanelModel, width: number): string[] {
 	// Narrow degradation level 1: Next-action keeps verb + id only.
 	const nextLabel = narrow1 ? model.nextAction.replace(/— .*$/, "") : model.nextAction;
 
-	const footerNote = `markers: [I-###:current] [I-###:implemented] [I-###:validating] [DONE:VC-###]`;
-
 	return [
 		renderPanelHeader(model.topic, w),
 		renderPanelLine(statusContent, w),
 		renderPanelLine(progressContent, w),
 		renderPanelLine(currentLabel, w),
 		renderPanelLine(`Next: ${nextLabel}`, w),
-		renderPanelLine(footerNote, w),
+		renderPanelLine(model.activity, w),
 		renderPanelFooter(w),
 	];
 }
