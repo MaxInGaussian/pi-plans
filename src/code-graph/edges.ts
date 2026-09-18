@@ -46,6 +46,13 @@ export interface ModuleInfo {
 	exports: Map<string, "function" | "other">;
 	hasDefault: boolean;
 	imports: ImportedSymbol[];
+	/** Raw `export { x } from '...'` specifiers (pre-resolution). */
+	reExports: Map<string, string>;
+	/** Raw `export * from '...'` specifiers (pre-resolution). */
+	starExports: string[];
+	/** Resolved passthrough: symbol -> DEFINING module rel path. Call edges
+	 *  must target the defining module, never the barrel (impl-review F-B). */
+	reExportTargets: Map<string, string>;
 }
 
 export type ModuleGraph = Map<string, ModuleInfo>;
@@ -86,18 +93,32 @@ const JS_INDEX_BASENAMES = ["index.ts", "index.tsx", "index.js", "index.jsx", "i
 // Module graph
 // ---------------------------------------------------------------------------
 
-function extractJsExports(text: string): { exports: Map<string, "function" | "other">; hasDefault: boolean } {
+function extractJsExports(text: string): {
+	exports: Map<string, "function" | "other">;
+	hasDefault: boolean;
+	/** Re-export passthrough (impl-review F-B): symbol -> source module. */
+	reExports: Map<string, string>;
+	starExports: string[];
+} {
 	const exports = new Map<string, "function" | "other">();
+	const reExports = new Map<string, string>();
+	const starExports: string[] = [];
 	let hasDefault = false;
 	for (const m of text.matchAll(/export\s+(?:default\s+)?(?:async\s+)?(function|class|const|let|var)\s+([A-Za-z_$][\w$]*)/g)) {
 		exports.set(m[2]!, m[1] === "function" ? "function" : "other");
 	}
-	for (const m of text.matchAll(/export\s*\{([^}]*)\}/g)) {
+	for (const m of text.matchAll(/export\s+\*\s+from\s*['"]([^'"]+)['"]/g)) {
+		starExports.push(m[1]!);
+	}
+	for (const m of text.matchAll(/export\s*\{([^}]*)\}(?:\s*from\s*['"]([^'"]+)['"])?/g)) {
+		const fromSource = m[2];
 		for (const part of m[1]!.split(",")) {
 			const seg = part.trim();
 			if (!seg) continue;
 			const name = seg.includes(" as ") ? seg.split(/\s+as\s+/).pop()!.trim() : seg;
-			if (name && !name.startsWith("*")) exports.set(name, "other");
+			if (!name || name.startsWith("*")) continue;
+			if (fromSource) reExports.set(name, fromSource);
+			else exports.set(name, "other");
 		}
 	}
 	for (const m of text.matchAll(/export\s+default\s+(?!function|class)([A-Za-z_$][\w$]*)?/g)) {
@@ -105,7 +126,7 @@ function extractJsExports(text: string): { exports: Map<string, "function" | "ot
 		if (m[1]) exports.set(m[1], "other");
 	}
 	if (/export\s+default\s+(?:async\s+)?function/.test(text) || /export\s+default\s+class/.test(text)) hasDefault = true;
-	return { exports, hasDefault };
+	return { exports, hasDefault, reExports, starExports };
 }
 
 function extractPyExports(text: string): Map<string, "function" | "other"> {
@@ -136,18 +157,23 @@ function extractJsImports(text: string): ImportedSymbol[] {
 			}
 		}
 	}
-	for (const m of text.matchAll(/(?:const|let|var)\s+\{?([^=}]*?)\}?\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+	// Destructured require (named bindings) vs plain require (default):
+	// `const { a, b: c } = require('./x')` binds named exports; only the
+	// brace-less form binds the module default (impl-review F-B).
+	for (const m of text.matchAll(/(?:const|let|var)\s+\{([^=}]*?)\}\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g)) {
 		const clause = m[1]!;
 		const source = m[2]!;
 		const byte = m.index ?? 0;
 		for (const part of clause.split(",")) {
 			const seg = part.trim();
 			if (!seg) continue;
-			const def = seg.match(/^([A-Za-z_$][\w$]*)$/);
-			if (def) out.push({ local: def[1]!, imported: "__default__", source, kind: "require", byte });
 			const prop = seg.match(/^([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)$/);
 			if (prop) out.push({ local: prop[2]!, imported: prop[1]!, source, kind: "require", byte });
+			else if (/^[A-Za-z_$][\w$]*$/.test(seg)) out.push({ local: seg, imported: seg, source, kind: "require", byte });
 		}
+	}
+	for (const m of text.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+		out.push({ local: m[1]!, imported: "__default__", source: m[2]!, kind: "require", byte: m.index ?? 0 });
 	}
 	return out;
 }
@@ -175,7 +201,9 @@ function extractPyImports(text: string): ImportedSymbol[] {
 		for (const part of m[1]!.split(",")) {
 			const mod = part.trim();
 			if (!mod) continue;
-			out.push({ local: mod.split(".").pop()!, imported: null, source: mod, kind: "import", byte });
+			// `import x.y` binds the HEAD module (x) in Python semantics, not
+			// the tail — `x.f()` must resolve while `y.f()` stays unbound.
+			out.push({ local: mod.split(".")[0]!, imported: null, source: mod.split(".")[0]!, kind: "import", byte });
 		}
 	}
 	return out;
@@ -187,7 +215,9 @@ function moduleInfoFor(key: ModuleKey, text: string): ModuleInfo {
 	const exports = isPython ? extractPyExports(text) : js.exports;
 	const hasDefault = isPython ? false : js.hasDefault;
 	const imports = isPython ? extractPyImports(text) : extractJsImports(text);
-	return { key, exports, hasDefault, imports };
+	const reExports = isPython ? new Map<string, string>() : js.reExports;
+	const starExports = isPython ? [] : js.starExports;
+	return { key, exports, hasDefault, imports, reExports, starExports, reExportTargets: new Map() };
 }
 
 /** Build (or extend) the module graph from DB snapshots, with in-batch text
@@ -216,6 +246,55 @@ export function buildModuleGraph(
 	for (const [rel, entry] of overrides) {
 		if (!graph.has(rel)) graph.set(rel, moduleInfoFor(entry.key, entry.text));
 	}
+	// Re-export passthrough (impl-review F-B): resolve `export { x } from
+	// './y'` and `export * from './y'` to the DEFINING module and record
+	// symbol -> defining rel path in reExportTargets. The barrel's own
+	// exports map stays untouched, so call edges target real function nodes
+	// in the defining file — never phantom barrel nodes. Chained barrels are
+	// followed transitively through the target's own reExportTargets.
+	const relOf = (info: ModuleInfo, spec: string): string | null => {
+		const target = resolveModulePath(spec, info.key, graph);
+		return target ? target.relPath : null;
+	};
+	for (let hop = 0; hop < 4; hop++) {
+		let expanded = false;
+		for (const info of graph.values()) {
+			if (info.reExports.size === 0 && info.starExports.length === 0) continue;
+			for (const [symbol, spec] of [...info.reExports]) {
+				const rel = relOf(info, spec);
+				const targetInfo = rel ? graph.get(rel) : null;
+				if (!targetInfo) {
+					info.reExports.delete(symbol); // external source: no phantom
+					expanded = true;
+					continue;
+				}
+				if (targetInfo.exports.has(symbol) || targetInfo.reExportTargets.has(symbol)) {
+					info.reExportTargets.set(symbol, targetInfo.exports.has(symbol) ? rel! : targetInfo.reExportTargets.get(symbol)!);
+					info.reExports.delete(symbol);
+					expanded = true;
+				}
+			}
+			for (const spec of [...info.starExports]) {
+				const rel = relOf(info, spec);
+				const targetInfo = rel ? graph.get(rel) : null;
+				if (!targetInfo) continue;
+				for (const name of targetInfo.exports.keys()) {
+					if (!info.exports.has(name) && !info.reExportTargets.has(name)) {
+						info.reExportTargets.set(name, rel!);
+						expanded = true;
+					}
+				}
+				for (const [name, defining] of targetInfo.reExportTargets) {
+					if (!info.exports.has(name) && !info.reExportTargets.has(name)) {
+						info.reExportTargets.set(name, defining);
+						expanded = true;
+					}
+				}
+				info.starExports = info.starExports.filter((x) => x !== spec);
+			}
+		}
+		if (!expanded) break;
+	}
 	return graph;
 }
 
@@ -234,6 +313,15 @@ export interface ResolvedModule {
  *  modules map to directory/file paths. Returns null for externals. */
 export function resolveModulePath(specifier: string, fromKey: ModuleKey, graph: ModuleGraph): ResolvedModule | null {
 	if (fromKey.language === "python") {
+		// `from . import x` / `from ..pkg import y`: resolve the current (or
+		// parent) package's __init__ instead of bailing out.
+		if (specifier === "." || specifier === "..") {
+			const dirParts = fromKey.fileDir === "." ? [] : fromKey.fileDir.split("/");
+			const targetDir = specifier === ".." ? dirParts.slice(0, -1) : dirParts;
+			const rel = targetDir.length === 0 ? "__init__.py" : `${targetDir.join("/")}/__init__.py`;
+			if (graph.has(rel)) return { key: graph.get(rel)!.key, relPath: rel, confidence: "EXTRACTED" };
+			return null;
+		}
 		const parts = specifier.split(".").filter((p) => p.length > 0);
 		if (parts.length === 0) return null;
 		const candidates: Array<{ rel: string; barrel: boolean }> = [];
@@ -385,6 +473,25 @@ export function extractEdges(
 			});
 		}
 	}
+	if (!isPython) {
+		// Dynamic imports (impl-review F-B): emit an import edge instead of
+		// dropping the specifier as keyword noise.
+		for (const m of text.matchAll(/import\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+			const spec = m[1]!;
+			const at = m.index ?? 0;
+			const module = resolveModulePath(spec, file, graph);
+			out.push({
+				fromFunction: "<module>",
+				calleeText: `import(${spec})`,
+				kind: "import",
+				resolution: module ? "resolved" : "unresolved",
+				confidence: module?.confidence ?? "EXTRACTED",
+				target: module ? { fileDir: module.key.fileDir, fileName: module.key.fileName, functionName: "<module>" } : undefined,
+				reason: module ? `dynamic import ${spec}` : `dynamic import (external) ${spec}`,
+				provenance: sourceLocation(li, at, m[0].length),
+			});
+		}
+	}
 
 	const sameFile = new Set(functions.map((fn) => fn.functionName));
 	const globalExports = buildGlobalExportIndex(graph);
@@ -399,9 +506,8 @@ export function extractEdges(
 		if (member && sameFile.has(`${head}.${member}`)) {
 			return { target: { fileDir: file.fileDir, fileName: file.fileName, functionName: `${head}.${member}` }, resolution: "resolved", confidence: "EXTRACTED", reason: "same-file qualified" };
 		}
-		if (member && sameFile.has(member)) {
-			return { target: { fileDir: file.fileDir, fileName: file.fileName, functionName: member }, resolution: "resolved", confidence: "EXTRACTED", reason: "same-file method" };
-		}
+		// Import bindings are consulted BEFORE the same-file member heuristic
+		// (impl-review F-B): a local `readFile` must not hijack `fs.readFile`.
 		const lists = bindings.get(head);
 		if (lists && lists.length > 0) {
 			if (lists.length > 1) {
@@ -431,13 +537,37 @@ export function extractEdges(
 			if (wanted && info.exports.has(wanted)) {
 				return { target: { fileDir: info.key.fileDir, fileName: info.key.fileName, functionName: wanted }, resolution: "resolved", confidence: "INFERRED", reason: `imported ${wanted}` };
 			}
+			if (wanted) {
+				// Re-export passthrough: target the DEFINING module.
+				const definingRel = info.reExportTargets.get(wanted);
+				if (definingRel) {
+					const defining = graph.get(definingRel);
+					if (defining) {
+						return {
+							target: { fileDir: defining.key.fileDir, fileName: defining.key.fileName, functionName: wanted },
+							resolution: "resolved",
+							confidence: "INFERRED",
+							reason: `re-export via ${binding.module.relPath}`,
+						};
+					}
+				}
+			}
 			return { resolution: "ambiguous", confidence: "EXTRACTED", reason: `${wanted} not exported by ${binding.module.relPath}` };
+		}
+		if (member && sameFile.has(member)) {
+			// Same-name method heuristic: a guess, not a proven binding —
+			// INFERRED, never EXTRACTED (impl-review F-B/F-D).
+			return { target: { fileDir: file.fileDir, fileName: file.fileName, functionName: member }, resolution: "resolved", confidence: "INFERRED", reason: "same-file method (inferred)" };
 		}
 		if (member) {
 			const hit = globalExports.get(member);
 			if (hit && hit.count === 1) {
 				const target = graph.get(hit.relPath)!.key;
 				return { target: { fileDir: target.fileDir, fileName: target.fileName, functionName: member }, resolution: "resolved", confidence: "INFERRED", reason: "unique export" };
+			}
+			if (hit && hit.count > 1) {
+				// Same-name exports across modules: ambiguous per plan R-003.
+				return { resolution: "ambiguous", confidence: "EXTRACTED", reason: `${hit.count} modules export ${member}` };
 			}
 		}
 		return { resolution: "unresolved", confidence: "EXTRACTED", reason: "unbound" };

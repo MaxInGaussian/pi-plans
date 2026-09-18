@@ -223,18 +223,28 @@ export async function runIndex(opts: IndexerOptions): Promise<IndexReport> {
 		exists: boolean;
 	}> = [];
 	let preflightConflict = 0;
-	const existingByFile = new Map<string, { sourceHash: string }>();
+	const existingByFile = new Map<string, { sourceHash: string; pendingKind: string | null }>();
 	for (const row of opts.store
-		.read(() => opts.store.db.prepare("SELECT file_dir, file_name, source_hash FROM files").all()) as Array<{
+		.read(() => opts.store.db.prepare("SELECT file_dir, file_name, source_hash, pending_kind FROM files").all()) as Array<{
 		file_dir: string;
 		file_name: string;
 		source_hash: string;
+		pending_kind: string | null;
 	}>) {
-		existingByFile.set(`${row.file_dir}/${row.file_name}`, { sourceHash: row.source_hash });
+		existingByFile.set(`${row.file_dir}/${row.file_name}`, {
+			sourceHash: row.source_hash,
+			pendingKind: row.pending_kind,
+		});
 	}
 	for (const file of files) {
 		const relativeKey = `${file.fileDir}/${file.fileName}`;
 		if (pathFilter && !pathFilter.has(relativeKey)) continue;
+		// Fail-closed pending guard (impl-review F-C): a full rebuild must
+		// never overwrite the staged (DB-ahead) text of pending files — only
+		// an explicit apply materializes them. Path-filtered rebuilds (purge
+		// or post-apply refresh) run only after pending was cleared.
+		const existingState = existingByFile.get(relativeKey);
+		if (existingState?.pendingKind && !pathFilter) continue;
 		let sourceText: string;
 		let exists = true;
 		try {
