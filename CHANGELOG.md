@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.3] - 2026-09-19
+
+### Fixed
+
+- **批量表单首选项静默丢失（fail-open 校验缺位）**：畸形批量 `ask_choice` 调用（首选项的 label/description 被序列化到题目层级、`recommended` 键丢失，RCA 见 PROBLEM_ANALYSIS E2 原始 toolCall 证据）此前静默通过并渲染出"缺首选项的表单"。现工具入口双保险：
+  - `Option` / `BatchQuestionParams` / `AskChoiceParams` 三 schema 对象 `additionalProperties: false`——任意层级杂散键在 TypeBox Check 处响亮报错，模型重发；
+  - 批量每题强制至少一个 `recommended: true`（D-4 至少一个契约，不锁位置），报错文案含自诊断提示（"did the first option's label/description get hoisted to the question level?"）；
+  - 校验先于任何 decisions/checkpoint 记录与 auto-approve 短路（D-7 无副作用断言钉死）；
+  - 新增 `tests/ask-choice-schema.test.ts` 10 项负例/正例（E2 实案回放），全量 464 测试全绿。
+
 All notable changes to **pi-plans** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).

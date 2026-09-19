@@ -142,28 +142,39 @@ export function fitAskChoicePanel(question: string, items: PanelItem[], columns:
 	return { question: currentQuestion, labels: currentLabels, overflowWarned };
 }
 
-const Option = Type.Object({
-	label: Type.String({ description: "Option label" }),
-	description: Type.Optional(Type.String({ description: "Short tradeoff that matters, shown to the user" })),
-	recommended: Type.Optional(Type.Boolean({ description: "Mark exactly one recommended option; put it first. Never embed (推荐)/(recommended) text in labels — the UI renders the ★ marker automatically" })),
-});
+// F-0.5.3 (batch-form-first-option-loss): every object closes its property
+// set — stray keys at ANY level (e.g. the first option's label/description
+// hoisted to the question level) fail TypeBox Check loudly at the tool
+// boundary instead of silently rendering a form missing its first option.
+export const Option = Type.Object(
+	{
+		label: Type.String({ description: "Option label" }),
+		description: Type.Optional(Type.String({ description: "Short tradeoff that matters, shown to the user" })),
+		recommended: Type.Optional(Type.Boolean({ description: "Mark exactly one recommended option; put it first. Never embed (推荐)/(recommended) text in labels — the UI renders the ★ marker automatically" })),
+	},
+	{ additionalProperties: false },
+);
 
-const BatchQuestionParams = Type.Object({
-	question: Type.String({ description: "The question to ask, in the configured language" }),
-	options: Type.Array(Option, { description: "Ordered options: recommended first, alternatives next. Do not include Other or Auto-complete yourself." }),
-	allowOther: Type.Optional(Type.Boolean({ description: "Offer free-form input for this question (default true)" })),
-	autoComplete: Type.Optional(
-		Type.Boolean({
-			description:
-				"Batches accept only autoComplete: true (or omitted) items — scope/handoff questions MUST stay single-question calls with autoComplete: false.",
-		}),
-	),
-	questionId: Type.Optional(Type.String({ description: "Stable id for cross-session dedupe (unique within the batch)." })),
-	purpose: Type.Optional(Type.String({ description: "Short machine-readable purpose." })),
-});
+export const BatchQuestionParams = Type.Object(
+	{
+		question: Type.String({ description: "The question to ask, in the configured language" }),
+		options: Type.Array(Option, { description: "Ordered options: recommended first, alternatives next. Do not include Other or Auto-complete yourself." }),
+		allowOther: Type.Optional(Type.Boolean({ description: "Offer free-form input for this question (default true)" })),
+		autoComplete: Type.Optional(
+			Type.Boolean({
+				description:
+					"Batches accept only autoComplete: true (or omitted) items — scope/handoff questions MUST stay single-question calls with autoComplete: false.",
+			}),
+		),
+		questionId: Type.Optional(Type.String({ description: "Stable id for cross-session dedupe (unique within the batch)." })),
+		purpose: Type.Optional(Type.String({ description: "Short machine-readable purpose." })),
+	},
+	{ additionalProperties: false },
+);
 
-const AskChoiceParams = Type.Object({
-	question: Type.Optional(Type.String({ description: "The single question to ask, in the configured language (mutually exclusive with questions)." })),
+export const AskChoiceParams = Type.Object(
+	{
+		question: Type.Optional(Type.String({ description: "The single question to ask, in the configured language (mutually exclusive with questions)." })),
 	options: Type.Optional(Type.Array(Option, { description: "Ordered options (single-question form): recommended first, alternatives next. Do not include Other or Auto-complete yourself." })),
 	questions: Type.Optional(
 		Type.Array(BatchQuestionParams, {
@@ -194,7 +205,9 @@ const AskChoiceParams = Type.Object({
 		}),
 	),
 	workdir: Type.Optional(Type.String({ description: "Target workspace; default current working directory" })),
-});
+	},
+	{ additionalProperties: false },
+);
 
 interface AskChoiceDetails {
 	question: string;
@@ -351,6 +364,16 @@ async function executeAskChoiceBatch(
 	const allowed = FORBIDDEN_BATCH_QUESTION_IDS;
 	for (const q of qs as Array<{ options: unknown[]; question: string; questionId?: string; autoComplete?: boolean }>) {
 		if (q.options.length === 0) throw new Error(`ask_choice batch question needs options: ${q.question}`);
+		// F-0.5.3: every batch question must carry a recommended option. A
+		// malformed call (first option's fields hoisted to the question level,
+		// recommended flag lost) previously slipped through schema validation
+		// and silently rendered a form missing its first option. Fail loudly
+		// BEFORE any recording/short-circuit side effects so the model retries.
+		if (!(q.options as Array<{ recommended?: boolean }>).some((option) => option.recommended === true)) {
+			throw new Error(
+				`ask_choice batch question needs a recommended option (options[n].recommended: true): ${q.question} — did the first option's label/description get hoisted to the question level?`,
+			);
+		}
 		// R-013b/D-025 safety red line: batches never carry questions that
 		// must not be auto-completed (scope confirmation, execution handoff).
 		if (q.autoComplete === false) {
