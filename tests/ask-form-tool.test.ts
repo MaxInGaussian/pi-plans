@@ -104,7 +104,9 @@ describe("ask_choice batch validation (R-013b/D-025)", () => {
 		const ctx = makeCtx(workdir);
 		const nine = Array.from({ length: 9 }, (_, i) => ({
 			question: `Q${i}?`,
-			options: [{ label: `O${i}` }],
+			// 0.5.3 D-4: well-formed batch questions carry a recommended option;
+			// this fixture targets the >8 limit, not the recommended contract.
+			options: [{ label: `O${i}`, recommended: true }],
 		}));
 		await assert.rejects(
 			() => tool.execute("t", { questions: nine }, undefined, undefined, ctx),
