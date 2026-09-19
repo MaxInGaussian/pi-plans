@@ -1,3 +1,5 @@
 node_modules/
 scripts/bench/vendor/
 scripts/bench/results/
+.package-lock.json
+src/*-hist-*.ts
