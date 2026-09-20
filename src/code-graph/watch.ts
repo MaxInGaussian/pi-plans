@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { isIndexablePath } from "./discovery.ts";
 import { reindexRelativePaths, type FreshnessRuntime } from "./freshness.ts";
-import { resolveCanonicalWorktree, type WorktreePaths } from "./paths.ts";
+import { PathError, resolveCanonicalWorktree, type WorktreePaths } from "./paths.ts";
 import { loadGraphRuntime } from "./runtime.ts";
 import { buildParsersFromRuntime } from "./freshness.ts";
 import type { Store } from "./store.ts";
@@ -250,7 +250,8 @@ export async function startGraphWatcher(workdir: string): Promise<StartResult> {
 }
 
 export function stopGraphWatcher(workdir: string): void {
-	const paths = resolveCanonicalWorktree(workdir);
+	const paths = tryResolveLifecyclePaths(workdir);
+	if (!paths) return;
 	const watcher = activeWatchers.get(paths.worktreeRoot);
 	if (watcher) {
 		watcher.stop();
@@ -267,9 +268,24 @@ export function stopGraphWatcher(workdir: string): void {
 	}
 }
 
+/**
+ * Lifecycle paths for non-session_start callers: the graph can only live
+ * inside a git worktree, so a non-git workdir is a normal no-op (silent
+ * degradation) rather than an error. Other errors still propagate.
+ */
+function tryResolveLifecyclePaths(workdir: string): WorktreePaths | null {
+	try {
+		return resolveCanonicalWorktree(workdir);
+	} catch (error) {
+		if (error instanceof PathError) return null;
+		throw error;
+	}
+}
+
 /** session_start re-establishment: marker present → best-effort restart. */
 export async function restartWatcherIfEnabled(workdir: string): Promise<void> {
-	const paths = resolveCanonicalWorktree(workdir);
+	const paths = tryResolveLifecyclePaths(workdir);
+	if (!paths) return;
 	try {
 		if (!fs.existsSync(markerPath(paths))) return;
 	} catch {
@@ -280,7 +296,8 @@ export async function restartWatcherIfEnabled(workdir: string): Promise<void> {
 
 /** disable-graph: stop watching and forget the marker. */
 export function disableWatcher(workdir: string): void {
-	const paths = resolveCanonicalWorktree(workdir);
+	const paths = tryResolveLifecyclePaths(workdir);
+	if (!paths) return;
 	stopGraphWatcher(workdir);
 	try {
 		fs.unlinkSync(markerPath(paths));

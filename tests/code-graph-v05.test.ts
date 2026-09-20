@@ -21,7 +21,7 @@ import {
 	resolveNodeSelector,
 } from "../src/code-graph/traverse.ts";
 import { computeCommunities } from "../src/code-graph/community.ts";
-import { startGraphWatcher, stopGraphWatcher, liveWatcherCount } from "../src/code-graph/watch.ts";
+import { startGraphWatcher, stopGraphWatcher, restartWatcherIfEnabled, disableWatcher, liveWatcherCount } from "../src/code-graph/watch.ts";
 import { makeBackend } from "../src/code-graph/parsers/javascript.ts";
 import { PythonBackend } from "../src/code-graph/parsers/python.ts";
 import { loadGraphRuntime } from "../src/code-graph/runtime.ts";
@@ -383,6 +383,56 @@ describe("watch lifecycle (VC-006)", () => {
 		}
 		stopGraphWatcher(root);
 		assert.equal(liveWatcherCount(), 0);
+		cleanup();
+	});
+});
+
+describe("non-git workdir degradation (0.5.5)", () => {
+	async function assertNonGit(root: string): Promise<void> {
+		const { execSync } = await import("node:child_process");
+		let notARepo = false;
+		try {
+			execSync("git rev-parse --show-toplevel", { cwd: root, stdio: "pipe" });
+		} catch {
+			notARepo = true;
+		}
+		assert.ok(notARepo, "fixture must not be inside a git work tree");
+	}
+
+	test("session_start restart is a silent no-op outside a git worktree", async () => {
+		const { root, cleanup } = tmpWorkdir(); // mkdtemp: never inside a git work tree
+		await assertNonGit(root);
+		// The pre-fix code rejected with PathError here, killing extension bind.
+		await assert.doesNotReject(() => restartWatcherIfEnabled(root));
+		assert.equal(liveWatcherCount(), 0, "no watcher may be created for a non-git workdir");
+		cleanup();
+	});
+
+	test("session_shutdown stop is a silent no-op outside a git worktree", async () => {
+		const { root, cleanup } = tmpWorkdir();
+		await assertNonGit(root);
+		// The pre-fix code threw PathError synchronously here.
+		assert.doesNotThrow(() => stopGraphWatcher(root));
+		assert.equal(liveWatcherCount(), 0);
+		cleanup();
+	});
+
+	test("disable-graph is a silent no-op outside a git worktree", async () => {
+		const { root, cleanup } = tmpWorkdir();
+		await assertNonGit(root);
+		// The pre-fix code threw PathError synchronously here.
+		assert.doesNotThrow(() => disableWatcher(root));
+		assert.equal(liveWatcherCount(), 0);
+		cleanup();
+	});
+
+	test("git worktree lifecycle entries keep working after the degradation guard", async () => {
+		const { root, cleanup } = tmpWorkdir();
+		const { execSync } = await import("node:child_process");
+		execSync("git init -q", { cwd: root });
+		await assert.doesNotReject(() => restartWatcherIfEnabled(root));
+		assert.doesNotThrow(() => stopGraphWatcher(root));
+		assert.doesNotThrow(() => disableWatcher(root));
 		cleanup();
 	});
 });

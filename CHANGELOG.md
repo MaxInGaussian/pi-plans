@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.5] - 2026-09-20
+
+### Fixed
+
+- **非 git 目录启动崩溃修复**：在非 git worktree（如 `~/Documents`）启动 pi 时，`session_start` → `restartWatcherIfEnabled` → `resolveCanonicalWorktree` 抛出的 `PathError` 以 unhandled rejection 形式被 pi 判为扩展 bind 失败，pi-plans 在非 git 目录完全不可用（skills/ask_choice/plans 全灭）。同类暴露：`session_shutdown` → `stopGraphWatcher`、`/disable-graph` → `disableWatcher`。现三入口统一静默降级（`tryResolveLifecyclePaths`：仅捕 `PathError` → 正常工况 no-op，其他异常照常抛出；非 git 目录无 `.git/pi_plans`，marker/lock/watcher 本就无从谈起）；`paths.ts` 的 fail-loud 语义与命令行路径不变。
+
 ## [0.5.4] - 2026-09-20
 
 ### Added
