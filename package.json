@@ -1,73 +1,73 @@
 {
-  "name": "pi-plans",
-  "version": "0.5.3",
-  "description": "Human-in-the-loop planning extension for the Pi coding agent: researched, refined Markdown plans before any code changes.",
-  "license": "MIT",
-  "type": "module",
-  "keywords": [
-    "pi-package",
-    "pi",
-    "planning",
-    "extension"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/MaxInGaussian/pi-plans.git"
-  },
-  "bugs": {
-    "url": "https://github.com/MaxInGaussian/pi-plans/issues"
-  },
-  "homepage": "https://github.com/MaxInGaussian/pi-plans#readme",
-  "publishConfig": {
-    "access": "public"
-  },
-  "engines": {
-    "node": ">=22.6"
-  },
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ],
-    "skills": [
-      "./skills",
-      "./skills/debug-and-plan",
-      "./skills/plan-small",
-      "./skills/plan-normal",
-      "./skills/plan-big",
-      "./skills/plan-with-refs"
-    ]
-  },
-  "files": [
-    "README.md",
-    "LICENSE",
-    "index.ts",
-    "agents/",
-    "docs/assets",
-    "references/",
-    "scripts/",
-    "skills/",
-    "src/",
-    "tests/",
-    "tools/"
-  ],
-  "scripts": {
-    "validate": "node --experimental-strip-types scripts/validate.ts",
-    "test": "node --experimental-strip-types scripts/run-tests.ts",
-    "prepack": "npm run validate && npm test"
-  },
-  "dependencies": {},
-  "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.4",
-    "@earendil-works/pi-coding-agent": "0.84.4",
-    "@earendil-works/pi-server": "0.84.4",
-    "@earendil-works/pi-tui": "0.84.4",
-    "typebox": "1.3.7",
-    "tree-sitter": "^0.25.1",
-    "tree-sitter-javascript": "^0.25.0",
-    "tree-sitter-python": "^0.25.0",
-    "tree-sitter-typescript": "^0.23.2"
-  },
-  "overrides": {
-    "tree-sitter": "^0.25.1"
-  }
+	"name": "pi-plans",
+	"version": "0.5.4",
+	"description": "Human-in-the-loop planning extension for the Pi coding agent: researched, refined Markdown plans before any code changes.",
+	"license": "MIT",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"planning",
+		"extension"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/MaxInGaussian/pi-plans.git"
+	},
+	"bugs": {
+		"url": "https://github.com/MaxInGaussian/pi-plans/issues"
+	},
+	"homepage": "https://github.com/MaxInGaussian/pi-plans#readme",
+	"publishConfig": {
+		"access": "public"
+	},
+	"engines": {
+		"node": ">=22.6"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		],
+		"skills": [
+			"./skills",
+			"./skills/debug-and-plan",
+			"./skills/plan-small",
+			"./skills/plan-normal",
+			"./skills/plan-big",
+			"./skills/plan-with-refs"
+		]
+	},
+	"files": [
+		"README.md",
+		"LICENSE",
+		"index.ts",
+		"agents/",
+		"docs/assets",
+		"references/",
+		"scripts/",
+		"skills/",
+		"src/",
+		"tests/",
+		"tools/"
+	],
+	"scripts": {
+		"validate": "node --experimental-strip-types scripts/validate.ts",
+		"test": "node --experimental-strip-types scripts/run-tests.ts",
+		"prepack": "npm run validate && npm test"
+	},
+	"dependencies": {},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "0.84.4",
+		"@earendil-works/pi-coding-agent": "0.84.4",
+		"@earendil-works/pi-server": "0.84.4",
+		"@earendil-works/pi-tui": "0.84.4",
+		"typebox": "1.3.7",
+		"tree-sitter": "^0.25.1",
+		"tree-sitter-javascript": "^0.25.0",
+		"tree-sitter-python": "^0.25.0",
+		"tree-sitter-typescript": "^0.23.2"
+	},
+	"overrides": {
+		"tree-sitter": "^0.25.1"
+	}
 }

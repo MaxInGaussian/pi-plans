@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
+	applyImplementationReviewConfigured,
 	applyLaneResult,
 	applyReviewConsolidated,
 	createCheckpoint,
@@ -322,3 +323,106 @@ describe("implementation-review round 1 fixes", () => {
 	});
 });
 
+describe("implementation-review reviewer-count fallback (0.5.4, D-4)", () => {
+	async function setupLoopRun(name: string, skill: string, reviewerCount?: number) {
+		const workdir = path.join(tmpRoot, name);
+		fs.mkdirSync(workdir, { recursive: true });
+		spawnSync("git", ["init"], { cwd: workdir });
+		const { initState, startRun, setRole } = await import("../src/state.ts");
+		initState(workdir);
+		setRole(workdir, { role: "reviewer", mode: "current-session", confirmed: true });
+		const { run } = startRun(workdir, { topic: name, skill, requestText: "t" });
+		createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+		fs.mkdirSync(run.artifact_dir, { recursive: true });
+		const planPath = path.join(run.artifact_dir, "PLAN_v1.md");
+		fs.writeFileSync(planPath, "# plan\n\n## Verifier Checklist\n\n- [ ] `VC-001` covers `I-001`; pass condition: x.\n", "utf8");
+		// refine's round-start guard requires a recorded termination condition
+		// before any implementation round, so the loop is always configured;
+		// reviewerCount may legitimately be absent (skill default applies).
+		mutateCheckpoint(workdir, run.run_id, (cp) =>
+			applyImplementationReviewConfigured(
+				{ ...cp, phase: "implementation-review", nextAction: "ask-question" },
+				"1 round",
+				reviewerCount,
+			),
+		);
+		return { workdir, runId: run.run_id, planPath };
+	}
+
+	async function registerToolHarness() {
+		const { registerRefineTool } = await import("../tools/refine.ts");
+		let tool: { execute: (id: string, params: unknown, signal: undefined, update: undefined, ctx: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> } | undefined;
+		const pi = {
+			registerTool: (definition: never) => {
+				tool = definition as unknown as typeof tool;
+			},
+		} as never;
+		registerRefineTool(pi, BASE_DIR_PLACEHOLDER);
+		assert.ok(tool, "refine tool registered");
+		return tool!;
+	}
+
+	it("omitted reviewers falls back to the checkpoint-configured reviewerCount", async () => {
+		const { workdir, runId, planPath } = await setupLoopRun("d4-fallback", "plan-small", 3);
+		const tool = await registerToolHarness();
+		const ctx = {
+			cwd: workdir,
+			sessionManager: {},
+			model: null,
+			mode: "print",
+			hasUI: false,
+			ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } },
+		};
+		const result = await tool.execute("t1", { role: "reviewer", target: "implementation", planPath }, undefined, undefined, ctx);
+		assert.match(result.content[0]?.text ?? "", /current-session/);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		const round = loaded.checkpoint.reviewRounds.at(-1);
+		assert.ok(round, "round recorded");
+		assert.equal(round!.reviewers, 3, "configured reviewerCount used as fallback");
+		assert.equal(round!.lanes.length, 3, "three lanes spawned");
+	});
+
+	it("explicit reviewers overrides the configured count", async () => {
+		const { workdir, runId, planPath } = await setupLoopRun("d4-explicit", "plan-big", 3);
+		const tool = await registerToolHarness();
+		const ctx = {
+			cwd: workdir,
+			sessionManager: {},
+			model: null,
+			mode: "print",
+			hasUI: false,
+			ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } },
+		};
+		await tool.execute("t1", { role: "reviewer", target: "implementation", planPath, reviewers: 1 }, undefined, undefined, ctx);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		const round = loaded.checkpoint.reviewRounds.at(-1);
+		assert.equal(round!.reviewers, 1, "explicit param wins");
+		assert.equal(round!.lanes.length, 1);
+	});
+
+	it("configured-without-count implementation round stays at 1 lane (skill default is prompt-level)", async () => {
+		const { workdir, runId, planPath } = await setupLoopRun("d4-unconfigured", "plan-big", undefined);
+		const tool = await registerToolHarness();
+		const ctx = {
+			cwd: workdir,
+			sessionManager: {},
+			model: null,
+			mode: "print",
+			hasUI: false,
+			ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } },
+		};
+		await tool.execute("t1", { role: "reviewer", target: "implementation", planPath }, undefined, undefined, ctx);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		const round = loaded.checkpoint.reviewRounds.at(-1);
+		assert.equal(round!.lanes.length, 1, "no configuration and no param → 1 lane");
+	});
+
+	it("count=2 consolidation text carries the source-reviewer contract (D-7)", async () => {
+		const source = fs.readFileSync(path.join(process.cwd(), "tools", "refine.ts"), "utf8");
+		assert.ok(source.includes("count > 1 ?"), "consolidation wording keyed on count > 1");
+		assert.ok(!source.includes("count === 3 ?"), "no 3-only gate remains");
+	});
+});

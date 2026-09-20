@@ -62,12 +62,23 @@ import {
 	PANEL_WIDGET_KEY,
 	derivePanelModel,
 	deriveNextAction,
+	deriveImplReviewLoopModel,
+	formatImplReviewLoopSummaryLine,
 	formatPanelSummaryLine,
+	renderImplReviewLoopLines,
 	renderPanelLines,
+	themeImplReviewLoopLines,
 	themePanelLines,
 } from "./panel.ts";
 import { resolveGraphMode } from "./code-graph/mode.ts";
-import { TERMINATION_QUESTION, TERMINATION_OPTIONS, TERMINATION_RECORDING_INSTRUCTIONS, renderTerminationOptions } from "./termination-prompt.ts";
+import {
+	TERMINATION_QUESTION,
+	TERMINATION_OPTIONS,
+	TERMINATION_RECORDING_INSTRUCTIONS,
+	defaultImplReviewers,
+	implReviewerCountPromptLine,
+	renderTerminationOptions,
+} from "./termination-prompt.ts";
 import {
 	extractCoverage,
 	latestPlanVersion,
@@ -421,6 +432,23 @@ function panelRunInfo(ctx: ExtensionContext): { status: string; created_at: stri
 }
 
 let panelRegistered = false;
+let loopPanelRegistered = false;
+
+/** Live implementation-review loop state for the panel: the widget stays
+ * alive while the active run is done BUT its checkpoint is still in the
+ * implementation-review phase (D-3). Read fresh on every call so post-write
+ * redraws (index.ts turn-end updateStatusWidget) never show stale rounds
+ * (D-8). Returns null once the phase flips to completed. */
+function implReviewLoopState(
+	ctx: ExtensionContext,
+): { topic: string; review: { terminationCondition?: string; reviewerCount?: number; completedRounds: number } } | null {
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	if (!active) return null;
+	if (getRun(ctx.cwd, active.run_id)?.status !== "done") return null;
+	const load = loadCheckpoint(ctx.cwd, active.run_id);
+	if (load.status !== "ok" || load.checkpoint.phase !== "implementation-review") return null;
+	return { topic: panelTopic(ctx), review: load.checkpoint.implementationReview };
+}
 
 /**
  * Register/update the fixed tasks' status panel (aboveEditor widget) for the
@@ -435,6 +463,36 @@ function updatePanelWidget(ctx: ExtensionContext): void {
 	// Capability guard: older Pi hosts and test harness mocks may not expose
 	// setWidget (the panel is a UI nicety, never a correctness dependency).
 	if (!ctx.hasUI || typeof ctx.ui.setWidget !== "function") return;
+	// Implementation-review loop widget (D-3): keeps the panel alive after
+	// execution ends while the loop is live; unregisters when the phase
+	// completes. Lives under the same widget key so the two widgets never
+	// stack.
+	const loop = execution === null ? implReviewLoopState(ctx) : null;
+	if (execution === null && loop) {
+		if (!loopPanelRegistered) {
+			ctx.ui.setWidget(
+				PANEL_WIDGET_KEY,
+				(ui, _theme) => ({
+					render(width: number) {
+						const theme = (ui as { theme?: { fg(color: string, text: string): string } }).theme ?? _theme;
+						// D-8 freshness: re-read the loop state per render; a phase flip to
+						// completed renders an empty box until the next turn-end refresh
+						// unregisters it (index.ts always calls updateStatusWidget then).
+						const live = implReviewLoopState(ctx);
+						if (!live) return [];
+						const model = deriveImplReviewLoopModel(live.topic, live.review);
+						const lines = renderImplReviewLoopLines(model, width);
+						return theme ? themeImplReviewLoopLines(lines, theme as never) : lines;
+					},
+				}),
+				{ placement: "aboveEditor" },
+			);
+			loopPanelRegistered = true;
+		}
+	} else if (loopPanelRegistered) {
+		ctx.ui.setWidget(PANEL_WIDGET_KEY, undefined);
+		loopPanelRegistered = false;
+	}
 	if (!execution) {
 		if (panelRegistered) {
 			ctx.ui.setWidget(PANEL_WIDGET_KEY, undefined);
@@ -487,6 +545,15 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 		// done reads as finished, abandoned as closed, stopped/accepted as paused.
 		const status = getRun(ctx.cwd, active.run_id)?.status;
 		if (status === "done") {
+			// D-3/D-015: while the implementation-review loop is live (checkpoint
+			// still in the implementation-review phase), the status line mirrors
+			// the loop box model instead of a bare "(done)".
+			const loop = implReviewLoopState(ctx);
+			if (loop) {
+				const line = formatImplReviewLoopSummaryLine(deriveImplReviewLoopModel(loop.topic, loop.review));
+				ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
+				return;
+			}
 			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("success", `🎯 plans: ${active.run_id} (done)`));
 			return;
 		}
@@ -1486,8 +1553,12 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 	// completion behavior. Both completeExecution call sites (turn_end and the
 	// restoreFromSession recovery path) share this behavior.
 	const interactive = ctx.hasUI === true;
+	// Skill-aware continuation: the reviewer-count default follows the active
+	// run's skill (D-1/D-4), so the prompt names the run's own recommended
+	// count instead of a static guess.
+	const activeRunForPrompt = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	const content = interactive
-		? `**Plan complete!** ✅ \`${planPath}\`\n\n${summary}\n\n${AMELIORATION_PROMPT_TEXT}`
+		? `**Plan complete!** ✅ \`${planPath}\`\n\n${summary}\n\n${ameliorationPromptText(activeRunForPrompt?.skill)}`
 		: `**Plan complete!** ✅ \`${planPath}\`\n\n${summary}`;
 	pi.sendMessage(
 		{
@@ -1513,10 +1584,14 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 
 /** Instructions appended to the post-execution completion message in
  * interactive sessions, telling the agent to enter the goal-running
- * implementation-review loop. Termination options are single-sourced from
+ * implementation-review loop. Skill-aware: the reviewer-count question's
+ * recommended option follows the run's skill (plan-big / plan-with-refs → 3,
+ * others → 1). Termination options are single-sourced from
  * src/termination-prompt.ts (shared with the ask_choice trailing branch). */
-export const AMELIORATION_PROMPT_TEXT = `---
-Goal-running continuation: immediately ask the user now via ask_choice (autoComplete: false, in the session language) the termination question: "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. ${TERMINATION_RECORDING_INSTRUCTIONS} Then keep running the implementation-review loop without asking whether to continue; the goal-wait option keeps the loop running until no unpassed VCs remain.`;
+export function ameliorationPromptText(skill: string | undefined): string {
+	return `---
+Goal-running continuation: immediately ask the user now via ask_choice (autoComplete: false, in the session language) the termination question: "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. ${TERMINATION_RECORDING_INSTRUCTIONS} ${implReviewerCountPromptLine(skill)} Then keep running the implementation-review loop without asking whether to continue; the goal-wait option keeps the loop running until no unpassed VCs remain.`;
+}
 
 /** Injection text for before_agent_start while executing. */
 export function executionContextMessage(ctx: ExtensionContext): string | null {

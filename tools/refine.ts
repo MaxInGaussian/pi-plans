@@ -107,7 +107,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 		name: "refine",
 		label: "Refine",
 		description:
-			"Run a reviewer or criticizer refinement round on a PLAN_vN.md (target=\"plan\", default) or on the implemented worktree (target=\"implementation\", post-execution amelioration) via read-only Pi subagents. Reviewer: findings with IDs, severity, evidence, impact, fix, disposition. Criticizer: up to five adaptive questions. Use reviewers: 3 for the big-plan concurrent reviewer round. Refuses to spawn until the role's mode and model are confirmed in .git/pi_plans/config.json (ask via ask_choice, persist via the plans tool).",
+			"Run a reviewer or criticizer refinement round on a PLAN_vN.md (target=\"plan\", default) or on the implemented worktree (target=\"implementation\", post-execution amelioration) via read-only Pi subagents. Reviewer: findings with IDs, severity, evidence, impact, fix, disposition. Criticizer: up to five adaptive questions. Use reviewers: 3 for concurrent reviewer rounds (big-plan plan review; implementation-review rounds honor the run's configured reviewerCount when reviewers is omitted). Refuses to spawn until the role's mode and model are confirmed in .git/pi_plans/config.json (ask via ask_choice, persist via the plans tool).",
 		promptSnippet: "Run reviewer/criticizer plan-refinement rounds",
 		parameters: RefineParams,
 
@@ -160,7 +160,18 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 			const useCheckpoint = checkpointLoad?.status === "ok" ? checkpointLoad.checkpoint : null;
 			const roundId =
 				params.resumeRoundId ?? `${target}-${params.role}-r${Date.now().toString(36)}`;
-			const roundReviewerCount = params.role === "reviewer" ? Math.min(3, Math.max(1, params.reviewers ?? 1)) : 1;
+			// D-4 durable reviewer-count fallback: an implementation-review reviewer
+			// round with an omitted `reviewers` reads the run's configured value
+			// from the checkpoint, so restarts/migrations never silently revert 2/3
+			// to 1. Explicit params always win; plan-review rounds are unchanged.
+			const configuredImplReviewers =
+				target === "implementation" && params.role === "reviewer"
+					? useCheckpoint?.implementationReview?.reviewerCount
+					: undefined;
+			const roundReviewerCount =
+				params.role === "reviewer"
+					? Math.min(3, Math.max(1, params.reviewers ?? configuredImplReviewers ?? 1))
+					: 1;
 			// F-001 (implementation review): the spec MUST carry lanes —
 			// reviewerLanes(count) for reviewer rounds, one lane for criticizer.
 			const roundLanes =
@@ -271,7 +282,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				}
 			}
 
-			const count = Math.min(3, Math.max(1, params.reviewers ?? 1));
+			const count = Math.min(3, Math.max(1, params.reviewers ?? configuredImplReviewers ?? 1));
 			const lanes = reviewerLanes(count);
 			const jobs = lanes.map((lane) => {
 				const name = `${roleConfig.name_prefix}-${active?.run_id ?? "adhoc"}-${lane.id}`;
@@ -383,7 +394,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 					content: [
 						{
 							type: "text",
-							text: `${text}\n\n---\nConsolidate: merge and dedupe findings into PLAN_vN_reviewer_comments.md${count === 3 ? " (one consolidated file; keep each finding's source reviewer, severity, evidence, and disposition)" : ""}, accept or reject each finding on repo/reference evidence, surface at most five high-priority findings to the user, then immediately ask the next refinement-mode question with ask_choice. Then record the boundary: plans record-checkpoint (checkpoint: { transition: "review-consolidated", roundId: "${roundId}", dispositionArtifact: "<comments file, run-dir relative>" }).${target === "implementation" ? ' When the whole round is disposed, also record (checkpoint: { transition: "implementation-round-finished" }); when the termination condition is met, close with (checkpoint: { transition: "completed", evidence: "<why the condition is satisfied>" }).' : ""}`,
+							text: `${text}\n\n---\nConsolidate: merge and dedupe findings into PLAN_vN_reviewer_comments.md${count > 1 ? " (one consolidated file; keep each finding's source reviewer, severity, evidence, and disposition)" : ""}, accept or reject each finding on repo/reference evidence, surface at most five high-priority findings to the user, then immediately ask the next refinement-mode question with ask_choice. Then record the boundary: plans record-checkpoint (checkpoint: { transition: "review-consolidated", roundId: "${roundId}", dispositionArtifact: "<comments file, run-dir relative>" }).${target === "implementation" ? ' When the whole round is disposed, also record (checkpoint: { transition: "implementation-round-finished" }); when the termination condition is met, close with (checkpoint: { transition: "completed", evidence: "<why the condition is satisfied>" }).' : ""}`,
 						},
 					],
 					details: {

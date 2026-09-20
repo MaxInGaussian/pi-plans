@@ -16,7 +16,13 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { disableAutoComplete, enableAutoComplete, isAutoCompleteEnabled, recordAskChoice } from "../src/autocomplete.ts";
 import { assertAutoApprovable, isAutoApproveEnabled } from "../src/auto-approve.ts";
-import { TERMINATION_QUESTION, TERMINATION_OPTIONS, TERMINATION_RECORDING_INSTRUCTIONS, renderTerminationOptions } from "../src/termination-prompt.ts";
+import {
+	TERMINATION_QUESTION,
+	TERMINATION_OPTIONS,
+	TERMINATION_RECORDING_INSTRUCTIONS,
+	implReviewerCountPromptLine,
+	renderTerminationOptions,
+} from "../src/termination-prompt.ts";
 import { truncateToWidth, visibleWidth } from "../src/refine-ui-helpers.ts";
 import { stripRecommendedMarker } from "../src/ask-form.ts";
 import {
@@ -226,7 +232,12 @@ interface AskChoiceDetails {
 /** Question ids reserved for single-question flows (R-013b/D-025): scope
  *  confirmation and the execution handoff must never ride inside a batch,
  *  where auto-complete could answer them without explicit user approval. */
-const FORBIDDEN_BATCH_QUESTION_IDS = new Set(["termination-condition", "scope-confirm", "scope-confirm-handoff"]);
+const FORBIDDEN_BATCH_QUESTION_IDS = new Set([
+	"termination-condition",
+	"impl-review-reviewer-count",
+	"scope-confirm",
+	"scope-confirm-handoff",
+]);
 
 interface BatchRuntime {
 	workdir: string;
@@ -792,11 +803,14 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			if (trailing && selected.startsWith("Auto-refine loop")) {
 				recordAskChoice(ctx, false);
 				record("Auto-refine loop", "user");
-				return {
+				// Skill-aware reviewer-count default (D-1/D-4): same mapping the
+				// goal-running continuation in src/exec.ts renders.
+				const activeSkill = resolveActiveRun(ctx.sessionManager, workdir)?.skill;
+			return {
 					content: [
 						{
 							type: "text",
-							text: `User selected Auto-refine loop. Immediately ask the follow-up with ask_choice (autoComplete: false, in the session language): "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. ${TERMINATION_RECORDING_INSTRUCTIONS} Then run the loop per the completion instructions: each round calls refine (role: "reviewer", target: "implementation"), accepts findings on evidence, applies fixes, re-runs relevant tests, and continues until the chosen termination condition — the goal-wait option keeps the loop running until no unpassed VCs remain.`,
+							text: `User selected Auto-refine loop. Immediately ask the follow-up with ask_choice (autoComplete: false, in the session language): "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. ${TERMINATION_RECORDING_INSTRUCTIONS} ${implReviewerCountPromptLine(activeSkill)} Then run the loop per the completion instructions: each round calls refine (role: "reviewer", target: "implementation", reviewers: <configured reviewerCount>), accepts findings on evidence, applies fixes, re-runs relevant tests, and continues until the chosen termination condition — the goal-wait option keeps the loop running until no unpassed VCs remain.`,
 						},
 					],
 					details: details("Auto-refine loop", "user"),

@@ -257,6 +257,44 @@ export interface ResumeBrief {
 	text: string;
 }
 
+/** D-5 crash-window recovery: rebuild the implementation-review loop
+ * configuration from the checkpoint plus the decisions ledger. Answers land
+ * in the ledger first (stable questionIds), the combined record-checkpoint
+ * second; between the two, this resolver reconstructs what is known and
+ * reports which questions are still missing. Exported for tests. */
+export function resolveImplReviewConfig(
+	review: { terminationCondition?: string; reviewerCount?: number; completedRounds: number } | undefined,
+	ledger: { questionId?: string; answer?: string }[],
+): {
+	condition: string | undefined;
+	conditionFromLedger: boolean;
+	reviewerCount: number | undefined;
+	reviewerCountFromLedger: boolean;
+	missing: Array<"termination-condition" | "impl-review-reviewer-count">;
+} {
+	const latest = (id: string): string | undefined =>
+		[...ledger].reverse().find((entry) => entry.questionId === id)?.answer;
+	const ledgerCondition = latest("termination-condition");
+	const ledgerCountRaw = latest("impl-review-reviewer-count");
+	const ledgerCount = ledgerCountRaw === undefined ? undefined : Number.parseInt(ledgerCountRaw, 10);
+	const ledgerCountValid = ledgerCount !== undefined && Number.isInteger(ledgerCount) && ledgerCount >= 1 && ledgerCount <= 3;
+	const condition = review?.terminationCondition ?? ledgerCondition;
+	const reviewerCount = review?.reviewerCount ?? (ledgerCountValid ? ledgerCount : undefined);
+	// Both questions are per-run configuration: a count is missing whenever it
+	// is unknown (including legacy checkpoints persisted before 0.5.4),
+	// independent of where the condition came from.
+	const missing: Array<"termination-condition" | "impl-review-reviewer-count"> = [];
+	if (condition === undefined) missing.push("termination-condition");
+	if (reviewerCount === undefined) missing.push("impl-review-reviewer-count");
+	return {
+		condition,
+		conditionFromLedger: review?.terminationCondition === undefined && ledgerCondition !== undefined,
+		reviewerCount,
+		reviewerCountFromLedger: review?.reviewerCount === undefined && ledgerCountValid,
+		missing,
+	};
+}
+
 async function buildBrief(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -323,12 +361,43 @@ async function buildBrief(
 			`[PI-PLANS RESUME] Implementation review of run ${runId} continues in this session.`,
 			`Plan: ${cp.plan?.path ?? "(unknown)"}`,
 		];
-		if (condition === undefined) {
+		// D-5 crash-window recovery: both config answers live in the decisions
+		// ledger under stable questionIds. Rebuild from the ledger, ask ONLY the
+		// missing question(s), then persist BOTH in one combined write. The
+		// re-ask guard on the checkpoint (termination condition already
+		// configured) rejects duplicate writes, so the combined write happens
+		// only while the field is genuinely absent.
+		const ledger = readDecisionLedger(ctx.cwd, runId);
+		const resolved = resolveImplReviewConfig(review, ledger);
+		const effectiveCondition = resolved.condition;
+		const effectiveCount = resolved.reviewerCount;
+		if (effectiveCondition === undefined) {
 			lines.push(
-				`The termination condition was never chosen. Ask it now via ask_choice (autoComplete: false, questionId: "termination-condition"): "How should the implementation-review loop terminate?" Options: goal wait (recommended) / until no high-severity finding (hard cap 5 rounds) / 1 / 2 / 3 rounds. Then persist with plans record-checkpoint (checkpoint: { transition: "implementation-review-configured", terminationCondition: ... }).`,
+				`The termination condition was never chosen. Ask it now via ask_choice (autoComplete: false, questionId: "termination-condition"): "How should the implementation-review loop terminate?" Options: goal wait (recommended) / until no high-severity finding (hard cap 5 rounds) / 1 / 2 / 3 rounds.`,
 			);
 		} else {
-			lines.push(`Termination condition: ${condition}`);
+			lines.push(`Termination condition: ${effectiveCondition}${resolved.conditionFromLedger ? " (recovered from the decisions ledger)" : ""}`);
+		}
+		if (review?.reviewerCount === undefined) {
+			if (effectiveCount !== undefined && Number.isInteger(effectiveCount) && effectiveCount >= 1 && effectiveCount <= 3) {
+				lines.push(`Reviewer count: ${effectiveCount} (recovered from the decisions ledger; not yet persisted).`);
+			} else {
+				lines.push(
+					`The reviewer count was never chosen. Ask it via ask_choice (autoComplete: false, allowOther: false, questionId: "impl-review-reviewer-count", digit labels "1"/"2"/"3"): "How many concurrent reviewers should each implementation-review round use?" — recommended default follows this run's skill: plan-big / plan-with-refs → 3, others → 1.`,
+				);
+			}
+		} else {
+			lines.push(`Reviewers per round: ${review.reviewerCount}`);
+		}
+		if (condition === undefined) {
+			// Only when the checkpoint is still unconfigured: the combined write
+			// (both answers) is one transaction. When only terminationCondition is
+			// missing but a ledger answer exists for both, write both; when a
+			// question is genuinely unanswered, ask first, then write.
+			lines.push(
+				`After both answers exist (asked now or recovered from the ledger), persist them in ONE call: plans record-checkpoint (checkpoint: { transition: "implementation-review-configured", terminationCondition: "<answer>", reviewerCount: <integer> }).`,
+			);
+		} else {
 			lines.push(`Completed rounds in this worktree: ${review?.completedRounds ?? 0} (hard cap 5).`);
 		}
 		const currentRound = review?.currentRoundId
@@ -342,7 +411,7 @@ async function buildBrief(
 			);
 		} else {
 			lines.push(
-				`Start the next round with refine (role: "reviewer", target: "implementation") — do NOT pass a resumeRoundId unless resuming an interrupted round.`,
+				`Start the next round with refine (role: "reviewer", target: "implementation", reviewers: ${review?.reviewerCount ?? effectiveCount ?? "<configured count>"}) — do NOT pass a resumeRoundId unless resuming an interrupted round; an omitted reviewers argument falls back to the run's configured reviewerCount.`,
 			);
 		}
 		lines.push(

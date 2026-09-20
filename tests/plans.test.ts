@@ -116,3 +116,72 @@ describe("pre-plan compaction wiring", () => {
 		assert.match(source, /pre-plan compaction skipped; continuing planning\./);
 	});
 });
+
+describe("record-checkpoint reviewerCount (0.5.4)", () => {
+	it("implementation-review-configured carries reviewerCount through schema and state", async () => {
+		const { recordCheckpointTransition } = await import("../tools/plans.ts");
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-rcp-rc-"));
+		try {
+			spawnSync("git", ["init"], { cwd: workdir });
+			const { initState, startRun } = await import("../src/state.ts");
+			initState(workdir);
+			const { run } = startRun(workdir, { topic: "rcp-rc", skill: "plan-big", requestText: "t" });
+			const { createCheckpoint, loadCheckpoint } = await import("../src/workflow-state.ts");
+			const { mutateCheckpoint } = await import("../src/workflow-state.ts");
+			createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+			mutateCheckpoint(workdir, run.run_id, (cp) => ({ ...cp, phase: "implementation-review", nextAction: "ask-question" }));
+			const ctx = { sessionManager: { id: "s" } };
+
+			const updated = recordCheckpointTransition(ctx, workdir, run.run_id, {
+				transition: "implementation-review-configured",
+				terminationCondition: "until no high-severity finding (hard cap 5 rounds)",
+				reviewerCount: 3,
+			});
+			assert.equal(updated.implementationReview?.reviewerCount, 3);
+			assert.equal(updated.nextAction, "run-review");
+			const loaded = loadCheckpoint(workdir, run.run_id);
+			assert.ok(loaded.status === "ok");
+			assert.equal(loaded.checkpoint.implementationReview?.reviewerCount, 3);
+
+			// Omitted reviewerCount still configures (skill default applies later).
+			const workdir2 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-rcp-rc2-"));
+			spawnSync("git", ["init"], { cwd: workdir2 });
+			initState(workdir2);
+			const { run: run2 } = startRun(workdir2, { topic: "rcp-rc2", skill: "plan-normal", requestText: "t" });
+			createCheckpoint(workdir2, { runId: run2.run_id, originWorkdir: workdir2, workdir: workdir2 });
+			mutateCheckpoint(workdir2, run2.run_id, (cp) => ({ ...cp, phase: "implementation-review", nextAction: "ask-question" }));
+			const updated2 = recordCheckpointTransition(ctx, workdir2, run2.run_id, {
+				transition: "implementation-review-configured",
+				terminationCondition: "1 round",
+			});
+			assert.equal(updated2.implementationReview?.reviewerCount, undefined);
+
+			// Boundary: reviewerCount outside 1-3 fails checkpoint validation on
+			// write (the tool's TypeBox schema rejects the same range earlier).
+			const workdir3 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-rcp-rc3-"));
+			try {
+				spawnSync("git", ["init"], { cwd: workdir3 });
+				initState(workdir3);
+				const { run: run3 } = startRun(workdir3, { topic: "rcp-rc3", skill: "plan-small", requestText: "t" });
+				createCheckpoint(workdir3, { runId: run3.run_id, originWorkdir: workdir3, workdir: workdir3 });
+				mutateCheckpoint(workdir3, run3.run_id, (cp) => ({ ...cp, phase: "implementation-review", nextAction: "ask-question" }));
+				for (const bad of [0, 4]) {
+					assert.throws(
+						() =>
+							recordCheckpointTransition(ctx, workdir3, run3.run_id, {
+								transition: "implementation-review-configured",
+								terminationCondition: "1 round",
+								reviewerCount: bad,
+							}),
+						/reviewerCount|1-3/,
+						`reviewerCount ${bad} rejected`,
+					);
+				}
+			} finally {
+				fs.rmSync(workdir3, { recursive: true, force: true });
+			}
+		} finally {
+			fs.rmSync(workdir, { recursive: true, force: true });
+		}
+	});
+});

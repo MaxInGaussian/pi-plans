@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
-	AMELIORATION_PROMPT_TEXT,
+	ameliorationPromptText,
 	applyDoneMarkers,
 	applyImplMarkers,
 	applyCurrentIMarker,
@@ -1468,9 +1468,28 @@ function makePreparation(reason: "manual" | "threshold" | "overflow", previousSu
 
 describe("amelioration termination prompt", () => {
 	it("recommends goal-wait first and keeps the round options", () => {
-		assert.match(AMELIORATION_PROMPT_TEXT, /goal wait: continue until no unpassed VCs remain/);
-		assert.match(AMELIORATION_PROMPT_TEXT, /until no high-severity finding \(hard cap 5 rounds\)/);
-		assert.match(AMELIORATION_PROMPT_TEXT, /How should the implementation-review loop terminate\?/);
+		const text = ameliorationPromptText("plan-normal");
+		assert.match(text, /goal wait: continue until no unpassed VCs remain/);
+		assert.match(text, /until no high-severity finding \(hard cap 5 rounds\)/);
+		assert.match(text, /How should the implementation-review loop terminate\?/);
+	});
+
+	it("asks the reviewer-count question with a skill-aware recommended default (D-1/D-2)", () => {
+		const big = ameliorationPromptText("plan-big");
+		assert.match(big, /impl-review-reviewer-count/);
+		assert.match(big, /How many concurrent reviewers should each implementation-review round use\?/);
+		assert.match(big, /3 \(recommended\)/);
+		assert.match(big, /reviewers: <configured reviewerCount>/);
+		const small = ameliorationPromptText("plan-small");
+		assert.match(small, /1 \(recommended\)/);
+		assert.doesNotMatch(small, /3 \(recommended\)/);
+	});
+
+	it("defers persistence to ONE combined record-checkpoint carrying both answers (D-5)", () => {
+		const text = ameliorationPromptText(undefined);
+		assert.match(text, /Do not persist yet/);
+		assert.match(text, /ONE call: plans record-checkpoint/);
+		assert.match(text, /terminationCondition: "<termination answer>", reviewerCount: <chosen integer>/);
 	});
 });
 

@@ -88,7 +88,14 @@ describe("ask_choice trailing option", () => {
 		assert.match(text, /User selected Auto-refine loop/);
 		assert.match(text, /until no high-severity finding \(hard cap 5 rounds\)/);
 		assert.match(text, /goal wait: continue until no unpassed VCs remain/);
-		assert.match(text, /refine \(role: "reviewer", target: "implementation"\)/);
+		assert.match(text, /refine \(role: "reviewer", target: "implementation", reviewers: <configured reviewerCount>\)/);
+		// 0.5.4: the trailing instructions now include the reviewer-count
+		// question with a skill-aware default (D-1/D-2) and the deferred
+		// combined persistence (D-5).
+		assert.match(text, /impl-review-reviewer-count/);
+		assert.match(text, /How many concurrent reviewers should each implementation-review round use\?/);
+		assert.match(text, /1 \(recommended\)/, "default workdir run has no active run → default 1");
+		assert.match(text, /Do not persist yet/);
 		assert.equal(result.details.source, "user");
 		assert.equal(result.details.answer, "Auto-refine loop");
 	});
