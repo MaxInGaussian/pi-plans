@@ -12,10 +12,13 @@ import {
 	BADGE_ROW_COUNT,
 	MIN_PANEL_WIDTH,
 	PANEL_ROW_COUNT,
+	deriveImplReviewLoopModel,
 	deriveNextAction,
 	derivePanelModel,
 	formatActivityTime,
+	formatImplReviewLoopSummaryLine,
 	formatPanelSummaryLine,
+	renderImplReviewLoopLines,
 	renderPanelLines,
 } from "../src/panel.ts";
 import { visibleWidth } from "../src/refine-ui-helpers.ts";
@@ -301,5 +304,52 @@ describe("no-timer discipline", () => {
 		const source = fs.readFileSync(path.join(process.cwd(), "src", "panel.ts"), "utf8");
 		assert.doesNotMatch(source, /setInterval|setTimeout/);
 		assert.doesNotMatch(source, /requestAnimationFrame/);
+	});
+});
+
+describe("implementation-review loop box (0.5.4, D-3)", () => {
+	it("derives the loop model from configured implementationReview state", () => {
+		const model = deriveImplReviewLoopModel("demo", {
+			terminationCondition: "goal wait: continue until no unpassed VCs remain (auto-continue each round)",
+			reviewerCount: 3,
+			completedRounds: 1,
+		});
+		assert.equal(model.roundLabel, "round 2");
+		assert.equal(model.reviewerLabel, "3 reviewers");
+		assert.match(model.conditionLabel, /goal wait/);
+	});
+
+	it("single reviewer never pluralizes; unconfigured state reads config pending", () => {
+		assert.equal(
+			deriveImplReviewLoopModel("t", { terminationCondition: "1 round", reviewerCount: 1, completedRounds: 0 }).reviewerLabel,
+			"1 reviewer",
+		);
+		const pending = deriveImplReviewLoopModel("t", { completedRounds: 0 });
+		assert.equal(pending.reviewerLabel, "reviewers config pending");
+		assert.equal(pending.conditionLabel, "termination config pending");
+		assert.equal(pending.roundLabel, "round 1");
+	});
+
+	it("renders a bounded 4-line box that survives narrow widths", () => {
+		const model = deriveImplReviewLoopModel("a-very-long-topic-name", {
+			terminationCondition: "goal wait",
+			reviewerCount: 2,
+			completedRounds: 0,
+		});
+		for (const width of [80, 40, 24]) {
+			const lines = renderImplReviewLoopLines(model, width);
+			assert.equal(lines.length, 4, `4 lines at width ${width}`);
+			for (const line of lines) {
+				assert.ok(visibleWidth(line) <= width, `line fits width ${width}: ${line}`);
+			}
+		}
+		// Full content only at comfortable widths; narrow widths degrade by
+		// truncation (asserted above by the width bound).
+		assert.match(renderImplReviewLoopLines(model, 80)[1], /impl-review . round 1 . 2 reviewers/);
+	});
+
+	it("summary line mirrors the box model (D-015)", () => {
+		const model = deriveImplReviewLoopModel("t", { terminationCondition: "1 round", reviewerCount: 3, completedRounds: 4 });
+		assert.equal(formatImplReviewLoopSummaryLine(model), "\ud83d\udd01 plans: impl-review round 5 \u00b7 3 reviewers");
 	});
 });

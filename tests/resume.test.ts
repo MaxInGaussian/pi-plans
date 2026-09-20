@@ -382,3 +382,59 @@ describe("F-004 ledger reconcile (crash window)", () => {
 		if (after.status === "ok") assert.equal(after.checkpoint.pendingQuestion, null);
 	});
 });
+
+describe("impl-review config crash-window recovery (0.5.4, D-5)", () => {
+	it("both answers in the ledger, none persisted: everything recovers, nothing missing", async () => {
+		const { resolveImplReviewConfig } = await import("../src/resume-command.ts");
+		const ledger = [
+			{ questionId: "termination-condition", answer: "1 round" },
+			{ questionId: "impl-review-reviewer-count", answer: "3" },
+		];
+		const resolved = resolveImplReviewConfig({ completedRounds: 0 }, ledger);
+		assert.equal(resolved.condition, "1 round");
+		assert.ok(resolved.conditionFromLedger);
+		assert.equal(resolved.reviewerCount, 3);
+		assert.ok(resolved.reviewerCountFromLedger);
+		assert.deepEqual(resolved.missing, []);
+	});
+
+	it("only termination answered: reviewer-count is the single missing question", async () => {
+		const { resolveImplReviewConfig } = await import("../src/resume-command.ts");
+		const resolved = resolveImplReviewConfig({ completedRounds: 0 }, [
+			{ questionId: "termination-condition", answer: "goal wait" },
+		]);
+		assert.equal(resolved.condition, "goal wait");
+		assert.equal(resolved.reviewerCount, undefined);
+		assert.deepEqual(resolved.missing, ["impl-review-reviewer-count"]);
+	});
+
+	it("persisted checkpoint wins over the ledger; latest ledger entry wins", async () => {
+		const { resolveImplReviewConfig } = await import("../src/resume-command.ts");
+		const resolved = resolveImplReviewConfig(
+			{ terminationCondition: "1 round", reviewerCount: 2, completedRounds: 0 },
+			[
+				{ questionId: "termination-condition", answer: "goal wait" },
+				{ questionId: "impl-review-reviewer-count", answer: "1" },
+			],
+		);
+		assert.equal(resolved.condition, "1 round");
+		assert.ok(!resolved.conditionFromLedger);
+		assert.equal(resolved.reviewerCount, 2);
+		assert.deepEqual(resolved.missing, []);
+		const staleThenFresh = resolveImplReviewConfig({ completedRounds: 0 }, [
+			{ questionId: "termination-condition", answer: "old" },
+			{ questionId: "termination-condition", answer: "new" },
+		]);
+		assert.equal(staleThenFresh.condition, "new", "latest ledger entry wins");
+	});
+
+	it("non-integer or out-of-range ledger counts are ignored, not adopted", async () => {
+		const { resolveImplReviewConfig } = await import("../src/resume-command.ts");
+		for (const bad of ["0", "4", "three"]) {
+			const resolved = resolveImplReviewConfig({ terminationCondition: "1 round", completedRounds: 0 }, [
+				{ questionId: "impl-review-reviewer-count", answer: bad },
+			]);
+			assert.equal(resolved.reviewerCount, undefined, `ledger answer ${bad} ignored`);
+		}
+	});
+});

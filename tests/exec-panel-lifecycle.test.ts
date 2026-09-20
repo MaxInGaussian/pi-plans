@@ -9,6 +9,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import { after, before, describe, it } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -273,5 +274,74 @@ describe("exec panel lifecycle", () => {
 		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_v4.md"), items("VC-001"));
 		assert.equal(h.recorded.widgets.length, 0, "capability guard skips widget registration");
 		assert.match(h.recorded.status ?? "", /plans: .* ▸ exec/);
+	});
+});
+describe("implementation-review loop widget (0.5.4, D-3/D-8)", () => {
+	it("stays alive after completion while the loop is live, then unregisters on completed", async () => {
+		const workdir = freshWorkdir();
+		const h = makeHarness(workdir);
+		// A previous test leaves a stray execution alive (module state); clear
+		// it so the loop widget's null-execution branch is reachable.
+		await stopExecution(h.pi, h.ctx, "cleanup-before-loop-test");
+		spawnSync("git", ["init"], { cwd: workdir });
+		const { startRun, setRunStatus } = await import("../src/state.ts");
+		const { run } = startRun(workdir, { topic: "loop-widget", skill: "plan-big", requestText: "t" });
+		const { createCheckpoint, mutateCheckpoint, applyImplementationReviewConfigured, applyCompleted } = await import(
+			"../src/workflow-state.ts"
+		);
+		createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+		mutateCheckpoint(workdir, run.run_id, (cp) =>
+			applyImplementationReviewConfigured(
+				{ ...cp, phase: "implementation-review", nextAction: "ask-question" },
+				"1 round",
+				3,
+			),
+		);
+		setRunStatus(workdir, run.run_id, "done");
+
+		updateStatusWidget(h.ctx);
+		const call = lastWidget(h);
+		assert.ok(call && call.content !== undefined, "loop widget registered while the loop is live");
+		assert.equal(call!.key, "pi-plans");
+		const lines = renderWidget(call, 80);
+		assert.equal(lines.length, 4, "compact 4-line loop box");
+		assert.match(lines[1], /impl-review . round 1 . 3 reviewers/);
+		assert.match(lines[2], /until: 1 round/);
+		assert.match(h.recorded.status ?? "", /plans: impl-review round 1 . 3 reviewers/);
+
+		// Round progress: completedRounds bump renders on the next refresh
+		// (D-8 live reads).
+		const { applyReviewRoundStarted, applyLaneResult, writeReviewOutput, applyReviewConsolidated, applyImplementationRoundFinished } =
+			await import("../src/workflow-state.ts");
+		mutateCheckpoint(workdir, run.run_id, (cp) =>
+			applyReviewRoundStarted(cp, {
+				roundId: "impl-reviewer-r1",
+				role: "reviewer",
+				target: "implementation",
+				reviewers: 3,
+				lanes: [{ laneId: "l1" }, { laneId: "l2" }, { laneId: "l3" }],
+			}),
+		);
+		const loadNow = await import("../src/workflow-state.ts");
+		const loadedNow = loadNow.loadCheckpoint(workdir, run.run_id);
+		assert.ok(loadedNow.status === "ok");
+		let cpNow = loadedNow.checkpoint;
+		for (const lane of ["l1", "l2", "l3"]) {
+			const file = writeReviewOutput(workdir, run.run_id, "impl-reviewer-r1", lane, "out");
+			cpNow = applyLaneResult(cpNow, "impl-reviewer-r1", lane, { ok: true, resultFile: file });
+		}
+		mutateCheckpoint(workdir, run.run_id, () =>
+			applyImplementationRoundFinished(applyReviewConsolidated(cpNow, "impl-reviewer-r1")),
+		);
+		updateStatusWidget(h.ctx);
+		const refreshed = renderWidget(lastWidget(h), 80);
+		assert.match(refreshed[1], /round 2/, "live checkpoint reads advance the round");
+
+		// Completion unregisters the widget and restores the (done) line.
+		mutateCheckpoint(workdir, run.run_id, (cp) => applyCompleted({ ...cp, nextAction: "finish-review" }, "1 round disposed; termination condition met"));
+		updateStatusWidget(h.ctx);
+		const lastCall = lastWidget(h);
+		assert.ok(lastCall && lastCall.content === undefined, "widget unregistered after completion");
+		assert.match(h.recorded.status ?? "", /\(done\)/);
 	});
 });

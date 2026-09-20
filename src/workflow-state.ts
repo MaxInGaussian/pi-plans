@@ -116,6 +116,9 @@ export interface ReviewRoundState {
 export interface ImplementationReviewState {
 	/** Serialized termination condition chosen by the user; undefined = not yet asked. */
 	terminationCondition?: string;
+	/** Concurrent reviewers per round (1-3), chosen per run; undefined = falls
+	 * back to the skill-level default (plan-big / plan-with-refs → 3, others → 1). */
+	reviewerCount?: number;
 	/** Whole rounds fully disposed in the CURRENT worktree (source-worktree rounds are history only). */
 	completedRounds: number;
 	currentRoundId?: string;
@@ -406,12 +409,23 @@ function asReviewRound(value: unknown, label: string): ReviewRoundState {
 
 function asImplementationReview(value: unknown, label: string): ImplementationReviewState {
 	const record = asRecord(value, label);
-	rejectExtraKeys(record, new Set(["terminationCondition", "completedRounds", "currentRoundId"]), label);
+	rejectExtraKeys(
+		record,
+		new Set(["terminationCondition", "reviewerCount", "completedRounds", "currentRoundId"]),
+		label,
+	);
 	const state: ImplementationReviewState = {
 		completedRounds: asInt(record.completedRounds, `${label}.completedRounds`, 0),
 	};
 	if (record.terminationCondition !== undefined) {
 		state.terminationCondition = asString(record.terminationCondition, `${label}.terminationCondition`);
+	}
+	if (record.reviewerCount !== undefined) {
+		const count = record.reviewerCount;
+		if (typeof count !== "number" || !Number.isInteger(count) || count < 1 || count > 3) {
+			throw new CheckpointValidationError(`${label}.reviewerCount must be an integer 1-3`);
+		}
+		state.reviewerCount = count;
 	}
 	if (record.currentRoundId !== undefined) {
 		state.currentRoundId = asOptionalId(record.currentRoundId, `${label}.currentRoundId`);
@@ -1056,7 +1070,11 @@ export function applyExecutionCompleted(cp: WorkflowCheckpoint): WorkflowCheckpo
 	};
 }
 
-export function applyImplementationReviewConfigured(cp: WorkflowCheckpoint, terminationCondition: string): WorkflowCheckpoint {
+export function applyImplementationReviewConfigured(
+	cp: WorkflowCheckpoint,
+	terminationCondition: string,
+	reviewerCount?: number,
+): WorkflowCheckpoint {
 	if (cp.phase !== "implementation-review") throw new StateError("requires phase \"implementation-review\"");
 	if (cp.implementationReview?.terminationCondition !== undefined) {
 		throw new StateError("termination condition already configured; do not re-ask");
@@ -1065,6 +1083,7 @@ export function applyImplementationReviewConfigured(cp: WorkflowCheckpoint, term
 		...cp,
 		implementationReview: {
 			terminationCondition,
+			reviewerCount,
 			completedRounds: cp.implementationReview?.completedRounds ?? 0,
 		},
 		nextAction: "run-review",
@@ -1109,7 +1128,11 @@ export function applyMigration(
 				}
 			: undefined,
 		implementationReview: cp.implementationReview
-			? { terminationCondition: cp.implementationReview.terminationCondition, completedRounds: 0 }
+			? {
+					terminationCondition: cp.implementationReview.terminationCondition,
+					reviewerCount: cp.implementationReview.reviewerCount,
+					completedRounds: 0,
+			}
 			: undefined,
 		nextAction: migrationNextAction(cp),
 	};

@@ -384,3 +384,77 @@ export function themePanelLines(lines: string[], model: PanelModel, theme: Panel
 		return theme.fg("muted", line);
 	});
 }
+// ---------------------------------------------------------------------------
+// Implementation-review loop widget (0.5.4, D-3): when execution is null but
+// the active run's checkpoint is still in the implementation-review phase, the
+// panel stays alive with a compact loop box derived from checkpoint state.
+// Pure model + renderer; exec.ts supplies live checkpoint reads at render
+// time (D-8 freshness) so post-write redraws never show stale rounds.
+// ---------------------------------------------------------------------------
+
+export interface ImplReviewLoopModel {
+	/** Run topic for the box header. */
+	topic: string;
+	/** 1-based round label for the NEXT round (completedRounds + 1). */
+	roundLabel: string;
+	/** "<n> reviewer(s)" or "config pending" when reviewerCount is unset. */
+	reviewerLabel: string;
+	/** Serialized termination condition, or "config pending". */
+	conditionLabel: string;
+}
+
+/** Derive the loop box model from the checkpoint's implementationReview state. */
+export function deriveImplReviewLoopModel(
+	topic: string,
+	review: { terminationCondition?: string; reviewerCount?: number; completedRounds: number } | undefined,
+): ImplReviewLoopModel {
+	const reviewers = review?.reviewerCount;
+	return {
+		topic,
+		roundLabel: `round ${(review?.completedRounds ?? 0) + 1}`,
+		reviewerLabel:
+			reviewers === undefined ? "reviewers config pending" : `${reviewers} reviewer${reviewers === 1 ? "" : "s"}`,
+		conditionLabel: review?.terminationCondition ?? "termination config pending",
+	};
+}
+
+/** Render the compact loop box (4 lines: header, loop, condition, footer). */
+export function renderImplReviewLoopLines(model: ImplReviewLoopModel, width: number): string[] {
+	const w = Math.max(4, Math.floor(width));
+	const loopContent = `impl-review · ${model.roundLabel} · ${model.reviewerLabel}`;
+	return [
+		renderPanelHeader(model.topic, w),
+		renderPanelLine(loopContent, w),
+		renderPanelLine(`until: ${model.conditionLabel}`, w),
+		renderPanelFooter(w),
+	];
+}
+
+/** Theme the loop box: header per themePanelLines conventions, accent loop
+ * line, muted rest; │ borders never inherit content color. */
+export function themeImplReviewLoopLines(lines: string[], theme: PanelTheme): string[] {
+	return lines.map((line, index) => {
+		if (index === 0) {
+			const brandIndex = line.indexOf("pi-plans");
+			if (brandIndex >= 0) {
+				return (
+					theme.fg("muted", line.slice(0, brandIndex)) +
+					theme.fg("accent", "pi-plans") +
+					theme.fg("muted", line.slice(brandIndex + "pi-plans".length))
+				);
+			}
+			return theme.fg("muted", line);
+		}
+		const color = index === 1 ? "accent" : "muted";
+		if (line.length >= 2 && line.startsWith(BORDER_V) && line.endsWith(BORDER_V)) {
+			return theme.fg("muted", BORDER_V) + theme.fg(color, line.slice(1, -1)) + theme.fg("muted", BORDER_V);
+		}
+		return theme.fg("muted", line);
+	});
+}
+
+/** Bottom status-bar line for the live implementation-review loop (D-015:
+ * same model as the box). */
+export function formatImplReviewLoopSummaryLine(model: ImplReviewLoopModel): string {
+	return `🔁 plans: impl-review ${model.roundLabel} · ${model.reviewerLabel}`;
+}

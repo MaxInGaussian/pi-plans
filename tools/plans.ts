@@ -146,6 +146,9 @@ const PlansParams = Type.Object({
 			dispositionArtifact: Type.Optional(Type.String()),
 			/** implementation-review-configured: the serialized termination condition chosen by the user. */
 			terminationCondition: Type.Optional(Type.String()),
+			/** implementation-review-configured: concurrent reviewers per round (1-3);
+			 * omit to keep the skill-level default (plan-big / plan-with-refs → 3, others → 1). */
+			reviewerCount: Type.Optional(Type.Integer({ minimum: 1, maximum: 3 })),
 			/** completed: non-empty evidence that the termination condition is satisfied. */
 			evidence: Type.Optional(Type.String()),
 		}),
@@ -240,6 +243,7 @@ export function recordCheckpointTransition(
 		roundId?: string;
 		dispositionArtifact?: string;
 		terminationCondition?: string;
+		reviewerCount?: number;
 		evidence?: string;
 	},
 ): WorkflowCheckpoint {
@@ -271,7 +275,7 @@ export function recordCheckpointTransition(
 				throw new StateError("implementation-review-configured requires terminationCondition");
 			}
 			return mutateCheckpoint(workdir, runId, (cp) =>
-				applyImplementationReviewConfigured(cp, checkpoint.terminationCondition!),
+				applyImplementationReviewConfigured(cp, checkpoint.terminationCondition!, checkpoint.reviewerCount),
 			);
 		}
 		case "implementation-round-finished": {

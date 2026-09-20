@@ -430,3 +430,73 @@ describe("state machine reducers", () => {
 		assert.equal(migrated.migration?.fromWorktree, cp.worktreeRoot);
 	});
 });
+
+describe("implementationReview.reviewerCount (0.5.4)", () => {
+	it("configured persists reviewerCount and survives checkpoint roundtrip", () => {
+		const { workdir, runId } = setupRun("rc-persist");
+		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
+		let cp = baseCheckpoint(workdir, runId);
+		cp = { ...cp, phase: "implementation-review", nextAction: "ask-question" };
+		cp = applyImplementationReviewConfigured(cp, "until-no-high", 2);
+		assert.equal(cp.implementationReview?.reviewerCount, 2);
+		assert.equal(cp.nextAction, "run-review");
+		mutateCheckpoint(workdir, runId, () => cp);
+		const reloaded = loadCheckpoint(workdir, runId);
+		assert.ok(reloaded.status === "ok");
+		assert.equal(reloaded.checkpoint.implementationReview?.reviewerCount, 2);
+	});
+
+	it("omitted reviewerCount stays undefined (legacy checkpoints unchanged)", () => {
+		const { workdir, runId } = setupRun("rc-legacy");
+		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
+		let cp = baseCheckpoint(workdir, runId);
+		cp = { ...cp, phase: "implementation-review", nextAction: "ask-question" };
+		cp = applyImplementationReviewConfigured(cp, "1 round");
+		assert.equal(cp.implementationReview?.reviewerCount, undefined);
+		mutateCheckpoint(workdir, runId, () => cp);
+		assert.ok(loadCheckpoint(workdir, runId).status === "ok");
+	});
+
+	it("rejects out-of-range and non-integer reviewerCount on load", () => {
+		const { workdir, runId } = setupRun("rc-invalid");
+		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
+		const file = checkpointFilePath(workdir, runId)!;
+		const base = JSON.parse(fs.readFileSync(file, "utf8")) as { implementationReview?: unknown };
+		for (const bad of [0, 4, "3", 1.5]) {
+			const doc = {
+				...base,
+				implementationReview: {
+					terminationCondition: "1 round",
+					reviewerCount: bad,
+					completedRounds: 0,
+				},
+			};
+			fs.writeFileSync(file, JSON.stringify(doc), "utf8");
+			const loaded = loadCheckpoint(workdir, runId);
+			assert.ok(loaded.status === "corrupt", `reviewerCount ${JSON.stringify(bad)} rejected`);
+		}
+		// Corrupt bytes refuse overwrite (mutateCheckpoint guard), which is the
+		// intended fail-loud behavior — no restore attempted here.
+	});
+
+	it("applyMigration preserves an explicit reviewerCount (CQ1/D-4)", () => {
+		const { workdir, runId } = setupRun("rc-migrate");
+		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
+		let cp = baseCheckpoint(workdir, runId);
+		cp = { ...cp, phase: "implementation-review", nextAction: "run-review" };
+		cp = applyImplementationReviewConfigured(cp, "until-no-high", 3);
+		cp = applyReviewRoundStarted(cp, { roundId: "i1", role: "reviewer", target: "implementation", reviewers: 3, lanes: [{ laneId: "l1" }] });
+		const migrated = applyMigration(cp, { workdir: "/target/wt", worktreeRoot: "/target/wt", commonDir: "/target/.git" });
+		assert.equal(migrated.implementationReview?.reviewerCount, 3);
+		assert.equal(migrated.implementationReview?.completedRounds, 0);
+	});
+
+	it("second configuration write is rejected even with identical values (replay guard)", () => {
+		const { workdir, runId } = setupRun("rc-replay");
+		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
+		let cp = baseCheckpoint(workdir, runId);
+		cp = { ...cp, phase: "implementation-review", nextAction: "ask-question" };
+		cp = applyImplementationReviewConfigured(cp, "until-no-high", 3);
+		assert.throws(() => applyImplementationReviewConfigured(cp, "until-no-high", 3), StateError);
+	});
+});

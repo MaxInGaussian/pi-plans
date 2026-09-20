@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.4] - 2026-09-20
+
+### Added
+
+- **implementation-review 并行 reviewer 支持**：此前每轮恒用 1 个 reviewer——能力层 `refine` 的 `reviewers`(1-3) 本就对两种 target 一视同仁，但所有引导文本（工具 description、完成续跑提示词、workflow 文档）都把 3 并行只绑定在 big-plan 的 PLAN 评审上，agent 进循环后从不传参。现全链路收口：
+  - **默认随 skill**：plan-big / plan-with-refs → 3，其余 → 1（`defaultImplReviewers`，控制 subagent 成本）；
+  - **每 run 可调**：终止条件问题后追加 reviewer-count 问题（questionId `impl-review-reviewer-count`，纯数字标签 1/2/3 + ★ 推荐位，`allowOther: false`），两答合并一次 `record-checkpoint` 持久化（`ImplementationReviewState.reviewerCount`，整数 1-3 校验）；
+  - **工具兑底（D-4）**：`refine` 在 implementation 轮省略 `reviewers` 时自动读 checkpoint 配置值——重启/worktree 迁移后 2/3 不会静默回落 1（`applyMigration` 同步保留字段）；
+  - **崩溃窗口恢复（D-5）**：两答已落 decisions.jsonl、合并写之前的窗口，`/resume-plans` 从台账重建已答部分、只补问缺失题（`resolveImplReviewConfig` 纯函数，latest-entry-wins）；
+  - **面板循环盒（D-3）**：loop 期间（run done + checkpoint phase=implementation-review）widget 保活渲染紧凑盒（round 数 + reviewer 数或 config pending + 终止条件），状态行同源镜像（D-015）；completed 后注销回落 `(done)`；渲染时活读 checkpoint，回合末刷新永不滞后（D-8）；
+  - **双 lane 合并契约统一（D-7）**：`refine` 结果文案的 source-reviewer 标注由 `count === 3` 改为 `count > 1`，2 lane 同样保留来源与 ≤5 高优上限；
+  - 新增 21 项测试（termination-prompt 映射/选项、workflow-state 校验/迁移/重放守卫、plans schema/透传、refine 兑底/覆盖/count=2 文案、panel 循环盒三态与窄宽度、loop widget 生命周期、ask_choice trailing 双问、resume 三态恢复），全量 485 测试全绿。
+
 ## [0.5.3] - 2026-09-19
 
 ### Fixed
