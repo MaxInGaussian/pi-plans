@@ -17,6 +17,7 @@
 
 import { CURSOR_MARKER, type TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "./refine-ui-helpers.ts";
+import { decodePrintableChunk, normalizeKey } from "./terminal-keys.ts";
 
 export const FORM_QUESTION_MAX = 8;
 const CUSTOM_LABEL = "✏️ 自定义答案…";
@@ -109,20 +110,28 @@ export type FormKeyEvent =
 	| "abort-editing";
 
 /**
- * Advance the state machine by one raw terminal key chunk. Returns the event
- * the caller should react to (submit/cancel/editing transitions need UI-level
- * side effects: hardware cursor, done(), ledger writes).
+ * Advance the state machine by one raw terminal key chunk. Keys are normalized
+ * through terminal-keys first, so legacy, SS3 (application-cursor) and kitty
+ * CSI-u encodings all drive the same transitions. Returns the event the caller
+ * should react to (submit/cancel/editing transitions need UI-level side
+ * effects: hardware cursor, done(), ledger writes).
  */
 export function formHandleKey(state: FormState, data: string): FormKeyEvent {
+	const key = normalizeKey(data);
 	if (state.editing) {
-		if (data === "\r" || data === "\n") return confirmBuffer(state);
-		if (data === "\x1b") {
+		if (key === "enter") return confirmBuffer(state);
+		if (key === "escape") {
 			state.editing = false;
 			state.buffer = "";
 			return "abort-editing";
 		}
-		if (data === "\x7f" || data === "\x08") {
+		if (key === "backspace") {
 			state.buffer = state.buffer.slice(0, -1);
+			return "render";
+		}
+		const text = decodePrintableChunk(data);
+		if (text !== undefined) {
+			state.buffer += text;
 			return "render";
 		}
 		if (data.startsWith("\x1b")) return "noop"; // arrow/CSI sequences ignored while typing
@@ -130,25 +139,25 @@ export function formHandleKey(state: FormState, data: string): FormKeyEvent {
 		return "render";
 	}
 	const n = state.questions.length;
-	if (data === "\x1b") return "cancel";
-	if (data === "\t") {
+	if (key === "escape") return "cancel";
+	if (key === "tab") {
 		state.tab = state.tab + 1 > n ? 0 : state.tab + 1;
 		return "render";
 	}
-	if (data === "\x1b[Z") {
+	if (key === "shift+tab") {
 		state.tab = state.tab - 1 < 0 ? n : state.tab - 1;
 		return "render";
 	}
-	if (data === "\x1b[C") {
+	if (key === "right") {
 		state.tab = Math.min(n, state.tab + 1);
 		return "render";
 	}
-	if (data === "\x1b[D") {
+	if (key === "left") {
 		state.tab = Math.max(0, state.tab - 1);
 		return "render";
 	}
 	if (state.tab === n) {
-		if (data === "\r" || data === "\n") {
+		if (key === "enter") {
 			return allAnswered(state) ? "submit" : "render";
 		}
 		return "noop";
@@ -156,16 +165,19 @@ export function formHandleKey(state: FormState, data: string): FormKeyEvent {
 	// Question tab.
 	const q = state.questions[state.tab];
 	const total = q.options.length + (q.allowOther ? 1 : 0);
-	if (data === "\x1b[A" || data === "\x1b[B") {
-		const delta = data === "\x1b[A" ? -1 : 1;
+	if (key === "up" || key === "down") {
+		const delta = key === "up" ? -1 : 1;
 		const row = state.selection[state.tab];
-		state.selection[state.tab] = total === 0 ? -1 : (row + delta + total + 1) % (total + 1);
+		const next = row + delta;
+		// Explicit clamp-wrap: the -1 "no cursor" position is part of the cycle,
+		// so the first row wraps up to it and the last row wraps down to it.
+		state.selection[state.tab] = next >= total ? -1 : next < -1 ? total - 1 : next;
 		// Moving the cursor off a confirmed row invalidates the confirm: the
 		// tab flips back to □ until Enter re-confirms the new row.
 		if (state.selection[state.tab] !== row) state.confirmed[state.tab] = false;
 		return "render";
 	}
-	if (data === "\r" || data === "\n") {
+	if (key === "enter") {
 		const row = state.selection[state.tab];
 		if (q.allowOther && row === q.options.length) {
 			state.editing = true;

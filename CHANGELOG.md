@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.6] - 2026-09-23
+
+### Fixed
+
+- **批量表单在 kitty / application-cursor 终端下按键全死（issue #2，致谢 @Griznah）**：`formHandleKey` 用裸字符串比较匹配 legacy CSI 序列，而 pi-tui 会把原始 stdin 直接交给聚焦组件——协商 kitty keyboard protocol 后所有键变 CSI-u（Enter=`\x1b[13u`、Tab=`\x1b[9u`、Esc=`\x1b[27u`、方向键=`\x1b[57417..57420u`），裸比较全部落空、表单 100% 不可操作；application-cursor（SS3 `\x1bOA`…）下方向键同样死。现统一迁移到键归一化：
+  - 新增共享 `src/terminal-keys.ts`：pi-tui 可解析时委托 `parseKey` / `matchesKey` / `decodeKittyPrintable`，不可解析时本地 fallback（legacy + SS3 + kitty CSI-u + 修饰键，与 pi-tui 语义逐项对齐：修饰键命名序、shifted 字母身份、功能码点等价表、printable 过滤）；
+  - `formHandleKey` 改为归一化判键；编辑分支支持 kitty 文本（含 CJK/Shift）与 kitty Backspace，非文本序列（方向键、ctrl 组合）不插入，非 kitty 原始 UTF-8（IME）直通，且一个 chunk 内的多个 CSI-u 序列全部解码；
+  - `refine-ui.ts` 同步迁移（生产路径本已走 `matchesKey`；fallback 键表补 kitty 形态，并修掉「任意 CSI 都算 Esc」的旧缺陷）；`refine-ui-helpers.matchesEscape` 随之删除；
+  - 附带修复 wrap 公式 off-by-one：UP from 首行 / DOWN from 末行会算出非法行 `total`（Enter 静默 noop），改为显式钳位换行（`-1` 未选中位参与循环）；
+  - 新增 17 项测试（terminal-keys loaded/fallback 与 pi-tui 的 parity 表、chunk 解码、kitty/SS3 全键表、编辑分支、wrap 四边界、refine-ui 双侧），全量 506 测试全绿。
+
 ## [0.5.5] - 2026-09-20
 
 ### Fixed

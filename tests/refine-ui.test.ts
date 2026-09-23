@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { RefineOverlayComponent, RefineOverlayController } from "../src/refine-ui.ts";
 import { visibleWidth } from "../src/refine-ui-helpers.ts";
+import { __clearPiTuiForTests, __setPiTuiForTests } from "../src/terminal-keys.ts";
 import { applyRefineProgress, applyRefineResult, statusLabel, type RefineLaneState } from "../src/refine-ui-state.ts";
 
 function lane(id = "lane-1", label = "reviewer-1", text = ""): RefineLaneState {
@@ -422,5 +423,67 @@ describe("overlay frame colors and ANSI width", () => {
 		}
 		// Zero-width accounting: pure escape payload measures nothing.
 		assert.equal(visibleWidth("\x1b[38;5;244m\x1b[0m"), 0);
+	});
+});
+
+describe("refine overlay kitty and fallback key handling (issue #2)", () => {
+	it("scrolls and switches lanes with kitty CSI-u keys", () => {
+		const long = Array.from({ length: 30 }, (_, index) => `line-${index + 1}`).join("\n");
+		const lanes = [readyLane("lane-1", "one", long), readyLane("lane-2", "two", long)];
+		const component = new RefineOverlayComponent(fakeTheme, "reviewer", lanes, () => {});
+		component.render(100);
+		const laneOneStart = lanes[0]!.scrollOffset;
+		component.handleInput("\x1b[57419u"); // kitty up on lane one
+		component.render(100);
+		assert.equal(lanes[0]!.followTranscript, false);
+		assert.equal(lanes[0]!.scrollOffset, laneOneStart - 1);
+		component.handleInput("\x1b[9u"); // kitty Tab → lane two
+		component.render(100);
+		const laneTwoStart = lanes[1]!.scrollOffset;
+		component.handleInput("\x1b[57419u"); // kitty up on lane two
+		component.render(100);
+		assert.equal(lanes[1]!.scrollOffset, laneTwoStart - 1);
+		component.handleInput("\x1b[57420u"); // kitty down on lane two
+		component.render(100);
+		assert.equal(lanes[1]!.scrollOffset, laneTwoStart);
+		component.handleInput("\x1b[9;2u"); // kitty Shift+Tab → back to lane one
+		component.handleInput("\x1b[57419u"); // kitty up on lane one again
+		component.render(100);
+		assert.equal(lanes[0]!.scrollOffset, laneOneStart - 2);
+	});
+
+	it("pages with kitty page keys and cancels with kitty Esc", () => {
+		const long = Array.from({ length: 30 }, (_, index) => `line-${index + 1}`).join("\n");
+		const lanes = [readyLane("lane-1", "one", long)];
+		const calls: string[] = [];
+		const component = new RefineOverlayComponent(fakeTheme, "reviewer", lanes, () => calls.push("cancel"));
+		component.render(100);
+		const initialOffset = lanes[0]!.scrollOffset;
+		component.handleInput("\x1b[57421u"); // kitty pageUp
+		assert.ok(lanes[0]!.scrollOffset < initialOffset);
+		component.handleInput("\x1b[27u"); // kitty Esc
+		assert.deepEqual(calls, ["cancel"]);
+	});
+
+	it("treats arrows as scroll keys, not escape, on the fallback path", () => {
+		__setPiTuiForTests(undefined);
+		try {
+			const long = Array.from({ length: 30 }, (_, index) => `line-${index + 1}`).join("\n");
+			const lanes = [readyLane("lane-1", "one", long)];
+			const calls: string[] = [];
+			const component = new RefineOverlayComponent(fakeTheme, "reviewer", lanes, () => calls.push("cancel"));
+			component.render(100);
+			const initialOffset = lanes[0]!.scrollOffset;
+			component.handleInput("\x1b[A"); // legacy up scrolls (must not cancel)
+			component.handleInput("\x1bOA"); // SS3 up scrolls
+			component.handleInput("\x1b[57419u"); // kitty up scrolls
+			component.render(100);
+			assert.deepEqual(calls, []);
+			assert.equal(lanes[0]!.scrollOffset, initialOffset - 3);
+			component.handleInput("\x1b"); // legacy Esc cancels
+			assert.deepEqual(calls, ["cancel"]);
+		} finally {
+			__clearPiTuiForTests();
+		}
 	});
 });

@@ -1,8 +1,8 @@
 import type { ExtensionCommandContext, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import type { SubagentProgressEvent, SubagentResult } from "./subagent.ts";
+import { getPiTui, matchesTerminalKey } from "./terminal-keys.ts";
 import {
-	matchesEscape as localMatchesEscape,
 	truncateToWidth as localTruncateToWidth,
 	visibleWidth as localVisibleWidth,
 	wrapTextWithAnsi as localWrapTextWithAnsi,
@@ -17,25 +17,10 @@ import {
 	type RefineOverlayRole,
 } from "./refine-ui-state.ts";
 
-let _piTui: typeof import("@earendil-works/pi-tui") | undefined;
-let _piTuiAttempted = false;
-
-async function loadPiTui(): Promise<typeof import("@earendil-works/pi-tui") | undefined> {
-	if (_piTuiAttempted) return _piTui;
-	_piTuiAttempted = true;
-	try {
-		_piTui = await import("@earendil-works/pi-tui");
-	} catch {
-		_piTui = undefined;
-	}
-	return _piTui;
-}
-
-void loadPiTui();
-
 function truncateToWidth(text: string, width: number, ellipsis = ""): string {
 	try {
-		return _piTui ? _piTui.truncateToWidth(text, width, ellipsis) : localTruncateToWidth(text, width, ellipsis);
+		const tui = getPiTui();
+		return tui ? tui.truncateToWidth(text, width, ellipsis) : localTruncateToWidth(text, width, ellipsis);
 	} catch {
 		return localTruncateToWidth(text, width, ellipsis);
 	}
@@ -43,7 +28,8 @@ function truncateToWidth(text: string, width: number, ellipsis = ""): string {
 
 function visibleWidth(text: string): number {
 	try {
-		return _piTui ? _piTui.visibleWidth(text) : localVisibleWidth(text);
+		const tui = getPiTui();
+		return tui ? tui.visibleWidth(text) : localVisibleWidth(text);
 	} catch {
 		return localVisibleWidth(text);
 	}
@@ -51,41 +37,16 @@ function visibleWidth(text: string): number {
 
 function wrapTextWithAnsi(text: string, width: number): string[] {
 	try {
-		return _piTui ? _piTui.wrapTextWithAnsi(text, width) : localWrapTextWithAnsi(text, width);
+		const tui = getPiTui();
+		return tui ? tui.wrapTextWithAnsi(text, width) : localWrapTextWithAnsi(text, width);
 	} catch {
 		return localWrapTextWithAnsi(text, width);
 	}
 }
 
-type RefineKey = "escape" | "tab" | "shift+tab" | "up" | "down" | "pageUp" | "pageDown";
-
-function fallbackKey(data: string, key: RefineKey): boolean {
-	const sequences: Record<RefineKey, string[]> = {
-		escape: ["\x1b", "\x1b\x1b"],
-		tab: ["\t"],
-		"shift+tab": ["\x1b[Z"],
-		up: ["\x1b[A", "\x1bOA"],
-		down: ["\x1b[B", "\x1bOB"],
-		pageUp: ["\x1b[5~"],
-		pageDown: ["\x1b[6~"],
-	};
-	return sequences[key].includes(data);
-}
-
-function matchesKey(data: string, key: RefineKey): boolean {
-	try {
-		return _piTui ? _piTui.matchesKey(data, key) : fallbackKey(data, key);
-	} catch {
-		return fallbackKey(data, key);
-	}
-}
-
-function handleEscape(data: string): boolean {
-	try {
-		return _piTui ? _piTui.matchesKey(data, "escape") : localMatchesEscape(data);
-	} catch {
-		return localMatchesEscape(data);
-	}
+/** Escape — plus the legacy double-ESC burst the fallback historically accepted. */
+function isEscape(data: string): boolean {
+	return matchesTerminalKey(data, "escape") || data === "\x1b\x1b";
 }
 
 export type { RefineLaneState, RefineLaneStatus, RefineOverlayRole, RefineTranscriptEntry, RefineTranscriptEntryType } from "./refine-ui-state.ts";
@@ -231,16 +192,16 @@ export class RefineOverlayComponent implements Component {
 
 	handleInput(data: string): void {
 		if (this.disposed) return;
-		if (handleEscape(data)) {
+		if (isEscape(data)) {
 			this.onCancel();
 			return;
 		}
-		if (this.lanes.length > 1 && matchesKey(data, "tab")) {
+		if (this.lanes.length > 1 && matchesTerminalKey(data, "tab")) {
 			this.selectedLane = (this.selectedLane + 1) % this.lanes.length;
 			this.tui?.requestRender();
 			return;
 		}
-		if (this.lanes.length > 1 && matchesKey(data, "shift+tab")) {
+		if (this.lanes.length > 1 && matchesTerminalKey(data, "shift+tab")) {
 			this.selectedLane = (this.selectedLane - 1 + this.lanes.length) % this.lanes.length;
 			this.tui?.requestRender();
 			return;
@@ -248,10 +209,10 @@ export class RefineOverlayComponent implements Component {
 		const lane = this.lanes[this.selectedLane];
 		if (!lane) return;
 		const viewport = Math.max(1, lane.viewportHeight ?? 1);
-		if (matchesKey(data, "up")) lane.scrollOffset -= 1;
-		else if (matchesKey(data, "down")) lane.scrollOffset += 1;
-		else if (matchesKey(data, "pageUp")) lane.scrollOffset -= Math.max(1, viewport - 1);
-		else if (matchesKey(data, "pageDown")) lane.scrollOffset += Math.max(1, viewport - 1);
+		if (matchesTerminalKey(data, "up")) lane.scrollOffset -= 1;
+		else if (matchesTerminalKey(data, "down")) lane.scrollOffset += 1;
+		else if (matchesTerminalKey(data, "pageUp")) lane.scrollOffset -= Math.max(1, viewport - 1);
+		else if (matchesTerminalKey(data, "pageDown")) lane.scrollOffset += Math.max(1, viewport - 1);
 		else {
 			const mouse = data.match(/^\x1b\[<(\d+);\d+;\d+[Mm]$/);
 			if (!mouse || (Number(mouse[1]) & 64) !== 64) return;
