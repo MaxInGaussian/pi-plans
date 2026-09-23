@@ -6,6 +6,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { visibleWidth } from "../src/refine-ui-helpers.ts";
+import { __clearPiTuiForTests, __setPiTuiForTests } from "../src/terminal-keys.ts";
 import {
 	FORM_QUESTION_MAX,
 	allAnswered,
@@ -397,5 +398,121 @@ describe("themed question frame (pi-goal-x alignment, 0.4.1)", () => {
 		const lines = formRender(state, 80, undefined, T);
 		assert.ok(lines[0]!.includes("⟪accent⟩"));
 		assert.ok(lines[4]!.includes("⟪dim⟩"));
+	});
+});
+
+describe("kitty and SS3 key normalization (issue #2)", () => {
+	it("navigates with SS3 application-cursor arrows", () => {
+		const state = createFormState(qs(2));
+		assert.equal(formHandleKey(state, "\x1bOC"), "render"); // SS3 right → next tab
+		assert.equal(state.tab, 1);
+		assert.equal(formHandleKey(state, "\x1bOD"), "render"); // SS3 left → previous tab
+		assert.equal(state.tab, 0);
+		assert.equal(formHandleKey(state, "\x1bOB"), "render"); // SS3 down → row 1
+		assert.equal(state.selection[0], 1);
+		assert.equal(formHandleKey(state, "\x1bOA"), "render"); // SS3 up → row 0
+		assert.equal(state.selection[0], 0);
+	});
+
+	it("drives the form with kitty CSI-u keys (Tab/Shift+Tab/arrows/Enter/Esc)", () => {
+		const state = createFormState(qs(2));
+		assert.equal(formHandleKey(state, "\x1b[9u"), "render"); // kitty Tab
+		assert.equal(state.tab, 1);
+		assert.equal(formHandleKey(state, "\x1b[9;2u"), "render"); // kitty Shift+Tab
+		assert.equal(state.tab, 0);
+		assert.equal(formHandleKey(state, "\x1b[57420u"), "render"); // kitty down
+		assert.equal(state.selection[0], 1);
+		assert.equal(formHandleKey(state, "\x1b[57419u"), "render"); // kitty up
+		assert.equal(state.selection[0], 0);
+		assert.equal(formHandleKey(state, "\x1b[13u"), "render"); // kitty Enter confirms + advances
+		assert.equal(state.confirmed[0], true);
+		assert.equal(state.tab, 1);
+		const cancel = createFormState(qs(1));
+		assert.equal(formHandleKey(cancel, "\x1b[27u"), "cancel"); // kitty Esc
+	});
+
+	it("types and edits a custom answer with kitty-encoded text", () => {
+		const state = createFormState([{ ...qs(1)[0], options: [{ label: "Only" }], allowOther: true }]);
+		assert.equal(formHandleKey(state, "\x1b[57420u"), "render"); // down → option 0
+		assert.equal(formHandleKey(state, "\x1b[57420u"), "render"); // down → custom row
+		assert.equal(formHandleKey(state, "\x1b[13u"), "start-editing");
+		assert.equal(formHandleKey(state, "\x1b[20320u"), "render"); // 你
+		assert.equal(formHandleKey(state, "\x1b[22909u"), "render"); // 好
+		assert.equal(formHandleKey(state, "\x1b[97;2u"), "render"); // a
+		assert.equal(state.buffer, "你好a");
+		assert.equal(formHandleKey(state, "\x1b[127u"), "render"); // kitty backspace
+		assert.equal(state.buffer, "你好");
+		assert.equal(formHandleKey(state, "\x1b[97;5u"), "noop"); // ctrl+a must not insert
+		assert.equal(formHandleKey(state, "\x1b[57419u"), "noop"); // arrows ignored while editing
+		assert.equal(state.buffer, "你好");
+		assert.equal(formHandleKey(state, "\x1b[13u"), "confirm-buffer");
+		assert.equal(state.custom[0], "你好");
+	});
+
+	it("decodes multiple kitty sequences inside one chunk", () => {
+		const state = createFormState([{ ...qs(1)[0], options: [{ label: "Only" }], allowOther: true }]);
+		state.editing = true;
+		assert.equal(formHandleKey(state, "\x1b[20320u\x1b[22909u"), "render");
+		assert.equal(state.buffer, "你好");
+	});
+
+	it("wraps selection at both ends without landing on an invalid row", () => {
+		const mk = (allowOther: boolean) =>
+			createFormState([
+				{ question: "Q?", options: [{ label: "A" }, { label: "B" }, { label: "C" }], allowOther },
+				{ question: "Q2?", options: [{ label: "A" }], allowOther: false },
+			]);
+		// No custom row: rows 0..2, -1 is the "no cursor" position.
+		let state = mk(false);
+		state.selection[0] = 0;
+		assert.equal(formHandleKey(state, "\x1b[A"), "render"); // up from first row → -1
+		assert.equal(state.selection[0], -1);
+		assert.equal(formHandleKey(state, "\x1b[B"), "render"); // down from -1 → first row
+		assert.equal(state.selection[0], 0);
+		state.selection[0] = 2;
+		assert.equal(formHandleKey(state, "\x1b[B"), "render"); // down from last row → -1
+		assert.equal(state.selection[0], -1);
+		assert.equal(formHandleKey(state, "\x1b[A"), "render"); // up from -1 → last row
+		assert.equal(state.selection[0], 2);
+		// allowOther: rows 0..3 with row 3 = custom answer row.
+		state = mk(true);
+		state.selection[0] = 0;
+		formHandleKey(state, "\x1b[A");
+		assert.equal(state.selection[0], -1);
+		formHandleKey(state, "\x1b[A");
+		assert.equal(state.selection[0], 3);
+		formHandleKey(state, "\x1b[B");
+		assert.equal(state.selection[0], -1);
+		formHandleKey(state, "\x1b[B");
+		assert.equal(state.selection[0], 0);
+		// Single-option question: total = 1.
+		state = mk(false);
+		state.tab = 1;
+		state.selection[1] = 0;
+		formHandleKey(state, "\x1b[B");
+		assert.equal(state.selection[1], -1);
+		formHandleKey(state, "\x1b[A");
+		assert.equal(state.selection[1], 0);
+	});
+
+	it("keeps working when the pi-tui module is unavailable (fallback path)", () => {
+		__setPiTuiForTests(undefined);
+		try {
+			const state = createFormState(qs(2));
+			assert.equal(formHandleKey(state, "\x1b[9u"), "render"); // kitty Tab
+			assert.equal(state.tab, 1);
+			assert.equal(formHandleKey(state, "\x1bOB"), "render"); // SS3 down
+			assert.equal(state.selection[1], 1);
+			assert.equal(formHandleKey(state, "\x1b[57419u"), "render"); // kitty up
+			assert.equal(state.selection[1], 0);
+			assert.equal(formHandleKey(state, "\x1b[13u"), "render"); // kitty Enter confirms
+			assert.equal(state.confirmed[1], true);
+			const editing = createFormState([{ ...qs(1)[0], options: [{ label: "Only" }], allowOther: true }]);
+			editing.editing = true;
+			assert.equal(formHandleKey(editing, "\x1b[20320u"), "render");
+			assert.equal(editing.buffer, "你");
+		} finally {
+			__clearPiTuiForTests();
+		}
 	});
 });

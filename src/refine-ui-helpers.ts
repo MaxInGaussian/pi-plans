@@ -136,7 +136,3 @@ export function wrapTextWithAnsi(text: string, maxWidth: number): string[] {
 	if (current.trim().length > 0) lines.push(current.trimEnd());
 	return lines;
 }
-
-export function matchesEscape(data: string): boolean {
-	return data === "\x1b" || data === "\x1b\x1b" || /^(\x1b\[\??\d*[A-Za-z])|(\x1bO[A-Za-z])$/.test(data);
-}
