@@ -2,6 +2,7 @@ import type { ExtensionCommandContext, ExtensionContext, Theme, ThemeColor } fro
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import type { SubagentProgressEvent, SubagentResult } from "./subagent.ts";
 import { getPiTui, matchesTerminalKey } from "./terminal-keys.ts";
+import { refineChrome, type UiLanguage } from "./ui-language.ts";
 import {
 	truncateToWidth as localTruncateToWidth,
 	visibleWidth as localVisibleWidth,
@@ -134,9 +135,10 @@ function previewTranscriptText(entry: RefineTranscriptEntry, width: number): { l
 	return { lines: lines.slice(-STREAMING_PREVIEW_LINES), truncated: true };
 }
 
-function footerText(laneCount: number): string {
-	const parts = ["Esc 关闭", "↑/↓ 滚动", "PgUp/PgDn 翻页"];
-	if (laneCount > 1) parts.push("Tab & Shift + Tab 切换 lane");
+function footerText(laneCount: number, lang: UiLanguage): string {
+	const chrome = refineChrome(lang);
+	const parts = [chrome.close, chrome.scroll, chrome.page];
+	if (laneCount > 1) parts.push(chrome.switchLane);
 	return parts.join(" · ");
 }
 
@@ -177,16 +179,19 @@ export class RefineOverlayComponent implements Component {
 	private readonly onCancel: () => void;
 	private readonly tui?: TUI;
 	private readonly modelLabel?: string;
+	/** Chrome language (issue #3); defaults to English for direct construction. */
+	private readonly lang: UiLanguage;
 	private selectedLane = 0;
 	private disposed = false;
 
-	constructor(theme: Theme, role: RefineOverlayRole, lanes: RefineLaneState[], onCancel: () => void, tui?: TUI, modelLabel?: string) {
+	constructor(theme: Theme, role: RefineOverlayRole, lanes: RefineLaneState[], onCancel: () => void, tui?: TUI, modelLabel?: string, lang: UiLanguage = "en") {
 		this.theme = theme;
 		this.role = role;
 		this.lanes = lanes;
 		this.onCancel = onCancel;
 		this.tui = tui;
 		this.modelLabel = modelLabel;
+		this.lang = lang;
 		this.tui?.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
 	}
 
@@ -245,7 +250,7 @@ export class RefineOverlayComponent implements Component {
 				lines.push(...this.renderPane(this.lanes[index]!, innerWidth, paneHeight, index === this.selectedLane));
 			}
 		}
-		lines.push(renderRow(this.theme, this.theme.fg("dim", footerText(this.lanes.length)), innerWidth));
+		lines.push(renderRow(this.theme, this.theme.fg("dim", footerText(this.lanes.length, this.lang)), innerWidth));
 		lines.push(renderBorderLine(this.theme, innerWidth, "bottom"));
 		return lines.map((line) => fitLine(line, width));
 	}
@@ -295,10 +300,12 @@ export class RefineOverlayController {
 	private overlayPromise: Promise<void> | undefined;
 	private tui: TUI | undefined;
 	private closed = false;
+	private readonly lang: UiLanguage;
 
-	constructor(role: RefineOverlayRole, laneIds: Array<{ id: string; label?: string }>, onCancel: () => void) {
+	constructor(role: RefineOverlayRole, laneIds: Array<{ id: string; label?: string }>, onCancel: () => void, lang: UiLanguage = "en") {
 		this.role = role;
 		this.onCancel = onCancel;
+		this.lang = lang;
 		this.lanes = laneIds.map((lane) => ({
 			id: lane.id,
 			label: lane.label ?? lane.id,
@@ -321,7 +328,7 @@ export class RefineOverlayController {
 				(_tui, theme, _keybindings, done) => {
 					this.tui = _tui;
 					this.done = done;
-					this.component = new RefineOverlayComponent(theme, this.role, this.lanes, () => this.cancel(), _tui, modelLabel);
+					this.component = new RefineOverlayComponent(theme, this.role, this.lanes, () => this.cancel(), _tui, modelLabel, this.lang);
 					if (this.closed) done(undefined);
 					return this.component;
 				},

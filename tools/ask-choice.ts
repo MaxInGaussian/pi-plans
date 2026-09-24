@@ -36,6 +36,7 @@ import {
 	runQuestionForm,
 } from "../src/ask-form.ts";
 import { normalizeWorkdir, readActive, recordDecision } from "../src/state.ts";
+import { resolveUiLanguage } from "../src/ui-language.ts";
 import { resolveActiveRun } from "../src/run-context.ts";
 import { applyQuestionAnswered, applyQuestionAsked, applyQuestionsAnswered, applyQuestionsAsked, loadCheckpoint, mutateCheckpoint } from "../src/workflow-state.ts";
 
@@ -457,9 +458,12 @@ async function executeAskChoiceBatch(
 		purpose: q.purpose,
 		autoComplete: true,
 	}));
+	// Issue #3: resolve the form chrome language only where the form is about to
+	// open (not on the batch runtime hot path).
+	const formLang = resolveUiLanguage(normalizeWorkdir(params.workdir ?? ctx.cwd));
 	let result: FormResult;
 	try {
-		result = await runQuestionForm(ctx.ui, formQuestions);
+		result = await runQuestionForm(ctx.ui, formQuestions, formLang);
 	} catch (error) {
 		// Host threw while opening the custom dialog (e.g. RPC without custom
 		// support): degrade to one sequential select per question.

@@ -23,6 +23,7 @@ import { resolveActiveRun } from "../src/run-context.ts";
 import { buildRefAnalystTask, type RefAnalystTaskInput } from "../src/refine-prompts.ts";
 import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
 import { RefineOverlayController, refineOverlayContext } from "../src/refine-ui.ts";
+import { resolveUiLanguage } from "../src/ui-language.ts";
 
 const BATCH_SIZE = 3;
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
@@ -190,7 +191,7 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 
 				const overlay =
 					ctx.mode === "tui"
-						? new RefineOverlayController("refs", batch.map((job) => ({ id: job.laneId, label: job.laneId })), relayAbort)
+						? new RefineOverlayController("refs", batch.map((job) => ({ id: job.laneId, label: job.laneId })), relayAbort, resolveUiLanguage(workdir))
 						: undefined;
 				overlay?.open(refineOverlayContext(ctx), modelLabel);
 				try {

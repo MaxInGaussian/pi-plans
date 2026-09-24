@@ -37,6 +37,7 @@ import {
 	type VccCompactionStats,
 } from "./compaction.ts";
 import { getRun, lintPlanIntoNotices, readActive, resolveStateRootOrNull, setRunStatus, StateError, utcNow } from "./state.ts";
+import { execChrome, resolveUiLanguage, type UiLanguage } from "./ui-language.ts";
 import { bindRun, resolveActiveRun } from "./run-context.ts";
 import { OwnershipError } from "./run-ownership.ts";
 import {
@@ -105,8 +106,21 @@ export interface ExecState {
 	implStatus?: Record<string, ImplMarkerState>;
 	/** Plan-lint warning backing the panel's implWarning line. */
 	implWarning?: string | null;
+	/** Chrome language for panel/status strings (issue #3); undefined → "en". */
+	uiLanguage?: UiLanguage;
 	currentI?: string;
 	goalWait?: GoalWaitState;
+}
+
+/**
+ * D-008 (issue #3): re-resolve the chrome language and repaint the panel and
+ * status bar. Called by the plans tool right after a successful
+ * `set-language` so an executing run switches language without a restart
+ * (and without reading config on every render tick).
+ */
+export function refreshUiLanguage(ctx: ExtensionContext): void {
+	if (execution) execution.uiLanguage = resolveUiLanguage(ctx.cwd);
+	updateStatusWidget(ctx);
 }
 
 export interface GoalWaitState {
@@ -248,6 +262,7 @@ export function loadExecutionFromCheckpoint(
 		implItems,
 		implStatus: { ...cp.execution.implStatus },
 		implWarning: lintImplItems(planText),
+		uiLanguage: resolveUiLanguage(ctx.cwd),
 		currentI: cp.execution.currentI,
 		goalWait: {
 			noProgressRounds: 0,
@@ -390,7 +405,7 @@ export function formatExecutionStatusLine(execution: ExecState): string {
 	if (goalWait?.paused) {
 		line += ` · ⏸ goal-wait paused (${goalWait.pausedReason ?? "paused"})`;
 	} else if (goalWait && (goalWait.noProgressRounds > 0 || goalWait.waitRounds > 0)) {
-		line += ` · 🔁 goal-wait · 无进展 ${goalWait.noProgressRounds}/3 · 等待 ${goalWait.waitRounds}/6`;
+		line += execChrome(execution.uiLanguage ?? "en").goalWait(goalWait.noProgressRounds, goalWait.waitRounds);
 	}
 	return line;
 }
@@ -628,6 +643,7 @@ export async function startExecution(
 		usage: { inToks: 0, outToks: 0 },
 		implItems: implItems ?? [],
 		implStatus: {},
+		uiLanguage: resolveUiLanguage(ctx.cwd),
 		// F-001 (impl review r1): derive the plan-lint warning on the live
 		// handoff path too, so the panel shows the ⚠ line immediately for a
 		// zero-parse section instead of only after a checkpoint restore.
@@ -1683,6 +1699,10 @@ export async function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext
 		usage: snapshot.usage ?? { inToks: 0, outToks: 0 },
 		implItems: snapshot.implItems ?? [],
 		implStatus: { ...(snapshot.implStatus ?? {}) },
+		// D-008: chrome language is re-resolved at restore time from the
+		// CURRENT config rather than trusted from the snapshot, so a
+		// `plans set-language` change survives restarts.
+		uiLanguage: resolveUiLanguage(ctx.cwd),
 		currentI: snapshot.currentI ?? inferCurrentI(snapshot.implItems, snapshot.items, snapshot.implStatus),
 		goalWait: snapshot.goalWait
 			? { ...snapshot.goalWait }

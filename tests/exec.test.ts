@@ -50,7 +50,7 @@ import {
 } from "../src/exec.ts";
 import { buildPiPlansVccCompaction, loadVccSettings } from "../src/compaction.ts";
 import type { CheckItem } from "../src/plan.ts";
-import { initState, setGraphEnabled, setRunStatus, startRun } from "../src/state.ts";
+import { initState, setGraphEnabled, setLanguage, setRunStatus, startRun } from "../src/state.ts";
 
 interface Recorded {
 	entries: { type: string; customType?: string; data?: unknown }[];
@@ -265,6 +265,38 @@ describe("execution loop", () => {
 		await completeExecution(pi, ctx);
 		assert.equal(getExecution(), null);
 		assert.ok(recorded.messages.some((message) => message.customType === "pi-plans-complete"));
+	});
+
+	it("chrome language (issue #3): goal-wait segment follows config, refresh switches it live", async () => {
+		const { formatExecutionStatusLine, refreshUiLanguage } = await import("../src/exec.ts");
+		const workdir = freshWorkdir();
+		const { spawnSync } = await import("node:child_process");
+		spawnSync("git", ["init"], { cwd: workdir });
+		spawnSync("git", ["config", "user.email", "t@e.com"], { cwd: workdir });
+		spawnSync("git", ["config", "user.name", "T"], { cwd: workdir });
+		initState(workdir);
+		const harness = makeHarness(workdir);
+		await startExecution(harness.pi, harness.ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001"));
+		const exec = getExecution()!;
+
+		// Default config (tag unset) → English chrome.
+		assert.equal(exec.uiLanguage, "en");
+		exec.goalWait = { noProgressRounds: 1, waitRounds: 2, lastMarkers: null, paused: false };
+		assert.match(formatExecutionStatusLine(exec), /no progress 1\/3 · waiting 2\/6/);
+		assert.ok(!/[\u4e00-\u9fff]/.test(formatExecutionStatusLine(exec)));
+
+		// zh-Hans config → verbatim 0.5.6 strings.
+		setLanguage(workdir, "zh-Hans", "user");
+		exec.uiLanguage = "zh";
+		assert.match(formatExecutionStatusLine(exec), /无进展 1\/3 · 等待 2\/6/);
+
+		// D-008: refreshUiLanguage re-resolves from the live config and repaints.
+		setLanguage(workdir, "en", "user");
+		exec.uiLanguage = "zh";
+		refreshUiLanguage(harness.ctx);
+		assert.equal(exec.uiLanguage, "en", "refresh re-resolves the configured language");
+		assert.match(formatExecutionStatusLine(exec), /no progress 1\/3/);
+		await completeExecution(harness.pi, harness.ctx);
 	});
 
 	it("completion enters goal-running continuation and triggers a turn in interactive sessions", async () => {

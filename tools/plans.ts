@@ -5,7 +5,7 @@
 
 import { bindRun, boundRunId, resolveActiveRun } from "../src/run-context.ts";
 import { lintPlanIntoNotices } from "../src/state.ts";
-import { getExecution, markPrePlanCompactPending } from "../src/exec.ts";
+import { getExecution, markPrePlanCompactPending, refreshUiLanguage } from "../src/exec.ts";
 import { loadVccSettings, scaffoldVccSettings } from "../src/compaction.ts";
 import {
 	applyCompleted,
@@ -341,6 +341,9 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 							throw new StateError("set-language requires tag and languageSource");
 						}
 						const updated = setLanguage(workdir, params.tag, params.languageSource);
+						// D-008 (issue #3): an executing run must switch chrome language
+						// immediately, not at the next restart.
+						refreshUiLanguage(ctx);
 						result = { config: updated.config, stateRoot: updated.stateRoot, notices: updated.notices };
 						break;
 					}

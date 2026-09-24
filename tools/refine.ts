@@ -15,6 +15,7 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadConfig, normalizeWorkdir, readActive, recordSubagent, resolveStateRootOrNull, StateError, type RoleConfig } from "../src/state.ts";
+import { uiLanguageFromTag, type UiLanguage } from "../src/ui-language.ts";
 import type { SubagentUsage } from "../src/subagent.ts";
 import { resolveActiveRun } from "../src/run-context.ts";
 import {
@@ -76,13 +77,14 @@ function setupRefinementExecution(
 	role: "reviewer" | "criticizer",
 	lanes: Array<{ id: string; label?: string }>,
 	modelLabel?: string,
+	lang: UiLanguage = "en",
 ) {
 	const controller = new AbortController();
 	const relayAbort = () => controller.abort();
 	if (parentSignal?.aborted) controller.abort();
 	else parentSignal?.addEventListener("abort", relayAbort, { once: true });
 
-	const overlay = ctx.mode === "tui" ? new RefineOverlayController(role, lanes, relayAbort) : undefined;
+	const overlay = ctx.mode === "tui" ? new RefineOverlayController(role, lanes, relayAbort, lang) : undefined;
 	overlay?.open(refineOverlayContext(ctx), modelLabel);
 
 	return {
@@ -133,6 +135,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 			if (!fs.existsSync(planPath)) throw new StateError(`plan file not found: ${planPath}`);
 			const planText = fs.readFileSync(planPath, "utf8");
 
+			const overlayLang = uiLanguageFromTag(config.language.tag);
 			// Record spawns against the active run when one exists.
 			const active = resolveActiveRun(ctx.sessionManager, workdir);
 			const record = (name: string, model?: string | null, usage?: SubagentUsage) => {
@@ -249,7 +252,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 					};
 				}
 				const name = `${roleConfig.name_prefix}-criticizer-${Date.now().toString(36)}`;
-				const execution = setupRefinementExecution(ctx, signal, "criticizer", [{ id: name, label: "criticizer" }], modelLabel);
+				const execution = setupRefinementExecution(ctx, signal, "criticizer", [{ id: name, label: "criticizer" }], modelLabel, overlayLang);
 				try {
 					const result = await runPiSubagent({
 						systemPrompt: `${systemPrompt}\n\n${graphPrompt}`,
@@ -308,6 +311,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				"reviewer",
 				runnableJobs.map((job) => ({ id: job.lane.id, label: job.lane.id })),
 				modelLabel,
+				overlayLang,
 			);
 			try {
 				const results = await Promise.all(

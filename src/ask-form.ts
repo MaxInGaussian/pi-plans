@@ -4,8 +4,12 @@
  * The form is a tabbed dialog opened via ctx.ui.custom: one tab per question
  * (options always visible in the first frame — options-first fit contract from
  * pi-goal-x's questionnaire) plus a final submit page listing every Q/A, and a
- * "✏️ 自定义答案…" row per tab that switches into a Focusable single-line input
+ * custom-answer row per tab that switches into a Focusable single-line input
  * (CURSOR_MARKER + hardware cursor so zh-Hans IME composition works).
+ *
+ * Chrome strings follow the workspace language (issue #3): createFormState /
+ * runQuestionForm take a UiLanguage (default "en") and render via the shared
+ * src/ui-language.ts tables.
  *
  * Everything user-visible is a pure state machine (createFormState /
  * formRender / formHandleKey) so node:test covers the interaction contract
@@ -18,9 +22,9 @@
 import { CURSOR_MARKER, type TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "./refine-ui-helpers.ts";
 import { decodePrintableChunk, normalizeKey } from "./terminal-keys.ts";
+import { formChrome, type UiLanguage } from "./ui-language.ts";
 
 export const FORM_QUESTION_MAX = 8;
-const CUSTOM_LABEL = "✏️ 自定义答案…";
 
 export interface FormOption {
 	label: string;
@@ -71,11 +75,14 @@ export interface FormState {
 	tab: number;
 	editing: boolean;
 	buffer: string;
+	/** Chrome language (issue #3): "zh" keeps the 0.5.6 strings, "en" is the default. */
+	lang: UiLanguage;
 }
 
-export function createFormState(questions: FormQuestion[]): FormState {
+export function createFormState(questions: FormQuestion[], lang: UiLanguage = "en"): FormState {
 	return {
 		questions,
+		lang,
 		// Cursor position per tab: pre-positioned on the recommended option
 		// where present. This is ONLY the highlight — an answer counts only
 		// after the user confirms it (Enter/custom submit), tracked in
@@ -254,7 +261,8 @@ export interface FormTheme {
 	bold(text: string): string;
 }
 
-function optionRows(q: FormQuestion, selected: number, width: number, theme?: FormTheme): string[] {
+function optionRows(q: FormQuestion, selected: number, width: number, lang: UiLanguage, theme?: FormTheme): string[] {
+	const chrome = formChrome(lang);
 	const rows: string[] = [];
 	q.options.forEach((opt, i) => {
 		const isSelected = i === selected;
@@ -268,7 +276,7 @@ function optionRows(q: FormQuestion, selected: number, width: number, theme?: Fo
 	if (q.allowOther) {
 		const otherSelected = q.options.length === selected;
 		const marker = otherSelected ? (theme ? theme.fg("accent", "→ ") : "→ ") : "  ";
-		rows.push(fit(`${marker}${CUSTOM_LABEL}`, width));
+		rows.push(fit(`${marker}${chrome.customLabel}`, width));
 	}
 	return rows;
 }
@@ -294,13 +302,14 @@ function themedQuestionFrame(
 	theme: FormTheme,
 ): string[] {
 	const n = state.questions.length;
+	const chrome = formChrome(state.lang);
 	const border = theme.fg("muted", "─".repeat(w));
 	const allAns = state.questions.every((_, i) => isAnswered(state, i));
 	const chips: string[] = [];
 	for (let i = 0; i <= n; i++) {
 		const isSubmit = i === n;
 		const answered = isAnswered(state, i);
-		const raw = isSubmit ? " ✓ 提交 " : ` ${answered ? "■" : "□"}Q${i + 1} `;
+		const raw = isSubmit ? chrome.submitChip : ` ${answered ? "■" : "□"}Q${i + 1} `;
 		if (i === state.tab) chips.push(theme.bg("selectedBg", theme.fg("text", raw)));
 		else if (isSubmit) chips.push(theme.fg(allAns ? "success" : "dim", raw));
 		else chips.push(theme.fg(answered ? "success" : "muted", raw));
@@ -308,13 +317,14 @@ function themedQuestionFrame(
 	const tabsRow = fit(` ← ${chips.join(" ")} →`, w);
 	const questionLine = fit(theme.fg("accent", `Q${state.tab + 1}/${n} · ${q.question}`), w);
 	const shortQuestion = fit(theme.fg("accent", `Q${state.tab + 1}/${n}`), w);
-	const hint = "[↑/↓] 选择  [Enter] 选定  [Tab] 下一题  [Esc] 取消";
+	const hint = chrome.optionsHint;
 	const footer = fit(theme.fg("dim", hint), w);
-	const optsFull = optionRows(q, state.selection[state.tab], w, theme);
+	const optsFull = optionRows(q, state.selection[state.tab], w, state.lang, theme);
 	const optsCompact = optionRows(
 		{ ...q, options: q.options.map((o) => ({ ...o, description: undefined })) },
 		state.selection[state.tab],
 		w,
+		state.lang,
 		theme,
 	);
 	const candidates: string[][] = [
@@ -344,9 +354,10 @@ export function formRender(state: FormState, width: number, rows?: number, theme
 	const n = state.questions.length;
 	if (rows !== undefined && rows < 5) rows = 5; // minimal viable form
 	if (state.editing) {
+		const chrome = formChrome(state.lang);
 		const q = state.questions[state.tab];
-		const header = `输入答案 — Q${state.tab + 1}/${n}: ${q.question}`;
-		const hint = "[Enter] 确认  [Esc] 放弃输入";
+		const header = chrome.editingHeader(state.tab + 1, n, q.question);
+		const hint = chrome.editingHint;
 		return [
 			fit(theme ? theme.fg("accent", header) : header, w),
 			"",
@@ -356,6 +367,7 @@ export function formRender(state: FormState, width: number, rows?: number, theme
 		];
 	}
 	if (state.tab === n) {
+		const chrome = formChrome(state.lang);
 		const missing: number[] = [];
 		state.questions.forEach((_, i) => {
 			if (!isAnswered(state, i)) missing.push(i);
@@ -363,13 +375,13 @@ export function formRender(state: FormState, width: number, rows?: number, theme
 		const answerFor = (i: number): string => {
 			const custom = state.custom[i];
 			if (custom !== null) return custom;
-			if (!state.confirmed[i]) return "(未作答)";
+			if (!state.confirmed[i]) return chrome.unanswered;
 			const sel = state.selection[i];
 			return sel >= 0 && sel < state.questions[i].options.length
 				? state.questions[i].options[sel].label
-				: "(未作答)";
+				: chrome.unanswered;
 		};
-		const header = `提交 — 全部 ${n} 题答案确认`;
+		const header = chrome.submitHeader(n);
 		const lines = [fit(theme ? theme.fg("accent", theme.bold(header)) : header, w), ""];
 		for (let i = 0; i < n; i++) {
 			const qLine = `${i + 1}. ${state.questions[i].question}`;
@@ -378,27 +390,27 @@ export function formRender(state: FormState, width: number, rows?: number, theme
 			lines.push(fit(theme ? theme.fg("text", aLine) : aLine, w));
 		}
 		lines.push("");
-		const foot = missing.length > 0
-			? `[Enter] 提交（还差 ${missing.length} 题未作答: Q${missing.map((i) => i + 1).join("/Q")}）  [←→] 返回修改  [Esc] 取消`
-			: "[Enter] 提交全部  [←→] 返回修改  [Esc] 取消";
+		const foot = missing.length > 0 ? chrome.blockedSubmitHint(missing) : chrome.submitAllHint;
 		lines.push(fit(theme ? theme.fg(missing.length > 0 ? "warning" : "success", foot) : foot, w));
 		return lines;
 	}
 	const q = state.questions[state.tab];
 	if (theme) return themedQuestionFrame(state, q, w, rows, theme);
+	const chrome = formChrome(state.lang);
 	const tabs = Array.from({ length: n + 1 }, (_, i) => (i === state.tab ? `●${i + 1}` : `○${i + 1}`))
 		.join(" ")
-		.concat(" 提交");
-	const footer = fit(`${tabs}  [↑/↓] 选择  [Enter] 选定  [Tab] 下一题  [Esc] 取消`, w);
+		.concat(chrome.tabsSubmit);
+	const footer = fit(`${tabs}  ${chrome.optionsHint}`, w);
 	const questionLine = fit(`Q${state.tab + 1}/${n} · ${q.question}`, w);
 	if (rows === undefined) {
-		return [questionLine, "", ...optionRows(q, state.selection[state.tab], w), "", footer];
+		return [questionLine, "", ...optionRows(q, state.selection[state.tab], w, state.lang), "", footer];
 	}
 	// Rows-budget degradation (F-001): options-first fit.
 	const compact = optionRows(
 		{ ...q, options: q.options.map((o) => ({ ...o, description: undefined })) },
 		state.selection[state.tab],
 		w,
+		state.lang,
 	);
 	const withBlanks = [questionLine, "", ...compact, "", footer];
 	if (withBlanks.length <= rows) return withBlanks;
@@ -431,10 +443,11 @@ export async function runQuestionForm(
 		setWorkingVisible?: (visible: boolean) => void;
 	},
 	questions: FormQuestion[],
+	lang: UiLanguage = "en",
 ): Promise<FormResult> {
 	if (typeof ui.custom !== "function") return { answers: [], cancelled: false, unavailable: true };
 	ui.setWorkingVisible?.(false);
-	const state = createFormState(questions);
+	const state = createFormState(questions, lang);
 	try {
 		const result = await ui.custom<TFormDone>((
 			tui: TUI,

@@ -217,13 +217,16 @@ describe("run notices persistence (VC-002)", () => {
 // ── VC-003: panel warning line instead of fake "I 0/0" ──────────────────────
 
 describe("panel impl-warning rendering (VC-003)", () => {
-	function model(implWarning: string | null): PanelModel {
+	const CJK = /[\u4e00-\u9fff]/;
+
+	function model(implWarning: string | null, lang?: "zh" | "en"): PanelModel {
 		return derivePanelModel(
 			{
 				items: [{ id: "VC-001", text: "`VC-001` covers `I-001`", done: false }],
 				implItems: [],
 				implStatus: {},
 				implWarning,
+				...(lang === undefined ? {} : { uiLanguage: lang }),
 			},
 			"fake-zero",
 			false,
@@ -231,7 +234,7 @@ describe("panel impl-warning rendering (VC-003)", () => {
 	}
 
 	it("replaces the I-count line with an explicit warning, keeping the 7-line envelope", () => {
-		const m = model("warning text");
+		const m = model("warning text", "zh");
 		assert.equal(m.implWarning, true);
 		const lines = renderPanelLines(m, 80);
 		assert.equal(lines.length, 7);
@@ -240,12 +243,27 @@ describe("panel impl-warning rendering (VC-003)", () => {
 	});
 
 	it("narrow mode badges the warning instead of counting, summary line too", () => {
-		const m = model("warning");
+		const m = model("warning", "zh");
 		const narrow = renderPanelLines(m, 20);
 		assert.equal(narrow.length, 3);
 		assert.match(narrow[1]!, /⚠ I/);
 		assert.ok(!narrow[1]!.includes("I 0/0"));
 		assert.match(formatPanelSummaryLine(m), /⚠ Implementation Items 解析 0 项/);
+	});
+
+	it("renders English warning chrome for en and for the omitted default (issue #3)", () => {
+		for (const lang of ["en", undefined] as const) {
+			const m = model("warning", lang);
+			const lines = renderPanelLines(m, 80);
+			assert.match(lines[2]!, /⚠ plan format: Implementation Items parsed 0 items/);
+			const narrow = renderPanelLines(m, 20);
+			// 20 columns truncate the badge right after the warning glyph.
+			assert.match(narrow[1]!, /⚠ I/);
+			assert.match(formatPanelSummaryLine(m), /⚠ Implementation Items parsed 0 items/);
+			for (const line of [...lines, ...narrow, formatPanelSummaryLine(m)]) {
+				assert.ok(!CJK.test(line), `CJK leaked (lang=${lang ?? "default"}): ${line}`);
+			}
+		}
 	});
 
 	it("keeps the legacy degradation when there is no lint hit", () => {

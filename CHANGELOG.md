@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.7] - 2026-09-24
+
+### Changed
+
+- **UI chrome 跟随 workspace 语言（issue #3，致谢 @Griznah）**：批量表单与状态面板等界面文案此前硬编码简体中文，无视 `plans set-language` 配置——英文 workspace 里中文注入，且 `language.tag` 未设置时同样中文。现全部用户可见 chrome 统一由 `src/ui-language.ts` 双语表驱动：
+  - **新增 `src/ui-language.ts`**：`UiLanguage` + `uiLanguageFromTag`（BCP47 主语言子标签回落，RFC 4647：`zh-Hant-CN` → `zh-Hant` → `zh`，非字符串/未设置一律 `en`）+ `resolveUiLanguage(workdir)`（无 git root / config 缺失 / JSON 损坏 / 类型异常均回落 `en`，永不抛错）+ 四组 chrome 表（`formChrome` / `refineChrome` / `panelChrome` / `execChrome`）；
+  - **批量表单**：自定义答案行、提交 chip、tabs 后缀、选项页/编辑页/提交页页脚与标题、`(未作答)` 占位共 10 条文案随语言切换（`createFormState` / `runQuestionForm` 新增可选 `lang`，默认 `en`；`tools/ask-choice.ts` 在表单即将打开处解析配置）；
+  - **refine / refs overlay 页脚**：`Esc 关闭` 等 4 条随语言切换，refine 复用已加载 config、analyze_refs 在构造点解析（两处构造点同步收口）；
+  - **状态面板与执行状态行**：`⚠ I 解析 0 项` 三条面板警告与 goal-wait 状态行随语言切换；panel render 与状态栏签名不变（语言经 `PanelModel`/`ExecState` 承载，构造期解析，不引入每帧读盘），`plans set-language` 成功后会立即重绘（`refreshUiLanguage`），跨会话恢复在恢复当刻重新解析、不依赖快照字段；
+  - **行为变更**：`language.tag` 未设置或不可读时，上述 chrome 由原来的中文改为 **英文**（与插件其余界面一致；`interface` 历史行为请显式 `plans set-language --tag zh-Hans`）；
+  - **已知残留**：`src/plan.ts` 的 lint 诊断文本（agent 面向，经 notices 透出）仍为中文，未在本次语言化范围内；
+  - 新增/改造测试 40+ 项（tag 映射与四路径回退、四组 chrome 表 verbatim、表单三页×窄/宽的 en 无 CJK 断言、overlay 两构造点含 fake-TUI 捕获、panel/exec 双语与 set-language 刷新），全量 524 测试全绿。
+
 ## [0.5.6] - 2026-09-23
 
 ### Fixed
