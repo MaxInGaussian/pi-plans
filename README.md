@@ -276,7 +276,7 @@ pi-plans/
 ├── skills/                # The planning router plus five specialist planning skills
 ├── references/            # Shared workflow, state/config, plan template (normative)
 ├── agents/                # reviewer.md / criticizer.md subagent prompts
-├── scripts/validate.ts    # Structure validator
+├── scripts/validate.ts    # Structure + package artifact guard
 └── tests/                 # node:test suite (state, guard, plan parsing, execution, refine progress, code-graph)
 ```
 
