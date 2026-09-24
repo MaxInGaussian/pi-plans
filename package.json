@@ -45,6 +45,8 @@
 		"docs/assets",
 		"references/",
 		"scripts/",
+		"!scripts/bench/vendor",
+		"!scripts/bench/results",
 		"skills/",
 		"src/",
 		"tests/",

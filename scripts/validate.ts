@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /** Validate the pi-plans extension structure. */
 
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
@@ -133,6 +134,9 @@ function validatePackageMetadata(): void {
 	for (const required of ["README.md", "LICENSE", "index.ts", "agents", "references", "scripts", "skills", "src", "tests", "tools"]) {
 		if (!files.has(required)) fail(`package.json: files must include ${required}`);
 	}
+	for (const excluded of ["!scripts/bench/vendor", "!scripts/bench/results"]) {
+		if (!files.has(excluded)) fail(`package.json: files must exclude ${excluded.slice(1)}`);
+	}
 
 	if (pkg.engines?.node !== ">=22.6") fail("package.json: engines.node must be >=22.6");
 	if (pkg.scripts?.test !== "node --experimental-strip-types scripts/run-tests.ts") {
@@ -141,6 +145,74 @@ function validatePackageMetadata(): void {
 	if (pkg.scripts?.prepack !== "npm run validate && npm test") {
 		fail("package.json: prepack must run validate and test");
 	}
+}
+
+const PACK_UNPACKED_LIMIT = 5 * 1024 * 1024;
+const PACK_PACKED_LIMIT = 3 * 1024 * 1024;
+const PACK_BLACKLIST_PREFIXES = ["scripts/bench/vendor/", "scripts/bench/results/"];
+const REQUIRED_PACK_ENTRIES = [
+	"README.md",
+	"LICENSE",
+	"index.ts",
+	"package.json",
+	"agents/reviewer.md",
+	"references/pi-planning-workflow.md",
+	"skills/planning/SKILL.md",
+	"tools/plans.ts",
+	"src/state.ts",
+	"scripts/validate.ts",
+	"scripts/run-tests.ts",
+];
+
+interface PackFileEntry {
+	path?: unknown;
+}
+
+interface PackResult {
+	files?: unknown;
+	unpackedSize?: unknown;
+	size?: unknown;
+}
+
+/** Pack the package for real (dry-run) and assert the artifact stays code-sized. */
+function validatePackageArtifact(): void {
+	const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+	const result = spawnSync(npm, ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+		cwd: ROOT,
+		encoding: "utf8",
+		maxBuffer: 64 * 1024 * 1024,
+		timeout: 120_000,
+	});
+	if (result.error) fail(`package artifact: npm pack failed to run: ${result.error.message}`);
+	if (result.status !== 0) {
+		const stderr = (result.stderr ?? "").trim().split("\n").slice(-3).join(" ");
+		fail(`package artifact: npm pack exited ${result.status}: ${stderr}`);
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(result.stdout);
+	} catch (error) {
+		fail(`package artifact: npm pack --json output is not JSON: ${(error as Error).message}`);
+	}
+	const pack = (Array.isArray(parsed) ? parsed[0] : undefined) as PackResult | undefined;
+	if (!pack || !Array.isArray(pack.files)) fail("package artifact: npm pack --json returned no file list");
+	const paths = (pack.files as PackFileEntry[]).map((entry) => String(entry?.path ?? ""));
+
+	const blacklisted = paths.filter((file) => PACK_BLACKLIST_PREFIXES.some((prefix) => file.startsWith(prefix)));
+	if (blacklisted.length) {
+		fail(`package artifact: ${blacklisted.length} forbidden entries (e.g. ${blacklisted.slice(0, 3).join(", ")})`);
+	}
+	const unpacked = Number(pack.unpackedSize);
+	if (!Number.isFinite(unpacked) || unpacked >= PACK_UNPACKED_LIMIT) {
+		fail(`package artifact: unpacked size ${unpacked} exceeds ${PACK_UNPACKED_LIMIT} bytes`);
+	}
+	const packed = Number(pack.size);
+	if (!Number.isFinite(packed) || packed >= PACK_PACKED_LIMIT) {
+		fail(`package artifact: packed size ${packed} exceeds ${PACK_PACKED_LIMIT} bytes`);
+	}
+	const present = new Set(paths);
+	const missing = REQUIRED_PACK_ENTRIES.filter((entry) => !present.has(entry));
+	if (missing.length) fail(`package artifact: required entries missing: ${missing.join(", ")}`);
 }
 
 function main(): void {
@@ -184,6 +256,7 @@ function main(): void {
 	validateDefaultConfig();
 	validatePlansTool();
 	validatePackageMetadata();
+	validatePackageArtifact();
 	console.log(`validated ${EXPECTED_SKILLS.size} skills, ${REQUIRED_REFERENCES.length} references, ${REQUIRED_AGENTS.length} agents, ${REQUIRED_TOOL_FILES.length} tools`);
 }
 
