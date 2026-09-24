@@ -287,7 +287,7 @@ Before the approved handoff the workflow writes only `.git/pi_plans/` state, the
 ## Verification
 
 ```bash
-npm run validate   # structure validator
+npm run validate   # structure + package artifact guard
 npm test           # node:test suite (stdlib only, no deps)
 ```
 

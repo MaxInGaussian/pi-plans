@@ -13,6 +13,13 @@
   - **已知残留**：`src/plan.ts` 的 lint 诊断文本（agent 面向，经 notices 透出）仍为中文，未在本次语言化范围内；
   - 新增/改造测试 40+ 项（tag 映射与四路径回退、四组 chrome 表 verbatim、表单三页×窄/宽的 en 无 CJK 断言、overlay 两构造点含 fake-TUI 捕获、panel/exec 双语与 set-language 刷新），全量 526 测试全绿。
 
+### Fixed
+
+- **npm 发布包体积修复：209MB → 1.8MB**：0.4.1–0.5.5 已发布版本的 tarball 异常膨胀至 **209MB / 6330+ 条目**（0.1.0–0.3.3 正常为 0.19–1.00MB）。根因：`package.json` 的 `files` 含目录条目 `"scripts/"`，npm 会递归收录整目录，而**根级 `.gitignore`/`.npmignore` 对 `files` 显式列出的目录内部无效**（npm 文档语义）——本地私有、已 gitignore 的 benchmark harness（`scripts/bench/vendor/`，harbor，磁盘约 570MB）与跑分产物（`scripts/bench/results/`）因此随包发布（vendor 占 99.1%，其中 126MB 为 harness 自带 results；300MB 的 `.venv` 因 harbor 自带子目录 `.gitignore` 侥幸排除）。修复：
+  - `files` 增加负模式 `!scripts/bench/vendor`、`!scripts/bench/results`（受控实验验证 `!` 负模式与子目录 ignore 均有效；根级 ignore 无效）；实测 **6343 → 136 条目、unpacked 209.38MB → 1.77MB、packed 86.09MB → 0.70MB**；
+  - **新增包体守卫**（`scripts/validate.ts`，随 `prepack` 与 CI 自动生效）：静态断言 `files` 含两条负模式；动态运行 `npm pack --dry-run --json --ignore-scripts`（必须带 `--ignore-scripts`，否则内层 pack 会重入 `prepack` 递归），断言 unpacked < 5MiB、packed < 3MiB、无 `scripts/bench/vendor|results` 条目、关键条目（index.ts / skills / agents / references / tools / src / scripts）在位；
+  - 说明：0.4.1 / 0.5.1 / 0.5.5 三个已发布版本均带此缺陷（各 209MB），registry 已发布 tarball 无法追溯修改；0.5.7 起恢复代码量级。
+
 ## [0.5.6] - 2026-09-23
 
 ### Fixed
