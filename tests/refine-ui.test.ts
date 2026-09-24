@@ -336,6 +336,18 @@ describe("refine overlay wiring", () => {
 		assert.doesNotMatch(source, /new Input|inputFrameLine|onSubmit/);
 		assert.doesNotMatch(source, /pi-btw|createAgentSession|AgentSession/);
 	});
+
+	it("threads the chrome language through both overlay construction sites (issue #3, VC-007)", () => {
+		const refineSource = fs.readFileSync(path.join(process.cwd(), "tools", "refine.ts"), "utf8");
+		assert.match(refineSource, /const overlayLang = uiLanguageFromTag\(config\.language\.tag\)/);
+		assert.match(refineSource, /new RefineOverlayController\(role, lanes, relayAbort, lang\)/);
+		assert.match(refineSource, /modelLabel,\s*\n\s*overlayLang,/);
+		const refsSource = fs.readFileSync(path.join(process.cwd(), "tools", "analyze-refs.ts"), "utf8");
+		assert.match(
+			refsSource,
+			/new RefineOverlayController\("refs", batch\.map\(\(job\) => \(\{ id: job\.laneId, label: job\.laneId \}\)\), relayAbort, resolveUiLanguage\(workdir\)\)/,
+		);
+	});
 });
 	describe("refine overlay lifecycle", () => {
 	it("treats Esc as close-only and never relays the abort hook", () => {
