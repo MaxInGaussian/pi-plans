@@ -11,7 +11,7 @@
   - **状态面板与执行状态行**：`⚠ I 解析 0 项` 三条面板警告与 goal-wait 状态行随语言切换；panel render 与状态栏签名不变（语言经 `PanelModel`/`ExecState` 承载，构造期解析，不引入每帧读盘），`plans set-language` 成功后会立即重绘（`refreshUiLanguage`），跨会话恢复在恢复当刻重新解析、不依赖快照字段；
   - **行为变更**：`language.tag` 未设置或不可读时，上述 chrome 由原来的中文改为 **英文**（与插件其余界面一致；`interface` 历史行为请显式 `plans set-language --tag zh-Hans`）；
   - **已知残留**：`src/plan.ts` 的 lint 诊断文本（agent 面向，经 notices 透出）仍为中文，未在本次语言化范围内；
-  - 新增/改造测试 40+ 项（tag 映射与四路径回退、四组 chrome 表 verbatim、表单三页×窄/宽的 en 无 CJK 断言、overlay 两构造点含 fake-TUI 捕获、panel/exec 双语与 set-language 刷新），全量 524 测试全绿。
+  - 新增/改造测试 40+ 项（tag 映射与四路径回退、四组 chrome 表 verbatim、表单三页×窄/宽的 en 无 CJK 断言、overlay 两构造点含 fake-TUI 捕获、panel/exec 双语与 set-language 刷新），全量 526 测试全绿。
 
 ## [0.5.6] - 2026-09-23
 
