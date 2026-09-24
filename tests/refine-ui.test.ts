@@ -175,11 +175,55 @@ describe("refine overlay viewport", () => {
 			() => {},
 			undefined,
 			"zai/glm-5.3-flash:high",
+			"zh",
 		);
 		const lines = component.render(120);
 		assert.ok(lines.some((line) => line.includes("Reviewer (zai/glm-5.3-flash:high)")));
 		assert.ok(lines.some((line) => line.includes("Esc 关闭")));
 		assert.ok(lines.some((line) => line.includes("Tab & Shift + Tab")));
+	});
+
+	it("follows the chrome language (issue #3): zh verbatim, en default", () => {
+		const lanes = [readyLane("lane-1", "reviewer-1", "output")];
+		const zh = new RefineOverlayComponent(fakeTheme, "reviewer", lanes, () => {}, undefined, undefined, "zh");
+		const zhLines = zh.render(120);
+		assert.ok(zhLines.some((line) => line.includes("Esc 关闭 · ↑/↓ 滚动 · PgUp/PgDn 翻页")));
+		const en = new RefineOverlayComponent(fakeTheme, "reviewer", lanes, () => {}, undefined, undefined, "en");
+		assert.ok(en.render(120).some((line) => line.includes("Esc close · ↑/↓ scroll · PgUp/PgDn page")));
+		const byDefault = new RefineOverlayComponent(fakeTheme, "reviewer", lanes, () => {});
+		assert.ok(byDefault.render(120).some((line) => line.includes("Esc close")));
+		// Multi-lane chrome keeps the lane-switch hint in both languages.
+		const multiZh = new RefineOverlayComponent(fakeTheme, "reviewer", [
+			readyLane("lane-1", "a", "x"),
+			readyLane("lane-2", "b", "y"),
+		], () => {}, undefined, undefined, "zh");
+		assert.ok(multiZh.render(120).some((line) => line.includes("Tab & Shift + Tab 切换 lane")));
+	});
+
+	it("controller threads the chrome language to the component", () => {
+		const captured: string[][] = [];
+		const ctx = {
+			hasUI: true,
+			ui: {
+				// Factory signature: (tui, theme, keybindings, done).
+				custom: async (factory: unknown) => {
+					const component = (factory as (...a: unknown[]) => { render(w: number): string[] })(
+						undefined,
+						fakeTheme,
+						{},
+						() => {},
+					);
+					captured.push(component.render(120));
+					return undefined;
+				},
+			},
+		};
+		const controller = new RefineOverlayController("reviewer", [{ id: "lane-1", label: "one" }], () => {}, "zh");
+		controller.open(ctx as never);
+		return Promise.resolve().then(() => {
+			assert.ok(captured.length === 1, "overlay component rendered via ctx.ui.custom");
+			assert.ok(captured[0]!.some((line) => line.includes("Esc 关闭")), "zh footer threaded through controller");
+		});
 	});
 
 	it("renders only the last three wrapped lines for streaming transcript previews", () => {

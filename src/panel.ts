@@ -33,6 +33,13 @@ export interface GoalWaitPanel {
 	waitRounds: number;
 }
 
+import { panelChrome, type UiLanguage } from "./ui-language.ts";
+
+/** Chrome language for panel strings (issue #3); defaults to English. */
+export function panelLang(model: PanelModel): UiLanguage {
+	return model.uiLanguage ?? "en";
+}
+
 export interface PanelModel {
 	/** Run topic (stable run-level slug; D-018). */
 	topic: string;
@@ -50,6 +57,8 @@ export interface PanelModel {
 	totalI: number;
 	/** Plan-format warning replaces the I-count line (never a fake "I 0/0"). */
 	implWarning: boolean;
+	/** Chrome language for the warning strings (issue #3); undefined → "en". */
+	uiLanguage?: UiLanguage;
 	/** Resolved current I (marker-backed or inferred; inferred is display-only). */
 	currentI?: string;
 	/** Short one-line description of the current I (display-only). */
@@ -125,6 +134,8 @@ export function derivePanelModel(
 		 * items). Non-null ⇒ implItems is empty — the panel must show the
 		 * warning instead of a fake "I 0/0" count (pi-goal-x semantics). */
 		implWarning?: string | null;
+		/** Chrome language for the warning strings (issue #3); undefined → "en". */
+		uiLanguage?: UiLanguage;
 	},
 	topic: string,
 	waiting: boolean,
@@ -203,6 +214,7 @@ export function derivePanelModel(
 		remainingI,
 		totalI: Math.max(0, implItems.length),
 		implWarning: (execution.implWarning ?? null) !== null,
+		uiLanguage: execution.uiLanguage ?? "en",
 		currentI,
 		currentIText,
 		currentState,
@@ -282,9 +294,10 @@ export function renderProgressBar(done: number, total: number, width: number): s
  */
 export function renderPanelLines(model: PanelModel, width: number): string[] {
 	const w = Math.max(4, Math.floor(width));
+	const chrome = panelChrome(panelLang(model));
 	if (w < MIN_PANEL_WIDTH) {
 		const status = model.implWarning
-			? `${model.topic} · ⚠ I 解析 0 项 · VC ${model.vcDone}/${model.vcTotal}`
+			? chrome.badgeStatus(model.topic, model.vcDone, model.vcTotal)
 			: `${model.topic} · I ${model.totalI - model.remainingI}/${model.totalI} · VC ${model.vcDone}/${model.vcTotal}`;
 		return [
 			boxLine(BORDER_LEFT, ` pi-plans ${HORIZ} ${fit(model.topic, Math.max(4, w - 14))}`, HORIZ, w, BORDER_RIGHT),
@@ -305,7 +318,7 @@ export function renderPanelLines(model: PanelModel, width: number): string[] {
 		: statusLine;
 
 	const progressContent = model.implWarning
-		? `⚠ plan 格式：Implementation Items 解析 0 项（面板无法计 I 进度）`
+		? chrome.progressWarning()
 		: `I items ${model.totalI - model.remainingI}/${model.totalI} · ${renderProgressBar(model.totalI - model.remainingI, model.totalI, w)} · VC ${model.vcDone}/${model.vcTotal}`;
 
 	// Narrow degradation level 3: current-I line keeps only the id.
@@ -333,7 +346,7 @@ export function renderPanelLines(model: PanelModel, width: number): string[] {
 /** Bottom status-bar summary line, derived from the same model (D-015). */
 export function formatPanelSummaryLine(model: PanelModel): string {
 	if (model.implWarning) {
-		return `plans: ${model.topic} ▸ ⚠ Implementation Items 解析 0 项 · VC ${model.vcDone}/${model.vcTotal} · next: ${model.nextAction}`;
+		return panelChrome(panelLang(model)).summaryWarning(model.topic, model.vcDone, model.vcTotal, model.nextAction);
 	}
 	const i = model.totalI > 0 ? ` · I ${model.totalI - model.remainingI}/${model.totalI}` : "";
 	const phase =

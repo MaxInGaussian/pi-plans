@@ -1,5 +1,6 @@
 import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, readActive, resolveStateRootOrNull, showConfig, type PlansConfig, utcNow, VALID_ROLE_MODES, updateConfig } from "./state.ts";
+import { refreshUiLanguage } from "./exec.ts";
 
 interface ModelLike {
 	provider?: unknown;
@@ -348,6 +349,10 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 			};
 			return config;
 		});
+
+		// D-008 (issue #3): language changes must repaint the panel/status bar
+		// immediately when an execution is live (no-op otherwise).
+		refreshUiLanguage(ctx as unknown as ExtensionContext);
 
 		// Display-only consumer (F-006): deliberately keeps the shared active
 		// pointer — the wizard summarizes repo state, not session attribution.

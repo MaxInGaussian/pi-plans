@@ -7,7 +7,7 @@ import * as path from "node:path";
 import * as url from "node:url";
 import { after, before, describe, it } from "node:test";
 import { registerAnalyzeRefsTool } from "../tools/analyze-refs.ts";
-import { initState, setRole, startRun, readActive } from "../src/state.ts";
+import { initState, setRole, setLanguage, startRun, readActive } from "../src/state.ts";
 
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
 
@@ -70,6 +70,25 @@ function headlessCtx(workdir: string): unknown {
 	return { cwd: workdir };
 }
 
+/** TUI-mode ctx whose fake ui.custom invokes the overlay factory and captures renders. */
+function tuiCtx(workdir: string, captured: string[][]): unknown {
+	const theme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
+	return {
+		cwd: workdir,
+		mode: "tui",
+		hasUI: true,
+		ui: {
+			custom: async (factory: unknown) => {
+				const component = (factory as (...a: unknown[]) => { render(w: number): string[] })(undefined, theme, {}, () => {});
+				captured.push(component.render(120));
+				return undefined;
+			},
+			setStatus: () => {},
+			notify: () => {},
+		},
+	};
+}
+
 function subagentLines(workdir: string): Array<any> {
 	const active = readActive(workdir);
 	assert.ok(active, "expected an active run");
@@ -127,6 +146,45 @@ describe("analyze_refs gates", () => {
 			tool.execute("c1", { refs: [{ id: "ref-1", localPath: "." }] }, undefined, undefined, headlessCtx(workdir)),
 			/model was never confirmed/,
 		);
+	});
+});
+
+describe("analyze_refs overlay chrome language (issue #3)", () => {
+	it("refs overlay footer follows the chrome language (D-010)", async () => {
+		const refDir = path.join(tmpRoot, "overlay-lang-ref");
+		fs.mkdirSync(refDir, { recursive: true });
+		const restore = withFakePi(
+			fakePiScript(
+				`emit({ type: "message_end", message: { role: "assistant", model: "fake/model", content: [{ type: "text", text: "OK" }] } });`,
+			),
+		);
+		const tool = loadTool();
+		try {
+			for (const [tag, expected] of [
+				["zh-Hans", "Esc 关闭"],
+				["en", "Esc close"],
+			] as const) {
+				const workdir = mkWorkdir(`overlay-lang-${tag}`);
+				initState(workdir);
+				setRole(workdir, { role: "reviewer", mode: "delegated-subagent", modelSelector: "fake/model", confirmed: true });
+				setLanguage(workdir, tag, "user");
+				const captured: string[][] = [];
+				await tool.execute(
+					"c1",
+					{ refs: [{ id: "ref-1", localPath: refDir }] },
+					undefined,
+					undefined,
+					tuiCtx(workdir, captured),
+				);
+				assert.equal(captured.length, 1, "refs overlay must render through ctx.ui.custom");
+				assert.ok(
+					captured[0]!.some((line) => line.includes(expected)),
+					`expected "${expected}" in refs overlay footer for tag ${tag}`,
+				);
+			}
+		} finally {
+			restore();
+		}
 	});
 });
 

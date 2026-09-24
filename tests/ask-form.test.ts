@@ -115,7 +115,7 @@ describe("form state machine", () => {
 	});
 
 	it("renders deterministic row shapes for question tab, submit page and editing", () => {
-		const state = createFormState(qs(2));
+		const state = createFormState(qs(2), "zh");
 		const tabLines = formRender(state, 80);
 		assert.ok(tabLines[0].includes("Q1/2"));
 		assert.ok(tabLines.some((l) => l.includes("Opt A1")));
@@ -181,6 +181,121 @@ describe("runQuestionForm", () => {
 		assert.equal(out.unavailable, false);
 		assert.equal(out.answers.length, 2);
 		assert.deepEqual(visible, [false, true], "spinner suspended while the form is open");
+	});
+});
+
+describe("chrome language (issue #3)", () => {
+	const CJK = /[\u4e00-\u9fff]/;
+
+	/** ASCII-only fixture so the no-CJK scan cannot be polluted by content. */
+	function asciiQs(): FormQuestion[] {
+		return [
+			{
+				question: "Question 1?",
+				options: [{ label: "Opt A1", recommended: true }, { label: "Opt B1" }],
+				allowOther: true,
+				questionId: "q-1",
+				autoComplete: true,
+			},
+			{
+				question: "Question 2?",
+				options: [{ label: "Opt A2", recommended: true }],
+				allowOther: false,
+				questionId: "q-2",
+				autoComplete: true,
+			},
+		];
+	}
+
+	function renderPages(state: ReturnType<typeof createFormState>, width: number): string[] {
+		const out: string[] = [];
+		state.tab = 0;
+		out.push(...formRender(state, width));
+		state.editing = true;
+		state.buffer = "typed";
+		out.push(...formRender(state, width));
+		state.editing = false;
+		state.buffer = "";
+		state.tab = state.questions.length;
+		out.push(...formRender(state, width));
+		state.tab = 0;
+		return out;
+	}
+
+	it("renders the 0.5.6 Simplified chrome verbatim for zh", () => {
+		const state = createFormState(asciiQs(), "zh");
+		const optionsPage = formRender(state, 100);
+		assert.ok(optionsPage.some((l) => l.includes("✏️ 自定义答案…")), "custom row label");
+		assert.ok(optionsPage.some((l) => l.includes("[Esc] 取消")), "options footer hint");
+		const themed = formRender(state, 100, undefined, {
+			fg: (_c, t) => t,
+			bg: (_c, t) => t,
+			bold: (t) => t,
+		});
+		assert.ok(themed.some((l) => l.includes(" ✓ 提交 ")), "submit chip");
+		state.editing = true;
+		const editPage = formRender(state, 100);
+		assert.equal(editPage[0], "输入答案 — Q1/2: Question 1?");
+		assert.ok(editPage.at(-1)!.includes("[Enter] 确认  [Esc] 放弃输入"), "editing hint");
+		state.editing = false;
+		state.tab = 2;
+		const submitPage = formRender(state, 100);
+		assert.equal(submitPage[0], "提交 — 全部 2 题答案确认");
+		assert.ok(submitPage.some((l) => l.includes("(未作答)")), "unanswered placeholder");
+		assert.ok(submitPage.at(-1)!.includes("[Enter] 提交（还差 2 题未作答: Q1/Q2）  [←→] 返回修改  [Esc] 取消"), "blocked submit hint");
+		state.tab = 0;
+		formHandleKey(state, "\r");
+		formHandleKey(state, "\r");
+		state.tab = 2;
+		assert.ok(formRender(state, 100).at(-1)!.includes("[Enter] 提交全部  [←→] 返回修改  [Esc] 取消"), "submit-all hint");
+		// Non-themed tab row keeps the zh " 提交" suffix.
+		state.tab = 0;
+		state.editing = false;
+		assert.ok(formRender(state, 100).at(-1)!.includes(" 提交"), "tabs suffix");
+	});
+
+	it("renders zero CJK for en (explicit and default) on all three pages", () => {
+		for (const lang of ["en", undefined] as const) {
+			for (const width of [40, 100]) {
+				const state = lang === undefined ? createFormState(asciiQs()) : createFormState(asciiQs(), lang);
+				for (const line of renderPages(state, width)) {
+					assert.ok(!CJK.test(line), `CJK leaked (lang=${lang ?? "default"}, width=${width}): ${line}`);
+				}
+			}
+		}
+	});
+
+	it("runQuestionForm threads the language end to end", async () => {
+		const rendered: string[][] = [];
+		const result = await runQuestionForm(
+			{
+				custom: async (factory) => {
+					let resolvePromise: ((r: unknown) => void) | undefined;
+					const promise = new Promise((resolve) => {
+						resolvePromise = resolve;
+					});
+					const comp = (factory as (...a: unknown[]) => { handleInput(d: string): void; render(w: number): string[] })(
+						{ setShowHardwareCursor: () => {} },
+						{ fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t },
+						{},
+						(r: unknown) => resolvePromise?.(r),
+					);
+					rendered.push(comp.render(80));
+					comp.handleInput("\r"); // Q1 confirmed → tab 2
+					comp.handleInput("\r"); // Q2 confirmed → submit page
+					rendered.push(comp.render(80));
+					comp.handleInput("\r"); // submit all
+					return promise;
+				},
+			},
+			asciiQs(),
+			"en",
+		);
+		assert.equal(result.unavailable, false);
+		assert.equal(result.answers.length, 2);
+		for (const lines of rendered) {
+			for (const line of lines) assert.ok(!CJK.test(line), `CJK leaked: ${line}`);
+		}
 	});
 });
 
@@ -321,7 +436,7 @@ describe("themed question frame (pi-goal-x alignment, 0.4.1)", () => {
 	};
 
 	it("draws accent borders, a selectedBg tab chip, an accent question and dim hints", () => {
-		const state = createFormState(qs(2));
+		const state = createFormState(qs(2), "zh");
 		const lines = formRender(state, 80, undefined, T);
 		// frame: border, tabs, blank, question, blank, 3 option rows (2 opts + Other), blank, footer, border
 		assert.equal(lines.length, 11);
@@ -346,7 +461,7 @@ describe("themed question frame (pi-goal-x alignment, 0.4.1)", () => {
 	});
 
 	it("marks answered vs pending chips and dims the submit chip until complete", () => {
-		const state = createFormState(qs(2));
+		const state = createFormState(qs(2), "zh");
 		state.selection[1] = -1; // Q2 unanswered
 		const lines = formRender(state, 80, undefined, T);
 		assert.ok(lines[1]!.includes("□Q2"), "unanswered chip should be □");
@@ -354,7 +469,7 @@ describe("themed question frame (pi-goal-x alignment, 0.4.1)", () => {
 	});
 
 	it("degrades borders before options under a tight rows budget", () => {
-		const state = createFormState(qs(2));
+		const state = createFormState(qs(2), "zh");
 		// rows=8: frame with blanks+descriptions stripped still keeps borders (8 lines)
 		const l8 = formRender(state, 80, 8, T);
 		assert.equal(l8.length, 8);
@@ -376,7 +491,7 @@ describe("themed question frame (pi-goal-x alignment, 0.4.1)", () => {
 				options: Array.from({ length: 6 }, (_, i) => ({ label: `Opt ${i + 1}` })),
 				allowOther: false,
 			},
-		]);
+		], "zh");
 		const l5w = formRender(wide, 80, 5, T);
 		assert.equal(l5w.length, 5);
 		assert.ok(l5w.some((l) => l.includes("… +4 more")), "overflow indicator expected");
@@ -384,7 +499,7 @@ describe("themed question frame (pi-goal-x alignment, 0.4.1)", () => {
 	});
 
 	it("themes the submit page: accent bold header, warning line when incomplete", () => {
-		const state = createFormState(qs(2));
+		const state = createFormState(qs(2), "zh");
 		state.selection[1] = -1;
 		state.tab = 2;
 		const lines = formRender(state, 80, undefined, T);

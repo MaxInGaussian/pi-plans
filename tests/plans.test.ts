@@ -99,7 +99,7 @@ describe("record-checkpoint transitions (I-003)", () => {
 describe("pre-plan compaction wiring", () => {
 	it("start-run marks pre-plan compaction pending under settings and execution guards", () => {
 		const source = readPlansSource();
-		assert.match(source, /import \{ getExecution, markPrePlanCompactPending \} from "\.\.\/src\/exec\.ts";/);
+		assert.match(source, /import \{ getExecution, markPrePlanCompactPending, refreshUiLanguage \} from "\.\.\/src\/exec\.ts";/);
 		assert.match(source, /import \{ loadVccSettings, scaffoldVccSettings \} from "\.\.\/src\/compaction\.ts";/);
 		assert.match(source, /const prePlanStateRoot = resolveStateRootOrNull\(workdir\);/);
 		assert.match(source, /if \(prePlanStateRoot && !getExecution\(\)\) \{/);
