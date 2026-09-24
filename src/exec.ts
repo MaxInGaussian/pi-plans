@@ -117,9 +117,15 @@ export interface ExecState {
  * status bar. Called by the plans tool right after a successful
  * `set-language` so an executing run switches language without a restart
  * (and without reading config on every render tick).
+ *
+ * Capability guard (implementation review F-001): partial contexts (some
+ * command/test harnesses expose only notify/select/input) may lack
+ * setStatus/theme — the refresh must stay a no-op there instead of throwing
+ * into the caller's error path (updateStatusWidget assumes a full ui).
  */
 export function refreshUiLanguage(ctx: ExtensionContext): void {
 	if (execution) execution.uiLanguage = resolveUiLanguage(ctx.cwd);
+	if (typeof ctx.ui?.setStatus !== "function" || !ctx.ui?.theme) return;
 	updateStatusWidget(ctx);
 }
 

@@ -260,4 +260,24 @@ describe("config-pi-plans command", () => {
 		assert.equal(config.reviewer.model_selector, null);
 		assert.ok(config.reviewer.confirmed_at);
 	});
+
+	it("with an active run, a successful save never notifies an error (impl review F-001)", async () => {
+		const dir = workdir("active-run-refresh-guard");
+		startRun(dir, { topic: "config-guard", skill: "plan-small", requestText: "x" });
+		const { ctx, recorded } = makeContext(dir, {
+			select: (question, labels) => {
+				if (question === "Language?") return labels.find((label) => label.includes("en"));
+				return labels[0];
+			},
+		});
+
+		await configPiPlansCommand("", ctx);
+
+		assert.equal(readJson(configPath(dir)).language.tag, "en", "the wizard must keep saving");
+		assert.equal(
+			recorded.notifies.find((entry) => entry.severity === "error"),
+			undefined,
+			`refreshUiLanguage must not throw into the wizard error path: ${JSON.stringify(recorded.notifies)}`,
+		);
+	});
 });
