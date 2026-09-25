@@ -36,13 +36,15 @@ pi-plans/
 `npm run validate` enforces several invariants, so keep them intact:
 
 - every directory under `skills/` has a `SKILL.md` with frontmatter (`name` matching the directory, routing language in `description`) and the required phrases (`ask_choice`, `refine`, `.git/pi_plans`, ...)
-- `agents/*.md` declare read-only tools and state the read-only contract
+- the `reviewer` and `criticizer` agent prompts declare read-only tools and state the read-only contract
 - the npm artifact stays code-sized: no `scripts/bench/vendor|results` entries, unpacked < 5 MiB, packed < 3 MiB, and key entries present
 - `package.json` metadata (license, `pi-package` keyword, engines, scripts, required `files`) stays as asserted
 
 ## Development setup
 
-Requirements: Node.js >= 22.6 (the suite runs with `--experimental-strip-types`).
+Requirements: Node.js >= 22.6 (the suite runs with `--experimental-strip-types`). The code-graph tests need `node:sqlite`: Node >= 22.13 unflagged, or `--experimental-sqlite` on 22.6–22.12.
+
+If you don't have write access, fork the repository first and clone your fork.
 
 ```bash
 git clone https://github.com/MaxInGaussian/pi-plans
@@ -52,7 +54,7 @@ npm run validate     # structure + package artifact guard
 npm test             # node:test suite
 ```
 
-There are no runtime dependencies, but `npm install` is still required: two lifecycle tests import `@earendil-works/pi-*` packages at runtime.
+There are no runtime dependencies, but `npm install` is still required: source modules and tests resolve `@earendil-works/pi-*` (the code-graph tests additionally need `tree-sitter`) from `node_modules` at runtime.
 
 To try the extension against a real session: `pi -e /path/to/pi-plans`.
 
