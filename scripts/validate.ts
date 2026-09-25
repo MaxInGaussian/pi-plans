@@ -131,7 +131,7 @@ function validatePackageMetadata(): void {
 	if (!skills.has("./skills")) fail("package.json: pi.skills must include ./skills");
 
 	const files = new Set((pkg.files ?? []).map(normalizePackageEntry));
-	for (const required of ["README.md", "LICENSE", "index.ts", "agents", "references", "scripts", "skills", "src", "tests", "tools"]) {
+	for (const required of ["README.md", "LICENSE", "CONTRIBUTING.md", "index.ts", "agents", "references", "scripts", "skills", "src", "tests", "tools"]) {
 		if (!files.has(required)) fail(`package.json: files must include ${required}`);
 	}
 	for (const excluded of ["!scripts/bench/vendor", "!scripts/bench/results"]) {
@@ -153,6 +153,7 @@ const PACK_BLACKLIST_PREFIXES = ["scripts/bench/vendor/", "scripts/bench/results
 const REQUIRED_PACK_ENTRIES = [
 	"README.md",
 	"LICENSE",
+	"CONTRIBUTING.md",
 	"index.ts",
 	"package.json",
 	"agents/reviewer.md",
