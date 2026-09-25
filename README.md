@@ -51,6 +51,7 @@ at <b>7.6× fewer tokens per solved task</b>.
 - [Safety model](#safety-model)
 - [Verification](#verification)
 - [FAQ](#faq)
+- [Contributing](#contributing)
 - [License](#license)
 
 ## How it works
@@ -317,6 +318,10 @@ Prompts produce one-shot diffs with no recorded reasoning. pi-plans produces ver
 **Doesn't injecting execution rules every turn cost extra tokens?**
 
 The injected rule set is four compressed lines. It buys back more than it costs: the executor stops re-deriving discipline (no speculative abstractions, no compatibility detours, no reinvented helpers), so finished items converge in fewer turns and fewer tokens overall.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow (setup, checks, commit style, and PR expectations). Small fixes can go straight to a pull request; for larger changes, open an issue first. Look for issues labeled `good first issue` to get started.
 
 ## License
 

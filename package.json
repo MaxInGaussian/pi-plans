@@ -40,6 +40,7 @@
 	"files": [
 		"README.md",
 		"LICENSE",
+		"CONTRIBUTING.md",
 		"index.ts",
 		"agents/",
 		"docs/assets",
