@@ -144,7 +144,7 @@ Local path (your working directory): ${opts.localPath}
 
 Authority boundary: read-only analysis only. Do not edit, write, delete, commit, push, or spawn subagents. Stay inside the reference directory.
 
-Evidence: inspect the reference with read, grep, find, and ls before judging it. Cite files as <relative-path>:<line> for every claim; quote only what you verified.${contextLine}${languageLine}
+Evidence: inspect the reference with read, grep, find, and ls before judging it. Cite evidence for every claim in the medium's format — code: <relative-path>:<line>; papers: section/theorem/table numbers with a short quote; blogs/docs: the heading or quoted passage. Quote only what you verified. Medium-aware deep-read: repos go through entry points, core modules, tests, and configuration; papers through claims, method, limitations, and experiments; blogs/docs through technique, measurements, and caveats. Theoretical grounding counts — an algorithm, a formal property, or a measured tradeoff is as adoptable as an implementation pattern.${contextLine}${languageLine}
 
 Success criteria: a structured analysis the main agent can paste into REF_ANALYSIS.md and turn into adoption questions.
 
@@ -157,7 +157,7 @@ Section contracts:
 - Key Mechanisms And Design Tradeoffs: the mechanisms that make it work and the tradeoffs they embody.
 - Adoptable Ideas For The Target Repo: concrete, portable ideas ranked by expected value; name the target-repo surface each would touch.
 - Pitfalls And Anti-Patterns: what to avoid when borrowing; failure modes the reference itself documents or exhibits.
-- Evidence Citations: the file:line references backing the claims above.
+- Evidence Citations: the evidence references backing the claims above (file:line for code; section/theorem/table + quote for papers; heading/quote for blogs and docs).
 - Coverage: which parts of the reference you actually read versus skipped.
 - Evidence Gaps: what you could not determine from the reference alone.`;
 }

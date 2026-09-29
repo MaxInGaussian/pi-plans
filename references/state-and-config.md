@@ -7,7 +7,7 @@ Do not store pi-plans preferences in Pi's own settings (`~/.pi/agent/settings.js
 ## State Root Resolution
 
 - Git runs with `GIT_DIR`, `GIT_COMMON_DIR`, and `GIT_WORK_TREE` scrubbed from the environment, so leaked env vars cannot misdirect state into an unrelated repository. Relative results (`.git`, `../.git`) resolve against the workdir.
-- Granularity is **per enclosing repository**: running from a subdirectory uses the enclosing repo's git dir (a one-line notice names that repo). Linked worktrees share one common dir; run directories are unique, but `active.json` may race across concurrent worktrees.
+- Granularity is **per enclosing repository**: running from a subdirectory uses the enclosing repo's git dir (a one-line notice names that repo). Linked worktrees share one common dir; run directories are unique, and since v0.6.0 the run registry is derived from `runs/` (no shared pointer to race). The legacy `active.json` is deprecated: reads fall back to it only when no `runs/` entries exist (pre-0.6.0 migration).
 - State does not travel with clones: a fresh clone starts with empty state while committed `./docs/pi-plans/` artifacts persist in the repository.
 
 ## Auto Git Init
@@ -26,9 +26,9 @@ Bare repositories are refused with a clear error. A missing `git` executable is 
 <git-common-dir>/pi_plans/
   config.json
   pi-vcc-config.json
-  active.json
-  runs/            # note: the refs root is a sibling — .git/pi-plans/refs (hyphenated), not under pi_plans/
-    <run-id>/
+  active.json      # deprecated (v0.6.0): legacy pointer, read only when runs/ is empty
+  runs/            # the run registry derives from runs/<run-id>/run.json
+    <run-id>/      # note: the refs root is a sibling — .git/pi-plans/refs (hyphenated), not under pi_plans/
       run.json
       decisions.jsonl
       subagents.jsonl
@@ -37,7 +37,7 @@ Bare repositories are refused with a clear error. A missing `git` executable is 
   cache/
 ```
 
-`config.json` is stable workspace preference state. `pi-vcc-config.json` is the repo-private compaction config used only by pi-plans' VCC-style compact hook. `active.json` and `runs/` are run state. Reference downloads go to the configured `refs_root` (asked once per workspace when unset; the recommended `.git/pi-plans/refs/` sits inside the git dir so git never tracks it), with metadata recorded in the run state and public artifacts.
+`config.json` is stable workspace preference state. `pi-vcc-config.json` is the repo-private compaction config used only by pi-plans' VCC-style compact hook. `runs/` is the run state and the source of the run registry: `listRuns` scans `runs/<run-id>/run.json` (sorted by `updated_at` desc, corrupt entries skipped) and the un-bound "active" resolution is the newest NON-TERMINAL run (null when every run is done/abandoned). Multiple concurrent planning runs in one workdir are supported: each session binds to the run it started (binding first, registry fallback after), and `/plans-abandon`, `/plans-execute`, and `/resume-plans` open a descriptive run-picker form when more than one candidate exists. Reference downloads go to the configured `refs_root` (asked once per workspace when unset; the recommended `.git/pi-plans/refs/` sits inside the git dir so git never tracks it), with metadata recorded in the run state and public artifacts.
 
 ## Config Schema
 
@@ -183,7 +183,7 @@ One run directory per planning request: `<git-common-dir>/pi_plans/runs/<YYYYMMD
 
 `run.json` includes: run ID; skill name; original request; target workspace; artifact directory; language tag; status (`planning` → `accepted` → `executing` → `done`, with `stopped`/`abandoned` as exits); timestamps.
 
-`decisions.jsonl` is appended automatically by `ask_choice` (question, options, answer, answer source). `subagents.jsonl` records reviewer/criticizer/ref-analyst spawns. `refs.jsonl` records reference metadata via `plans` (`record-ref`).
+`decisions.jsonl` is appended automatically by `ask_choice` (question, options, answer, answer source). `subagents.jsonl` records reviewer/criticizer/ref-analyst spawns. `refs.jsonl` records reference metadata via `plans` (`record-ref`); its `kind` field is `project` (repos), `paper` (arXiv etc.), `article` (blog posts), or `docs` (documentation sites).
 
 ## Workflow Checkpoints (`/resume-plans`)
 
@@ -200,4 +200,4 @@ Rules:
 
 ## Run Ownership
 
-A run may be held by at most one live owner (`owner.json`: host, pid, process start time via `ps -o lstart=`, session id, random process token, generation). Acquisition is an atomic exclusive create; takeovers require proof the previous owner is dead (process gone, or pid alive with a different start time — PID reuse). Foreign hosts, corrupt records, and unverifiable liveness are conservatively refused; `/resume-plans` never queues or interrupts. Sessions bind to the run they start/execute/resume (restored from `pi-plans-run-start` entries on the current branch), and attribution (tools, write guard, autocomplete, execution bookkeeping, code-graph apply gate) prefers the binding over the shared `active.json` pointer.
+A run may be held by at most one live owner (`owner.json`: host, pid, process start time via `ps -o lstart=`, session id, random process token, generation). Acquisition is an atomic exclusive create; takeovers require proof the previous owner is dead (process gone, or pid alive with a different start time — PID reuse). Foreign hosts, corrupt records, and unverifiable liveness are conservatively refused; `/resume-plans` never queues or interrupts. Sessions bind to the run they start/execute/resume (restored from `pi-plans-run-start` entries on the current branch), and attribution (tools, write guard, autocomplete, execution bookkeeping, code-graph apply gate) prefers the binding, falling back to the registry's newest non-terminal run (v0.6.0 — the shared `active.json` pointer is deprecated). Delegated executor children pin their run via `PI_PLANS_RUN_ID` and are exempt from the planning write guard (`PI_PLANS_EXECUTOR=1`).

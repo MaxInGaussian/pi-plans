@@ -69,7 +69,7 @@ function validateSkill(dir: string): void {
 	if (!description || description.length > 1024) fail(`${file}: invalid description length`);
 	if (!/Use|MUST USE/.test(description)) fail(`${file}: description should include routing language`);
 
-	const requiredPhrases = ["Auto-complete", "ask_choice", "refine", "language", "reviewer", "criticizer", ".git/pi_plans"];
+	const requiredPhrases = ["Auto-complete", "ask_choice", "refine", "language", "reviewer", "criticizer", ".git/pi_plans", "drawback"];
 	for (const phrase of requiredPhrases) {
 		if (!text.includes(phrase)) fail(`${file}: missing required phrase ${phrase!}`);
 	}

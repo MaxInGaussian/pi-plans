@@ -277,6 +277,10 @@ function createGraphReadTool(cwd: string) {
 				};
 			};
 			const mode: GraphMode = resolveGraphMode(ctx.cwd);
+			// Delegated executor children (PI_PLANS_EXECUTOR=1) always use the
+			// native tools: DB-first staging would never be materialized inside
+			// the child (no code_graph in its allowlist), so writes must hit disk.
+			if (process.env.PI_PLANS_EXECUTOR === "1") return native(null);
 			if (mode === "off") return native(null);
 			if (mode === "config-unavailable") return native("config read failed");
 			const ensured = await ensureRuntime(ctx.cwd, ctx);
@@ -326,6 +330,8 @@ function createGraphWriteTool(cwd: string) {
 				};
 			};
 			const mode: GraphMode = resolveGraphMode(ctx.cwd);
+			// Delegated executor children bypass DB-first staging (see read tool).
+			if (process.env.PI_PLANS_EXECUTOR === "1") return stage(null);
 			if (mode === "off") return stage(null);
 			if (mode === "config-unavailable") return stage("config read failed");
 			const ensured = await ensureRuntime(ctx.cwd, ctx);
@@ -375,6 +381,8 @@ function createGraphEditTool(cwd: string) {
 				};
 			};
 			const mode: GraphMode = resolveGraphMode(ctx.cwd);
+			// Delegated executor children bypass DB-first staging (see read tool).
+			if (process.env.PI_PLANS_EXECUTOR === "1") return stage(null);
 			if (mode === "off") return stage(null);
 			if (mode === "config-unavailable") return stage("config read failed");
 			const ensured = await ensureRuntime(ctx.cwd, ctx);

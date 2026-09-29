@@ -51,6 +51,8 @@ export interface PlansConfig {
 	/** null = never asked; the plans tool surfaces a hint so the agent asks once. */
 	graph_enabled: boolean | null;
 	graph_enabled_updated_at: string | null;
+	/** Delegated executor child timeout in minutes (v0.6.0). 0/absent = default (60). */
+	executor_timeout_minutes?: number;
 }
 
 const DEFAULT_ARTIFACT_ROOT = "./docs/pi-plans";
@@ -135,6 +137,93 @@ export interface ActiveInfo {
 	run_id: string;
 	run_dir: string;
 	artifact_dir: string;
+}
+
+/** Lightweight registry view of one run (RunInfo minus the heavy fields). */
+export interface RunSummary {
+	run_id: string;
+	topic: string;
+	skill: string;
+	status: string;
+	created_at: string;
+	updated_at: string;
+	artifact_dir: string;
+}
+
+/** Terminal statuses: a run that can no longer be resumed or guarded. */
+export const TERMINAL_RUN_STATUSES = new Set(["abandoned", "done"]);
+
+function summarize(run: RunInfo): RunSummary {
+	return {
+		run_id: run.run_id,
+		topic: run.topic,
+		skill: run.skill,
+		status: run.status,
+		created_at: run.created_at,
+		updated_at: run.updated_at,
+		artifact_dir: run.artifact_dir,
+	};
+}
+
+/**
+ * Filesystem-derived run registry (v0.6.0): scans `<stateRoot>/runs/<runId>/run.json`
+ * and returns summaries sorted by `updated_at` desc (ties go to run_id desc so the
+ * newest-created run wins within one timestamp tick). Corrupt or partial run
+ * dirs are skipped, never thrown. This replaces the racy shared `active.json`
+ * pointer: there is no new shared mutable file, and per-run files are written
+ * only by the flow that owns the run.
+ */
+export function listRuns(workdir: string): RunSummary[] {
+	const stateRoot = resolveStateRootOrNull(workdir);
+	if (stateRoot === null) return [];
+	const runsRoot = path.join(stateRoot, "runs");
+	let entries: string[] = [];
+	try {
+		entries = fs.readdirSync(runsRoot);
+	} catch {
+		return [];
+	}
+	const summaries: Array<RunSummary & { mtimeMs: number }> = [];
+	for (const entry of entries) {
+		const runPath = path.join(runsRoot, entry, "run.json");
+		if (!existsSync(runPath)) continue;
+		try {
+			const run = JSON.parse(readFileSync(runPath, "utf8")) as RunInfo;
+			if (typeof run?.run_id !== "string" || typeof run?.status !== "string") continue;
+			// utcNow() has second precision: same-second runs tie on updated_at, so
+			// the per-run run.json mtime (written only by the owning flow) is the
+		// race-free recency tie-break.
+			summaries.push({ ...summarize(run), mtimeMs: Number(fs.statSync(runPath, { bigint: true }).mtimeNs) / 1e6 });
+	} catch {
+			/* corrupt run.json: skip, never fail the registry scan */
+		}
+	}
+	summaries.sort((a, b) =>
+		a.updated_at === b.updated_at
+			? a.mtimeMs === b.mtimeMs
+				? (a.run_id < b.run_id ? 1 : -1)
+				: b.mtimeMs - a.mtimeMs
+			: a.updated_at < b.updated_at ? 1 : -1,
+	);
+	return summaries.map(({ mtimeMs: _mtimeMs, ...summary }) => summary);
+}
+
+/** The newest non-terminal run (planning/accepted/executing/stopped), or null. */
+export function newestNonTerminalRun(workdir: string): RunSummary | null {
+	return listRuns(workdir).find((run) => !TERMINAL_RUN_STATUSES.has(run.status)) ?? null;
+}
+
+/** The newest run of ANY status — display-only (status widget), never attribution. */
+export function latestRun(workdir: string): RunSummary | null {
+	return listRuns(workdir)[0] ?? null;
+}
+
+function activeInfoFromSummary(stateRoot: string, run: RunSummary): ActiveInfo {
+	return {
+		run_id: run.run_id,
+		run_dir: path.join(stateRoot, "runs", run.run_id),
+		artifact_dir: run.artifact_dir,
+	};
 }
 
 export interface DecisionEntry {
@@ -442,7 +531,15 @@ export function startRun(workdir: string, options: StartRunOptions): StartRunRes
 	let artifactRoot = config.artifact_root ?? DEFAULT_ARTIFACT_ROOT;
 	if (!path.isAbsolute(artifactRoot)) artifactRoot = path.resolve(workdir, artifactRoot);
 	const dateSlug = now.slice(0, 10);
-	const artifactDir = path.join(artifactRoot, `${dateSlug}-${topicSlug}`);
+	const baseArtifactDir = path.join(artifactRoot, `${dateSlug}-${topicSlug}`);
+	// v0.6.0: same-topic runs on the same day (concurrent sessions) must not
+	// share an artifact directory — suffix until unused, mirroring the run-id loop.
+	let artifactDir = baseArtifactDir;
+	let artifactSuffix = 2;
+	while (existsSync(artifactDir)) {
+		artifactDir = `${baseArtifactDir}-${artifactSuffix}`;
+		artifactSuffix += 1;
+	}
 	const runDir = path.join(stateRoot, "runs", runId);
 	mkdirSync(runDir, { recursive: true });
 	mkdirSync(artifactDir, { recursive: true });
@@ -464,11 +561,8 @@ export function startRun(workdir: string, options: StartRunOptions): StartRunRes
 		const ledger = path.join(runDir, name);
 		if (!existsSync(ledger)) writeFileSync(ledger, "", "utf8");
 	}
-	atomicWriteJson(path.join(stateRoot, "active.json"), {
-		run_id: runId,
-		run_dir: runDir,
-		artifact_dir: artifactDir,
-	} satisfies ActiveInfo);
+	// v0.6.0: the shared active.json pointer is no longer written — the run
+	// registry is derived from runs/*/run.json (race-free across sessions).
 	if (options.onStart) {
 		try {
 			options.onStart(run);
@@ -479,10 +573,19 @@ export function startRun(workdir: string, options: StartRunOptions): StartRunRes
 	return { run, notices };
 }
 
-/** Read the active run pointer; read-only, returns null when absent. */
+/**
+ * v0.6.0 registry-backed resolution (replaces the shared `active.json`
+ * pointer): the newest NON-TERMINAL run, or null when every run is terminal.
+ * Legacy fallback: when the scan finds zero runs but a pre-0.6.0 `active.json`
+ * exists, honor it once (one-release migration shim; deprecation is surfaced
+ * on the `/plans` and `/resume-plans` command surfaces, not here — this is a
+ * read-only hot path with no notices channel).
+ */
 export function readActive(workdir: string): ActiveInfo | null {
 	const stateRoot = resolveStateRootOrNull(workdir);
 	if (stateRoot === null) return null;
+	const newest = newestNonTerminalRun(workdir);
+	if (newest !== null) return activeInfoFromSummary(stateRoot, newest);
 	const activePath = path.join(stateRoot, "active.json");
 	if (!existsSync(activePath)) return null;
 	try {

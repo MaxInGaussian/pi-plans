@@ -15,7 +15,7 @@ Read `../../references/pi-planning-workflow.md` and `../../references/state-and-
 
 1. Inspect available evidence first: repository files, logs, tests, command output, stack traces, recent diffs, CI output, environment details, and user-provided symptoms.
 2. Produce an in-message RCA summary before asking whether to plan. Use at most 5 Whys. Stop with `unknown` when evidence is insufficient; do not invent a cause.
-3. Ask one `ask_choice` question in the configured language whose preamble includes the RCA summary, with these options:
+3. Ask one `ask_choice` question in the configured language whose preamble includes the RCA summary, with these options. Every option you write carries a `description` of `✓ <advantage> / ✗ <drawback>` in the configured language, kept terse:
    1. `Create the scoped fix plan` — recommended when evidence supports a planning path.
    2. `Stop after RCA` — keep the diagnosis only.
    3. `Other` / 4. `Auto-complete` are added by the tool.

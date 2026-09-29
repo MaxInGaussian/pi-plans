@@ -296,7 +296,7 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 		name: "plans",
 		label: "Plans",
 		description:
-			"Manage pi-plans planning state in the target workspace: init/show config, set language and planning docs root plus reviewer/criticizer roles and the code-graph enabled flag, start planning runs, record decisions/refs/subagents, and update run status. State lives in .git/pi_plans/ inside the resolved git common dir. Actions: init, show, set-language, set-artifact-root, set-refs-root, set-graph-enabled, set-role, start-run, set-status, final-commit, record-decision, record-ref, record-subagent.",
+			"Manage pi-plans planning state in the target workspace: init/show config, set language and planning docs root plus reviewer/criticizer roles and the code-graph enabled flag, start planning runs, record decisions/refs/subagents, and update run status. Multiple concurrent runs per workdir are supported (registry-derived from runs/; sessions bind to their run). State lives in .git/pi_plans/ inside the resolved git common dir. Actions: init, show, set-language, set-artifact-root, set-refs-root, set-graph-enabled, set-role, start-run, set-status, final-commit, record-decision, record-ref, record-subagent.",
 		promptSnippet: "Manage pi-plans planning state, runs, and ledgers",
 		parameters: PlansParams,
 

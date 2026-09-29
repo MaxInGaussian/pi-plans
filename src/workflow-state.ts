@@ -144,6 +144,9 @@ export interface ExecutionCheckpoint {
 	reverifyAll?: boolean;
 	/** True when this approval/progress was produced in a different (origin) worktree. */
 	originWorktree?: string;
+	/** v0.6.0: set while a delegated executor child owns the implementation;
+	 * stale after a restart (orphaned delegate — the child died with the parent). */
+	delegate?: { modelSelector: string; startedAt: string };
 }
 
 export interface OwnerInfo {
@@ -451,7 +454,7 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	const record = asRecord(value, label);
 	rejectExtraKeys(
 		record,
-		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree"]),
+		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate"]),
 		label,
 	);
 	const execution: ExecutionCheckpoint = {
@@ -473,6 +476,14 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	if (record.pausedReason !== undefined) execution.pausedReason = asString(record.pausedReason, `${label}.pausedReason`);
 	if (record.reverifyAll !== undefined) execution.reverifyAll = asBool(record.reverifyAll, `${label}.reverifyAll`);
 	if (record.originWorktree !== undefined) execution.originWorktree = asString(record.originWorktree, `${label}.originWorktree`);
+	if (record.delegate !== undefined && record.delegate !== null) {
+		const delegate = asRecord(record.delegate, `${label}.delegate`);
+		rejectExtraKeys(delegate, new Set(["modelSelector", "startedAt"]), `${label}.delegate`);
+		execution.delegate = {
+			modelSelector: asString(delegate.modelSelector, `${label}.delegate.modelSelector`),
+			startedAt: asString(delegate.startedAt, `${label}.delegate.startedAt`),
+		};
+	}
 	return execution;
 }
 
@@ -1035,6 +1046,8 @@ export interface ExecutionProgressInput {
 	currentI?: string;
 	usage?: { inToks: number; outToks: number };
 	pausedReason?: string | null;
+	/** v0.6.0: set/clear the delegated-executor record; null clears it. */
+	delegate?: { modelSelector: string; startedAt: string } | null;
 }
 
 export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: ExecutionProgressInput): WorkflowCheckpoint {
@@ -1051,6 +1064,8 @@ export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: Executi
 	}
 	if (progress.pausedReason === null) delete execution.pausedReason;
 	else if (progress.pausedReason !== undefined) execution.pausedReason = progress.pausedReason;
+	if (progress.delegate === null) delete execution.delegate;
+	else if (progress.delegate !== undefined) execution.delegate = progress.delegate;
 	return { ...cp, execution };
 }
 
@@ -1148,7 +1163,8 @@ function migrationNextAction(cp: WorkflowCheckpoint): NextAction {
 /** Mark a paused stop without erasing the last phase (D-008). */
 export function applyExecutionStopped(cp: WorkflowCheckpoint, reason: string): WorkflowCheckpoint {
 	if (cp.phase !== "executing" || !cp.execution) throw new StateError("requires phase \"executing\"");
-	return { ...cp, execution: { ...cp.execution, pausedReason: reason } };
+	const { delegate: _delegate, ...execution } = cp.execution;
+	return { ...cp, execution: { ...execution, pausedReason: reason } };
 }
 
 // ---------------------------------------------------------------------------

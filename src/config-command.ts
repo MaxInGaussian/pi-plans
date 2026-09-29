@@ -7,7 +7,7 @@ interface ModelLike {
 	id?: unknown;
 }
 
-interface ConfigCommandContext {
+export interface ConfigCommandContext {
 	cwd: string;
 	hasUI: boolean;
 	model?: unknown;
@@ -34,7 +34,7 @@ function cancelled<T>(reason: "user" | "invalid" = "user"): ChoiceResult<T> {
 	return { cancelled: true, reason };
 }
 
-function modelSelectorOf(value: unknown): string | null {
+export function modelSelectorOf(value: unknown): string | null {
 	if (!value || typeof value !== "object") return null;
 	const model = value as ModelLike;
 	if (typeof model.provider !== "string" || typeof model.id !== "string") return null;
@@ -42,7 +42,12 @@ function modelSelectorOf(value: unknown): string | null {
 	return `${model.provider}/${model.id}`;
 }
 
-function collectModelSelectors(ctx: ConfigCommandContext, currentSelector: string | null): string[] {
+/**
+ * Merge the session-visible model selectors (ctx.model + ctx.scopedModels +
+ * the model registry), deduped, EXCLUDING `currentSelector` — the result is a
+ * switch-target list (v0.6.0 delegated-execution model picker reuses this).
+ */
+export function collectModelSelectors(ctx: ConfigCommandContext, currentSelector: string | null): string[] {
 	const selectors: string[] = [];
 	const push = (selector: string | null): void => {
 		if (!selector) return;

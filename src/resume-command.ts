@@ -17,7 +17,7 @@ import * as fs from "node:fs";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { loadExecutionFromCheckpoint } from "./exec.ts";
-import { bindRun } from "./run-context.ts";
+import { bindRun, boundRunId } from "./run-context.ts";
 import { acquireOwnership, OwnershipError, releaseOwnership } from "./run-ownership.ts";
 import { loadConfig, resolveStateRootOrNull, setRunStatus, updateRunWorkdir } from "./state.ts";
 import {
@@ -73,7 +73,11 @@ async function run(pi: ExtensionAPI, ctx: ExtensionContext, baseDir: string): Pr
 		return;
 	}
 
-	let candidate = pickDefaultCandidate(ctx.cwd, candidates);
+	// v0.6.0 (D-1): a session-bound resumable run resumes directly; the
+	// active-pointer auto-win is gone — ambiguity opens the descriptive form.
+	const bound = boundRunId(ctx.sessionManager, ctx.cwd);
+	const boundCandidate = bound ? candidates.find((candidate) => candidate.runId === bound) ?? null : null;
+	let candidate = boundCandidate ?? pickDefaultCandidate(ctx.cwd, candidates);
 	if (candidate === null) {
 		const labels = candidates.map((entry, index) => {
 			const cross = entry.crossWorktree ? " · cross-worktree" : "";

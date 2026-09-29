@@ -113,7 +113,7 @@ after(() => {
 });
 
 describe("candidate discovery", () => {
-	it("lists resumable runs, excludes terminal ones, prioritizes active", () => {
+	it("lists resumable runs, excludes terminal ones, registry hint first", () => {
 		const workdir = setupRepo("discovery");
 		const planning = startRun(workdir, { topic: "alpha", skill: "plan-normal", requestText: "a" }).run;
 		const stopped = startRun(workdir, { topic: "beta", skill: "plan-normal", requestText: "b" }).run;
@@ -136,21 +136,24 @@ describe("candidate discovery", () => {
 		assert.equal(ids.includes(abandoned.run_id), false);
 		assert.equal(ids.includes(done.run_id), false, "plain done excluded");
 
-		// Active priority: shared pointer names `doneWithReview` (last started).
-		const picked = pickDefaultCandidate(workdir, candidates);
-		assert.equal(picked?.runId, doneWithReview.run_id);
+		// v0.6.0: the active-pointer auto-win is gone. The registry hint (newest
+		// non-terminal run) still sorts first; picking defaults to null when
+		// several candidates exist — the command opens the form (binding-first).
+		assert.equal(candidates[0]!.runId, stopped.run_id, "registry hint sorts first");
+		assert.equal(pickDefaultCandidate(workdir, candidates), null, "multi-candidate requires choosing");
 	});
 
-	it("unique candidate auto-picks; unfinished active wins; ambiguity requires choosing", () => {
+	it("unique candidate auto-picks; ambiguity requires choosing (v0.6.0)", () => {
 		const workdir = setupRepo("picking");
 		const only = startRun(workdir, { topic: "only", skill: "plan-normal", requestText: "a" }).run;
 		const candidates = listResumeCandidates(workdir);
 		assert.equal(pickDefaultCandidate(workdir, candidates)?.runId, only.run_id);
 
-		// D-001: an unfinished active run wins even when others exist.
+		// v0.6.0 (D-1): no auto-win — two resumable runs are ambiguous here; the
+		// command's binding-first path handles the session-bound case.
 		const second = startRun(workdir, { topic: "second", skill: "plan-normal", requestText: "b" }).run;
 		const withActive = listResumeCandidates(workdir);
-		assert.equal(pickDefaultCandidate(workdir, withActive)?.runId, second.run_id);
+		assert.equal(pickDefaultCandidate(workdir, withActive), null, "two candidates require choosing");
 
 		// Ambiguity: two resumable runs, active pointer names a non-resumable one.
 		const third = startRun(workdir, { topic: "third", skill: "plan-normal", requestText: "c" }).run;

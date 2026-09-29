@@ -19,4 +19,4 @@ Use this skill when a task is planning-related but the right specialist is not o
 
 ## Pi Setup
 
-Use the same language, `ask_choice`, `refine`, reviewer, criticizer, Auto-complete, and `.git/pi_plans` rules as the selected specialist skill and the shared workflow. Questions prefer the 0.4.0 batch form: one `ask_choice` call with `questions: [...]` (2-8) opens a tabbed multiple-choice form; scope confirmation and execution handoff stay single-question with `autoComplete: false`.
+Use the same language, `ask_choice`, `refine`, reviewer, criticizer, Auto-complete, and `.git/pi_plans` rules as the selected specialist skill and the shared workflow — including the per-option `✓ <advantage> / ✗ <drawback>` descriptions, which every option you write carries in the configured language, kept terse. Questions prefer the 0.4.0 batch form: one `ask_choice` call with `questions: [...]` (2-8) opens a tabbed multiple-choice form; scope confirmation and execution handoff stay single-question with `autoComplete: false`.

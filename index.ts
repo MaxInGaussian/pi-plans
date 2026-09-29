@@ -44,6 +44,7 @@ import {
 	requestPlanningCompaction,
 	restoreFromSession,
 	stopExecution,
+	abortDelegatedExecutor,
 	updateStatusWidget,
 	shouldTriggerPlanningCompaction,
 } from "./src/exec.ts";
@@ -75,8 +76,9 @@ import { restartWatcherIfEnabled, stopGraphWatcher, disableWatcher } from "./src
 import { latestPlanVersion, nextPlanVersionPath } from "./src/plan.ts";
 import { configPiPlansCommand } from "./src/config-command.ts";
 import { resumePlansCommand } from "./src/resume-command.ts";
-import { getRun, loadConfig, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
+import { getRun, listRuns, loadConfig, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
 import { boundRunId, resolveActiveRun, restoreRunBindingFromSession } from "./src/run-context.ts";
+import { abandonCandidates, resolveCommandRun } from "./src/run-picker.ts";
 import { applyPlanWritten, mutateCheckpoint, planIdentityOf } from "./src/workflow-state.ts";
 import { registerAskChoiceTool } from "./tools/ask-choice.ts";
 import { executeCommand, registerExecutePlanTool } from "./tools/execute-plan.ts";
@@ -436,16 +438,30 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		description: "Show pi-plans state: config, active run, and execution progress",
 		handler: async (_args, ctx) => {
 			const lines: string[] = [];
+			// v0.6.0: list ALL runs (newest first, bound marked, cap 50) instead of
+			// only the shared active one — multi-run workdirs stay legible.
+			const runs = listRuns(ctx.cwd).slice(0, 50);
+			const bound = boundRunId(ctx.sessionManager, ctx.cwd);
+			if (runs.length === 0) {
+				lines.push("No planning runs recorded in this workdir.");
+			} else {
+				lines.push(`Runs (${runs.length} shown, newest first):`);
+				for (const run of runs) {
+					lines.push(`  ${run.run_id === bound ? "★" : " "} ${run.topic} · ${run.status} · ${run.skill} · ${run.updated_at}`);
+				}
+			}
 			const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 			const run = active ? getRun(ctx.cwd, active.run_id) : null;
-			if (!run) {
-				lines.push("No active planning run.");
-			} else {
-				lines.push(`Active run: ${run.run_id}`);
+			if (run) {
+				lines.push(`Session run: ${run.run_id}`);
 				lines.push(`Skill: ${run.skill}  Status: ${run.status}`);
 				lines.push(`Artifacts: ${run.artifact_dir}`);
 				lines.push(`Language: ${run.language_tag ?? "(unset)"}`);
 				lines.push(`State: ${resolveStateRootOrNull(ctx.cwd) ?? "(no repo)"}`);
+			}
+			// One-time active.json deprecation note (v0.6.0 registry migration).
+			if (fs.existsSync(path.join(resolveStateRootOrNull(ctx.cwd) ?? ".git/pi_plans", "active.json"))) {
+				lines.push("Note: active.json is deprecated — the run registry now derives from runs/*/run.json; the legacy file is ignored.");
 			}
 			const execution = getExecution();
 			if (execution) {
@@ -599,6 +615,9 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			}
 			const ok = await ctx.ui.confirm("Stop execution?", "Remaining verifier items will be left unfinished.");
 			if (!ok) return;
+			// v0.6.0: a delegated executor child is killed via its AbortController
+			// before the shared stop path clears the state.
+			abortDelegatedExecutor();
 			await stopExecution(pi, ctx, "stopped by user via /plans-stop");
 			ctx.ui.notify("Execution stopped.", "info");
 		},
@@ -615,24 +634,32 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("plans-abandon", {
 		description: "Abandon the active planning run (lifts the read-only guard; artifacts are kept)",
 		handler: async (_args, ctx) => {
-			const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
-			if (!active) {
+			// v0.6.0 (R-3): pick the run to abandon when several candidates exist;
+			// binding-first, single candidate stays direct (0.5.7 parity).
+			const chosen = await resolveCommandRun(
+				{ cwd: ctx.cwd, sessionManager: ctx.sessionManager, ui: ctx.ui },
+				{ candidates: abandonCandidates(ctx.cwd), title: "Abandon which run?" },
+			);
+			if (!chosen) {
 				ctx.ui.notify("No active planning run.", "info");
 				return;
 			}
+			const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+			const abandoningBound = active?.run_id === chosen.run_id;
 			const ok = await ctx.ui.confirm(
 				"Abandon planning run?",
-				`${active.run_id}\nThe read-only guard lifts; committed artifacts stay in place.`,
+				`${chosen.run_id} (${chosen.topic} · ${chosen.status})\nThe read-only guard lifts; committed artifacts stay in place.`,
 			);
 			if (!ok) return;
 			// Abandon must end execution first so the planning model is restored.
 			disableAutoComplete(ctx, "run abandoned");
-			if (getExecution()) {
+			if (abandoningBound && getExecution()) {
+				abortDelegatedExecutor();
 				await stopExecution(pi, ctx, "run abandoned via /plans-abandon");
 			}
 			try {
-				setRunStatus(ctx.cwd, active.run_id, "abandoned");
-				ctx.ui.notify(`Run ${active.run_id} abandoned.`, "info");
+				setRunStatus(ctx.cwd, chosen.run_id, "abandoned");
+			ctx.ui.notify(`Run ${chosen.run_id} abandoned.`, "info");
 			} catch (error) {
 				ctx.ui.notify(`Failed: ${(error as Error).message}`, "error");
 			}

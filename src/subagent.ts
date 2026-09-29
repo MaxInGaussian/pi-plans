@@ -40,6 +40,16 @@ export interface SubagentOptions {
 	timeoutMs?: number;
 	/** Optional normalized progress sink. Exceptions from the sink are ignored. */
 	onProgress?: (event: SubagentProgressEvent) => void;
+	/**
+	 * Child env marker (v0.6.0): "refiner" (default — read-only reviewer/
+	 * criticizer/ref-analyst children; sets PI_PLANS_REFINER=1, which the code
+	 * graph gates treat as read-only), "executor" (delegated plan executor;
+	 * sets PI_PLANS_EXECUTOR=1 so the write guard and the graph-aware file
+	 * tools bypass staging and run natively), or "none".
+	 */
+	envMarker?: "refiner" | "executor" | "none";
+	/** Pin the run id a delegated executor child operates on (PI_PLANS_RUN_ID). */
+	runId?: string;
 }
 
 export interface SubagentResult {
@@ -283,6 +293,37 @@ function emitProgress(options: SubagentOptions, event: SubagentProgressEvent): v
 
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 
+/**
+ * Build the child process env for a subagent run (v0.6.0): refiner children
+ * carry PI_PLANS_REFINER=1, executor children PI_PLANS_EXECUTOR=1 plus an
+ * optional PI_PLANS_RUN_ID pin, and marker keys never leak across kinds.
+ */
+export function subagentChildEnv(
+	options: Pick<SubagentOptions, "envMarker" | "runId">,
+	parentEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+	const childEnv: NodeJS.ProcessEnv = { ...parentEnv };
+	switch (options.envMarker ?? "refiner") {
+		case "refiner":
+			childEnv.PI_PLANS_REFINER = "1";
+			delete childEnv.PI_PLANS_EXECUTOR;
+			delete childEnv.PI_PLANS_RUN_ID;
+			break;
+		case "executor":
+			childEnv.PI_PLANS_EXECUTOR = "1";
+			delete childEnv.PI_PLANS_REFINER;
+			if (options.runId) childEnv.PI_PLANS_RUN_ID = options.runId;
+			else delete childEnv.PI_PLANS_RUN_ID;
+			break;
+		case "none":
+			delete childEnv.PI_PLANS_REFINER;
+			delete childEnv.PI_PLANS_EXECUTOR;
+			delete childEnv.PI_PLANS_RUN_ID;
+			break;
+	}
+	return childEnv;
+}
+
 export async function runPiSubagent(options: SubagentOptions): Promise<SubagentResult> {
 	const tools = options.tools ?? ["read", "grep", "find", "ls"];
 	let tmpDir = "";
@@ -322,7 +363,7 @@ export async function runPiSubagent(options: SubagentOptions): Promise<SubagentR
 				cwd: options.cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, PI_PLANS_REFINER: "1" },
+				env: subagentChildEnv(options),
 			});
 			let buffer = "";
 			let closed = false;

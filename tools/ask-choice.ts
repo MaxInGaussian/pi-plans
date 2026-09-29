@@ -156,7 +156,12 @@ export function fitAskChoicePanel(question: string, items: PanelItem[], columns:
 export const Option = Type.Object(
 	{
 		label: Type.String({ description: "Option label" }),
-		description: Type.Optional(Type.String({ description: "Short tradeoff that matters, shown to the user" })),
+		description: Type.Optional(
+			Type.String({
+				description:
+					"REQUIRED on every option you author: '✓ <advantage> / ✗ <drawback>' — the user compares options side by side, so each one must state what it gains AND what it costs. Write BOTH halves in this single description string, in the configured language, tersely (≈8 words per half). If a side is genuinely absent write '—' rather than dropping it. Do NOT invent separate pros/cons fields: Option accepts no other keys.",
+			}),
+		),
 		recommended: Type.Optional(Type.Boolean({ description: "Mark exactly one recommended option; put it first. Never embed (推荐)/(recommended) text in labels — the UI renders the ★ marker automatically" })),
 	},
 	{ additionalProperties: false },
@@ -165,7 +170,10 @@ export const Option = Type.Object(
 export const BatchQuestionParams = Type.Object(
 	{
 		question: Type.String({ description: "The question to ask, in the configured language" }),
-		options: Type.Array(Option, { description: "Ordered options: recommended first, alternatives next. Do not include Other or Auto-complete yourself." }),
+		options: Type.Array(Option, {
+			description:
+				"Ordered options: recommended first, alternatives next. Every option's description states its advantage AND its drawback as '✓ <advantage> / ✗ <drawback>' in the configured language. Do not include Other or Auto-complete yourself.",
+		}),
 		allowOther: Type.Optional(Type.Boolean({ description: "Offer free-form input for this question (default true)" })),
 		autoComplete: Type.Optional(
 			Type.Boolean({
@@ -182,7 +190,7 @@ export const BatchQuestionParams = Type.Object(
 export const AskChoiceParams = Type.Object(
 	{
 		question: Type.Optional(Type.String({ description: "The single question to ask, in the configured language (mutually exclusive with questions)." })),
-	options: Type.Optional(Type.Array(Option, { description: "Ordered options (single-question form): recommended first, alternatives next. Do not include Other or Auto-complete yourself." })),
+	options: Type.Optional(Type.Array(Option, { description: "Ordered options (single-question form): recommended first, alternatives next. Every option's description states its advantage AND its drawback as '✓ <advantage> / ✗ <drawback>' in the configured language. Do not include Other or Auto-complete yourself." })),
 	questions: Type.Optional(
 		Type.Array(BatchQuestionParams, {
 			description:
@@ -586,16 +594,24 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 		name: "ask_choice",
 		label: "Ask Choice",
 		description:
-			"Ask the user planning or refinement questions as numbered choice prompts: recommended option first, alternatives next, then Other and Auto-complete. Two shapes: questions: [...] (2-8 questions) opens ONE tabbed multiple-choice form with a submit page — use it to batch a round of questions (≤8), then think about the answers and follow up in later calls (phased questioning stays agent-driven); question + options asks one question at a time (classic flow). Use ask_choice for every user-facing planning question, the final scope confirmation, refinement-mode questions, language/role/model settings, and the execution handoff. Scope confirmation and the execution handoff MUST stay single-question calls (autoComplete: false); batches reject autoComplete: false items and the termination/questionIds reserved for handoff. The optional trailing parameter swaps the trailing Auto-complete option to Auto-refine loop for the post-execution amelioration prompt.",
+			"Ask the user planning or refinement questions as numbered choice prompts: recommended option first, alternatives next, then Other and Auto-complete. Two shapes: questions: [...] (2-8 questions) opens ONE tabbed multiple-choice form with a submit page — use it to batch a round of questions (≤8), then think about the answers and follow up in later calls (phased questioning stays agent-driven); question + options asks one question at a time (classic flow). Use ask_choice for every user-facing planning question, the final scope confirmation, refinement-mode questions, language/role/model settings, and the execution handoff. Scope confirmation and the execution handoff MUST stay single-question calls (autoComplete: false); batches reject autoComplete: false items and the termination/questionIds reserved for handoff. The optional trailing parameter swaps the trailing Auto-complete option to Auto-refine loop for the post-execution amelioration prompt. EVERY option you author — including the accept/execute handoff and the implementation-review setup questions — must set description to '✓ <advantage> / ✗ <drawback>' in the configured language, so the user can see what each option gains and what it costs. Other and Auto-complete are appended by this tool and need no description.",
 		promptSnippet: "Ask structured planning questions with recommended/Other/Auto-complete ordering; batch ≤8 questions per form",
 		promptGuidelines: [
 			"Use ask_choice for every pi-plans question to the user instead of plain-text questions; it enforces option ordering and records decisions.",
 			"Batch a round's questions into one ask_choice call (questions: [...], 2-8 items) instead of asking one at a time, then think after the answers and follow up with later calls. Scope confirmation and execution handoff are always separate single-question calls (autoComplete: false).",
+			"Give every option you author a description of the form '✓ <advantage> / ✗ <drawback>' — the user's whole point is seeing what each option wins and what it costs, in the configured language. Keep each half terse (~8 words). Put both halves in the description string; there are no separate pros/cons fields, and Other/Auto-complete are added by the tool.",
 		],
 		parameters: AskChoiceParams,
 		executionMode: "sequential",
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// R-13 (defense-in-depth): a delegated executor child has no user to
+			// answer — refuse instead of blocking a headless run on a UI prompt.
+			if (process.env.PI_PLANS_EXECUTOR === "1") {
+				throw new Error(
+					"ask_choice is unavailable in a delegated executor session: no interactive user. Decide autonomously, proceed, and record the deviation in your final summary.",
+				);
+			}
 			// 0.4.0 batch mode: one tabbed form for a whole round of questions
 			// (2-8). The single-question path below is untouched (C-004).
 			// F-005 (impl review r1): ambiguous shapes fail loudly instead of

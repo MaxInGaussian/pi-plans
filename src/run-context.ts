@@ -10,7 +10,7 @@
  */
 
 import * as path from "node:path";
-import { getRun, readActive, runDirPath, type ActiveInfo } from "./state.ts";
+import { getRun, newestNonTerminalRun, readActive, runDirPath, type ActiveInfo } from "./state.ts";
 
 interface RunBinding {
 	runId: string;
@@ -54,11 +54,19 @@ export function activeInfoById(workdir: string, runId: string): ActiveInfo | nul
 }
 
 /**
- * Resolve the run this session should attribute work to. A session-bound
- * run always wins; sessions without a binding keep the legacy
- * shared-pointer behavior.
+ * Resolve the run this session should attribute work to. Resolution order:
+ * 1. `PI_PLANS_RUN_ID` env (delegated executor children — deterministic even
+ *    when several runs are active concurrently);
+ * 2. the session binding (a session-bound run always wins);
+ * 3. registry fallback: the newest non-terminal run (`readActive` shim), or
+ *    null when every run is terminal.
  */
 export function resolveActiveRun(session: unknown, workdir: string): ActiveInfo | null {
+	const envRunId = process.env.PI_PLANS_RUN_ID;
+	if (typeof envRunId === "string" && envRunId.trim() !== "") {
+		const pinned = activeInfoById(workdir, envRunId.trim());
+		if (pinned !== null) return pinned;
+	}
 	if (session !== undefined && session !== null) {
 		const runId = boundRunId(session, workdir);
 		if (runId !== null) {

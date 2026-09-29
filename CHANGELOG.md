@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0] - 2026-09-26
+
+### Added
+
+- **同 workdir 多 run 并存（v0.6.0 核心演进）**：废除共享单指针 `active.json`（并发会话最后写入者胜出、跨 worktree 竞态），改为**文件系统派生的 run 注册表**：`listRuns` 扫描 `runs/<run-id>/run.json`（按 `updated_at` 降序，同秒内以 run.json 的纳秒 mtime 决胜，损坏目录跳过不抛错），无新增共享可变文件；未绑定会话的回退解析 = 最新非终态 run（全部终态时为 null，写入不再被误拦）。`start-run` 并行不再写指针；同日同主题 run 的 artifact 目录自动加后缀避免合并；`/plans-abandon`、`/plans-execute`、`/resume-plans` 改为**绑定优先 + 候选>1 时弹描述性选择表单**（★ 推荐项置顶，主题·状态·skill·时间），单候选路径与 0.5.7 完全一致；`/resume-plans` 移除 active 指针自动胜出；`/plans` 现列出全部 run（最新在前，标记会话绑定，上限 50）并附 active.json 弃用提示；执行状态栏在全部终态时仍显示最新 run 的 done/abandoned 结果与存活 impl-review 循环；旧 `active.json` 仅在 `runs/` 扫描为空时作一次性迁移回退读取。
+- **Execute 后可选切换模型执行（delegated executor）**：执行批准后新增运行时选择——① 使用当前会话（推荐，行为与 0.5.7 一致）② 切换至其他模型（列出 ≥3 个 `provider/model` 切换目标：会话可见模型 + 模型注册表去重、排除当前；不足时提供 Other 自由输入）。切换后由**单个 executor 子代理**跑完整个计划：原生写工具（read/write/edit/bash/grep/find/ls，钉在 SDK ToolName 并集）、`--model` 指定模型、`PI_PLANS_EXECUTOR=1` + `PI_PLANS_RUN_ID` 钉定 run；父会话阻塞式等待并以 Executor overlay 直播进度，从子代理**全文消息事件**解析 `[DONE:VC-xxx]`/`[I-###]` 标记镜像进检查点与状态栏；Esc（工具信号贯通）或 `/plans-stop` 终止子代理并置 stopped（可续，已完成 VC 不重问）；超时可配（config.json `executor_timeout_minutes`，默认 60，0=默认）；子代理退出后父会话校验剩余项——全部完成走正常完成流，有剩余保持 executing 可续；崩溃重启后孤儿 delegate 检测提示。安全隔离：写保护与 graph 感知写工具对 `PI_PLANS_EXECUTOR=1` 旁路（原生落盘，不受另一会话 planning run 拦截、不做 DB-first 暂存），`ask_choice` 在 executor 子进程内拒绝执行（自主决策）；auto-approve / 无 UI 时跳过提问（当前会话 + `[auto-approve]` 记录），决策记入 decisions.jsonl。`execute_plan` 工具与 `/plans-execute` 命令路径统一（多 run 先选 run 再选运行时）。
+- **每个 AI 写的 ask question item 都写清优势 & drawbacks**：`ask_choice` 的每个由 AI 撰写的选项（含最终 scope 确认、合并的 accept/execute 交接、implementation-review 配置问题）必须在既有 `description` 字符串里写出 `✓ <advantage> / ✗ <drawback>`——**按 workspace 配置语言（`language.tag`）书写**、每半句控制在 ~8 词。用户因此能横向比较每个选项"得到什么 / 付出什么"，而不是只看标签。约定落在 `Option.description` 的 schema 描述（`tools/ask-choice.ts`）、工具 `description`、新增第三条 `promptGuidelines`、单问与批量两条 `options` 数组描述，并同步 `references/pi-planning-workflow.md`（options 条款 + 交接 + impl-review 段）、全部 6 个 `skills/*/SKILL.md`、`README.md` 特性表。由工具自动追加的固定尾项（`Other…` / `Auto-complete` / `Auto-refine loop`）不在此列。**无 UI、无 schema、无状态改动**：两条渲染路径本来就输出 `1. <label> — ${description}`（`tools/ask-choice.ts:479`、`:766`、`src/ask-form.ts:273`），`decisions.jsonl` 记录格式不变；代价是描述变长会让单问面板更早进入 `fitAskChoicePanel` 的"剥离描述"降级档（既有优雅降级，非缺陷），故措辞要求简洁。
+- **plan-normal / plan-big 可选参考检索**：两技能的 web 研究规则扩写——完成仓库调研后可选地检索 1–2 个具名参考（论文/工程博客/其他仓库均可），在计划 Evidence 节引用 URL；明确可选、不计入提问限额、无需下载分析（那是 plan-with-refs 的职责）。
+- **plan-with-refs 参考不限 GitHub**：论文（arXiv 等）、工程博客、文档站成为一等参考，**理论参考与实现参考同等有效**；按介质定义合格下载（仓库=克隆；论文=全文（HTML 优先，PDF 提取文本；仅摘要不合格）；博客/文档站=整篇可读 markdown；每参考一目录，`analyze_refs` 只接受目录）；新增明确多样性规则：≥3 个合格参考且 ≥2 个不同来源；`refs.jsonl` 的 kind 值约定为 `project | paper | article | docs`；ref-analyst 提示词与 `buildRefAnalystTask` 任务简报同步泛化（按介质深读；证据=代码 file:line / 论文章节·定理·表号+短引 / 博客标题+引文，七段结构不变）。
+
+### Changed
+
+- `agents/executor.md` 新增（delegated executor 系统提示：自主整计划实施、逐消息标记、结构化收尾总结）；normative 文档 `references/state-and-config.md`（目录布局、注册表语义、弃用说明、run-id 钉定）与 `references/pi-planning-workflow.md`（运行时选择、任意介质参考、可选参考检索）同步更新；`collectModelSelectors`/`modelSelectorOf` 从 config-command 导出复用。
+- 测试：新增 `tests/multi-run.test.ts`（注册表排序/容错、readActive 回退、终端态空解析、并行 start-run 目录唯一、PI_PLANS_RUN_ID 钉定、guard executor 旁路、picker 候选与标签、子代理 env 标记、标记镜像）与 `tests/ask-choice-pros-cons.test.ts`（契约文案 × 8：Option/工具 description/promptGuidelines/批量与单问 options 数组、6 个技能、normative 文档条款、**formRender 渲染实证**、schema 回归）；`tests/resume.test.ts` 两处 picking 断言按 v0.6.0 绑定优先语义更新（多候选不再自动胜出）。`scripts/validate.ts` 的 `validateSkill()` 追加 `drawback` 必需词，6 个技能在 pack 期静态兜底。全量 **549 测试全绿**（526 存量 + 15 多 run + 8 pros/cons）。
+
 ## [0.5.7] - 2026-09-24
 
 ### Changed

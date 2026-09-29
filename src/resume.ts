@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
-import { getRun, readActive, resolveStateRootOrNull, runDirPath, type RunInfo } from "./state.ts";
+import { getRun, listRuns, readActive, resolveStateRootOrNull, runDirPath, type RunInfo } from "./state.ts";
 import { loadCheckpoint, mutateCheckpoint, type WorkflowCheckpoint } from "./workflow-state.ts";
 
 export interface ResumeCandidate {
@@ -81,22 +81,17 @@ function planVersionOf(checkpoint: WorkflowCheckpoint | null, run: RunInfo): num
 /**
  * Enumerate resumable runs for the repo containing `workdir`. Corrupt
  * checkpoints are surfaced (not hidden) so the command can report them;
- * read errors never abort discovery of other runs.
+ * read errors never abort discovery of other runs. v0.6.0: enumeration is
+ * driven by the filesystem-derived registry (`listRuns`) so ordering and
+ * corrupt-run tolerance match every other multi-run surface.
  */
 export function listResumeCandidates(workdir: string): ResumeCandidate[] {
 	const stateRoot = resolveStateRootOrNull(workdir);
 	if (stateRoot === null) return [];
-	const runsDir = path.join(stateRoot, "runs");
-	if (!existsSync(runsDir)) return [];
 	const active = readActive(workdir);
 	const candidates: ResumeCandidate[] = [];
-	let entries: string[] = [];
-	try {
-		entries = fs.readdirSync(runsDir);
-	} catch {
-		return [];
-	}
-	for (const runId of entries) {
+	for (const summary of listRuns(workdir)) {
+		const runId = summary.run_id;
 		const run = getRun(workdir, runId);
 		if (!run) continue;
 		const runDir = runDirPath(workdir, runId);
@@ -130,7 +125,7 @@ export function listResumeCandidates(workdir: string): ResumeCandidate[] {
 			updatedAt: checkpoint?.updatedAt ?? run.updated_at,
 		});
 	}
-	// Active pointer first (priority, not exclusivity), then newest updated.
+	// Newest updated first; the active run (registry hint) gets priority.
 	candidates.sort((a, b) => {
 		const aActive = active?.run_id === a.runId ? 1 : 0;
 		const bActive = active?.run_id === b.runId ? 1 : 0;
@@ -140,14 +135,17 @@ export function listResumeCandidates(workdir: string): ResumeCandidate[] {
 	return candidates;
 }
 
-/** Pick the default candidate: active-unfinished first, else unique candidate (D-001). */
+/**
+ * Pick the default candidate (v0.6.0 D-1): the SESSION BINDING is resolved by
+ * the command (it owns the SessionManager); here a unique candidate goes
+ * direct and everything else is ambiguous — the active-pointer auto-win is
+ * gone (multi-run workdirs must not silently pick the registry hint).
+ */
 export function pickDefaultCandidate(workdir: string, candidates: ResumeCandidate[]): ResumeCandidate | null {
+	void workdir;
 	if (candidates.length === 0) return null;
-	const active = readActive(workdir);
-	const activeCandidate = active ? candidates.find((candidate) => candidate.runId === active.run_id) ?? null : null;
-	if (activeCandidate !== null) return activeCandidate;
 	if (candidates.length === 1) return candidates[0]!;
-	return null; // ambiguous: the command must ask
+	return null; // ambiguous: the command must ask (binding first, then form)
 }
 
 export interface DecisionLedgerEntry {

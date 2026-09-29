@@ -36,9 +36,11 @@ import {
 	type VccCompactionBuildResult,
 	type VccCompactionStats,
 } from "./compaction.ts";
-import { getRun, lintPlanIntoNotices, readActive, resolveStateRootOrNull, setRunStatus, StateError, utcNow } from "./state.ts";
+import { TERMINAL_RUN_STATUSES, getRun, latestRun, lintPlanIntoNotices, loadConfig, readActive, resolveStateRootOrNull, setRunStatus, StateError, utcNow } from "./state.ts";
 import { execChrome, resolveUiLanguage, type UiLanguage } from "./ui-language.ts";
 import { bindRun, resolveActiveRun } from "./run-context.ts";
+import { runPiSubagent, type SubagentProgressEvent } from "./subagent.ts";
+import { RefineOverlayController, refineOverlayContext } from "./refine-ui.ts";
 import { OwnershipError } from "./run-ownership.ts";
 import {
 	applyExecutionApproved,
@@ -110,6 +112,10 @@ export interface ExecState {
 	uiLanguage?: UiLanguage;
 	currentI?: string;
 	goalWait?: GoalWaitState;
+	/** v0.6.0: set while a delegated executor child owns the implementation.
+	 * Persisted subset only (modelSelector + startedAt); the AbortController is
+	 * runtime state kept in delegatedRuntime, never persisted. */
+	delegate?: { modelSelector: string; startedAt: string };
 }
 
 /**
@@ -283,6 +289,19 @@ export function loadExecutionFromCheckpoint(
 	resetGoalWaitRuntime(ctx);
 	pendingExecutionFlush = false; // restored state: no inherited flush debt
 	resetExecutionCompactionState(ctx);
+	// v0.6.0 orphaned-delegate detection: a restart never carries a live child.
+	// If the checkpoint/session carries delegate state, surface it so the user
+	// knows the previous executor died mid-run (VC state is intact, resumable).
+	if (cp.execution.delegate) {
+		try {
+			ctx.ui.notify?.(
+				`pi-plans: the previous delegated executor (${cp.execution.delegate.modelSelector}) did not finish before this session ended. Verified VC state is preserved; resume with /plans-execute.`,
+				"warning",
+			);
+		} catch {
+			/* notification is best-effort */
+		}
+	}
 	if (headChanged) {
 		withExecutionCheckpoint(ctx, (current) => applyExecutionHeadChanged(current));
 	}
@@ -463,7 +482,13 @@ let loopPanelRegistered = false;
 function implReviewLoopState(
 	ctx: ExtensionContext,
 ): { topic: string; review: { terminationCondition?: string; reviewerCount?: number; completedRounds: number } } | null {
-	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	// v0.6.0: resolveActiveRun only returns NON-TERMINAL runs, but this state
+	// is by definition attached to a DONE run — fall back to the newest run of
+	// any status (display-only) when the active resolution is null.
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd) ?? (() => {
+		const latest = latestRun(ctx.cwd);
+		return latest === null ? null : { run_id: latest.run_id, artifact_dir: latest.artifact_dir };
+	})();
 	if (!active) return null;
 	if (getRun(ctx.cwd, active.run_id)?.status !== "done") return null;
 	const load = loadCheckpoint(ctx.cwd, active.run_id);
@@ -564,7 +589,10 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 	if (active) {
 		// Idle indicator depends on the run's lifecycle, not just its existence:
 		// done reads as finished, abandoned as closed, stopped/accepted as paused.
-		const status = getRun(ctx.cwd, active.run_id)?.status;
+		// v0.6.0: resolveActiveRun only returns NON-TERMINAL runs; for the pure
+		// display line below, fall back to the newest run of any status so a
+		// finished workdir still shows its last run's outcome.
+		const status = getRun(ctx.cwd, active.run_id)?.status ?? latestRun(ctx.cwd)?.status;
 		if (status === "done") {
 			// D-3/D-015: while the implementation-review loop is live (checkpoint
 			// still in the implementation-review phase), the status line mirrors
@@ -599,6 +627,24 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 		}
 		// unknown status: no indicator.
 	}
+	// Terminal-only workdir: resolveActiveRun is null, but the display line
+	// still reports the newest run's outcome (done/abandoned, plus its live
+	// implementation-review loop).
+	const terminalLatest = latestRun(ctx.cwd);
+	if (terminalLatest && TERMINAL_RUN_STATUSES.has(terminalLatest.status)) {
+		if (terminalLatest.status === "done") {
+			const loop = implReviewLoopState(ctx);
+			if (loop) {
+				const line = formatImplReviewLoopSummaryLine(deriveImplReviewLoopModel(loop.topic, loop.review));
+				ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
+				return;
+			}
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("success", `🎯 plans: ${terminalLatest.run_id} (done)`));
+		} else {
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("error", `🚫 plans: ${terminalLatest.run_id}`));
+		}
+		return;
+	}
 	ctx.ui.setStatus("pi-plans", undefined);
 }
 
@@ -614,6 +660,7 @@ function persist(pi: ExtensionAPI): void {
 		implWarning: execution.implWarning ?? null,
 		currentI: execution.currentI,
 		goalWait: execution.goalWait,
+		delegate: execution.delegate ?? null,
 	});
 }
 
@@ -641,6 +688,7 @@ export async function startExecution(
 	planPath: string,
 	items: CheckItem[],
 	implItems?: ImplItem[],
+	opts?: StartExecutionOptions,
 ): Promise<void> {
 	execution = {
 		planPath,
@@ -721,6 +769,189 @@ export async function startExecution(
 		},
 		{ triggerTurn: false },
 	);
+	// Delegated runtime (v0.6.0): one executor child implements the whole plan
+	// while this tool call blocks; the parent mirrors VC progress from the
+	// child's streamed assistant messages (R-9..R-12).
+	updateStatusWidget(ctx);
+	if (opts?.runtime && opts.runtime !== "current-session") {
+		await runDelegatedExecution(pi, ctx, opts.runtime.modelSelector, opts.signal);
+	}
+}
+
+/** Where a chosen execution runs: this session, or a delegated executor child. */
+export type ExecutionRuntime = "current-session" | { modelSelector: string };
+
+export interface StartExecutionOptions {
+	/** "current-session" (default) or a delegated executor model selector. */
+	runtime?: ExecutionRuntime;
+	/** Tool-call abort signal, threaded into the delegated child. */
+	signal?: AbortSignal;
+}
+
+/** Default delegated executor timeout when config omits executor_timeout_minutes. */
+const DELEGATE_DEFAULT_TIMEOUT_MINUTES = 60;
+void DELEGATE_DEFAULT_TIMEOUT_MINUTES;
+
+/** Live AbortController for the delegated executor child (runtime-only state). */
+let delegatedRuntime: AbortController | null = null;
+
+/** Abort the delegated executor child, if one is running (used by /plans-stop). */
+export function abortDelegatedExecutor(): boolean {
+	if (delegatedRuntime === null) return false;
+	delegatedRuntime.abort();
+	return true;
+}
+
+function executorAgentPrompt(): string {
+	try {
+		const agentPath = new URL("../agents/executor.md", import.meta.url);
+		return fs.readFileSync(agentPath, "utf8");
+	} catch {
+		return "You are a delegated plan executor in the pi-plans workflow. Implement the accepted plan autonomously and emit [DONE:VC-xxx] markers in your replies as verifier items pass.";
+	}
+}
+
+function delegatedExecutorTimeoutMs(): number | undefined {
+	try {
+		const stateRoot = resolveStateRootOrNull(process.cwd());
+		if (stateRoot === null) return undefined;
+		const minutes = loadConfig(stateRoot).executor_timeout_minutes;
+		if (typeof minutes !== "number" || minutes <= 0) return undefined;
+		return minutes * 60 * 1000;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Delegated execution (R-9..R-12): spawn ONE executor child for the whole
+ * plan (write-capable tools, chosen model, PI_PLANS_EXECUTOR=1 + pinned run
+ * id), stream its progress into the overlay, parse full-text assistant
+ * messages for [DONE:VC-xxx]/[I-xxx] markers, and on exit verify the
+ * remaining items. Abort/timeout → stopExecution (stopped, resumable);
+ * clean exit with items left → stay executing (resumable under either
+ * runtime); clean exit complete → normal completion flow.
+ */
+async function runDelegatedExecution(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	modelSelector: string,
+	parentSignal: AbortSignal | undefined,
+): Promise<void> {
+	if (!execution) return;
+	const controller = new AbortController();
+	delegatedRuntime = controller;
+	const relayAbort = () => controller.abort();
+	if (parentSignal?.aborted) controller.abort();
+	else parentSignal?.addEventListener("abort", relayAbort, { once: true });
+	const lang = resolveUiLanguage(ctx.cwd);
+	const overlay = ctx.mode === "tui" ? new RefineOverlayController("executor", [{ id: "executor" }], relayAbort, lang) : undefined;
+	if (overlay) {
+		try {
+			overlay.open(refineOverlayContext(ctx), modelSelector);
+		} catch {
+			/* overlay is best-effort; the blocking call itself must not fail */
+		}
+	}
+	execution.delegate = { modelSelector, startedAt: utcNow() };
+	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { delegate: execution?.delegate ?? null }));
+	persist(pi);
+	const runId = executionRunId;
+	const remainingAtStart = execution.items.filter((item) => !item.done).map((item) => item.id);
+	const task = [
+		`Implement the accepted plan at ${execution.planPath} (workdir: ${ctx.cwd}).`,
+		"Read the plan file first; it is the source of truth for scope, sequencing, and verification steps.",
+		remainingAtStart.length > 0
+			? `Verifier items still open: ${remainingAtStart.join(", ")}. Emit [DONE:VC-xxx] markers in your replies as each item's stated evidence passes.`
+			: "All verifier items already passed; verify the plan end-to-end and report.",
+		execution.implItems?.length
+			? `Implementation items: ${execution.implItems.map((item) => item.id).join(", ")} — emit [I-###:implemented]/[I-###:validating] markers as you progress.`
+			: "",
+		"Finish with the structured summary your system prompt specifies.",
+	]
+		.filter((line) => line !== "")
+		.join("\n");
+	let result: Awaited<ReturnType<typeof runPiSubagent>>;
+	try {
+		result = await runPiSubagent({
+			systemPrompt: executorAgentPrompt(),
+			task,
+			cwd: ctx.cwd,
+			model: modelSelector,
+			tools: ["read", "write", "edit", "bash", "grep", "find", "ls"],
+			envMarker: "executor",
+			runId: runId ?? undefined,
+			signal: controller.signal,
+			timeoutMs: delegatedExecutorTimeoutMs(),
+			onProgress: (event: SubagentProgressEvent) => {
+				try {
+					overlay?.update("executor", event);
+			} catch {
+				/* display must not fail the child runner */
+			}
+			if (
+					event.type === "transcript"
+					&& event.phase === "end"
+					&& event.entryType === "assistant-text"
+					&& typeof event.text === "string"
+			) {
+					mirrorDelegateMarkers(pi, ctx, event.text);
+			}
+			},
+		});
+	} finally {
+		delegatedRuntime = null;
+		try {
+			await overlay?.close();
+		} catch {
+			/* best-effort */
+		}
+		parentSignal?.removeEventListener("abort", relayAbort);
+	}
+	if (!result.ok) {
+		const reason = result.timedOut
+			? `delegated executor timed out (${result.errorMessage ?? "no output"})`
+			: result.cancelled || controller.signal.aborted
+				? "delegated executor aborted by user"
+				: `delegated executor failed: ${result.errorMessage ?? "unknown error"}${result.stderr ? `; stderr: ${result.stderr.slice(0, 500)}` : ""}`;
+		await stopExecution(pi, ctx, reason);
+		return;
+	}
+	// Clean exit: land any markers from the final output text, then verify.
+	mirrorDelegateMarkers(pi, ctx, result.output);
+	if (isExecutionComplete()) {
+		await completeExecution(pi, ctx);
+		return;
+	}
+	// Items remain: keep the run executing (resumable via /plans-execute under
+	// either runtime); the delegate bookkeeping is cleared so restarts do not
+	// treat this as an orphaned child.
+	if (execution) {
+		execution.delegate = undefined;
+		withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { delegate: null }));
+		persist(pi);
+	}
+	const remaining = execution?.items.filter((item) => !item.done).map((item) => item.id) ?? [];
+	pi.sendMessage(
+		{
+			customType: "pi-plans-exec-delegate-exit",
+			content: `**pi-plans: delegated executor exited with items remaining** — ${remaining.join(", ") || "(none)"}. Run stays executing; resume with /plans-execute (either runtime). Executor summary:\n${result.output.slice(0, 2000)}`,
+			display: true,
+		},
+		{ triggerTurn: false },
+	);
+	ctx.ui.notify?.(`Delegated executor exited; ${remaining.length} verifier item(s) remain. Resume with /plans-execute.`, "warning");
+	updateStatusWidget(ctx);
+}
+
+/** Apply VC/I markers parsed from a delegated child's full-text message. Exported for tests. */
+export function mirrorDelegateMarkers(pi: ExtensionAPI, ctx: ExtensionContext, text: string): void {
+	const changedVc = applyDoneMarkers(text);
+	const changedImpl = applyImplMarkers(text);
+	applyCurrentIMarker(text);
+	if (changedVc.length === 0 && changedImpl.length === 0) return;
+	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp));
+	persist(pi);
 	updateStatusWidget(ctx);
 }
 
