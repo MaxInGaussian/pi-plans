@@ -1,6 +1,9 @@
 /**
- * `execute_plan` tool — the execution handoff. On explicit user approval (no
- * Auto-complete) the extension enters execution mode with checklist tracking.
+ * `execute_plan` tool — the execution handoff (v0.6.1). On explicit user
+ * approval (no Auto-complete) the extension enters task-tree execution mode:
+ * progress flows through `plans_update_task`, the dashboard tracks every
+ * task, and the completion auditor gates the final pass. Legacy I-### plans
+ * parse through the fallback with an upgrade notice.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -12,15 +15,13 @@ import {
 	getExecution,
 	resumeActiveExecution,
 	startExecution,
-	type ExecutionRuntime,
 } from "../src/exec.ts";
 import { disableAutoComplete } from "../src/autocomplete.ts";
 import { isAutoApproveEnabled } from "../src/auto-approve.ts";
-import { latestPlanVersion, parseChecklist, parseImplItems } from "../src/plan.ts";
-import { normalizeWorkdir, recordDecision, type RunSummary } from "../src/state.ts";
-import { bindRun, resolveActiveRun } from "../src/run-context.ts";
+import { checklistHeaderName, latestPlanVersion, lintPlanTasks, parseChecklist, parsePlanTasks } from "../src/plan.ts";
+import { normalizeWorkdir, type RunSummary } from "../src/state.ts";
+import { bindRun } from "../src/run-context.ts";
 import { executionCandidates, resolveCommandRun } from "../src/run-picker.ts";
-import { collectModelSelectors, modelSelectorOf } from "../src/config-command.ts";
 import { resolveUiLanguage } from "../src/ui-language.ts";
 
 
@@ -43,7 +44,7 @@ export async function executeHandoff(
 	ctx: ExtensionContext,
 	planPathArg?: string,
 	workdirArg?: string,
-	signal?: AbortSignal,
+	_signal?: AbortSignal,
 ): Promise<HandoffOutcome> {
 	const workdir = normalizeWorkdir(workdirArg ?? ctx.cwd);
 
@@ -79,10 +80,28 @@ export async function executeHandoff(
 	if (items.length === 0) {
 		return {
 			status: "error",
-			message: `${planPath} has no parsable \`## Verifier Checklist\` with \`- [ ] \`VC-###\` ...\` items. Fix the plan before execution.`,
+			message: `${planPath} has no parsable \`## Verification Checks\` (or legacy \`## Verifier Checklist\`) with \`- [ ] \`VC-###\` ...\` items. Fix the plan before execution.`,
 		};
 	}
-	const implItems = parseImplItems(planText);
+	const planTasks = parsePlanTasks(planText);
+	if (planTasks.tasks.length === 0) {
+		return {
+			status: "error",
+			message: `${planPath} has no parsable tasks: add a \`## Tasks\` section (\`- \`Task-1\`: title — deps: …; files: …; wave: 1\`).`,
+		};
+	}
+	// I-001/R-001: task-tree consistency is advisory while planning and
+	// hard-rejected at this gate. Legacy I-### fallback plans are exempt
+	// (their shape predates the microsyntax).
+	if (!planTasks.legacy) {
+		const lint = lintPlanTasks(planText);
+		if (lint !== null) {
+			return {
+				status: "error",
+				message: `${planPath} failed the task-tree consistency gate; fix these before execution:\n${lint}`,
+			};
+		}
+	}
 
 	disableAutoComplete(ctx, "execution handoff");
 	// I-004/D-019: PI_PLANS_AUTO_APPROVE=1 short-circuits the confirm BEFORE
@@ -96,14 +115,22 @@ export async function executeHandoff(
 		};
 	}
 
+	const legacyPlan = planTasks.legacy || checklistHeaderName(planText) === "Verifier Checklist";
+
 	let approved: boolean;
 	if (autoApprove) {
 		approved = true;
 	} else {
+		const lang = resolveUiLanguage(workdir);
 		const preview = items.map((item) => `- ${item.done ? "☑" : "☐"} ${item.id}`).join("\n");
+		const legacyNote = legacyPlan
+			? (lang === "zh"
+				? "\n\n注意：该计划使用旧版 I-### 格式，将以兼容映射执行；建议在下次修订时升级为 ## Tasks 新格式。"
+				: "\n\nNote: this plan uses the legacy I-### format and executes through the compatibility mapping; upgrade it to the ## Tasks format at the next revision.")
+			: "";
 		approved = await ctx.ui.confirm(
 			"Execute this plan now?",
-			`${planPath}\n${items.length} verifier item(s):\n${preview}\n\nExecution mode enables write access and tracks [DONE:VC-xxx] progress.`,
+			`${planPath}\n${items.length} verification check(s) over ${planTasks.tasks.length} task(s):\n${preview}${legacyNote}\n\nExecution mode enables write access; task progress is reported with the plans_update_task tool and gated by the completion auditor.`,
 		);
 	}
 	if (!approved) {
@@ -114,81 +141,15 @@ export async function executeHandoff(
 	// the approval checkpoint and status flip land on the run the user chose.
 	if (chosenRun) bindRun(ctx.sessionManager, workdir, chosenRun.run_id);
 
-	// v0.6.0 (R-8): runtime question — current session (recommended) or a
-	// delegated executor on another model. Skipped under auto-approve/no-UI.
-	const runtime = await chooseExecutionRuntime(ctx, workdir, autoApprove, chosenRun);
-
-	await startExecution(getCurrentApi(), ctx, planPath, items, implItems, { runtime, signal });
-	const scopeNote = implItems.length ? ` Tracking ${implItems.length} implementation item(s).` : "";
+	await startExecution(ctx, { planPath, planTasks, items });
 	const autoNote = autoApprove ? "[auto-approve] " : "";
-	const runtimeNote = runtime === "current-session" ? "" : ` Delegated to executor model ${runtime.modelSelector}; progress mirrors in the overlay.`;
+	const legacyNote = legacyPlan ? " Legacy I-### mapping active; upgrade the plan at the next revision." : "";
 	return {
 		status: "executing",
 		planPath,
 		itemCount: items.length,
-		message: `${autoNote}Execution approved. ${items.length} verifier item(s) queued; implement in dependency order and mark verified items with [DONE:VC-xxx].${scopeNote}${runtimeNote}`,
+		message: `${autoNote}Execution approved. ${planTasks.tasks.length} task(s) queued in wave order; report progress with the plans_update_task tool (status + evidence); the completion auditor verifies every check before the run completes.${legacyNote}`,
 	};
-}
-
-const MODEL_SELECTOR_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
-
-/**
- * R-8: ask where the execution runs. Uses ctx.ui.select directly (ask_choice
- * is a tool and cannot be invoked from tool/command context). Under
- * auto-approve or no-UI the question is skipped: current session, decision
- * recorded with the [auto-approve] annotation convention.
- */
-async function chooseExecutionRuntime(
-	ctx: ExtensionContext,
-	workdir: string,
-	autoApprove: boolean,
-	chosenRun: RunSummary | null,
-): Promise<ExecutionRuntime> {
-	const record = (answer: string, source: "user" | "auto-complete", question: string, options: string[]): void => {
-		const runId = chosenRun?.run_id ?? resolveActiveRun(ctx.sessionManager, workdir)?.run_id ?? null;
-		if (!runId) return;
-		try {
-			recordDecision(workdir, runId, {
-				question,
-				options,
-				answer,
-				answer_source: source,
-			});
-		} catch {
-			/* decision audit trail is best-effort */
-		}
-	};
-	if (autoApprove || !ctx.hasUI) {
-		record("current session [auto-approve]", "auto-complete", "Execution runtime", ["current session", "switch model"]);
-		return "current-session";
-	}
-	const lang = resolveUiLanguage(workdir);
-	const currentLabel = lang === "zh" ? "使用当前会话（推荐）" : "Use the current session (recommended)";
-	const switchLabel = lang === "zh" ? "切换至其他模型…" : "Switch to another model…";
-	const title = lang === "zh" ? "执行运行时" : "Execution runtime";
-	const first = await ctx.ui.select(title, [currentLabel, switchLabel]);
-	if (first === undefined || first === currentLabel) {
-		record("current session", "user", "Execution runtime", [currentLabel, switchLabel]);
-		return "current-session";
-	}
-	// Model picker: switch targets exclude the current selector by design
-	// (option 1 IS the current session).
-	const currentSelector = modelSelectorOf(ctx.model);
-	const targets = collectModelSelectors(ctx, currentSelector);
-	const otherLabel = lang === "zh" ? "其他（输入 provider/model）…" : "Other (type provider/model)…";
-	const modelTitle = lang === "zh" ? "切换至哪个模型执行？" : "Switch to which model?";
-	let modelPick = await ctx.ui.select(modelTitle, [...targets, otherLabel]);
-	if (modelPick === otherLabel) {
-		const typed = await ctx.ui.input(modelTitle, "provider/model");
-		modelPick = typed && MODEL_SELECTOR_RE.test(typed.trim()) ? typed.trim() : undefined;
-	}
-	if (modelPick === undefined || !MODEL_SELECTOR_RE.test(modelPick)) {
-		// Cancelled or invalid: fall back to the current session, recorded.
-		record("current session (model switch cancelled)", "user", "Execution runtime", [currentLabel, switchLabel]);
-		return "current-session";
-	}
-	record(`switch model: ${modelPick}`, "user", "Execution runtime", [currentLabel, switchLabel, ...targets, otherLabel]);
-	return { modelSelector: modelPick };
 }
 
 /** The user command may resume an approved execution; the tool always asks. */
@@ -196,40 +157,28 @@ export async function executeCommand(ctx: ExtensionContext, planPathArg?: string
 	const activeExecution = getExecution();
 	const planPath = planPathArg ? path.resolve(ctx.cwd, planPathArg.replace(/^@/, "")) : activeExecution?.planPath;
 	if (activeExecution && planPath && path.resolve(activeExecution.planPath) === path.resolve(planPath)) {
-		const resumed = resumeActiveExecution(getCurrentApi(), ctx);
+		const resumed = resumeActiveExecution(ctx);
 		return {
 			status: "executing",
 			planPath,
 			itemCount: activeExecution.items.length,
-			message: resumed ? "Execution resumed; verified progress preserved." : "This plan is already executing.",
+			message: resumed ? "Execution resumed; task progress preserved." : "This plan is already executing.",
 		};
 	}
 	return executeHandoff(ctx, planPathArg);
 }
 
-// The tool registers with the ExtensionAPI in scope; keep a module-level
-// reference so the shared handoff helper can reach appendEntry/sendMessage.
-let currentApi: ExtensionAPI | null = null;
-export function setCurrentApi(api: ExtensionAPI): void {
-	currentApi = api;
-}
-function getCurrentApi(): ExtensionAPI {
-	if (!currentApi) throw new Error("execute_plan used before extension initialization");
-	return currentApi;
-}
-
-export function registerExecutePlanTool(pi: ExtensionAPI): void {
-	setCurrentApi(pi);
-	pi.registerTool({
+export function registerExecutePlanTool(ext: ExtensionAPI): void {
+	ext.registerTool({
 		name: "execute_plan",
 		label: "Execute Plan",
 		description:
-			"Execution handoff for an accepted plan. Asks the user for explicit approval (never auto-completed), then asks which runtime executes the plan — the current session (recommended) or a delegated executor subagent on another model (>=3 switch targets listed; the child writes natively and reports [DONE:VC-xxx] markers the parent tracks). Either way the extension tracks Verifier-Checklist progress. When several runs with plans exist, a run-picker form selects the target run first. Only call after the user chose 'Execute this plan now' at the handoff question.",
+			"Execution handoff for an accepted plan. Asks the user for explicit approval (never auto-completed), then enters task-tree execution mode: every task's progress is reported via the plans_update_task tool (status + evidence), the task dashboard tracks the tree (Ctrl+Shift+T expands it), and an independent completion auditor verifies the verification checks before the run completes. Legacy I-### plans parse through the compatibility mapping with an upgrade notice. When several runs with plans exist, a run-picker form selects the target run first. Only call after the user chose 'Execute this plan now' at the handoff question.",
 		promptSnippet: "Hand an accepted plan off to the tracked execution loop",
 		parameters: ExecutePlanParams,
 
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const outcome = await executeHandoff(ctx, params.planPath, params.workdir, signal);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const outcome = await executeHandoff(ctx, params.planPath, params.workdir);
 			if (outcome.status === "error") throw new Error(outcome.message);
 			return {
 				content: [{ type: "text", text: outcome.message }],

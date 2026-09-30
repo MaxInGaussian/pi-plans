@@ -1,18 +1,20 @@
 # State And Config
 
-pi-plans stores all planning preferences and run state in the target workspace's git directory as `<git-common-dir>/pi_plans/` — in an ordinary repository this is simply `.git/pi_plans/` — resolving the git common dir with `git rev-parse --git-common-dir` from the workspace. Because the state lives inside the git dir, git never tracks it and no `.gitignore` entries are needed. The target workspace is the current working directory unless the user explicitly names another repository.
+pi-plans stores planning preferences and run state in the target workspace's git directory as `<git-common-dir>/pi-plans/` — in an ordinary repository this is simply `.git/pi-plans/` — resolving the git common dir with `git rev-parse --git-common-dir` from the workspace. Because the state lives inside the git dir, git never tracks it and no `.gitignore` entries are needed. The target workspace is the current working directory unless the user explicitly names another repository.
 
-Do not store pi-plans preferences in Pi's own settings (`~/.pi/agent/settings.json`); pi-plans uses `.git/pi_plans/config.json` for its state.
+The one workspace-independent piece is the **reviewer role** (v0.7.0): it lives in the global config `~/.pi/pi-plans/config.json` (override the directory with `PI_PLANS_GLOBAL_DIR`), confirmed once and shared across every workspace. It is a standalone pi-plans file, never Pi's own settings.
+
+Do not store pi-plans preferences in Pi's own settings (`~/.pi/agent/settings.json`); pi-plans uses `.git/pi-plans/config.json` for workspace state and `~/.pi/pi-plans/config.json` for the reviewer role.
 
 ## State Root Resolution
 
 - Git runs with `GIT_DIR`, `GIT_COMMON_DIR`, and `GIT_WORK_TREE` scrubbed from the environment, so leaked env vars cannot misdirect state into an unrelated repository. Relative results (`.git`, `../.git`) resolve against the workdir.
 - Granularity is **per enclosing repository**: running from a subdirectory uses the enclosing repo's git dir (a one-line notice names that repo). Linked worktrees share one common dir; run directories are unique, and since v0.6.0 the run registry is derived from `runs/` (no shared pointer to race). The legacy `active.json` is deprecated: reads fall back to it only when no `runs/` entries exist (pre-0.6.0 migration).
-- State does not travel with clones: a fresh clone starts with empty state while committed `./docs/pi-plans/` artifacts persist in the repository.
+- State does not travel with clones: a fresh clone starts with empty state, and the default plan artifacts live in the git dir with it. Point `artifact_root` at `./docs/pi-plans` when you want the plans committed and public instead.
 
 ## Auto Git Init
 
-When a mutating state action (`init`, `set-language`, `set-role`, `start-run`, record-*) runs in a workdir that is not a git repository, the helper auto-runs `git init` there (with a one-line notice) and then creates the state dir. It never creates commits. Auto-init runs only when ALL of the following hold:
+When a mutating state action (`init`, `set-language`, `set-artifact-root`, `set-refs-root`, `set-graph-enabled`, `start-run`, record-*) runs in a workdir that is not a git repository, the helper auto-runs `git init` there (with a one-line notice) and then creates the state dir. It never creates commits. `set-role` is deliberately NOT in this list: it writes only the global config and never triggers auto-init or any workspace write. Auto-init runs only when ALL of the following hold:
 
 - the workdir has no `.git` entry (a pre-existing `.git` file or directory that git cannot resolve is a fatal error, never a silent reinit);
 - the workdir is not inside any git work tree (a subdirectory of a repo uses the enclosing repo instead);
@@ -23,12 +25,12 @@ Bare repositories are refused with a clear error. A missing `git` executable is 
 ## Directory Layout
 
 ```text
-<git-common-dir>/pi_plans/
+<git-common-dir>/pi-plans/
   config.json
   pi-vcc-config.json
   active.json      # deprecated (v0.6.0): legacy pointer, read only when runs/ is empty
   runs/            # the run registry derives from runs/<run-id>/run.json
-    <run-id>/      # note: the refs root is a sibling — .git/pi-plans/refs (hyphenated), not under pi_plans/
+    <run-id>/      # note: the refs root is a sibling — .git/pi-plans/refs (hyphenated), not under pi-plans/
       run.json
       decisions.jsonl
       subagents.jsonl
@@ -41,25 +43,13 @@ Bare repositories are refused with a clear error. A missing `git` executable is 
 
 ## Config Schema
 
-The default config is:
+The default workspace config is (no `reviewer` key — the role lives globally since v0.7.0):
 
 ```json
 {
   "schema": 1,
   "language": { "tag": null, "source": "unset", "updated_at": null },
-  "reviewer": {
-    "mode": "delegated-subagent",
-    "model_selector": null,
-    "name_prefix": "pi-plans-reviewer",
-    "confirmed_at": null
-  },
-  "criticizer": {
-    "mode": "delegated-subagent",
-    "model_selector": null,
-    "name_prefix": "pi-plans-criticizer",
-    "confirmed_at": null
-  },
-  "artifact_root": "./docs/pi-plans",
+  "artifact_root": "./.git/pi-plans/plans",
   "artifact_root_source": "unset",
   "artifact_root_updated_at": null,
   "refs_root": null,
@@ -72,18 +62,42 @@ Rules:
 
 - `schema` must be `1`.
 - `language.tag` is a BCP47-style tag such as `zh-Hans`, `en`, or `zh-Hant`, or `null` before selection; `language.source` is `user`, `auto`, or `unset`.
-- `reviewer.mode` and `criticizer.mode` are `delegated-subagent` or `current-session`.
-- `model_selector` is `null` to inherit the dispatching session's model, or an exact `provider/model` selector matching Pi's model registry.
-- `confirmed_at` is `null` until the user has confirmed the role's model at first use; see below.
+- A legacy workspace `reviewer` block (pre-0.7.0, and the removed v0.6.0 `criticizer` key) is read-tolerated: the first mutating state call seeds the global config from intent blocks and the next workspace write strips the key. Read-only paths resolve the effective reviewer in memory (global first, legacy block second) and never write.
 - `artifact_root` is relative to the target workspace unless absolute.
 - `artifact_root_source` is `user`, `auto`, or `unset`.
 - `artifact_root_updated_at` is the selection timestamp or `null` before confirmation.
 - `refs_root` is where plan-with-refs downloads references, relative to the target workspace unless absolute, or `null` before selection; `refs_root_source` is `user`, `auto`, or `unset`; `refs_root_updated_at` is the selection timestamp or `null`.
-- There is intentionally no `effort` field: subagents inherit the dispatching session's model and thinking level unless an exact selector is stored. The real lever is the main session's thinking level at refine time.
+
+## Global Reviewer Config (v0.7.0)
+
+The reviewer role is stored in `~/.pi/pi-plans/config.json` (`PI_PLANS_GLOBAL_DIR` overrides the directory; tests, CI, and bench containers rely on it):
+
+```json
+{
+  "schema": 1,
+  "reviewer": {
+    "mode": "delegated-subagent",
+    "model_selector": "devin/claude-sonnet-5.5",
+    "thinking_level": null,
+    "name_prefix": "pi-plans-reviewer",
+    "confirmed_at": "2026-09-30T07:54:12Z"
+  }
+}
+```
+
+Rules:
+
+- `mode` is `delegated-subagent` or `current-session`.
+- `model_selector` is an exact `provider/model` selector. There is no inherit entry point anymore: after first-use confirmation the delegated reviewer always runs a concrete model (`modelSelector: "inherit"` in `set-role` is a full reset — it clears the selector AND `confirmed_at`).
+- `thinking_level` is `null` (default — spawn WITHOUT `--thinking`, letting the child pi resolve its own chain: per-model settings → `defaultThinkingLevel` → `medium`, then model clamping) or an explicit level (`off | minimal | low | medium | high | xhigh | max`; the domain comes from the chosen model's `thinkingLevelMap` via pi-ai's `getSupportedThinkingLevels`). `"off"` is a real level and deliberately distinct from `null`. Changing `modelSelector` without passing `thinkingLevel` resets the level.
+- `confirmed_at` is stamped only by a real confirmation. `reviewerReady(role)` = current-session, or delegated with `confirmed_at` set AND a concrete `model_selector` — a confirmed null selector can never pass (the old confirmed-inherit state is unreachable).
+- A corrupt or wrong-schema global file yields defaults plus a notice and is NEVER clobbered by reads.
+- Migration (Q-1=A): the first mutating pi-plans call in a workspace with a legacy intent block (`confirmed_at` set, an explicit selector, or a non-default mode) seeds the global file once — first touched workspace wins; other workspaces get a one-time "ignored" notice. A confirmed-inherit block seeds with the selector null and NO confirmation, so the next `refine` re-asks once via the native panel. Scaffold-only blocks are dropped silently.
+- The completion auditor's spawns are NOT governed by this role: it runs its own model; `subagents.jsonl` records the reviewer/ref-analyst thinking level actually passed (`thinking_level` field, older entries have none).
 
 ## VCC Compact Config
 
-`pi-vcc-config.json` is scaffolded under the resolved `<git-common-dir>/pi_plans/` state root when an active planning or execution compaction hook first needs it. It is independent from `config.json` so planning preferences, run state, and compact policy can evolve separately.
+`pi-vcc-config.json` is scaffolded under the resolved `<git-common-dir>/pi-plans/` state root when an active planning or execution compaction hook first needs it. It is independent from `config.json` so planning preferences, run state, and compact policy can evolve separately.
 
 Default values:
 
@@ -117,7 +131,7 @@ Before the first product planning question, check the persisted config (`plans` 
 4. `Other` — user provides a BCP47 tag.
 5. `Auto-complete` — select the recommended language.
 
-Persist with `plans` (`set-language`, `languageSource: "user"`). Use the selected language for visible questions, choices, review summaries, criticizer questions, and Markdown artifacts. Keep IDs, file paths, command names, JSON keys, and protocol labels stable in English.
+Persist with `plans` (`set-language`, `languageSource: "user"`). Use the selected language for visible questions, choices, review summaries, reviewer questions, and Markdown artifacts. Keep IDs, file paths, command names, JSON keys, and protocol labels stable in English.
 
 ## Code Graph Enabled
 
@@ -125,13 +139,13 @@ Persist with `plans` (`set-language`, `languageSource: "user"`). Use the selecte
 
 ## `/config-pi-plans`
 
-`/config-pi-plans` is an interactive workspace configuration wizard. It re-asks the workspace language, planning docs root, refs root, code graph toggle, reviewer mode/model, and criticizer mode/model, then writes the chosen defaults back to `.git/pi_plans/config.json`. When code graph is enabled, the extension also overrides built-in `read`/`write`/`edit` for indexed source files so graph-backed source reads and DB-first edits happen automatically. Model pickers can reuse the current session model, any available selector surfaced by `ctx.scopedModels` or the model registry, or a manually entered exact `provider/model` string. If a run is already active, only the workspace defaults change; the active run's `artifact_dir` and `language_tag` stay unchanged.
+`/config-pi-plans` is an interactive workspace configuration wizard. It re-asks the workspace language, planning docs root, refs root, and code graph toggle (written to `.git/pi-plans/config.json`), plus the reviewer mode and model. The reviewer steps live in the GLOBAL config: the mode switch persists immediately, and the model step shows a keep/change entry menu — `Keep current (provider/model · level)` or `Choose model & thinking level…`. When the mode is `current-session` the model step is skipped entirely (an existing selector is never cleared). Choosing opens the native model panel + effort panel in TUI, or model/effort menus otherwise; Esc keeps the current role and the wizard CONTINUES instead of discarding earlier answers. A failed global write is reported explicitly while workspace settings still save. When code graph is enabled, the extension also overrides built-in `read`/`write`/`edit` for indexed source files so graph-backed source reads and DB-first edits happen automatically. If a run is already active, only the workspace defaults change; the active run's `artifact_dir` and `language_tag` stay unchanged.
 
 
 Before the first product planning question, check the persisted config again. If `artifact_root_source` is missing or `unset`, ask exactly one `ask_choice` question:
 
-1. `./docs/pi-plans` — recommended; planning docs live in the repository and are public.
-2. `./.git/pi_plans/plans` — private to the repository; not published.
+1. `./.git/pi-plans/plans` — recommended; the default. Planning docs stay private to the repository and are never tracked.
+2. `./docs/pi-plans` — planning docs live in the working tree, are public, and can be committed with the repository.
 3. `Other` — user provides a custom path.
 4. `Auto-complete` — select the recommended path.
 
@@ -147,27 +161,29 @@ Before downloading any reference in a plan-with-refs flow, check the persisted c
 Persist with `plans` (`set-refs-root`, `refsRoot: <selected path>`, `refsRootSource: "user"` or `"auto"`). Download references under this root. This question does not count against the planning-question limit.
 
 
-Before running a `refine` round, read the role setting from the persisted config.
+Before running a `refine` round, read the role setting from the persisted global config.
 
-If the role's `mode` is missing or invalid, ask exactly one `ask_choice` question and persist:
+If the role's `mode` is missing or invalid, ask exactly one `ask_choice` question and persist (the mode question stays agent-mediated):
 
 1. `Delegated subagent` — recommended; read-only `pi` subprocess with isolated context.
 2. `Current session` — run the read-only pass in the current foreground session.
 3. `Other` / 4. `Auto-complete` — select the recommended delegated subagent.
 
-Independently, each role's **model** is confirmed once, at that role's first actual use: when `confirmed_at` is `null` and a `refine` round is about to run, ask exactly one `ask_choice` question:
+The **model + thinking level** are confirmed once, at first actual use, through NATIVE panels — not ask_choice:
 
-1. `Inherit the main agent's model` — recommended; stores `model_selector: null`.
-2. `Choose a model` — pick from the models available in this Pi install (check `/model` or `ctx.scopedModels`); persist the exact `provider/model` selector; do not invent model names.
-3. `Other` / 4. `Auto-complete` — select inherit.
+- **TUI**: the gate itself pops a `/model`-style searchable model panel (pi's `ModelSelectorComponent`; the runtime adapter maps the public model registry facade — `getAvailable`/`find`/`getError`/`refresh` — onto the four runtime methods, with the private `.runtime` field as a secondary attempt and menus as the construction fallback), then a `/thinking`-style effort panel whose first row is `Default (no --thinking flag: the child pi resolves per-model settings → defaultThinkingLevel → medium)` followed by the chosen model's `thinkingLevelMap` levels. Both panels must complete; the result persists to the global config (`modelSelector` + `thinkingLevel`, `confirmed: true`) only then, and the same invocation continues with the returned values.
+- **hasUI non-TUI (RPC/ACP)**: native `ctx.ui.select` menus over the same data (model list, then effort list).
+- **UI-less (print/json/bench)**: the gate returns text guidance embedding the available selectors and the exact `set-role` call; persist that way. Automation may also pre-write `~/.pi/pi-plans/config.json` directly.
 
-Persist with `plans` (`set-role`, `confirmed: true`, `modelSelector: <selector or "inherit">`). `confirmed_at` is set only by this confirmation flow; a mode-only edit never forges or discards a confirmation, and a confirmed inherit (`model_selector: null` plus a stamp) is distinguishable from never-confirmed.
+Pressing Esc on either panel CANCELS the whole gate: nothing is persisted and the tool returns a dedicated error (`details.cancelled`) instructing the agent NOT to re-ask via ask_choice and NOT to retry unless the user asks — suggest `/config-pi-plans` instead. Cheap validations (plan path, refs) run BEFORE any panel so a typo never walks the user through panels.
 
-If a spawn later fails because the stored selector is unavailable, reset the marker (`set-role`, `resetConfirmation: true`) and re-ask the confirmation question.
+The confirmation applies only to `delegated-subagent` mode (current-session runs in the main session and needs no model). If a stored selector is missing from the registry at spawn time, TUI re-opens the panel; other modes return an error naming the selector — reset with `set-role` (`resetConfirmation: true`) and re-confirm.
+
+`set-role` invariants: `confirmed: true` requires a concrete `provider/model` selector in delegated mode; `modelSelector: "inherit"` resets BOTH the selector and `confirmed_at`; `thinkingLevel: "default"` stores `null`; changing `modelSelector` without `thinkingLevel` resets the level.
 
 ## Subagent Spawning
 
-When `mode` is `delegated-subagent`, the `refine` tool spawns a read-only `pi` subprocess (`--mode json -p --no-session --tools read,grep,find,ls`) whose system prompt comes from `agents/reviewer.md` or `agents/criticizer.md`. In TUI mode, delegated runs also show a standalone `Reviewer` or `Criticizer` overlay with live lane/tool status; the child is awaited and the overlay is closed before the tool result returns. The subagent:
+When `mode` is `delegated-subagent`, the `refine` tool spawns a read-only `pi` subprocess (`--mode json -p --no-session --tools read,grep,find,ls`, plus `--model <provider/model>` and — only when `thinking_level` is set — `--thinking <level>`) whose system prompt comes from `agents/reviewer.md`. In TUI mode, delegated runs also show a standalone `Reviewer` overlay with live lane/tool status (header label `provider/model:level`); the child is awaited and the overlay is closed before the tool result returns. The subagent:
 
 - performs read-only analysis and never edits files;
 - receives the full plan text and a review/criticism brief;
@@ -175,19 +191,19 @@ When `mode` is `delegated-subagent`, the `refine` tool spawns a read-only `pi` s
 
 The main agent consolidates the results, records dispositions, revises the plan, and asks the next merged accept/execute question — all in the same turn.
 
-The `analyze_refs` tool (plan-with-refs) uses the same spawning machinery with the **reviewer** role's gates (`mode` must be `delegated-subagent`; a confirmed `current-session` reviewer is refused with guidance to switch, since analysis is spawn-only) and the reviewer's model selector. Each downloaded reference gets one independent read-only subagent whose system prompt comes from `agents/ref-analyst.md` and whose working directory is that reference's own directory; lanes never get `code_graph`. Lanes run in sequential batches of at most 3 under a standalone overlay titled `Refs`; each batch's controller opens and closes exactly like a single refine round. Successful spawns are recorded best-effort in `subagents.jsonl` with role `ref-analyst` (skipped when no active run exists, e.g. adhoc calls). The structured per-reference sections come back as the tool result; the main agent owns `REF_ANALYSIS.md` and fills `coverage`/`gaps` in `refs.jsonl` via `plans` (`record-ref`).
+The `analyze_refs` tool (plan-with-refs) uses the same spawning machinery with the **reviewer** role's model confirmation from the global config — but NOT its mode (v0.7.0, Q-4): analysis is spawn-only by nature, so a `current-session` reviewer still gets spawned ref-analyst lanes (a one-time notice says the mode is ignored and unchanged) while the confirmed concrete model remains required. Each downloaded reference gets one independent read-only subagent whose system prompt comes from `agents/ref-analyst.md` and whose working directory is that reference's own directory; lanes never get `code_graph`. Lanes run in sequential batches of at most 3 under a standalone overlay titled `Refs`; each batch's controller opens and closes exactly like a single refine round. Successful spawns are recorded best-effort in `subagents.jsonl` with role `ref-analyst` and the thinking level actually passed (skipped when no active run exists, e.g. adhoc calls). The structured per-reference sections come back as the tool result; the main agent owns `REF_ANALYSIS.md` and fills `coverage`/`gaps` in `refs.jsonl` via `plans` (`record-ref`).
 
 ## Run State
 
-One run directory per planning request: `<git-common-dir>/pi_plans/runs/<YYYYMMDDTHHMMSSZ-topic>/` (second-precision; `-2`, `-3` suffixes on collision).
+One run directory per planning request: `<git-common-dir>/pi-plans/runs/<YYYYMMDDTHHMMSSZ-topic>/` (second-precision; `-2`, `-3` suffixes on collision).
 
 `run.json` includes: run ID; skill name; original request; target workspace; artifact directory; language tag; status (`planning` → `accepted` → `executing` → `done`, with `stopped`/`abandoned` as exits); timestamps.
 
-`decisions.jsonl` is appended automatically by `ask_choice` (question, options, answer, answer source). `subagents.jsonl` records reviewer/criticizer/ref-analyst spawns. `refs.jsonl` records reference metadata via `plans` (`record-ref`); its `kind` field is `project` (repos), `paper` (arXiv etc.), `article` (blog posts), or `docs` (documentation sites).
+`decisions.jsonl` is appended automatically by `ask_choice` (question, options, answer, answer source). `subagents.jsonl` records reviewer/ref-analyst spawns (legacy 0.6.0 entries with `criticizer` remain readable). `refs.jsonl` records reference metadata via `plans` (`record-ref`); its `kind` field is `project` (repos), `paper` (arXiv etc.), `article` (blog posts), or `docs` (documentation sites).
 
 ## Workflow Checkpoints (`/resume-plans`)
 
-Each run may carry a `checkpoint.json` — the durable, cross-session workflow state that `/resume-plans` restores in the current session. It records: logical `phase` (`planning | reviewing | executing | implementation-review | completed`), `nextAction`, the exact plan identity (path + version + SHA-256), pending/answered questions (stable `questionId`), review rounds with per-lane status and result-file references, execution approval evidence (plan digest, worktree, `git rev-parse HEAD` at approval, verified VC/I set, usage), the implementation-review termination condition and completed-round count, and ownership metadata. Full review outputs live in separate `reviews/` files; the checkpoint keeps only validated references.
+Each run may carry a `checkpoint.json` — the durable, cross-session workflow state that `/resume-plans` restores in the current session. It records: logical `phase` (`planning | reviewing | executing | completed`; the legacy 0.6.0 `implementation-review` phase is read-tolerated and maps to done), `nextAction`, the exact plan identity (path + version + SHA-256), pending/answered questions (stable `questionId`), review rounds with per-lane status and result-file references, execution approval evidence (plan digest, worktree, `git rev-parse HEAD` at approval, task progress map, audit rounds, verified VC set, usage), and ownership metadata. Full review outputs live in separate `reviews/` files; the checkpoint keeps only validated references.
 
 Rules:
 
@@ -200,4 +216,4 @@ Rules:
 
 ## Run Ownership
 
-A run may be held by at most one live owner (`owner.json`: host, pid, process start time via `ps -o lstart=`, session id, random process token, generation). Acquisition is an atomic exclusive create; takeovers require proof the previous owner is dead (process gone, or pid alive with a different start time — PID reuse). Foreign hosts, corrupt records, and unverifiable liveness are conservatively refused; `/resume-plans` never queues or interrupts. Sessions bind to the run they start/execute/resume (restored from `pi-plans-run-start` entries on the current branch), and attribution (tools, write guard, autocomplete, execution bookkeeping, code-graph apply gate) prefers the binding, falling back to the registry's newest non-terminal run (v0.6.0 — the shared `active.json` pointer is deprecated). Delegated executor children pin their run via `PI_PLANS_RUN_ID` and are exempt from the planning write guard (`PI_PLANS_EXECUTOR=1`).
+A run may be held by at most one live owner (`owner.json`: host, pid, process start time via `ps -o lstart=`, session id, random process token, generation). Acquisition is an atomic exclusive create; takeovers require proof the previous owner is dead (process gone, or pid alive with a different start time — PID reuse). Foreign hosts, corrupt records, and unverifiable liveness are conservatively refused; `/resume-plans` never queues or interrupts. Sessions bind to the run they start/execute/resume (restored from `pi-plans-run-start` entries on the current branch), and attribution (tools, write guard, autocomplete, execution bookkeeping, code-graph apply gate) prefers the binding, falling back to the registry's newest non-terminal run (v0.6.0 — the shared `active.json` pointer is deprecated). The v0.6.0 delegated-executor env pins (`PI_PLANS_RUN_ID` / `PI_PLANS_EXECUTOR`) are gone; read-only subagent children carry `PI_PLANS_REFINER=1`.

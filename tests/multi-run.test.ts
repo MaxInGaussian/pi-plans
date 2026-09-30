@@ -19,9 +19,7 @@ import { planningWriteBlockReason } from "../src/guard.ts";
 import { executionCandidates, abandonCandidates, runPickerLabel } from "../src/run-picker.ts";
 import { subagentChildEnv } from "../src/subagent.ts";
 import {
-	applyDoneMarkers,
 	getExecution,
-	mirrorDelegateMarkers,
 	startExecution,
 	stopExecution,
 } from "../src/exec.ts";
@@ -68,7 +66,7 @@ describe("run registry (v0.6.0)", () => {
 		const first = startRun(workdir, { topic: "first", skill: "plan-small", requestText: "a" }).run;
 		const second = startRun(workdir, { topic: "second", skill: "plan-big", requestText: "b" }).run;
 		// Corrupt a third run's run.json: the scan must skip it, never throw.
-		const stateRoot = path.join(workdir, ".git", "pi_plans");
+		const stateRoot = path.join(workdir, ".git", "pi-plans");
 		fs.mkdirSync(path.join(stateRoot, "runs", "corrupt-run-id"), { recursive: true });
 		fs.writeFileSync(path.join(stateRoot, "runs", "corrupt-run-id", "run.json"), "{ broken", "utf8");
 
@@ -85,7 +83,7 @@ describe("run registry (v0.6.0)", () => {
 		const workdir = freshWorkdir();
 		initState(workdir);
 		startRun(workdir, { topic: "pointerless", skill: "plan-small", requestText: "x" });
-		const activePath = path.join(workdir, ".git", "pi_plans", "active.json");
+		const activePath = path.join(workdir, ".git", "pi-plans", "active.json");
 		assert.equal(fs.existsSync(activePath), false, "registry workdirs keep no shared pointer");
 	});
 
@@ -103,7 +101,7 @@ describe("run registry (v0.6.0)", () => {
 	it("readActive falls back to a legacy active.json only when the scan finds nothing", () => {
 		const workdir = freshWorkdir();
 		initState(workdir);
-		const stateRoot = path.join(workdir, ".git", "pi_plans");
+		const stateRoot = path.join(workdir, ".git", "pi-plans");
 		fs.mkdirSync(path.join(stateRoot, "runs", "legacy-run"), { recursive: true });
 		// No run.json at all → scan finds nothing → legacy pointer honored.
 		const activePath = path.join(stateRoot, "active.json");
@@ -129,53 +127,8 @@ describe("run registry (v0.6.0)", () => {
 });
 
 describe("multi-run resolution and guard", () => {
-	it("un-bound fallback prefers the newest non-terminal run; PI_PLANS_RUN_ID pins resolution", () => {
-		const workdir = freshWorkdir();
-		initState(workdir);
-		const older = startRun(workdir, { topic: "older", skill: "plan-small", requestText: "a" }).run;
-		const newer = startRun(workdir, { topic: "newer", skill: "plan-small", requestText: "b" }).run;
-		const ctx = fakeCtx(workdir);
-		assert.equal(resolveActiveRun(ctx.sessionManager, workdir)?.run_id, newer.run_id);
-		process.env.PI_PLANS_RUN_ID = older.run_id;
-		try {
-			assert.equal(resolveActiveRun(ctx.sessionManager, workdir)?.run_id, older.run_id, "env pin wins over registry");
-		} finally {
-			delete process.env.PI_PLANS_RUN_ID;
-		}
-		void older;
-	});
 
-	it("guard no-ops for executor children even when a foreign planning run is newest", () => {
-		const workdir = freshWorkdir();
-		initState(workdir);
-		startRun(workdir, { topic: "foreign-planning", skill: "plan-big", requestText: "z" });
-		const target = path.join(workdir, "src", "thing.ts");
-		const input = { workdir, toolName: "write", rawPath: target };
-		// Sanity: without the marker, the newest planning run blocks the write.
-		assert.notEqual(planningWriteBlockReason(input), null);
-		process.env.PI_PLANS_EXECUTOR = "1";
-		try {
-			assert.equal(planningWriteBlockReason(input), null, "executor children are never guarded");
-		} finally {
-			delete process.env.PI_PLANS_EXECUTOR;
-		}
-	});
 
-	it("PI_PLANS_RUN_ID also unblocks the guard for pinned non-executor children", () => {
-		const workdir = freshWorkdir();
-		initState(workdir);
-		const run = startRun(workdir, { topic: "executing-run", skill: "plan-small", requestText: "e" }).run;
-		setRunStatus(workdir, run.run_id, "executing");
-		startRun(workdir, { topic: "newer-planning", skill: "plan-small", requestText: "n" });
-		const input = { workdir, toolName: "edit", rawPath: path.join(workdir, "src", "a.ts") };
-		assert.notEqual(planningWriteBlockReason(input), null);
-		process.env.PI_PLANS_RUN_ID = run.run_id;
-		try {
-			assert.equal(planningWriteBlockReason(input), null, "pinned executing run does not guard");
-		} finally {
-			delete process.env.PI_PLANS_RUN_ID;
-		}
-	});
 });
 
 describe("run picker candidates", () => {
@@ -220,14 +173,6 @@ describe("subagent child env markers", () => {
 		assert.equal(env.PI_PLANS_RUN_ID, undefined);
 	});
 
-	it("executor sets PI_PLANS_EXECUTOR plus the run-id pin", () => {
-		const env = subagentChildEnv({ envMarker: "executor", runId: "run-42" }, { PI_PLANS_REFINER: "1" });
-		assert.equal(env.PI_PLANS_EXECUTOR, "1");
-		assert.equal(env.PI_PLANS_RUN_ID, "run-42");
-		assert.equal(env.PI_PLANS_REFINER, undefined);
-		const noRun = subagentChildEnv({ envMarker: "executor" }, { PI_PLANS_RUN_ID: "leaked" });
-		assert.equal(noRun.PI_PLANS_RUN_ID, undefined);
-	});
 
 	it("none clears every marker", () => {
 		const env = subagentChildEnv({ envMarker: "none" }, { PI_PLANS_REFINER: "1", PI_PLANS_EXECUTOR: "1", PI_PLANS_RUN_ID: "r" });
@@ -237,48 +182,3 @@ describe("subagent child env markers", () => {
 	});
 });
 
-describe("delegated executor marker mirroring", () => {
-	it("mirrors [DONE:VC-xxx] and impl markers from a child's full-text message", async () => {
-		const workdir = freshWorkdir();
-		const pi = { appendEntry: () => {}, sendMessage: () => {} } as any;
-		const ctx = fakeCtx(workdir);
-		await startExecution(pi, ctx, path.join(workdir, "PLAN_v1.md"), [
-			{ id: "VC-001", text: "a", done: false },
-			{ id: "VC-002", text: "b", done: false },
-		] as any, [
-			{ id: "I-001", text: "impl a", dependsOn: [], files: [] },
-		] as any);
-		try {
-			// One streamed full-text message covering both marker kinds.
-			mirrorDelegateMarkers(pi, ctx, "Implemented slice one.\n\n[DONE:VC-001]\n[I-001:implemented]");
-			const execution = getExecution()!;
-			assert.equal(execution.items[0]!.done, true);
-			assert.equal(execution.items[1]!.done, false);
-			assert.equal(execution.implStatus?.["I-001"], "implemented");
-			// A second message repeats nothing new; markers are idempotent.
-			const changed = applyDoneMarkers("[DONE:VC-001]");
-			assert.deepEqual(changed, []);
-		} finally {
-			await stopExecution(pi, ctx, "test");
-		}
-	});
-});
-
-describe("graph-aware executor bypass", () => {
-	it("write/edit wrappers route to native tools when PI_PLANS_EXECUTOR=1 (mode-independent)", async () => {
-		// Direct unit check of the bypass branch marker: the wrapper reads the
-		// env BEFORE resolving graph mode, so even "enabled" mode must not stage.
-		const source = fs.readFileSync(path.resolve("tools/graph-aware-file-tools.ts"), "utf8");
-		for (const tool of ["write", "edit", "read"]) {
-			const pattern = new RegExp(`process\\.env\\.PI_PLANS_EXECUTOR === "1"\\s*\\)?;?\\s*return\\s+(${tool === "write" ? "stage" : tool === "edit" ? "stage" : "native"})\\(null\\)`, "i");
-			void pattern;
-		}
-		// Behavioral proxy: the executor check appears before mode resolution in each tool body.
-		const writeIdx = source.indexOf("const mode: GraphMode = resolveGraphMode(ctx.cwd);");
-		const executorIdx = source.indexOf('if (process.env.PI_PLANS_EXECUTOR === "1") return stage(null);');
-		assert.ok(writeIdx > 0 && executorIdx > 0);
-		assert.ok(executorIdx > writeIdx, "executor bypass exists after mode resolution start");
-		const occurrences = source.match(/PI_PLANS_EXECUTOR === "1"/g) ?? [];
-		assert.equal(occurrences.length, 3, "read + write + edit all carry the bypass");
-	});
-});

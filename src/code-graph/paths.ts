@@ -34,7 +34,7 @@ export function resolveCanonicalWorktree(workdir: string): WorktreePaths {
 	}
 	const worktreeRoot = path.resolve(toplevel.stdout.trim());
 	const gitCommonDir = path.resolve(workdir, common.stdout.trim());
-	const stateRoot = path.join(gitCommonDir, "pi_plans");
+	const stateRoot = path.join(gitCommonDir, "pi-plans");
 	if (!resolveStateRootOrNull(workdir)) {
 		throw new PathError(`pi-plans state missing; run a planning init first`);
 	}

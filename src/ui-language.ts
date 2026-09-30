@@ -1,10 +1,9 @@
 /**
  * Single source of truth for user-visible UI chrome language (issue #3).
  *
- * Workspace `language.tag` (`.git/pi_plans/config.json`) selects the chrome
- * strings for every user-visible surface: the batch form (src/ask-form.ts),
- * the refine/refs overlay footer (src/refine-ui.ts), the status panel
- * (src/panel.ts) and the execution status line (src/exec.ts).
+ * Workspace `language.tag` (`.git/pi-plans/config.json`) selects the chrome
+ * strings for every user-visible surface: the batch form (src/ask-form.ts)
+ * and the refine/refs overlay footer (src/refine-ui.ts).
  *
  * Mapping follows RFC 4647 primary-subtag fallback (zh-Hant-CN → zh-Hant →
  * zh), so every `zh*` tag renders the existing Simplified strings verbatim.
@@ -125,54 +124,4 @@ export function refineChrome(lang: UiLanguage): RefineChrome {
 	return REFINE_CHROME[lang];
 }
 
-// ---------------------------------------------------------------------------
-// Status panel chrome (src/panel.ts) — implWarning branch only.
-// ---------------------------------------------------------------------------
 
-export interface PanelChrome {
-	badgeStatus(topic: string, vcDone: number, vcTotal: number): string;
-	progressWarning(): string;
-	summaryWarning(topic: string, vcDone: number, vcTotal: number, nextAction: string): string;
-}
-
-const PANEL_CHROME: Record<UiLanguage, PanelChrome> = {
-	zh: {
-		badgeStatus: (topic, vcDone, vcTotal) => `${topic} · ⚠ I 解析 0 项 · VC ${vcDone}/${vcTotal}`,
-		progressWarning: () => `⚠ plan 格式：Implementation Items 解析 0 项（面板无法计 I 进度）`,
-		summaryWarning: (topic, vcDone, vcTotal, nextAction) =>
-			`plans: ${topic} ▸ ⚠ Implementation Items 解析 0 项 · VC ${vcDone}/${vcTotal} · next: ${nextAction}`,
-	},
-	en: {
-		badgeStatus: (topic, vcDone, vcTotal) => `${topic} · ⚠ I parse 0 items · VC ${vcDone}/${vcTotal}`,
-		progressWarning: () => `⚠ plan format: Implementation Items parsed 0 items (I progress cannot be counted)`,
-		summaryWarning: (topic, vcDone, vcTotal, nextAction) =>
-			`plans: ${topic} ▸ ⚠ Implementation Items parsed 0 items · VC ${vcDone}/${vcTotal} · next: ${nextAction}`,
-	},
-};
-
-export function panelChrome(lang: UiLanguage): PanelChrome {
-	return PANEL_CHROME[lang];
-}
-
-// ---------------------------------------------------------------------------
-// Execution status line chrome (src/exec.ts) — goal-wait segment.
-// ---------------------------------------------------------------------------
-
-export interface ExecChrome {
-	goalWait(noProgressRounds: number, waitRounds: number): string;
-}
-
-const EXEC_CHROME: Record<UiLanguage, ExecChrome> = {
-	zh: {
-		goalWait: (noProgressRounds, waitRounds) =>
-			` · 🔁 goal-wait · 无进展 ${noProgressRounds}/3 · 等待 ${waitRounds}/6`,
-	},
-	en: {
-		goalWait: (noProgressRounds, waitRounds) =>
-			` · 🔁 goal-wait · no progress ${noProgressRounds}/3 · waiting ${waitRounds}/6`,
-	},
-};
-
-export function execChrome(lang: UiLanguage): ExecChrome {
-	return EXEC_CHROME[lang];
-}

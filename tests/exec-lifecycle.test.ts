@@ -1,137 +1,203 @@
+/**
+ * Execution lifecycle on the real Pi host (v0.6.1): an execution whose tasks
+ * close through the task-status API completes through the audit gate wired
+ * by the loaded extension's turn handlers.
+ */
+
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { after, describe, it } from "node:test";
+import { spawnSync } from "node:child_process";
+import { after, before, describe, it } from "node:test";
 import { InMemoryCredentialStore, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, initTheme, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import piPlansExtension from "../index.ts";
-import { GOAL_WAIT_CUSTOM_TYPE, getExecution, startExecution } from "../src/exec.ts";
+import { __setAuditRunnerForTests } from "../src/exec.ts";
+import { getRun, initState, startRun } from "../src/state.ts";
+import { createCheckpoint, loadCheckpoint } from "../src/workflow-state.ts";
+import { setMessagingApi } from "../src/messaging.ts";
 
 initTheme("dark", false);
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-lifecycle-"));
-after(() => fs.rmSync(root, { recursive: true, force: true }));
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-exec-life-"));
+after(() => {
+	fs.rmSync(root, { recursive: true, force: true });
+	__setAuditRunnerForTests(null);
+});
 let serial = 0;
 
-async function exercise(mode: "tui" | "rpc" | "print" | "json", needsWake: boolean, commandResume = false) {
-	const cwd = path.join(root, String(++serial));
-	fs.mkdirSync(cwd);
+const PLAN = `# PLAN_v1 - lifecycle
+
+## Tasks
+
+- Task-1: parser — files: src/a.ts; wave: 1
+- Task-2: tool — files: src/b.ts; wave: 1
+
+### Execution Waves
+
+- wave 1: Task-1, Task-2 — parallel
+
+## Verification Checks
+
+- [ ] \`VC-001\` covers \`Task-1\`; pass condition: parser green
+- [ ] \`VC-002\` covers \`Task-2\`; pass condition: tool green
+`;
+
+interface Fixture {
+	script: Array<{ kind: "text"; text: string }>;
+	calls: { messages: unknown; systemPrompt: string }[];
+}
+
+function fixtureRuntime(cwd: string, fixture: Fixture) {
+	return ModelRuntime.create({
+		credentials: new InMemoryCredentialStore(),
+		modelsPath: null,
+		modelsStorePath: path.join(cwd, "models-store.json"),
+		allowModelNetwork: false,
+		refreshOnCreate: false,
+	}).then((modelRuntime) => {
+		modelRuntime.registerProvider("local-exec-life", {
+			baseUrl: "http://unused.invalid",
+			api: "openai-completions",
+			apiKey: "not-a-real-key",
+			models: [
+				{
+					id: "fixture",
+					name: "fixture",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					contextWindow: 100000,
+					maxTokens: 1024,
+				},
+			],
+			streamSimple: (model: unknown, context: { messages: unknown; systemPrompt: string }) => {
+				fixture.calls.push(structuredClone({ messages: context.messages, systemPrompt: context.systemPrompt }));
+				const step = fixture.script[Math.min(fixture.calls.length, fixture.script.length) - 1] ?? { kind: "text", text: "done" } as const;
+				const message = {
+					role: "assistant",
+					api: "openai-completions",
+					provider: "local-exec-life",
+					model: "fixture",
+					content: [{ type: "text", text: (step as { text: string }).text }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				};
+				const stream = createAssistantMessageEventStream();
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "done", reason: message.stopReason, message });
+				stream.end(message);
+				return stream;
+			},
+		});
+		return modelRuntime;
+	});
+}
+
+async function makeSession(options: { cwd: string; fixture: Fixture; mode: "rpc" }) {
+	const { cwd, fixture, mode } = options;
 	const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
-	const modelRuntime = await ModelRuntime.create({
-		credentials: new InMemoryCredentialStore(), modelsPath: null,
-		modelsStorePath: path.join(cwd, "models-store.json"), allowModelNetwork: false, refreshOnCreate: false,
-	});
-	const inputs: any[] = [];
-	let toolCalls = 0;
-	modelRuntime.registerProvider("local-lifecycle-test", {
-		baseUrl: "http://unused.invalid", api: "openai-completions", apiKey: "not-a-real-key",
-		models: [{ id: "fixture", name: "fixture", reasoning: false, input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1024 }],
-		streamSimple: (model: any, context: any) => {
-			inputs.push(structuredClone({ messages: context.messages, systemPrompt: context.systemPrompt }));
-			const call = inputs.length;
-			assert.ok(call <= 5, "unexpected extra model invocation");
-			const tool = call <= 2;
-			const text = call === 3
-				? needsWake ? "[DONE:VC-001] More verification remains." : "[DONE:VC-001] [DONE:VC-002]"
-				: call === 4 && needsWake ? "[DONE:VC-002]" : "Review awaits explicit user approval.";
-			const message: any = {
-				role: "assistant", api: model.api, provider: model.provider, model: model.id,
-				content: tool ? [
-					...(commandResume && call === 2 ? [{ type: "text", text: "[DONE:VC-001]" }] : []),
-					{ type: "toolCall", id: `call-${call}`, name: "probe", arguments: {} },
-				] : [{ type: "text", text: commandResume && call === 3 ? "Interrupted." : text }],
-				stopReason: tool ? "toolUse" : commandResume && call === 3 ? "aborted" : "stop", timestamp: Date.now(),
-				usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-			};
-			const stream = createAssistantMessageEventStream();
-			stream.push({ type: "start", partial: message });
-			if (message.stopReason === "aborted") stream.push({ type: "error", reason: "aborted", error: message });
-			else stream.push({ type: "done", reason: message.stopReason, message });
-			stream.end(message);
-			return stream;
-		},
-	});
-	let beforeAgentStarts = 0;
-	const events: string[] = [];
-	const errors: string[] = [];
+	const modelRuntime = await fixtureRuntime(cwd, fixture);
 	const loader = new DefaultResourceLoader({
-		cwd, agentDir: path.join(cwd, "agent"), settingsManager,
-		noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
-		agentsFilesOverride: () => ({ agentsFiles: [] }), systemPromptOverride: () => "Deterministic test.",
-		extensionFactories: [piPlansExtension, pi => {
-			pi.on("before_agent_start", () => { beforeAgentStarts++; });
-			pi.on("session_start", async (_event, ctx) => {
-				await startExecution(pi, ctx, path.join(cwd, "PLAN_v1.md"), [
-					{ id: "VC-001", text: "first", done: false }, { id: "VC-002", text: "second", done: false },
-				]);
-			});
-		}],
+		cwd,
+		agentDir: path.join(cwd, "agent"),
+		settingsManager,
+		noExtensions: true,
+		noSkills: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		agentsFilesOverride: () => ({ agentsFiles: [] }),
+		systemPromptOverride: () => "Deterministic test.",
+		extensionFactories: [piPlansExtension as never],
 	});
 	await loader.reload();
 	assert.deepEqual(loader.getExtensions().errors, []);
 	const { session } = await createAgentSession({
-		cwd, agentDir: path.join(cwd, "agent"), modelRuntime,
-		model: modelRuntime.getModel("local-lifecycle-test", "fixture")!, thinkingLevel: "off",
-		resourceLoader: loader, settingsManager, sessionManager: SessionManager.inMemory(cwd), tools: ["probe"],
-		customTools: [{ name: "probe", label: "Probe", description: "Local test probe", parameters: Type.Object({}),
-			execute: async () => { toolCalls++; return { content: [{ type: "text", text: "ok" }], details: {} }; } }],
+		cwd,
+		agentDir: path.join(cwd, "agent"),
+		modelRuntime,
+		model: modelRuntime.getModel("local-exec-life", "fixture")!,
+		thinkingLevel: "off",
+		resourceLoader: loader,
+		settingsManager,
+		sessionManager: SessionManager.inMemory(cwd),
+		tools: [],
+		customTools: [],
 	});
-	const unsubscribe = session.subscribe(event => events.push(event.type));
-	try {
-		await session.bindExtensions({
-			mode,
-			...(mode === "tui" || mode === "rpc" ? { uiContext: {
-				setStatus: () => {}, notify: () => {}, theme: { fg: (_c: string, s: string) => s },
-			} as any } : {}),
-			onError: error => errors.push(error.error),
-		});
-		await session.prompt("Implement the test plan.");
-		await session.waitForIdle();
-		if (commandResume) {
-			assert.equal(getExecution()?.goalWait?.paused, true);
-			assert.deepEqual(getExecution()?.items.map(item => item.done), [true, false]);
-			assert.equal(inputs.length, 3);
-			await session.prompt("/plans-execute");
-		}
-		// SDK callers, unlike print mode, own the runtime until all nested wakes settle.
-		await session.waitForIdle();
-		assert.deepEqual(errors, []);
-		assert.deepEqual(session.messages.filter((m: any) => m.role === "assistant" && m.stopReason === "error"), [], "fixture model must run successfully");
-		const wakes = session.messages.filter((m: any) => m.customType === GOAL_WAIT_CUSTOM_TYPE) as any[];
-		assert.equal(toolCalls, 2);
-		assert.equal(beforeAgentStarts, 1, "custom wake must work without before_agent_start");
-		const interactive = mode === "tui" || mode === "rpc";
-		assert.equal(wakes.length, interactive && needsWake ? 1 : 0);
-		assert.equal(inputs.length, interactive ? needsWake ? 5 : 4 : 3);
-		if (interactive && needsWake) {
-			assert.equal(wakes[0].display, false);
-			assert.match(JSON.stringify(inputs[3].messages), /1\/2 verifier items done/);
-			assert.match(wakes[0].content, /- `VC-002` second/);
-			assert.doesNotMatch(wakes[0].content, /- `VC-001` first/);
-		}
-		if (interactive || !needsWake) assert.equal(getExecution(), null);
-		else assert.deepEqual(getExecution()?.items.map(item => item.done), [true, false]);
-		assert.equal(session.pendingMessageCount, 0);
-		assert.equal(events.at(-1), "agent_settled");
-		return { events, calls: inputs.length, wakes: wakes.length };
-	} finally {
-		unsubscribe();
-		session.dispose();
-	}
+	const errors: string[] = [];
+	await session.bindExtensions({
+		mode,
+		uiContext: {
+			setStatus: () => {},
+			notify: () => {},
+			confirm: async () => true,
+			select: async (_t: string, options: string[]) => options[0],
+			input: async () => "typed",
+			theme: { fg: (_c: string, s: string) => s },
+		},
+		onError: (error: { error: string }) => errors.push(error.error),
+	});
+	(session as unknown as { errors: string[] }).errors = errors;
+	return session as never as Awaited<ReturnType<typeof import("../index.ts").default>> extends never ? never : typeof session;
 }
 
-describe("goal-wait on the real Pi host", () => {
-	it("dispatches the registered /plans-execute command and preserves completed VCs", { timeout: 15000 }, async () => {
-		await exercise("rpc", true, true);
-	});
-	for (const mode of ["tui", "rpc", "print", "json"] as const) {
-		for (const needsWake of [false, true]) {
-			it(`${mode}: tools then ${needsWake ? "incomplete stop" : "completion"}`, { timeout: 15000 }, async () => {
-				await exercise(mode, needsWake);
-			});
+before(() => {
+	// deterministic audit: every check passes
+	__setAuditRunnerForTests(async ({ checklist }) => ({
+		round: 1,
+		passed: checklist.map((item) => {
+			item.done = true;
+			return item.id;
+		}),
+		failed: [],
+		rolledBack: [],
+		report: "all checks pass",
+	}));
+});
+
+describe("execution lifecycle on the real host", () => {
+	it("completes a task-tree execution through the audit gate", { timeout: 60000 }, async () => {
+		serial += 1;
+		const cwd = path.join(root, String(serial));
+		fs.mkdirSync(cwd);
+		spawnSync("git", ["init"], { cwd });
+		spawnSync("git", ["config", "user.email", "t@e.com"], { cwd });
+		spawnSync("git", ["config", "user.name", "T"], { cwd });
+		initState(cwd);
+		const { run } = startRun(cwd, { topic: "lifecycle", skill: "plan-small", requestText: "x" });
+		createCheckpoint(cwd, { runId: run.run_id, originWorkdir: cwd, workdir: cwd });
+		fs.mkdirSync(run.artifact_dir, { recursive: true });
+		const planPath = path.join(run.artifact_dir, "PLAN_v1.md");
+		fs.writeFileSync(planPath, PLAN, "utf8");
+		spawnSync("git", ["add", "-A"], { cwd });
+		spawnSync("git", ["commit", "-m", "seed"], { cwd });
+
+		const fixture: Fixture = { script: [{ kind: "text", text: "All tasks verified." }], calls: [] };
+		const session = (await makeSession({ cwd, fixture, mode: "rpc" })) as unknown as { prompt: (t: string) => Promise<unknown>; waitForIdle: () => Promise<void>; dispose: () => void; sessionManager: unknown; errors: string[] };
+		try {
+			// Same-process module instances as the session's extension wiring.
+			const { startExecution, getExecution, persistTaskProgress } = await import("../src/exec.ts");
+			const { parseChecklist, parsePlanTasks } = await import("../src/plan.ts");
+			const { applyTaskUpdate } = await import("../src/task-tool.ts");
+			const ctxLike = { cwd, sessionManager: session.sessionManager, hasUI: false, mode: "json", ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } } } as never;
+		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
+			await startExecution(ctxLike, { planPath, planTasks: parsePlanTasks(PLAN), items: parseChecklist(PLAN) });
+			applyTaskUpdate(getExecution()!.tasks, "Task-1", "complete", "parser green");
+			applyTaskUpdate(getExecution()!.tasks, "Task-2", "complete", "tool green");
+			persistTaskProgress(ctxLike);
+
+			await session.prompt("Finish the run.");
+			await session.waitForIdle();
+
+			const final = loadCheckpoint(cwd, run.run_id);
+			assert.equal(final.status, "ok");
+			assert.equal(final.checkpoint.phase, "completed", "audit passed → terminal phase");
+			assert.equal(final.checkpoint.execution?.audit?.passed, true);
+			assert.deepEqual((final.checkpoint.execution?.doneVcIds ?? []).sort(), ["VC-001", "VC-002"]);
+			assert.equal(getRun(cwd, run.run_id)?.status, "done");
+		} finally {
+			session.dispose();
 		}
-	}
+	});
 });

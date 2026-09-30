@@ -1,37 +1,58 @@
 /**
- * Fixed tasks' status panel lifecycle (0.4.0 feature 2, VC-006): the
- * aboveEditor widget registers when execution starts, refreshes from marker
- * updates, unregisters on complete/stop with the status line cleared, and
- * rebuilds after restoreFromSession. The panel never installs timers.
+ * Task dashboard lifecycle (v0.6.1): the aboveEditor widget registers when
+ * execution starts, reflects task-tool updates, renders the expanded tree on
+ * toggle, unregisters on stop/complete with the status line cleared, and
+ * rebuilds after restoreFromSession.
  */
 
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
 import { after, before, describe, it } from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	executionContextMessage,
-	registerExecutionTurnHandlers,
+	getExecution,
+	isDashboardExpanded,
+	persistTaskProgress,
 	restoreFromSession,
 	startExecution,
 	stopExecution,
+	toggleDashboardExpanded,
 	updateStatusWidget,
 } from "../src/exec.ts";
+import { applyTaskUpdate } from "../src/task-tool.ts";
+import { parseChecklist, parsePlanTasks } from "../src/plan.ts";
 import { initState, startRun } from "../src/state.ts";
+import { setMessagingApi } from "../src/messaging.ts";
 
 let root: string;
 let counter = 0;
 
 before(() => {
-	root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-panel-life-"));
+	root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-dash-life-"));
 });
 
 after(() => {
 	fs.rmSync(root, { recursive: true, force: true });
 });
+
+const PLAN = `## Tasks
+
+- Task-1: parser — files: src/a.ts; wave: 1
+- Task-2: tool — files: src/b.ts; wave: 2
+
+### Execution Waves
+
+- wave 1: Task-1 — first
+- wave 2: Task-2 — second
+
+## Verification Checks
+
+- [ ] \`VC-001\` covers \`Task-1\`; pass condition: parser
+- [ ] \`VC-002\` covers \`Task-2\`; pass condition: tool
+`;
 
 function freshWorkdir(): string {
 	counter += 1;
@@ -49,55 +70,38 @@ interface PanelCall {
 
 function makeHarness(workdir: string) {
 	const recorded: {
-		status: string | undefined;
-		statusCalls: number;
 		widgets: PanelCall[];
-		entries: Array<{ customType: string; data: unknown }>;
-		messages: Array<{ customType: string }>;
-		notifies: Array<{ message: string }>;
-	} = { status: undefined, statusCalls: 0, widgets: [], entries: [], messages: [], notifies: [] };
-	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
-	const pi = {
-		on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => {
-			const list = handlers.get(name) ?? [];
-			list.push(handler);
-			handlers.set(name, list);
-		},
-		registerTool: () => {},
-		registerCommand: () => {},
-		appendEntry: (customType: string, data: unknown) => {
-			recorded.entries.push({ customType, data });
-		},
-		sendMessage: (message: { customType: string }) => {
-			recorded.messages.push({ customType: message.customType });
-		},
-	} as unknown as ExtensionAPI;
+		status: string | undefined;
+		entries: Array<{ customType: string; data?: unknown; content?: string }>;
+		messages: string[];
+	} = { widgets: [], status: undefined, entries: [], messages: [] };
 	const ctx = {
 		cwd: workdir,
-		hasUI: true,
 		sessionManager: {},
+		hasUI: true,
+		mode: "print" as const,
 		ui: {
-			setStatus: (_key: string, value: string | undefined) => {
-				recorded.status = value;
-				recorded.statusCalls += 1;
+			setStatus: (_key: string, text: string | undefined) => {
+				recorded.status = text;
 			},
 			setWidget: (key: string, content: unknown, options?: { placement?: string }) => {
+				if (content === undefined) {
+					recorded.widgets.push({ key, content: undefined });
+					return;
+				}
 				recorded.widgets.push({ key, content, placement: options?.placement });
 			},
-			notify: (message: string) => {
-				recorded.notifies.push({ message });
-			},
-			theme: { fg: (_c: string, s: string) => s },
+			theme: { fg: (_c: string, t: string) => t, bold: (t: string) => t },
 		},
+		isIdle: () => true,
+		hasPendingMessages: () => false,
 	} as unknown as ExtensionContext;
-	const emit = async (name: string, event: unknown): Promise<void> => {
-		for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
-	};
-	return { pi, ctx, recorded, emit };
-}
-
-function items(...ids: string[]) {
-	return ids.map((id) => ({ id, text: `\`${id}\` demo item`, done: false }));
+	setMessagingApi({
+		appendEntry: (customType: string, data: unknown) => recorded.entries.push({ customType, data }),
+		sendMessage: (message: { customType: string; content: string }) => recorded.messages.push(message.content),
+		sendUserMessage: async () => {},
+	});
+	return { ctx, recorded };
 }
 
 function lastWidget(h: ReturnType<typeof makeHarness>): PanelCall | undefined {
@@ -110,238 +114,89 @@ function renderWidget(call: PanelCall | undefined, width: number): string[] {
 	return factory({ theme: { fg: (_c: string, s: string) => s } }, { fg: (_c: string, s: string) => s }).render(width);
 }
 
-describe("exec panel lifecycle", () => {
-	it("registers the panel above the editor when execution starts", async () => {
+async function start(h: ReturnType<typeof makeHarness>, workdir: string, name = "PLAN_v1.md") {
+	const planPath = path.join(workdir, name);
+	fs.writeFileSync(planPath, PLAN, "utf8");
+	await startExecution(h.ctx, { planPath, planTasks: parsePlanTasks(PLAN), items: parseChecklist(PLAN) });
+}
+
+describe("dashboard lifecycle", () => {
+	it("registers the dashboard above the editor when execution starts", async () => {
 		const workdir = freshWorkdir();
 		const h = makeHarness(workdir);
-		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_v1.md"), items("VC-001", "VC-002"), [
-			{ id: "I-001", text: "First item." },
-			{ id: "I-002", text: "Second item." },
-		]);
+		await start(h, workdir);
 		const call = lastWidget(h);
 		assert.ok(call, "widget registered");
-		assert.equal(call!.key, "pi-plans");
+		assert.equal(call!.key, "pi-plans-dashboard");
 		assert.equal(call!.placement, "aboveEditor");
 		const lines = renderWidget(call, 100);
-		assert.equal(lines.length, 7);
-		assert.ok(lines[0].includes("pi-plans"));
-		assert.ok(lines.join("\n").includes("Next: Implement I-001"));
-		assert.match(h.recorded.status ?? "", /plans: .* ▸ exec/);
-		await stopExecution(h.pi, h.ctx, "done");
+		assert.ok(lines.join("\n").includes("Task-1"));
+		assert.match(h.recorded.status ?? "", /tasks 0\/2/);
+		await stopExecution(h.ctx, "done");
 	});
 
-	it("activity row shows run status · since-time on live execution", async () => {
+	it("task updates refresh the widget content and status line", async () => {
 		const workdir = freshWorkdir();
-		startRun(workdir, { topic: "live-activity", skill: "plan-small", requestText: "x" });
 		const h = makeHarness(workdir);
-		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_vA.md"), items("VC-001", "VC-002"), [
-			{ id: "I-001", text: "First item." },
-		]);
+		await start(h, workdir);
+		applyTaskUpdate(getExecution()!.tasks, "Task-1", "complete", "a-tests green");
+		persistTaskProgress(h.ctx);
+		updateStatusWidget(h.ctx);
+		assert.match(h.recorded.status ?? "", /tasks 1\/2/);
 		const lines = renderWidget(lastWidget(h), 100);
-		assert.equal(lines.length, 7);
-		assert.match(lines[5] ?? "", /executing · since \d{2}-\d{2} \d{2}:\d{2}/, "activity row wired from run.json");
-		assert.ok((lines[6] ?? "").startsWith("╰"));
-		assert.ok(!lines.join("\n").includes("markers:"), "no duplicated legend rows");
-		await stopExecution(h.pi, h.ctx, "done");
+		assert.ok(lines.join("\n").includes("Task-2"), "current task advances");
+		await stopExecution(h.ctx, "done");
 	});
 
-	it("activity row falls back to the phase word when the run record is missing", async () => {
+	it("toggle switches the widget to the expanded tree view", async () => {
 		const workdir = freshWorkdir();
-		startRun(workdir, { topic: "missing-activity", skill: "plan-small", requestText: "x" });
 		const h = makeHarness(workdir);
-		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_vB.md"), items("VC-001", "VC-002"), [
-			{ id: "I-001", text: "First item." },
-		]);
-		// Simulate a lost/stale run record: stash run.json, render, restore.
-		const runsDir = path.join(workdir, ".git", "pi_plans", "runs");
-		const stash = path.join(os.tmpdir(), `pi-plans-runs-stash-${Date.now()}-${counter}`);
-		fs.renameSync(runsDir, stash);
-		try {
-			const lines = renderWidget(lastWidget(h), 100);
-			assert.match(lines[5] ?? "", /executing/);
-			assert.ok(!(lines[5] ?? "").includes("since"), "no fabricated since-time without a run record");
-			assert.ok(!(lines[5] ?? "").includes("undefined"));
-		} finally {
-			fs.renameSync(stash, runsDir);
-		}
-		await stopExecution(h.pi, h.ctx, "done");
+		await start(h, workdir);
+		toggleDashboardExpanded(h.ctx);
+		assert.equal(isDashboardExpanded(), true);
+		const lines = renderWidget(lastWidget(h), 120);
+		assert.ok(lines.join("\n").includes("Verification checks:"), "tree view lists checks");
+		toggleDashboardExpanded(h.ctx);
+		assert.equal(isDashboardExpanded(), false);
+		const compact = renderWidget(lastWidget(h), 100);
+		assert.ok(!compact.join("\n").includes("Verification checks:"), "compact view returns");
+		await stopExecution(h.ctx, "done");
 	});
 
-	it("activity row degrades to the phase word when the active pointer moves to another run", async () => {
-		const workdir = freshWorkdir();
-		startRun(workdir, { topic: "first-run", skill: "plan-small", requestText: "x" });
-		const h = makeHarness(workdir);
-		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_vC.md"), items("VC-001", "VC-002"), [
-			{ id: "I-001", text: "First item." },
-		]);
-		const before = renderWidget(lastWidget(h), 100);
-		assert.match(before[5] ?? "", /executing · since \d{2}-\d{2} \d{2}:\d{2}/, "activity resolves while the pointer agrees");
-		// A second run claims the shared disk pointer mid-execution, and the
-		// session is replaced (binding identity mismatch → resolve falls to the
-		// disk pointer): the activity row must degrade instead of mixing the
-		// new run's topic with the old run's status (impl-review r1 F-001).
-		startRun(workdir, { topic: "second-run", skill: "plan-small", requestText: "y" });
-		const prevSessionManager = (h.ctx as { sessionManager: unknown }).sessionManager;
-		(h.ctx as { sessionManager: unknown }).sessionManager = {};
-		try {
-			const after = renderWidget(lastWidget(h), 100);
-			assert.match(after[5] ?? "", /executing/);
-			assert.ok(!(after[5] ?? "").includes("since"), "no mixed-run status when the pointer moved");
-		} finally {
-			(h.ctx as { sessionManager: unknown }).sessionManager = prevSessionManager;
-		}
-		await stopExecution(h.pi, h.ctx, "done");
-	});
-
-	it("refreshes panel content from marker updates without re-registering", async () => {
+	it("clears the widget and status line on stop", async () => {
 		const workdir = freshWorkdir();
 		const h = makeHarness(workdir);
-		registerExecutionTurnHandlers(h.pi);
-		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_v2.md"), items("VC-001", "VC-002"), [
-			{ id: "I-001", text: "First item." },
-			{ id: "I-002", text: "Second item." },
-		]);
-		await h.emit("turn_end", {
-			message: { role: "assistant", content: [{ type: "text", text: "starting [I-002:current]" }] },
-		});
-		// The factory closure reads live state: render picks up the new focus.
-		const lines = renderWidget(lastWidget(h), 100);
-		assert.ok(lines.join("\n").includes("I-002"), "panel content follows the current-I marker");
-		assert.equal(h.recorded.widgets.length, 1, "no duplicate registrations across updates");
-		await stopExecution(h.pi, h.ctx, "done");
-	});
-
-	it("unregisters the panel and clears the execution summary on stop", async () => {
-		const workdir = freshWorkdir();
-		const h = makeHarness(workdir);
-		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_v3.md"), items("VC-001"));
-		await stopExecution(h.pi, h.ctx, "test-stop");
+		await start(h, workdir);
+		await stopExecution(h.ctx, "user stop");
 		const call = lastWidget(h);
-		assert.ok(call, "clear call recorded");
-		assert.equal(call!.key, "pi-plans");
-		assert.equal(call!.content, undefined, "widget cleared");
+		assert.ok(call && call.content === undefined, "widget unregistered");
 	});
 
-	it("rebuilds the panel from a session snapshot on restore", async () => {
+	it("rebuilds the dashboard after restoreFromSession", async () => {
 		const workdir = freshWorkdir();
-		startRun(workdir, { topic: "restore-topic", skill: "plan-small", requestText: "x" });
-		fs.writeFileSync(path.join(workdir, "PLAN_v9.md"), "# plan");
+		startRun(workdir, { topic: "restore", skill: "plan-small", requestText: "x" });
 		const h = makeHarness(workdir);
-		// A prior session persisted an exec snapshot; restore must rebind the UI.
-		await restoreFromSession(
-			h.pi,
-			h.ctx,
-			[
-				{ type: "custom", customType: "pi-plans-exec", data: {
-					planPath: path.join(workdir, "PLAN_v9.md"),
-					items: items("VC-001", "VC-002"),
-					implItems: [{ id: "I-001", text: "First." }],
-					startedAt: new Date().toISOString(),
-					usage: { inToks: 0, outToks: 0 },
-				} },
-			] as never,
-		);
-		const lines = renderWidget(lastWidget(h), 100);
-		assert.equal(lines.length, 7, "panel rebuilt after restore");
-		assert.match(h.recorded.status ?? "", /plans: restore-topic ▸ exec/);
-		assert.match(lines[5] ?? "", /· since \d{2}-\d{2} \d{2}:\d{2}/, "restored panel rebinds the activity row to run.json");
-		await stopExecution(h.pi, h.ctx, "done");
+		await start(h, workdir);
+		applyTaskUpdate(getExecution()!.tasks, "Task-1", "complete", "e1");
+		persistTaskProgress(h.ctx);
+		const snapshot = getExecution();
+		await stopExecution(h.ctx, "restart");
+		assert.equal(getExecution(), null);
+		const h2 = makeHarness(workdir);
+		await restoreFromSession(h2.ctx, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
+		assert.ok(getExecution(), "execution restored");
+		const lines = renderWidget(lastWidget(h2), 100);
+		assert.ok(lines.join("\n").includes("Task-2"), "restored view shows the open task");
+		await stopExecution(h2.ctx, "done");
 	});
 
-	it("injection text shares the panel's next action (VC-007 same-source)", async () => {
+	it("injection names the current wave and the task tool", async () => {
 		const workdir = freshWorkdir();
 		const h = makeHarness(workdir);
-		registerExecutionTurnHandlers(h.pi);
-		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_v5.md"), items("VC-001", "VC-002"), [
-			{ id: "I-001", text: "First item." },
-			{ id: "I-002", text: "Second item." },
-		]);
-		await h.emit("turn_end", {
-			message: { role: "assistant", content: [{ type: "text", text: "starting [I-002:current]" }] },
-		});
-		const rules = executionContextMessage(h.ctx)!;
-		assert.ok(rules.includes("Suggested next action"), "injection carries the next-action line");
-		assert.ok(rules.includes("Implement I-002"), "injection matches the panel's derived action");
-		const panelLines = renderWidget(lastWidget(h), 100).join("\n");
-		assert.ok(panelLines.includes("Next: Implement I-002"), "panel shows the same action");
-		await stopExecution(h.pi, h.ctx, "done");
-	});
-
-	it("ignores widget work entirely when the host lacks setWidget", async () => {
-		const workdir = freshWorkdir();
-		const h = makeHarness(workdir);
-		(h.ctx as unknown as { ui: Record<string, unknown> }).ui.setWidget = undefined;
-		await startExecution(h.pi, h.ctx, path.join(workdir, "PLAN_v4.md"), items("VC-001"));
-		assert.equal(h.recorded.widgets.length, 0, "capability guard skips widget registration");
-		assert.match(h.recorded.status ?? "", /plans: .* ▸ exec/);
-	});
-});
-describe("implementation-review loop widget (0.5.4, D-3/D-8)", () => {
-	it("stays alive after completion while the loop is live, then unregisters on completed", async () => {
-		const workdir = freshWorkdir();
-		const h = makeHarness(workdir);
-		// A previous test leaves a stray execution alive (module state); clear
-		// it so the loop widget's null-execution branch is reachable.
-		await stopExecution(h.pi, h.ctx, "cleanup-before-loop-test");
-		spawnSync("git", ["init"], { cwd: workdir });
-		const { startRun, setRunStatus } = await import("../src/state.ts");
-		const { run } = startRun(workdir, { topic: "loop-widget", skill: "plan-big", requestText: "t" });
-		const { createCheckpoint, mutateCheckpoint, applyImplementationReviewConfigured, applyCompleted } = await import(
-			"../src/workflow-state.ts"
-		);
-		createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
-		mutateCheckpoint(workdir, run.run_id, (cp) =>
-			applyImplementationReviewConfigured(
-				{ ...cp, phase: "implementation-review", nextAction: "ask-question" },
-				"1 round",
-				3,
-			),
-		);
-		setRunStatus(workdir, run.run_id, "done");
-
-		updateStatusWidget(h.ctx);
-		const call = lastWidget(h);
-		assert.ok(call && call.content !== undefined, "loop widget registered while the loop is live");
-		assert.equal(call!.key, "pi-plans");
-		const lines = renderWidget(call, 80);
-		assert.equal(lines.length, 4, "compact 4-line loop box");
-		assert.match(lines[1], /impl-review . round 1 . 3 reviewers/);
-		assert.match(lines[2], /until: 1 round/);
-		assert.match(h.recorded.status ?? "", /plans: impl-review round 1 . 3 reviewers/);
-
-		// Round progress: completedRounds bump renders on the next refresh
-		// (D-8 live reads).
-		const { applyReviewRoundStarted, applyLaneResult, writeReviewOutput, applyReviewConsolidated, applyImplementationRoundFinished } =
-			await import("../src/workflow-state.ts");
-		mutateCheckpoint(workdir, run.run_id, (cp) =>
-			applyReviewRoundStarted(cp, {
-				roundId: "impl-reviewer-r1",
-				role: "reviewer",
-				target: "implementation",
-				reviewers: 3,
-				lanes: [{ laneId: "l1" }, { laneId: "l2" }, { laneId: "l3" }],
-			}),
-		);
-		const loadNow = await import("../src/workflow-state.ts");
-		const loadedNow = loadNow.loadCheckpoint(workdir, run.run_id);
-		assert.ok(loadedNow.status === "ok");
-		let cpNow = loadedNow.checkpoint;
-		for (const lane of ["l1", "l2", "l3"]) {
-			const file = writeReviewOutput(workdir, run.run_id, "impl-reviewer-r1", lane, "out");
-			cpNow = applyLaneResult(cpNow, "impl-reviewer-r1", lane, { ok: true, resultFile: file });
-		}
-		mutateCheckpoint(workdir, run.run_id, () =>
-			applyImplementationRoundFinished(applyReviewConsolidated(cpNow, "impl-reviewer-r1")),
-		);
-		updateStatusWidget(h.ctx);
-		const refreshed = renderWidget(lastWidget(h), 80);
-		assert.match(refreshed[1], /round 2/, "live checkpoint reads advance the round");
-
-		// Completion unregisters the widget and restores the (done) line.
-		mutateCheckpoint(workdir, run.run_id, (cp) => applyCompleted({ ...cp, nextAction: "finish-review" }, "1 round disposed; termination condition met"));
-		updateStatusWidget(h.ctx);
-		const lastCall = lastWidget(h);
-		assert.ok(lastCall && lastCall.content === undefined, "widget unregistered after completion");
-		assert.match(h.recorded.status ?? "", /\(done\)/);
+		await start(h, workdir);
+		const injection = executionContextMessage(h.ctx)!;
+		assert.match(injection, /Current wave 1 open tasks:/);
+		assert.match(injection, /plans_update_task/);
+		await stopExecution(h.ctx, "done");
 	});
 });

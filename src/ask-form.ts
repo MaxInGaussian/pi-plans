@@ -3,7 +3,7 @@
  *
  * The form is a tabbed dialog opened via ctx.ui.custom: one tab per question
  * (options always visible in the first frame — options-first fit contract from
- * pi-goal-x's questionnaire) plus a final submit page listing every Q/A, and a
+ * a guided multi-question questionnaire) plus a final submit page listing every Q/A, and a
  * custom-answer row per tab that switches into a Focusable single-line input
  * (CURSOR_MARKER + hardware cursor so zh-Hans IME composition works).
  *
@@ -69,7 +69,7 @@ export interface FormState {
 	custom: (string | null)[];
 	/** Whether the user explicitly confirmed an answer on tab i (Enter on an
 	 * option row or a committed custom answer). The cursor `selection` alone
-	 * never flips this — goal-x aligned ■/□ chips read this field. */
+	 * never flips this — the ■/□ chips read this field. */
 	confirmed: boolean[];
 	/** Current tab: 0..N-1 = question tabs, N = submit page. */
 	tab: number;
@@ -86,7 +86,7 @@ export function createFormState(questions: FormQuestion[], lang: UiLanguage = "e
 		// Cursor position per tab: pre-positioned on the recommended option
 		// where present. This is ONLY the highlight — an answer counts only
 		// after the user confirms it (Enter/custom submit), tracked in
-		// `confirmed` (pi-goal-x semantics: chips show □ until answered).
+		// `confirmed` semantics: chips show □ until answered.
 		selection: questions.map((q) => q.options.findIndex((o) => o.recommended === true)),
 		confirmed: questions.map(() => false),
 		custom: questions.map(() => null),
@@ -286,7 +286,7 @@ export const FORM_ROWS_RESERVE = 4;
 export const FORM_FALLBACK_ROWS = 30;
 
 /**
- * pi-goal-x aligned question-tab frame: accent borders, tab chips with a
+ * themed question-tab frame: accent borders, tab chips with a
  * selectedBg background on the active chip (■ answered / □ pending), colored
  * question line, dim key hints. Under a `rows` budget it degrades richest
  * first — descriptions, then blank separators, then the borders (the chips

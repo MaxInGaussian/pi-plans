@@ -37,7 +37,7 @@ describe("form state machine", () => {
 	it("preselects the recommended option as cursor without marking it answered", () => {
 		const state = createFormState(qs(2));
 		assert.deepEqual(state.selection, [0, 0]);
-		// goal-x semantics: a pre-positioned cursor is NOT an answer — chips
+		// a pre-positioned cursor is NOT an answer — chips
 		// stay □ until the user presses Enter (or commits a custom answer).
 		assert.equal(allAnswered(state), false);
 		assert.deepEqual(state.confirmed, [false, false]);
@@ -428,7 +428,7 @@ describe("recommended marker hygiene (0.4.1)", () => {
 	});
 });
 
-describe("themed question frame (pi-goal-x alignment, 0.4.1)", () => {
+describe("themed question frame (0.4.1)", () => {
 	const T: FormTheme = {
 		fg: (c, t) => `⟪${c}⟩${t}⟪/⟫`,
 		bg: (c, t) => `⟦${c}⟧${t}⟦/⟧`,

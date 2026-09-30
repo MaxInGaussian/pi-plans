@@ -74,7 +74,7 @@ describe("run binding", () => {
 		const session = { id: "s" };
 		bindRun(session, workdir, first.run_id);
 		// Delete the bound run's state directory; active.json still names `second`.
-		fs.rmSync(path.join(workdir, ".git", "pi_plans", "runs", first.run_id), { recursive: true, force: true });
+		fs.rmSync(path.join(workdir, ".git", "pi-plans", "runs", first.run_id), { recursive: true, force: true });
 		const resolved = resolveActiveRun(session, workdir);
 		assert.equal(resolved?.run_id, second.run_id);
 		resetRunBindingForTests();

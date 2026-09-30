@@ -1,6 +1,6 @@
 ---
 name: debug-and-plan
-description: Diagnose failures before creating a Pi plan. MUST USE for bugs, CI failures, test failures, regressions, incidents, broken behavior, root cause, RCA, or debug-why requests before deciding whether to plan; preserve language, reviewer, and criticizer settings in `.git/pi_plans/config.json`; exclude ordinary feature planning, direct implementation-only, factual/explanation, trivial command-only, or explicit no-plan requests.
+description: Diagnose failures before creating a Pi plan. MUST USE for bugs, CI failures, test failures, regressions, incidents, broken behavior, root cause, RCA, or debug-why requests before deciding whether to plan; preserve the workspace language settings in `.git/pi-plans/config.json` and the reviewer role in the global config (`~/.pi/pi-plans/config.json`); exclude ordinary feature planning, direct implementation-only, factual/explanation, trivial command-only, or explicit no-plan requests.
 ---
 
 # Debug And Plan
@@ -9,7 +9,7 @@ Use this skill for problem or failure inputs that need diagnosis before planning
 
 ## Pi Setup
 
-Read `../../references/pi-planning-workflow.md` and `../../references/state-and-config.md` — both normative — and follow their setup, state, `language`, and reviewer/criticizer rules. Initialize workspace state with the `plans` tool (`action: "init"`); state lives in `.git/pi_plans/`. Ask every question with the `ask_choice` tool (batch related questions into one `questions: [...]` form call, 2-8 items; scope/handoff stays single-question with `autoComplete: false`); run refinement rounds with the `refine` tool.
+Read `../../references/pi-planning-workflow.md` and `../../references/state-and-config.md` — both normative — and follow their setup, state, `language`, and reviewer rules. Initialize workspace state with the `plans` tool (`action: "init"`); state lives in `.git/pi-plans/`. Ask every question with the `ask_choice` tool (batch related questions into one `questions: [...]` form call, 2-8 items; scope/handoff stays single-question with `autoComplete: false`); run refinement rounds with the `refine` tool.
 
 ## Diagnostic Workflow
 
@@ -32,4 +32,4 @@ Do not ask the user to choose the level unless the evidence supports two materia
 
 ## PROBLEM_ANALYSIS.md
 
-After opt-in, create the selected planning run's `.git/pi_plans` state and public artifact directory (`plans` action `start-run`), then write `PROBLEM_ANALYSIS.md` before `PLAN_v1.md`. Include: original problem; symptoms and reproduction status; evidence inspected; RCA summary and 5 Whys (ending early with `unknown` when evidence stops); suspected root cause and confidence; planning skill selected and why; language, reviewer, and criticizer settings used; open diagnostic gaps the plan must address. Pass the original problem, RCA summary, evidence, and `PROBLEM_ANALYSIS.md` path into the selected planning skill.
+After opt-in, create the selected planning run's `.git/pi-plans` state and public artifact directory (`plans` action `start-run`), then write `PROBLEM_ANALYSIS.md` before `PLAN_v1.md`. Include: original problem; symptoms and reproduction status; evidence inspected; RCA summary and 5 Whys (ending early with `unknown` when evidence stops); suspected root cause and confidence; planning skill selected and why; language, reviewer, and reviewer settings used; open diagnostic gaps the plan must address. Pass the original problem, RCA summary, evidence, and `PROBLEM_ANALYSIS.md` path into the selected planning skill.

@@ -7,9 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
-	execChrome,
 	formChrome,
-	panelChrome,
 	refineChrome,
 	resolveUiLanguage,
 	uiLanguageFromTag,
@@ -73,7 +71,7 @@ describe("resolveUiLanguage (best-effort config read)", () => {
 	it("returns en for a corrupt config without throwing", () => {
 		const workdir = freshWorkdir("cfg-corrupt");
 		gitInit(workdir);
-		const stateRoot = path.join(workdir, ".git", "pi_plans");
+		const stateRoot = path.join(workdir, ".git", "pi-plans");
 		fs.mkdirSync(stateRoot, { recursive: true });
 		fs.writeFileSync(path.join(stateRoot, "config.json"), "{ not json", "utf8");
 		assert.equal(resolveUiLanguage(workdir), "en");
@@ -109,21 +107,12 @@ describe("chrome tables", () => {
 		assert.equal(zh.submitAllHint, "[Enter] 提交全部  [←→] 返回修改  [Esc] 取消");
 	});
 
-	it("keeps the zh refine/panel/exec strings byte-identical to 0.5.6", () => {
+	it("keeps the zh refine strings byte-identical to 0.5.6", () => {
 		const refine = refineChrome("zh");
 		assert.equal(refine.close, "Esc 关闭");
 		assert.equal(refine.scroll, "↑/↓ 滚动");
 		assert.equal(refine.page, "PgUp/PgDn 翻页");
 		assert.equal(refine.switchLane, "Tab & Shift + Tab 切换 lane");
-		const panel = panelChrome("zh");
-		assert.equal(panel.badgeStatus("t", 0, 1), "t · ⚠ I 解析 0 项 · VC 0/1");
-		assert.equal(panel.progressWarning(), "⚠ plan 格式：Implementation Items 解析 0 项（面板无法计 I 进度）");
-		assert.equal(
-			panel.summaryWarning("t", 0, 1, "next"),
-			"plans: t ▸ ⚠ Implementation Items 解析 0 项 · VC 0/1 · next: next",
-		);
-		const exec = execChrome("zh");
-		assert.equal(exec.goalWait(1, 2), " · 🔁 goal-wait · 无进展 1/3 · 等待 2/6");
 	});
 
 	it("keeps every en string free of CJK", () => {
@@ -143,10 +132,6 @@ describe("chrome tables", () => {
 		]);
 		const r = refineChrome("en");
 		groups.push([r.close, r.scroll, r.page, r.switchLane]);
-		const p = panelChrome("en");
-		groups.push([p.badgeStatus("t", 0, 1), p.progressWarning(), p.summaryWarning("t", 0, 1, "next")]);
-		const e = execChrome("en");
-		groups.push([e.goalWait(1, 2)]);
 		for (const group of groups) {
 			for (const text of group) {
 				assert.ok(!CJK.test(text), `CJK leaked in en chrome: ${text}`);

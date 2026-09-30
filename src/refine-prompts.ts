@@ -17,34 +17,17 @@ export const REVIEWER_LENSES: readonly ReviewerLane[] = [
 	{ id: "verification", lens: "verification rigor, risks, and evidence gaps" },
 ] as const;
 
-function buildSharedHeader(role: "reviewer" | "criticizer", opts: RefinePromptInput): string {
-	const lensLine = role === "reviewer" && opts.lens ? `\nReview lens: ${opts.lens}.` : "";
+function buildSharedHeader(opts: RefinePromptInput): string {
+	const lensLine = opts.lens ? `\nReview lens: ${opts.lens}.` : "";
 	const focusLine = opts.focus ? `\n\nSpecific concerns from the main agent: ${opts.focus}` : "";
 	const contextLine = opts.context ? `\n\nContext: ${opts.context}` : "";
-	return `Goal: ${role === "reviewer" ? "review the plan against the repository" : "stress-test the plan's assumptions"}.
+	return `Goal: review the plan against the repository and surface what needs the user's judgment.
 
 Target: ${opts.planPath}
 
 Authority boundary: read-only analysis only. Do not edit, write, delete, commit, push, or spawn subagents.
 
 Evidence: inspect the repository with read, grep, find, and ls before judging the plan.${lensLine}${focusLine}${contextLine}`;
-}
-
-/** Shared header for the post-execution implementation review: the
- * accepted plan is the contract, the IMPLEMENTATION in the worktree is
- * under review. Findings must anchor to the plan's goals/acceptance
- * criteria and explicitly assess delivery maturity. */
-function buildImplementationSharedHeader(role: "reviewer" | "criticizer", opts: RefinePromptInput): string {
-	const lensLine = role === "reviewer" && opts.lens ? `\nReview lens: ${opts.lens}.` : "";
-	const focusLine = opts.focus ? `\n\nSpecific concerns from the main agent: ${opts.focus}` : "";
-	const contextLine = opts.context ? `\n\nContext: ${opts.context}` : "";
-	return `Goal: ${role === "reviewer" ? "review the implemented result in the worktree against the plan" : "stress-test the implemented result's assumptions"}.
-
-Target: ${opts.planPath} (the accepted plan; the IMPLEMENTATION in the worktree is under review)
-
-Authority boundary: read-only analysis only. Do not edit, write, delete, commit, push, or spawn subagents.
-
-Evidence: inspect the repository with read, grep, find, and ls before judging the implementation. Judge the implementation against the plan's goals, verifier checklist, and acceptance criteria. Explicitly assess delivery maturity: did the executor ship a minimal MVP only, or refine for long-term growth (no stopgaps, long-term architectural decisions, missing tests, technical debt, production readiness)? Calibrate severity accordingly. Out-of-scope improvement ideas are low severity by default and must not be forced into findings.${lensLine}${focusLine}${contextLine}`;
 }
 
 export function reviewerLanes(count: number): ReviewerLane[] {
@@ -54,47 +37,22 @@ export function reviewerLanes(count: number): ReviewerLane[] {
 }
 
 export function buildReviewerTask(opts: RefinePromptInput): string {
-	return `${buildSharedHeader("reviewer", opts)}
+	return `${buildSharedHeader(opts)}
 
-Success criteria: return evidence-backed findings or explicitly say the plan holds up.
+Success criteria: return evidence-backed findings, plus the questions only the user can settle. If the plan holds up, say so explicitly and list what you checked.
 
-Output: Markdown, highest severity first. For each finding use this shape:
+Output: Markdown with exactly two top-level parts, in this order.
+
+## Findings
+
+Highest severity first. For each finding use this shape:
 - \`F-###\` — severity: high | medium | low; affected plan IDs (e.g. R-001, I-003); evidence: repo path/command or external source that proves it; impact; recommended fix; suggested disposition (accept | reject | needs-discussion).
 
-Surface at most five high-priority findings; list lower-severity findings after them. If the plan holds up, say so explicitly and list what you checked.
+Surface at most five high-priority findings; list lower-severity findings after them. Write "None." when there are none.
 
-Plan file: ${opts.planPath}
+## Questions
 
----8<--- PLAN CONTENT ---8<---
-${opts.planText}
----8<--- END PLAN CONTENT ---8<---`;
-}
-
-export function buildCriticizerTask(opts: RefinePromptInput): string {
-	return `${buildSharedHeader("criticizer", opts)}
-
-Success criteria: return concrete, answerable questions only; never rewrite the plan.
-
-Output: Markdown in exactly this shape:
-1. A summary of your core criticism in at most three sentences, highlighting the single most important point.
-2. Then at most five adaptive questions, numbered, each with one line of why it matters. Questions must be answerable by a user with repo access — never rhetorical. Stop earlier if the plan genuinely holds.
-
-Plan file: ${opts.planPath}
-
----8<--- PLAN CONTENT ---8<---
-${opts.planText}
----8<--- END PLAN CONTENT ---8<---`;
-}
-
-export function buildImplementationReviewerTask(opts: RefinePromptInput): string {
-	return `${buildImplementationSharedHeader("reviewer", opts)}
-
-Success criteria: return evidence-backed findings or explicitly say the implementation holds up.
-
-Output: Markdown, highest severity first. For each finding use this shape:
-- \`F-###\` — severity: high | medium | low; affected plan IDs (e.g. R-001, I-003) or files; evidence: repo path/command that proves it; impact; recommended fix; suggested disposition (accept | reject | needs-discussion).
-
-Surface at most five high-priority findings; list lower-severity findings after them. If the implementation holds up, say so explicitly and list what you checked.
+At most five numbered questions (\`Q-1\`, \`Q-2\`, …) covering everything that needs the user's decision before the plan can be safely revised — hidden trade-offs, undetermined semantics, accept/reject calls on findings marked needs-discussion. Each question gets one line of why it matters, phrased so a user with repo access can answer it concretely. Never rhetorical; never questions the repository itself already answers. Stop earlier if nothing genuinely needs the user.
 
 Plan file: ${opts.planPath}
 
@@ -160,20 +118,4 @@ Section contracts:
 - Evidence Citations: the evidence references backing the claims above (file:line for code; section/theorem/table + quote for papers; heading/quote for blogs and docs).
 - Coverage: which parts of the reference you actually read versus skipped.
 - Evidence Gaps: what you could not determine from the reference alone.`;
-}
-
-export function buildImplementationCriticizerTask(opts: RefinePromptInput): string {
-	return `${buildImplementationSharedHeader("criticizer", opts)}
-
-Success criteria: return concrete, answerable questions only; never rewrite the plan or the implementation.
-
-Output: Markdown in exactly this shape:
-1. A summary of your core criticism in at most three sentences, highlighting the single most important point.
-2. Then at most five adaptive questions, numbered, each with one line of why it matters. Questions must be answerable by a user with repo access — never rhetorical. Stop earlier if the implementation genuinely holds.
-
-Plan file: ${opts.planPath}
-
----8<--- PLAN CONTENT ---8<---
-${opts.planText}
----8<--- END PLAN CONTENT ---8<---`;
 }

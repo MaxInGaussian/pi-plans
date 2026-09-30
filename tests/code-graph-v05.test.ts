@@ -362,8 +362,8 @@ describe("watch lifecycle (VC-006)", () => {
 		execSync('git config user.email t@t && git config user.name t', { cwd: root, shell: "/bin/bash" });
 		const { parsers, sqlite } = await makeParsers();
 		fs.writeFileSync(path.join(root, "a.ts"), "export function alpha() { return 1; }\n");
-		// The watcher always opens the CANONICAL db under .git/pi_plans/.
-		const dbPath = path.join(root, ".git", "pi_plans", "code_graph.db");
+		// The watcher always opens the CANONICAL db under .git/pi-plans/.
+		const dbPath = path.join(root, ".git", "pi-plans", "code_graph.db");
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 		const store = new Store({ dbPath, worktreeRoot: root, gitCommonDir: path.join(root, ".git") }, sqlite);
 		await runIndex({ store, worktreeRoot: root, parsers });

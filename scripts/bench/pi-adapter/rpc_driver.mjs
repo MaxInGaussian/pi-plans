@@ -184,11 +184,11 @@ function snapshotPlanArtifacts(dest) {
   if (!dest) return;
   // Plan artifact locations: the seeded artifact root (/tmp/pi-plans-bench/docs)
   // and pi-plans' own fallbacks — the repo-local docs/pi-plans and the state
-  // root .git/pi_plans/docs (where run plans actually land).
+  // root .git/pi-plans/docs (where run plans actually land).
   const roots = [
     "/tmp/pi-plans-bench/docs",
     path.join(process.cwd(), "docs", "pi-plans"),
-    path.join(process.cwd(), ".git", "pi_plans", "docs"),
+    path.join(process.cwd(), ".git", "pi-plans", "docs"),
   ];
   try {
     mkdirSync(dest, { recursive: true });
@@ -209,8 +209,8 @@ function snapshotPlanArtifacts(dest) {
 
 function snapshotSubagentUsage(dest) {
   if (!dest) return;
-  // pi-plans state root convention: <workdir>/.git/pi_plans/runs/<id>/subagents.jsonl
-  const stateRoots = [path.join(process.cwd(), ".git", "pi_plans", "runs")];
+  // pi-plans state root convention: <workdir>/.git/pi-plans/runs/<id>/subagents.jsonl
+  const stateRoots = [path.join(process.cwd(), ".git", "pi-plans", "runs")];
   const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, children: 0 };
   try {
     for (const root of stateRoots) {

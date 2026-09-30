@@ -66,41 +66,7 @@ const OPTIONS = [
 ];
 
 describe("ask_choice trailing option", () => {
-	it("renders Auto-refine loop as the trailing option and suppresses Auto-complete", async () => {
-		const tool = loadTool();
-		let seenLabels: string[] = [];
-		const ctx = makeCtx({
-			select: async (_question, labels) => {
-				seenLabels = labels;
-				return labels.find((label) => label.startsWith("Auto-refine loop"));
-			},
-		});
-		const result = await tool.execute("t1", {
-			question: "Ameliorate?",
-			options: OPTIONS,
-			autoComplete: true, // deliberately erroneous: trailing must suppress it
-			trailing: "auto-refine-loop",
-		}, undefined, undefined, ctx);
-
-		assert.equal(seenLabels.at(-1)?.startsWith("Auto-refine loop"), true, "Auto-refine loop must be last");
-		assert.equal(seenLabels.some((label) => label.startsWith("Auto-complete")), false, "Auto-complete must be absent");
-		const text = result.content[0].text as string;
-		assert.match(text, /User selected Auto-refine loop/);
-		assert.match(text, /until no high-severity finding \(hard cap 5 rounds\)/);
-		assert.match(text, /goal wait: continue until no unpassed VCs remain/);
-		assert.match(text, /refine \(role: "reviewer", target: "implementation", reviewers: <configured reviewerCount>\)/);
-		// 0.5.4: the trailing instructions now include the reviewer-count
-		// question with a skill-aware default (D-1/D-2) and the deferred
-		// combined persistence (D-5).
-		assert.match(text, /impl-review-reviewer-count/);
-		assert.match(text, /How many concurrent reviewers should each implementation-review round use\?/);
-		assert.match(text, /1 \(recommended\)/, "default workdir run has no active run → default 1");
-		assert.match(text, /Do not persist yet/);
-		assert.equal(result.details.source, "user");
-		assert.equal(result.details.answer, "Auto-refine loop");
-	});
-
-	it("keeps Auto-complete as the trailing option without the trailing param", async () => {
+	it("keeps Auto-complete as the trailing option (the auto-refine trailing param was removed in v0.6.1)", async () => {
 		const tool = loadTool();
 		let seenLabels: string[] = [];
 		const ctx = makeCtx({
@@ -117,21 +83,8 @@ describe("ask_choice trailing option", () => {
 		assert.equal(seenLabels.at(-1)?.startsWith("Auto-complete"), true);
 		assert.equal(seenLabels.some((label) => label.startsWith("Auto-refine loop")), false);
 	});
-
-	it("never auto-answers a trailing question in headless sessions", async () => {
-		const tool = loadTool();
-		const ctx = makeCtx({ hasUI: false, select: async () => undefined });
-		await assert.rejects(
-			tool.execute("t3", {
-				question: "Ameliorate?",
-				options: OPTIONS,
-				autoComplete: true,
-				trailing: "auto-refine-loop",
-			}, undefined, undefined, ctx),
-			/No UI available/,
-		);
-	});
 });
+
 
 describe("ask_choice panel fitting", () => {
 	it("sanitizes newlines in the question and labels", () => {

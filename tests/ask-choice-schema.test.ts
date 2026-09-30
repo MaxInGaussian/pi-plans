@@ -157,18 +157,6 @@ describe("VC-2 · hardening does not wound legitimate single-question shapes", (
 		assert.equal(Value.Check(AskChoiceParams as never, wellFormed), true);
 	});
 
-	it("single question with trailing + autoComplete:false passes Value.Check", () => {
-		const wellFormed = {
-			question: "实现评审循环如何终止？",
-			options: [
-				{ label: "goal wait：直到无未通过 VC", recommended: true },
-				{ label: "直到无高危发现（硬帽 5 轮）" },
-			],
-			trailing: "auto-refine-loop",
-			autoComplete: false,
-		};
-		assert.equal(Value.Check(AskChoiceParams as never, wellFormed), true);
-	});
 });
 
 describe("VC-3 · zero-recommended batches reject loudly with zero side effects", () => {

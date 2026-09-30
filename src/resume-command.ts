@@ -12,14 +12,14 @@
  * - R-007: after every dialog the world is re-checked; one kickoff max.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { loadExecutionFromCheckpoint } from "./exec.ts";
 import { bindRun, boundRunId } from "./run-context.ts";
 import { acquireOwnership, OwnershipError, releaseOwnership } from "./run-ownership.ts";
-import { loadConfig, resolveStateRootOrNull, setRunStatus, updateRunWorkdir } from "./state.ts";
+import { loadConfig, resolveArtifactRoot, resolveStateRootOrNull, setRunStatus, updateRunWorkdir } from "./state.ts";
 import {
 	applyMigration,
 	mutateCheckpoint,
@@ -35,12 +35,12 @@ import {
 	reconcileCheckpointWithLedger,
 	type ResumeCandidate,
 } from "./resume.ts";
+import { messaging } from "./messaging.ts";
 
 /** One kickoff per invocation; repeat invocations are blocked by the idle check. */
 let inFlight = false;
 
 export async function resumePlansCommand(
-	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	baseDir: string,
 ): Promise<void> {
@@ -50,13 +50,13 @@ export async function resumePlansCommand(
 	}
 	inFlight = true;
 	try {
-		await run(pi, ctx, baseDir);
+		await run(ctx, baseDir);
 	} finally {
 		inFlight = false;
 	}
 }
 
-async function run(pi: ExtensionAPI, ctx: ExtensionContext, baseDir: string): Promise<void> {
+async function run(ctx: ExtensionContext, baseDir: string): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify?.("/resume-plans needs an interactive session (TUI/RPC); print/json cannot resume.", "warning");
 		return;
@@ -105,7 +105,7 @@ async function run(pi: ExtensionAPI, ctx: ExtensionContext, baseDir: string): Pr
 	}
 	if (candidate.checkpointStatus === "corrupt") {
 		ctx.ui.notify(
-			`Checkpoint for ${candidate.runId} is corrupt (${candidate.checkpointError ?? "unknown"}). Repair or remove .git/pi_plans/runs/${candidate.runId}/checkpoint.json explicitly; nothing was changed.`,
+			`Checkpoint for ${candidate.runId} is corrupt (${candidate.checkpointError ?? "unknown"}). Repair or remove .git/pi-plans/runs/${candidate.runId}/checkpoint.json explicitly; nothing was changed.`,
 			"error",
 		);
 		return;
@@ -159,7 +159,7 @@ async function run(pi: ExtensionAPI, ctx: ExtensionContext, baseDir: string): Pr
 			}
 		}
 
-		const brief = await buildBrief(pi, ctx, baseDir, candidate);
+		const brief = await buildBrief(ctx, baseDir, candidate);
 		if (brief === null) {
 			releaseOwnership(ctx.cwd, candidate.runId, ownerToken);
 			return; // buildBrief reported the specific problem
@@ -167,7 +167,7 @@ async function run(pi: ExtensionAPI, ctx: ExtensionContext, baseDir: string): Pr
 
 		// Exactly one kickoff (R-007). The idle re-check happens above and in
 		// buildBrief's dialogs; the message itself starts the continuation.
-		await pi.sendUserMessage(brief.text);
+		await messaging().sendUserMessage(brief.text);
 		ctx.ui.notify(`Resumed ${candidate.runId} (${brief.phaseLabel}).`, "info");
 	} catch (error) {
 		releaseOwnership(ctx.cwd, candidate.runId, ownerToken);
@@ -189,13 +189,12 @@ export function migrateRunIntoCurrentWorktree(workdir: string, candidate: Resume
 	const stateRoot = loadConfigShared(workdir);
 	if (stateRoot === null) return null;
 	const config = loadConfig(stateRoot);
-	let artifactRoot = config.artifact_root;
-	if (!path.isAbsolute(artifactRoot)) artifactRoot = path.resolve(workdir, artifactRoot);
+	const artifactRoot = resolveArtifactRoot(workdir, config.artifact_root);
 	const sourceDir = candidate.run.artifact_dir;
 	if (!existsSync(sourceDir)) return null;
 	// Artifacts already in a shared location stay put.
 	const gitRoot = findGitCommonDir(workdir);
-	if (gitRoot !== null && isInside(sourceDir, path.join(gitRoot, "pi_plans"))) return sourceDir;
+	if (gitRoot !== null && isInside(sourceDir, path.join(gitRoot, "pi-plans"))) return sourceDir;
 	const targetDir = path.join(artifactRoot, path.basename(sourceDir));
 	for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
 		if (!entry.isFile()) continue;
@@ -261,46 +260,7 @@ export interface ResumeBrief {
 	text: string;
 }
 
-/** D-5 crash-window recovery: rebuild the implementation-review loop
- * configuration from the checkpoint plus the decisions ledger. Answers land
- * in the ledger first (stable questionIds), the combined record-checkpoint
- * second; between the two, this resolver reconstructs what is known and
- * reports which questions are still missing. Exported for tests. */
-export function resolveImplReviewConfig(
-	review: { terminationCondition?: string; reviewerCount?: number; completedRounds: number } | undefined,
-	ledger: { questionId?: string; answer?: string }[],
-): {
-	condition: string | undefined;
-	conditionFromLedger: boolean;
-	reviewerCount: number | undefined;
-	reviewerCountFromLedger: boolean;
-	missing: Array<"termination-condition" | "impl-review-reviewer-count">;
-} {
-	const latest = (id: string): string | undefined =>
-		[...ledger].reverse().find((entry) => entry.questionId === id)?.answer;
-	const ledgerCondition = latest("termination-condition");
-	const ledgerCountRaw = latest("impl-review-reviewer-count");
-	const ledgerCount = ledgerCountRaw === undefined ? undefined : Number.parseInt(ledgerCountRaw, 10);
-	const ledgerCountValid = ledgerCount !== undefined && Number.isInteger(ledgerCount) && ledgerCount >= 1 && ledgerCount <= 3;
-	const condition = review?.terminationCondition ?? ledgerCondition;
-	const reviewerCount = review?.reviewerCount ?? (ledgerCountValid ? ledgerCount : undefined);
-	// Both questions are per-run configuration: a count is missing whenever it
-	// is unknown (including legacy checkpoints persisted before 0.5.4),
-	// independent of where the condition came from.
-	const missing: Array<"termination-condition" | "impl-review-reviewer-count"> = [];
-	if (condition === undefined) missing.push("termination-condition");
-	if (reviewerCount === undefined) missing.push("impl-review-reviewer-count");
-	return {
-		condition,
-		conditionFromLedger: review?.terminationCondition === undefined && ledgerCondition !== undefined,
-		reviewerCount,
-		reviewerCountFromLedger: review?.reviewerCount === undefined && ledgerCountValid,
-		missing,
-	};
-}
-
 async function buildBrief(
-	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	baseDir: string,
 	candidate: ResumeCandidate,
@@ -327,7 +287,7 @@ async function buildBrief(
 	bindRun(ctx.sessionManager, ctx.cwd, runId);
 
 	if (cp.phase === "executing") {
-		const load = loadExecutionFromCheckpoint(pi, ctx, runId);
+		const load = loadExecutionFromCheckpoint(ctx, runId);
 		if (load.status === "loaded") {
 			if (run.status === "stopped" || run.status === "accepted") {
 				try {
@@ -338,13 +298,21 @@ async function buildBrief(
 			}
 			const doneList = (load.doneVcIds ?? []).join(", ") || "none";
 			const reverify = load.reverifyAll
-				? `\nThe code state (HEAD) changed since approval: the authorization is KEPT, but every previously verified VC must be re-verified before new work counts. Historically verified (evidence only): ${doneList}.`
+				? `\nThe code state (HEAD) changed since approval: the authorization is KEPT, but every previously closed task was re-opened and must be re-done. Historically verified checks (evidence only): ${doneList}.`
 				: `\nPreviously verified and still valid: ${doneList}.`;
-			const paused = load.pausedReason ? `\nExecution was paused: ${load.pausedReason}. Continue from where it stopped.` : "";
+			const paused = load.pausedReason ? `\nExecution had been paused: ${load.pausedReason} — the pause is cleared by this resume; continue from where it stopped.` : "";
+			const legacy = load.legacyPlan ? "\nThis plan parses through the legacy I-### compatibility mapping; upgrade it to the ## Tasks format at the next revision." : "";
 			return {
 				phaseLabel: "executing",
-				text: `[PI-PLANS RESUME] Execution of run ${runId} continues in this session.\nPlan: ${load.planPath}${reverify}${paused}\nFollow the execution-loop contract: implement in dependency order, verify each VC, and mark completions with [DONE:VC-xxx]. The remaining checklist is injected each turn.`,
+				text: `[PI-PLANS RESUME] Execution of run ${runId} continues in this session.\nPlan: ${load.planPath}${reverify}${paused}${legacy}\nFollow the execution-loop contract: work through tasks in wave order, report every task with the plans_update_task tool (status + evidence / skipReason), and let the completion auditor verify the checks. The current wave and remaining tasks are injected each turn.`,
 			};
+		}
+		if (load.legacyDelegate) {
+			ctx.ui.notify(
+				`Cannot resume ${runId} directly: it was mid-flight under a v0.6.0 delegated executor (removed in v0.6.1). Run /plans-execute to re-approve the handoff; execution restarts from the first task (0.6.0 progress cannot map onto the task tree).`,
+				"warning",
+			);
+			return null;
 		}
 		if (load.status === "plan-missing" || load.status === "plan-mismatch") {
 			ctx.ui.notify(`Cannot resume ${runId}: ${load.error ?? "plan file missing"}.`, "error");
@@ -359,69 +327,19 @@ async function buildBrief(
 	}
 
 	if (cp.phase === "implementation-review") {
-		const review = cp.implementationReview;
-		const condition = review?.terminationCondition;
-		const lines: string[] = [
-			`[PI-PLANS RESUME] Implementation review of run ${runId} continues in this session.`,
-			`Plan: ${cp.plan?.path ?? "(unknown)"}`,
-		];
-		// D-5 crash-window recovery: both config answers live in the decisions
-		// ledger under stable questionIds. Rebuild from the ledger, ask ONLY the
-		// missing question(s), then persist BOTH in one combined write. The
-		// re-ask guard on the checkpoint (termination condition already
-		// configured) rejects duplicate writes, so the combined write happens
-		// only while the field is genuinely absent.
-		const ledger = readDecisionLedger(ctx.cwd, runId);
-		const resolved = resolveImplReviewConfig(review, ledger);
-		const effectiveCondition = resolved.condition;
-		const effectiveCount = resolved.reviewerCount;
-		if (effectiveCondition === undefined) {
-			lines.push(
-				`The termination condition was never chosen. Ask it now via ask_choice (autoComplete: false, questionId: "termination-condition"): "How should the implementation-review loop terminate?" Options: goal wait (recommended) / until no high-severity finding (hard cap 5 rounds) / 1 / 2 / 3 rounds.`,
-			);
-		} else {
-			lines.push(`Termination condition: ${effectiveCondition}${resolved.conditionFromLedger ? " (recovered from the decisions ledger)" : ""}`);
+		// v0.6.1 (D-018/D-020): the implementation-review loop is gone; a
+		// legacy 0.6.0 checkpoint in this phase maps to execution completed.
+		// The run flips to done so the status line and run registry agree.
+		try {
+			setRunStatus(ctx.cwd, runId, "done");
+		} catch {
+			/* best-effort */
 		}
-		if (review?.reviewerCount === undefined) {
-			if (effectiveCount !== undefined && Number.isInteger(effectiveCount) && effectiveCount >= 1 && effectiveCount <= 3) {
-				lines.push(`Reviewer count: ${effectiveCount} (recovered from the decisions ledger; not yet persisted).`);
-			} else {
-				lines.push(
-					`The reviewer count was never chosen. Ask it via ask_choice (autoComplete: false, allowOther: false, questionId: "impl-review-reviewer-count", digit labels "1"/"2"/"3"): "How many concurrent reviewers should each implementation-review round use?" — recommended default follows this run's skill: plan-big / plan-with-refs → 3, others → 1.`,
-				);
-			}
-		} else {
-			lines.push(`Reviewers per round: ${review.reviewerCount}`);
-		}
-		if (condition === undefined) {
-			// Only when the checkpoint is still unconfigured: the combined write
-			// (both answers) is one transaction. When only terminationCondition is
-			// missing but a ledger answer exists for both, write both; when a
-			// question is genuinely unanswered, ask first, then write.
-			lines.push(
-				`After both answers exist (asked now or recovered from the ledger), persist them in ONE call: plans record-checkpoint (checkpoint: { transition: "implementation-review-configured", terminationCondition: "<answer>", reviewerCount: <integer> }).`,
-			);
-		} else {
-			lines.push(`Completed rounds in this worktree: ${review?.completedRounds ?? 0} (hard cap 5).`);
-		}
-		const currentRound = review?.currentRoundId
-			? cp.reviewRounds.find((round) => round.roundId === review.currentRoundId)
-			: undefined;
-		if (currentRound) {
-			const done = currentRound.lanes.filter((lane) => lane.status === "complete").map((lane) => lane.laneId);
-			const pending = currentRound.lanes.filter((lane) => lane.status !== "complete").map((lane) => lane.laneId);
-			lines.push(
-				`Round ${currentRound.roundId} is in flight — complete lanes: ${done.join(", ") || "none"}; pending/failed lanes: ${pending.join(", ") || "none"}. Resume it with refine (role: "reviewer", target: "implementation", resumeRoundId: "${currentRound.roundId}") so completed lanes are reused, never re-run.`,
-			);
-		} else {
-			lines.push(
-				`Start the next round with refine (role: "reviewer", target: "implementation", reviewers: ${review?.reviewerCount ?? effectiveCount ?? "<configured count>"}) — do NOT pass a resumeRoundId unless resuming an interrupted round; an omitted reviewers argument falls back to the run's configured reviewerCount.`,
-			);
-		}
-		lines.push(
-			`Record boundaries with plans record-checkpoint: review-consolidated → implementation-round-finished per round; completed (with evidence) when the termination condition is met.`,
+		ctx.ui.notify(
+			`${runId} finished under the removed v0.6.0 implementation-review loop; mapped to done. Its historical acceptance stands; no review loop to resume.`,
+			"info",
 		);
-		return { phaseLabel: "implementation-review", text: lines.join("\n") };
+		return null;
 	}
 
 	// planning / reviewing: rebuild the workflow context (R-002/R-003).
@@ -512,19 +430,7 @@ async function buildLegacyBrief(
 			`This run predates durable checkpoints: treat every VC as unverified and re-run the execution handoff (execute_plan or /plans-execute) for explicit approval before writing any code.`,
 		);
 	}
-	if (candidate.run.status === "done") {
-		const ok = await ctx.ui.confirm(
-			"Finished run with review artifacts",
-			`${candidate.runId} is marked done and has review records, but completion of the implementation-review loop cannot be proven for legacy runs. Resume the review loop anyway?`,
-		);
-		if (!ok) {
-			ctx.ui.notify("Cancelled; nothing was changed.", "info");
-			return null;
-		}
-		lines.push(
-			`Resume the implementation-review loop: ask the termination condition (questionId: "termination-condition") if unknown, then run rounds with refine (target: "implementation").`,
-		);
-	}
 	lines.push(`Continue only the missing work; never restart the interview from scratch.`);
 	return { phaseLabel: candidate.phaseLabel, text: lines.join("\n") };
 }
+

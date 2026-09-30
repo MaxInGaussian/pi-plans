@@ -29,7 +29,7 @@ function setupRun(name: string): { workdir: string; runId: string } {
 }
 
 function ownerPath(workdir: string, runId: string): string {
-	return path.join(workdir, ".git", "pi_plans", "runs", runId, "owner.json");
+	return path.join(workdir, ".git", "pi-plans", "runs", runId, "owner.json");
 }
 
 function writeRawOwner(workdir: string, runId: string, record: Record<string, unknown>): void {

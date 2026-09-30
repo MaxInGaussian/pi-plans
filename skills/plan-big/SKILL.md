@@ -1,6 +1,6 @@
 ---
 name: plan-big
-description: Create a large Pi plan before implementation. Use for open-ended or high-risk repo efforts needing 10 or more planning questions, web research, concurrent reviewer or criticizer refinement, and refinement until convergence; exclude direct implementation-only, factual/explanation, trivial command-only, or explicit no-plan requests.
+description: Create a large Pi plan before implementation. Use for open-ended or high-risk repo efforts needing 10 or more planning questions, web research, concurrent reviewer refinement (findings plus questions), and refinement until convergence; exclude direct implementation-only, factual/explanation, trivial command-only, or explicit no-plan requests.
 ---
 
 # Plan Big
@@ -9,7 +9,7 @@ Use this skill when the user wants a large, high-risk, or open-ended plan before
 
 ## Pi Setup
 
-Read `../../references/pi-planning-workflow.md` and `../../references/state-and-config.md` — both normative — and follow their setup, state, `language`, and reviewer/criticizer rules. Initialize workspace state with the `plans` tool (`action: "init"`); state lives in `.git/pi_plans/`. Ask every question with the `ask_choice` tool; run refinement rounds with the `refine` tool.
+Read `../../references/pi-planning-workflow.md` and `../../references/state-and-config.md` — both normative — and follow their setup, state, `language`, and reviewer rules. Initialize workspace state with the `plans` tool (`action: "init"`); state lives in `.git/pi-plans/`. Ask every question with the `ask_choice` tool; run refinement rounds with the `refine` tool.
 
 ## Depth Contract
 
@@ -18,7 +18,7 @@ Read `../../references/pi-planning-workflow.md` and `../../references/state-and-
 - Batch protocol (0.4.0): when a round has several questions, submit them together as one `ask_choice` call with `questions: [...]` (2-8 items, recommended option first per question) — the tool opens one tabbed multiple-choice form with a submit page instead of asking one at a time. After the batch returns, think about the answers, then follow up in later calls (batch again for 2+ related follow-ups; single `question` for one). `Esc` on the form returns the answered subset as partial answers — continue with what you got and re-ask only what matters. The final scope confirmation and the execution handoff are ALWAYS single-question calls with `autoComplete: false`; batches reject those questions.
 - Use web research during both brainstorming and refinement when outside facts, patterns, or ecosystem constraints matter, and cite sources in the plan. Optionally (never required) you may also search 1–2 named references — a paper (e.g. arXiv), an engineering blog post, or another repository — whose technique or measurements strengthen the plan's reasoning; cite their URLs in the plan's Evidence section. This optional reference search does not count against the planning-question limit and never requires downloading or analyzing material (that is plan-with-refs' job).
 - Ask the final scope confirmation, then write `PLAN_v1.md` per `../../references/plan-artifact-template.md`.
-- After each plan version, ask the merged accept/execute question via `ask_choice` with `autoComplete: false` — never run `refine` unless the user picked another round at that question. Default sequence: one `Reviewer` round as three concurrent independent reviewers (`refine` with `reviewers: 3`, consolidated by the main agent per the shared workflow), then one `Criticizer` round; afterwards the recommended option is `✓ Accept & execute now` in the merged accept/execute question. Beyond the default sequence, refine until convergence on high-priority findings, unresolved questions, or evidence gaps; surface at most five per round. Then the merged accept/execute question (ask_choice with `autoComplete: false`: ✓ Accept & execute now / Accept, don't execute yet / another round) and the `execute_plan` tool.
+- After each plan version, ask the merged accept/execute question via `ask_choice` with `autoComplete: false` — never run `refine` unless the user picked another round at that question. Default sequence: one reviewer round as three concurrent independent reviewers (`refine` with `reviewers: 3`), each returning findings (`F-###`) and up to five questions (`Q-1..Q-5`); consolidate per the shared workflow, ask every question with `ask_choice`, record the answers, then revise. Afterwards the recommended option is `✓ Accept & execute now` in the merged accept/execute question. Beyond the default sequence, refine until convergence on high-priority findings, unresolved questions, or evidence gaps; surface at most five per round. Then the merged accept/execute question (ask_choice with `autoComplete: false`: ✓ Accept & execute now / Accept, don't execute yet / another round) and the `execute_plan` tool.
 
 ## Fit
 

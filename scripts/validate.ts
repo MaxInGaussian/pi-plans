@@ -17,7 +17,7 @@ const EXPECTED_SKILLS = new Set([
 	"debug-and-plan",
 ]);
 const REQUIRED_REFERENCES = ["pi-planning-workflow.md", "plan-artifact-template.md", "state-and-config.md"];
-const REQUIRED_AGENTS = ["reviewer.md", "criticizer.md"];
+const REQUIRED_AGENTS = ["reviewer.md"];
 const REQUIRED_TOOL_FILES = [
 	"tools/plans.ts",
 	"tools/ask-choice.ts",
@@ -26,6 +26,7 @@ const REQUIRED_TOOL_FILES = [
 	"tools/execute-plan.ts",
 	"tools/code-graph.ts",
 	"src/state.ts",
+	"src/global-state.ts",
 	"src/guard.ts",
 	"src/plan.ts",
 	"src/subagent.ts",
@@ -69,7 +70,7 @@ function validateSkill(dir: string): void {
 	if (!description || description.length > 1024) fail(`${file}: invalid description length`);
 	if (!/Use|MUST USE/.test(description)) fail(`${file}: description should include routing language`);
 
-	const requiredPhrases = ["Auto-complete", "ask_choice", "refine", "language", "reviewer", "criticizer", ".git/pi_plans", "drawback"];
+	const requiredPhrases = ["Auto-complete", "ask_choice", "refine", "language", "reviewer", ".git/pi-plans", "drawback"];
 	for (const phrase of requiredPhrases) {
 		if (!text.includes(phrase)) fail(`${file}: missing required phrase ${phrase!}`);
 	}
@@ -77,14 +78,24 @@ function validateSkill(dir: string): void {
 
 function validateDefaultConfig(): void {
 	const source = fs.readFileSync(path.join(ROOT, "src", "state.ts"), "utf8");
-	if (!source.includes('"pi-plans-reviewer"') || !source.includes('"pi-plans-criticizer"')) {
-		fail("src/state.ts: name_prefix defaults missing");
-	}
-	if (source.includes("effort")) fail("src/state.ts: per-role effort must not exist");
-	if (!source.includes('"delegated-subagent"')) fail("src/state.ts: delegated-subagent default missing");
 	if (!source.includes('artifact_root: DEFAULT_ARTIFACT_ROOT')) fail("src/state.ts: artifact_root default missing");
 	if (!source.includes('artifact_root_source: "unset"')) fail("src/state.ts: artifact_root_source default missing");
 	if (!source.includes('artifact_root_updated_at: null')) fail("src/state.ts: artifact_root_updated_at default missing");
+	// The reviewer role defaults live in the GLOBAL config module (v0.7.0):
+	// one reviewer, one file, shared across workspaces.
+	const globalSource = fs.readFileSync(path.join(ROOT, "src", "global-state.ts"), "utf8");
+	if (!globalSource.includes('"pi-plans-reviewer"')) {
+		fail("src/global-state.ts: reviewer name_prefix default missing");
+	}
+	if (!globalSource.includes('"delegated-subagent"')) {
+		fail("src/global-state.ts: delegated-subagent default missing");
+	}
+	if (!globalSource.includes('thinking_level')) {
+		fail("src/global-state.ts: reviewer thinking_level field missing");
+	}
+	if (!globalSource.includes("PI_PLANS_GLOBAL_DIR")) {
+		fail("src/global-state.ts: PI_PLANS_GLOBAL_DIR override missing");
+	}
 }
 
 interface PackageJson {
@@ -235,8 +246,8 @@ function main(): void {
 	for (const ref of REQUIRED_REFERENCES) {
 		const file = path.join(ROOT, "references", ref);
 		if (!fs.existsSync(file)) fail(`missing reference ${ref}`);
-		if (!fs.readFileSync(file, "utf8").includes(".git/pi_plans")) {
-			fail(`${ref}: missing .git/pi_plans state location`);
+		if (!fs.readFileSync(file, "utf8").includes(".git/pi-plans")) {
+			fail(`${ref}: missing .git/pi-plans state location`);
 		}
 	}
 

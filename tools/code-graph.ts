@@ -128,8 +128,8 @@ export async function ensureRuntime(workdir: string, ctx: CodeGraphContext): Pro
 	return { entry: runtimeCache, status };
 }
 
-export function registerCodeGraphTool(pi: ExtensionAPI): void {
-	pi.registerTool({
+export function registerCodeGraphTool(ext: ExtensionAPI): void {
+	ext.registerTool({
 		name: "code_graph",
 		label: "Code Graph",
 		description:

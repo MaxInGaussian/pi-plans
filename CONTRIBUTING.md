@@ -28,15 +28,15 @@ pi-plans/
 │   └── code-graph/ # SQLite schema/store, parsers, indexer, summary, materialize
 ├── skills/         # Planning router plus five specialist planning skills
 ├── references/     # Shared workflow, state/config, plan template (normative)
-├── agents/         # reviewer.md / criticizer.md subagent prompts (read-only)
+├── agents/         # reviewer.md subagent prompt (read-only; ref-analyst.md for reference analysis)
 ├── scripts/        # validate.ts (structure + package artifact guard), run-tests.ts
 └── tests/          # node:test suite
 ```
 
 `npm run validate` enforces several invariants, so keep them intact:
 
-- every directory under `skills/` has a `SKILL.md` with frontmatter (`name` matching the directory, routing language in `description`) and the required phrases (`ask_choice`, `refine`, `.git/pi_plans`, ...)
-- the `reviewer` and `criticizer` agent prompts declare read-only tools and state the read-only contract
+- every directory under `skills/` has a `SKILL.md` with frontmatter (`name` matching the directory, routing language in `description`) and the required phrases (`ask_choice`, `refine`, `.git/pi-plans`, ...)
+- the `reviewer` agent prompt declares read-only tools and states the read-only contract
 - the npm artifact stays code-sized: no `scripts/bench/vendor|results` entries, unpacked < 5 MiB, packed < 3 MiB, and key entries present
 - `package.json` metadata (license, `pi-package` keyword, engines, scripts, required `files`) stays as asserted
 

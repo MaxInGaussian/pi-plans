@@ -151,15 +151,6 @@ describe("refine overlay viewport", () => {
 		);
 		assert.ok(reviewer.render(120).some((line) => line.includes("Reviewer (m1)")));
 
-		const criticizer = new RefineOverlayComponent(
-			fakeTheme,
-			"criticizer",
-			[readyLane("lane-1", "criticizer", "ok")],
-			() => {},
-			undefined,
-			"m2",
-		);
-		assert.ok(criticizer.render(120).some((line) => line.includes("Criticizer (m2)")));
 	});
 
 	it("renders model-aware titles and footer hints", () => {
@@ -230,14 +221,14 @@ describe("refine overlay viewport", () => {
 		const linesText = ["line 1", "line 2", "line 3", "line 4", "line 5"].join("\n");
 		const component = new RefineOverlayComponent(
 			fakeTheme,
-			"criticizer",
-			[streamingToolLane("lane-1", "criticizer", linesText)],
+			"reviewer",
+			[streamingToolLane("lane-1", "reviewer", linesText)],
 			() => {},
 			undefined,
 			"singularity-gpt/gpt-5.5:xhigh",
 		);
 		const lines = component.render(90);
-		assert.ok(lines.some((line) => line.includes("Criticizer (singularity-gpt/gpt-5.5:xhigh)")));
+		assert.ok(lines.some((line) => line.includes("Reviewer (singularity-gpt/gpt-5.5:xhigh)")));
 		assert.ok(lines.some((line) => line.includes("…")));
 		assert.ok(lines.some((line) => line.includes("line 3")));
 		assert.ok(lines.some((line) => line.includes("line 4")));
@@ -269,8 +260,8 @@ describe("refine overlay viewport", () => {
 	it("renders a single pane with pi-btw-style transcript badges", () => {
 		const component = new RefineOverlayComponent(
 			fakeTheme,
-			"criticizer",
-			[readyLane("lane-1", "criticizer", "assistant output")],
+			"refs",
+			[readyLane("lane-1", "refs", "assistant output")],
 			() => {},
 		);
 		const lines = component.render(90);
@@ -340,7 +331,7 @@ describe("refine overlay wiring", () => {
 	it("threads the chrome language through both overlay construction sites (issue #3, VC-007)", () => {
 		const refineSource = fs.readFileSync(path.join(process.cwd(), "tools", "refine.ts"), "utf8");
 		assert.match(refineSource, /const overlayLang = uiLanguageFromTag\(config\.language\.tag\)/);
-		assert.match(refineSource, /new RefineOverlayController\(role, lanes, relayAbort, lang\)/);
+		assert.match(refineSource, /new RefineOverlayController\("reviewer", lanes, relayAbort, lang\)/);
 		assert.match(refineSource, /modelLabel,\s*\n\s*overlayLang,/);
 		const refsSource = fs.readFileSync(path.join(process.cwd(), "tools", "analyze-refs.ts"), "utf8");
 		assert.match(

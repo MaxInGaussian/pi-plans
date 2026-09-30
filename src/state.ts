@@ -1,8 +1,8 @@
 /**
- * pi-plans workspace state, persisted under <git-common-dir>/pi_plans/.
+ * pi-plans workspace state, persisted under <git-common-dir>/pi-plans/.
  *
  * State lives inside the resolved git common dir (`git rev-parse
- * --git-common-dir`) as `.git/pi_plans/`, so it is never tracked and needs no
+ * --git-common-dir`) as `.git/pi-plans/`, so it is never tracked and needs no
  * .gitignore rules. When the workdir is not a git repository, mutating
  * functions auto-run `git init` (never commits) under the same safety
  * conditions as the original helper.
@@ -13,9 +13,44 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { lintImplItems } from "./plan.ts";
+import { lintImplItems, lintPlanTasks } from "./plan.ts";
+import {
+	DEFAULT_GLOBAL_CONFIG,
+	GlobalStateError,
+	globalIgnoredNotice,
+	globalMigratedNotice,
+	legacyReviewerHasUserIntent,
+	loadGlobalConfig,
+	resolveGlobalConfigPath,
+	resolveGlobalDir,
+	seedGlobalRoleFromLegacy,
+	setGlobalRole,
+	testHooks,
+	utcNow,
+	writeGlobalConfig,
+	type GlobalConfig,
+	type GlobalRoleConfig,
+	type SetGlobalRoleOptions,
+} from "./global-state.ts";
 
-export const STATE_DIRNAME = "pi_plans";
+export {
+	GLOBAL_DIR_ENV,
+	GlobalStateError,
+	VALID_ROLE_MODES,
+	VALID_THINKING_LEVELS,
+	loadGlobalConfig,
+	resolveGlobalConfigPath,
+	resolveGlobalDir,
+	reviewerReady,
+	writeGlobalConfig,
+	utcNow,
+	testHooks,
+} from "./global-state.ts";
+export type { GlobalConfig, GlobalRoleConfig, ThinkingLevelValue } from "./global-state.ts";
+/** Back-compat alias: the reviewer role now lives in the global config. */
+export type RoleConfig = GlobalRoleConfig;
+
+export const STATE_DIRNAME = "pi-plans";
 const GIT_ENV_SCRUB = ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"];
 
 export class StateError extends Error {}
@@ -28,19 +63,17 @@ export interface LanguageConfig {
 	updated_at: string | null;
 }
 
-export interface RoleConfig {
-	mode: string;
-	model_selector: string | null;
-	name_prefix: string;
-	confirmed_at: string | null;
-}
 
-
+/** Pre-0.7.0 reviewer block as it may still exist inside a workspace
+ * config.json. Read-tolerated: honored read-only until the first mutating
+ * state call seeds the global config from it (intent blocks only) and the
+ * next workspace write strips the key. */
 export interface PlansConfig {
 	schema: number;
 	language: LanguageConfig;
-	reviewer: RoleConfig;
-	criticizer: RoleConfig;
+	/** Legacy v0.6.x reviewer block — the source of truth is the global
+	 * config (`~/.pi/pi-plans/config.json`); see global-state.ts. */
+	reviewer?: GlobalRoleConfig;
 	artifact_root: string;
 	artifact_root_source: SettingSource;
 	artifact_root_updated_at: string | null;
@@ -51,11 +84,10 @@ export interface PlansConfig {
 	/** null = never asked; the plans tool surfaces a hint so the agent asks once. */
 	graph_enabled: boolean | null;
 	graph_enabled_updated_at: string | null;
-	/** Delegated executor child timeout in minutes (v0.6.0). 0/absent = default (60). */
-	executor_timeout_minutes?: number;
 }
 
-const DEFAULT_ARTIFACT_ROOT = "./docs/pi-plans";
+/** Plan artifacts default inside the state root: `<git-common-dir>/pi-plans/plans/`. */
+const DEFAULT_ARTIFACT_ROOT = "./.git/pi-plans/plans";
 const LEGACY_ARTIFACT_ROOTS = new Set(["docs/plans", "./docs/plans"]);
 
 function normalizeArtifactRoot(config: PlansConfig): PlansConfig {
@@ -65,28 +97,14 @@ function normalizeArtifactRoot(config: PlansConfig): PlansConfig {
 	return config;
 }
 
-type LegacyPlansConfig = PlansConfig & { execution?: unknown };
-
-function normalizeLegacyExecutionConfig(config: LegacyPlansConfig): PlansConfig {
-	const { execution: _execution, ...rest } = config;
-	return rest as PlansConfig;
-}
+/** Raw config shape as it may exist on disk, including keys this version
+ * ignores (the v0.6.0 `criticizer` role block, removed in v0.6.1 when the
+ * reviewer absorbed the criticizer's questioning duty). */
+type LegacyPlansConfig = PlansConfig & { execution?: unknown; criticizer?: unknown };
 
 export const DEFAULT_CONFIG: PlansConfig = {
 	schema: 1,
 	language: { tag: null, source: "unset", updated_at: null },
-	reviewer: {
-		mode: "delegated-subagent",
-		model_selector: null,
-		name_prefix: "pi-plans-reviewer",
-		confirmed_at: null,
-	},
-	criticizer: {
-		mode: "delegated-subagent",
-		model_selector: null,
-		name_prefix: "pi-plans-criticizer",
-		confirmed_at: null,
-	},
 	artifact_root: DEFAULT_ARTIFACT_ROOT,
 	artifact_root_source: "unset",
 	artifact_root_updated_at: null,
@@ -97,7 +115,6 @@ export const DEFAULT_CONFIG: PlansConfig = {
 	graph_enabled_updated_at: null,
 };
 
-export const VALID_ROLE_MODES = new Set(["delegated-subagent", "current-session"]);
 export const VALID_RUN_STATUSES = new Set([
 	"planning",
 	"accepted",
@@ -252,17 +269,13 @@ export interface SubagentEntry {
 	role: "reviewer" | "criticizer" | "ref-analyst";
 	name: string;
 	model?: string | null;
+	/** Thinking level actually passed to the child ("--thinking"); null or
+	 * absent = default chain (v0.7.0). Older entries remain readable. */
+	thinking_level?: string | null;
 	session_dir?: string;
 	/** I-010: aggregated child usage (tokens/cost) recorded after the run. */
 	usage?: { input: number; output: number; cache_read: number; cache_write: number; cost: number } | null;
 	recorded_at: string;
-}
-
-/** Test hook so tests can pin the clock (run-id dedup etc.). */
-export const testHooks: { now: () => Date } = { now: () => new Date() };
-
-export function utcNow(): string {
-	return testHooks.now().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 // ---------------------------------------------------------------------------
@@ -383,8 +396,34 @@ export function loadConfig(stateRoot: string): PlansConfig {
 		throw new StateError(`invalid config.json: ${(error as Error).message}`);
 	}
 	const merged = deepMergeDefaults(data as LegacyPlansConfig, DEFAULT_CONFIG as LegacyPlansConfig);
-	return normalizeLegacyExecutionConfig(normalizeArtifactRoot(merged as PlansConfig));
+	return normalizeLegacyKeys(normalizeArtifactRoot(merged as PlansConfig));
 }
+
+/** Strip ignored legacy keys (`execution`, `criticizer`) from a loaded
+ * config. The criticizer role was removed in v0.6.1 — the reviewer now
+ * carries the questioning duty — so its block is dropped on read and a
+ * migration notice is surfaced when the caller has a notices channel. */
+function normalizeLegacyKeys(config: LegacyPlansConfig): PlansConfig {
+	const { execution: _execution, criticizer: _criticizer, ...rest } = config;
+	return rest as PlansConfig;
+}
+
+/** True when the on-disk config still carries the removed `criticizer`
+ * role block (v0.6.0 and earlier). Callers surface a one-time migration
+ * notice; the next config write persists the trimmed shape. */
+export function configHasLegacyCriticizer(stateRoot: string): boolean {
+	const configPath = path.join(stateRoot, "config.json");
+	if (!existsSync(configPath)) return false;
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+		return Object.hasOwn(raw, "criticizer");
+	} catch {
+		return false;
+	}
+}
+
+export const CRITICIZER_MIGRATION_NOTICE =
+	"config.json 仍含已移除的 criticizer 角色块（v0.6.1 起 reviewer 同轮输出 findings+questions，criticizer 已合并）：读入时忽略该键，下次写配置时自动落盘为单 reviewer 形状";
 
 function noticeIfSubdir(workdir: string, notices: string[]): void {
 	const result = runGit(workdir, "rev-parse", "--show-toplevel");
@@ -409,9 +448,59 @@ function ensureState(workdir: string): EnsureResult {
 		mkdirSync(path.join(stateRoot, sub), { recursive: true });
 	}
 	noticeIfSubdir(workdir, notices);
+	if (configHasLegacyCriticizer(stateRoot)) notices.push(CRITICIZER_MIGRATION_NOTICE);
 	const config = loadConfig(stateRoot);
+	migrateLegacyReviewer(config, notices);
 	atomicWriteJson(path.join(stateRoot, "config.json"), config);
 	return { config, stateRoot, notices };
+}
+
+/** Migrate the legacy workspace reviewer block (v0.6.x) into the global
+ * config — the single source of truth since v0.7.0. Runs ONLY inside
+ * mutating state calls (ensureState): read paths resolve the effective
+ * reviewer in memory and never write (F-001).
+ *
+ * Rules (Q-1=A):
+ * - no legacy block → nothing to do;
+ * - legacy block with user intent (confirmed, explicit selector, or
+ *   non-default mode) + missing global file → seed the global file once
+ *   (first touched workspace wins); a confirmed-inherit block seeds with
+ *   model_selector null and NO confirmation (re-asked once via the panel);
+ * - legacy block with intent + existing global file → one-time "ignored"
+ *   notice (the global config wins);
+ * - scaffold-only block (pure defaults) → dropped silently;
+ * - corrupt global file → never seeded over; the corrupt-file notice from
+ *   loadGlobalConfig is surfaced by the caller.
+ *
+ * In every case the workspace key is stripped from the config before the
+ * caller writes it back. */
+function migrateLegacyReviewer(config: PlansConfig, notices: string[]): void {
+	if (config.reviewer === undefined) return;
+	const legacy = config.reviewer;
+	const globalPath = resolveGlobalConfigPath();
+	if (legacyReviewerHasUserIntent(legacy)) {
+		const global = loadGlobalConfig();
+		if (global.fresh && !global.corrupt) {
+			const seeded = seedGlobalRoleFromLegacy(legacy);
+			writeGlobalConfigSafe({ schema: 1, reviewer: seeded.role }, notices);
+			notices.push(globalMigratedNotice(globalPath));
+			notices.push(...seeded.notices);
+		} else {
+			notices.push(globalIgnoredNotice(globalPath));
+		}
+	}
+	delete config.reviewer;
+}
+
+/** Best-effort global write inside migration: a failure to persist must not
+ * break the workspace state write (the effective reviewer falls back to the
+ * in-memory legacy block on read paths until the global file exists). */
+function writeGlobalConfigSafe(config: GlobalConfig, notices: string[]): void {
+	try {
+		writeGlobalConfig(config);
+	} catch (error) {
+		notices.push(`failed to write global config (${(error as Error).message}); reviewer migration skipped — will retry on the next mutating call`);
+	}
 }
 
 export function initState(workdir: string): EnsureResult {
@@ -425,6 +514,63 @@ export function showConfig(workdir: string): PlansConfig {
 		throw new StateError("no pi-plans state found; run the plans tool with action \"init\" first");
 	}
 	return loadConfig(stateRoot);
+}
+
+export interface StateView {
+	config: PlansConfig;
+	stateRoot: string | null;
+	/** Effective reviewer role: global config first, then the legacy
+	 * workspace block (read-only compat), then defaults. */
+	reviewer: GlobalRoleConfig;
+	globalRoot: string;
+	globalConfigPath: string;
+	notices: string[];
+}
+
+/** Composite read-only view for the `plans show` action: workspace config +
+ * effective global reviewer + diagnostics. Never writes (F-001: read paths
+ * resolve the effective reviewer in memory only). */
+export function showStateView(workdir: string): StateView {
+	const stateRoot = resolveStateRootOrNull(workdir);
+	const config =
+		stateRoot !== null && existsSync(path.join(stateRoot, "config.json")) ? loadConfig(stateRoot) : null;
+	const global = loadGlobalConfig();
+	const notices = [...global.notices];
+	let reviewer = global.config.reviewer;
+	if (global.fresh && config?.reviewer !== undefined) {
+		// Global never configured: fall back to the legacy workspace block so
+		// read-only consumers (gates, show) see the pre-migration intent.
+		const legacy = seedGlobalRoleFromLegacy(config.reviewer);
+		reviewer = legacy.role;
+		notices.push(...legacy.notices);
+		notices.push(
+			`reviewer not yet migrated to the global config; showing the workspace block (${resolveGlobalConfigPath()}) — the next mutating pi-plans call migrates it`,
+		);
+	}
+	return {
+		config: config ?? structuredClone(DEFAULT_CONFIG),
+		stateRoot,
+		reviewer,
+		globalRoot: resolveGlobalDir(),
+		globalConfigPath: resolveGlobalConfigPath(),
+		notices,
+	};
+}
+
+/** Effective reviewer for read-only gates (refine / analyze_refs): global
+ * config first; before migration, the legacy workspace block still counts
+ * (in memory — never written). */
+export function resolveEffectiveReviewer(stateRoot: string): { reviewer: GlobalRoleConfig; notices: string[] } {
+	const global = loadGlobalConfig();
+	if (!global.fresh) return { reviewer: global.config.reviewer, notices: global.notices };
+	if (existsSync(path.join(stateRoot, "config.json"))) {
+		const config = loadConfig(stateRoot);
+		if (config.reviewer !== undefined) {
+			const legacy = seedGlobalRoleFromLegacy(config.reviewer);
+			return { reviewer: legacy.role, notices: [...global.notices, ...legacy.notices] };
+		}
+	}
+	return { reviewer: structuredClone(DEFAULT_GLOBAL_CONFIG).reviewer, notices: global.notices };
 }
 
 export function setLanguage(workdir: string, tag: string, source: "user" | "auto"): EnsureResult {
@@ -460,32 +606,55 @@ export function setGraphEnabled(workdir: string, enabled: boolean): EnsureResult
 	return { config, stateRoot, notices };
 }
 
-export interface SetRoleOptions {
-	role: "reviewer" | "criticizer";
-	mode?: string;
-	modelSelector?: string; // exact "provider/model" selector, or "inherit" to reset
-	confirmed?: boolean;
-	resetConfirmation?: boolean;
+export interface SetRoleOptions extends SetGlobalRoleOptions {
+	role: "reviewer";
 }
 
-export function setRole(workdir: string, options: SetRoleOptions): EnsureResult {
-	if (options.mode !== undefined && !VALID_ROLE_MODES.has(options.mode)) {
-		throw new StateError(`mode must be one of ${[...VALID_ROLE_MODES].sort().join(", ")}`);
+export interface SetRoleResult {
+	/** The updated global config (source of truth for the reviewer role). */
+	global: GlobalConfig;
+	globalRoot: string;
+	/** Load-time diagnostics from the global file. */
+	notices: string[];
+	/** Read-only workspace snapshot (null outside a repo or when the
+	 * workspace config is unusable — global writes never auto-init). */
+	config: PlansConfig | null;
+	stateRoot: string | null;
+}
+
+/** Set the reviewer role in the GLOBAL config (`~/.pi/pi-plans/config.json`,
+ * overridable via PI_PLANS_GLOBAL_DIR). Since v0.7.0 this never touches
+ * workspace state and never triggers auto git-init (F-013); a legacy
+ * workspace reviewer key is opportunistically stripped when workspace state
+ * already exists. */
+export function setRole(workdir: string, options: SetRoleOptions): SetRoleResult {
+	try {
+		const applied = setGlobalRole(options);
+		const stateRoot = resolveStateRootOrNull(workdir);
+		let config: PlansConfig | null = null;
+		if (stateRoot !== null && existsSync(path.join(stateRoot, "config.json"))) {
+			try {
+				const workspace = loadConfig(stateRoot);
+				if (workspace.reviewer !== undefined) {
+					delete workspace.reviewer;
+					atomicWriteJson(path.join(stateRoot, "config.json"), workspace);
+				}
+				config = workspace;
+			} catch {
+				/* corrupt workspace config: strip skipped, global write still wins */
+			}
+		}
+		return {
+			global: applied.global,
+			globalRoot: resolveGlobalDir(),
+			notices: applied.notices,
+			config,
+			stateRoot,
+		};
+	} catch (error) {
+		if (error instanceof GlobalStateError) throw new StateError(error.message);
+		throw error;
 	}
-	if (options.confirmed && options.resetConfirmation) {
-		throw new StateError("confirmed and resetConfirmation are mutually exclusive");
-	}
-	const { config, stateRoot, notices } = ensureState(workdir);
-	const role: RoleConfig = { ...DEFAULT_CONFIG[options.role], ...(config[options.role] as RoleConfig | undefined) };
-	if (options.mode !== undefined) role.mode = options.mode;
-	if (options.modelSelector !== undefined) {
-		role.model_selector = options.modelSelector === "inherit" ? null : options.modelSelector;
-	}
-	if (options.confirmed) role.confirmed_at = utcNow();
-	if (options.resetConfirmation) role.confirmed_at = null;
-	config[options.role] = role;
-	atomicWriteJson(path.join(stateRoot, "config.json"), config);
-	return { config, stateRoot, notices };
 }
 
 export function updateConfig(workdir: string, updater: (config: PlansConfig) => PlansConfig): EnsureResult {
@@ -516,6 +685,25 @@ export interface StartRunResult {
 	notices: string[];
 }
 
+/**
+ * Resolve a configured artifact root to an absolute directory.
+ *
+ * A leading `.git/` segment resolves against the git *common* dir rather than
+ * the workdir: in a linked worktree `<workdir>/.git` is a file holding a
+ * `gitdir:` pointer, not a directory, so the naive `path.resolve(workdir,
+ * root)` would not name a usable path there. The default artifact root lives
+ * under `.git/`, so this is the common path, not an edge case.
+ */
+export function resolveArtifactRoot(workdir: string, artifactRoot: string): string {
+	if (path.isAbsolute(artifactRoot)) return artifactRoot;
+	const rel = artifactRoot.replace(/^\.\//, "");
+	if (rel === ".git" || rel.startsWith(`.git${path.sep}`) || rel.startsWith(".git/")) {
+		const common = resolveGitCommonDir(workdir);
+		if (common !== null) return path.join(common, rel.slice(".git".length).replace(/^[/\\]+/, ""));
+	}
+	return path.resolve(workdir, artifactRoot);
+}
+
 export function startRun(workdir: string, options: StartRunOptions): StartRunResult {
 	const { config, stateRoot, notices } = ensureState(workdir);
 	const now = utcNow();
@@ -528,8 +716,7 @@ export function startRun(workdir: string, options: StartRunOptions): StartRunRes
 		runId = `${baseRunId}-${suffix}`;
 		suffix += 1;
 	}
-	let artifactRoot = config.artifact_root ?? DEFAULT_ARTIFACT_ROOT;
-	if (!path.isAbsolute(artifactRoot)) artifactRoot = path.resolve(workdir, artifactRoot);
+	const artifactRoot = resolveArtifactRoot(workdir, config.artifact_root ?? DEFAULT_ARTIFACT_ROOT);
 	const dateSlug = now.slice(0, 10);
 	const baseArtifactDir = path.join(artifactRoot, `${dateSlug}-${topicSlug}`);
 	// v0.6.0: same-topic runs on the same day (concurrent sessions) must not
@@ -688,13 +875,26 @@ export function appendRunNotice(workdir: string, runId: string, notice: Omit<Run
  * entry points (plan-written checkpoint, execute handoff, auto apply). */
 export function lintPlanIntoNotices(workdir: string, runId: string, planPath: string): string | null {
 	let text: string | null = null;
+	const parts: string[] = [];
+	const sources: string[] = [];
 	try {
-		text = lintImplItems(readFileSync(planPath, "utf8"));
+		const planText = readFileSync(planPath, "utf8");
+		const implLint = lintImplItems(planText);
+		const taskLint = lintPlanTasks(planText);
+		if (implLint !== null) {
+			parts.push(implLint);
+			sources.push("lint-impl-items");
+		}
+		if (taskLint !== null) {
+			parts.push(taskLint);
+			sources.push("lint-plan-tasks");
+		}
 	} catch {
 		return null;
 	}
-	if (text === null) return null;
-	appendRunNotice(workdir, runId, { kind: "plan-lint", source: "lint-impl-items", text });
+	if (parts.length === 0) return null;
+	text = parts.join("\n");
+	appendRunNotice(workdir, runId, { kind: "plan-lint", source: sources.join("+"), text });
 	return text;
 }
 

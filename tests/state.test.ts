@@ -5,12 +5,13 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { after, before, describe, it } from "node:test";
+import { after, before, beforeEach, describe, it } from "node:test";
 import {
 	initState,
 	getRun,
 	readActive,
 	recordDecision,
+	resolveArtifactRoot,
 	setLanguage,
 	setArtifactRoot,
 	setRefsRoot,
@@ -45,7 +46,7 @@ function commonDir(workdir: string): string {
 }
 
 function readConfig(workdir: string): Record<string, any> {
-	return JSON.parse(fs.readFileSync(path.join(commonDir(workdir), "pi_plans", "config.json"), "utf8"));
+	return JSON.parse(fs.readFileSync(path.join(commonDir(workdir), "pi-plans", "config.json"), "utf8"));
 }
 
 before(() => {
@@ -62,16 +63,17 @@ describe("init", () => {
 		const workdir = mkWorkdir("fresh");
 		const result = initState(workdir);
 		assert.ok(result.notices.some((notice) => notice.includes("git init")));
-		const state = path.join(workdir, ".git", "pi_plans");
-		assert.equal(path.join(commonDir(workdir), "pi_plans"), state);
+		const state = path.join(workdir, ".git", "pi-plans");
+		assert.equal(path.join(commonDir(workdir), "pi-plans"), state);
 		const config = JSON.parse(fs.readFileSync(path.join(state, "config.json"), "utf8"));
 		assert.equal(config.schema, 1);
 		assert.equal(config.language.tag, null);
-		assert.equal(config.reviewer.mode, "delegated-subagent");
-		assert.equal(config.reviewer.confirmed_at, null);
-		assert.equal(config.criticizer.confirmed_at, null);
+		// v0.7.0: the reviewer role lives in the GLOBAL config, never in the
+		// workspace config (the legacy key is stripped on every write).
+		assert.equal("reviewer" in config, false);
+		assert.equal("criticizer" in config, false);
 		assert.equal("execution" in config, false);
-		assert.equal(config.artifact_root, "./docs/pi-plans");
+		assert.equal(config.artifact_root, "./.git/pi-plans/plans");
 		assert.equal(config.artifact_root_source, "unset");
 		assert.equal(config.artifact_root_updated_at, null);
 		assert.equal(config.refs_root, null);
@@ -82,7 +84,7 @@ describe("init", () => {
 	it("normalizes old configs missing the refs_root trio", () => {
 		const workdir = mkWorkdir("refs-root-normalize");
 		initState(workdir);
-		const configPath = path.join(commonDir(workdir), "pi_plans", "config.json");
+		const configPath = path.join(commonDir(workdir), "pi-plans", "config.json");
 		const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 		delete config.refs_root;
 		delete config.refs_root_source;
@@ -107,19 +109,48 @@ describe("init", () => {
 		assert.equal(shown.refs_root_source, "user");
 	});
 
-	it("migrates legacy artifact roots to ./docs/pi-plans", () => {
+	it("resolves a .git/-prefixed artifact root against the git common dir", () => {
+		const workdir = mkWorkdir("artifact-root-gitdir");
+		initState(workdir);
+		// A plain relative root stays workdir-relative.
+		assert.equal(resolveArtifactRoot(workdir, "./docs/pi-plans"), path.join(workdir, "docs", "pi-plans"));
+		// A `.git/` root lands in the common dir, not `<workdir>/.git/...`.
+		assert.equal(resolveArtifactRoot(workdir, "./.git/pi-plans/plans"), path.join(commonDir(workdir), "pi-plans", "plans"));
+		assert.equal(resolveArtifactRoot(workdir, ".git/pi-plans/plans"), path.join(commonDir(workdir), "pi-plans", "plans"));
+		// Absolute roots pass through.
+		assert.equal(resolveArtifactRoot(workdir, "/tmp/abs-root"), "/tmp/abs-root");
+	});
+
+	it("default artifact root lands in the state dir of a linked worktree", () => {
+		const main = mkWorkdir("wt-main");
+		git(main, "init", "-q");
+		initState(main);
+		const linked = path.join(tmpRoot, "wt-linked");
+		git(main, "worktree", "add", linked, "-b", "wt-branch");
+		// A linked worktree's `.git` is a file, so the default must resolve via
+		// the common dir or mkdirSync would fail with ENOTDIR. Compare on the
+		// realpath: on macOS /var is a symlink to /private/var and `git rev-parse`
+		// reports the short form while the resolver returns the real one.
+		const expected = path.join(fs.realpathSync(commonDir(main)), "pi-plans", "plans");
+		const { run } = startRun(linked, { topic: "linked run", skill: "plan-small", requestText: "x" });
+		assert.equal(path.dirname(run.artifact_dir), expected);
+		assert.ok(fs.existsSync(run.artifact_dir), "artifact directory created inside the shared state dir");
+		assert.equal(getRun(linked, run.run_id)?.artifact_dir, run.artifact_dir);
+	});
+
+	it("migrates legacy artifact roots to ./.git/pi-plans/plans", () => {
 		const workdir = mkWorkdir("artifact-root-migration");
 		initState(workdir);
-		const configPath = path.join(commonDir(workdir), "pi_plans", "config.json");
+		const configPath = path.join(commonDir(workdir), "pi-plans", "config.json");
 		const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 		config.artifact_root = "docs/plans";
 		delete config.artifact_root_source;
 		delete config.artifact_root_updated_at;
 		fs.writeFileSync(configPath, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
 		const updated = initState(workdir);
-		assert.equal(updated.config.artifact_root, "./docs/pi-plans");
+		assert.equal(updated.config.artifact_root, "./.git/pi-plans/plans");
 		assert.equal(updated.config.artifact_root_source, "unset");
-		assert.equal(readConfig(workdir).artifact_root, "./docs/pi-plans");
+		assert.equal(readConfig(workdir).artifact_root, "./.git/pi-plans/plans");
 		assert.equal(readConfig(workdir).artifact_root_source, "unset");
 	});
 
@@ -159,21 +190,21 @@ describe("init", () => {
 		fs.mkdirSync(sub, { recursive: true });
 		const result = initState(sub);
 		assert.ok(result.notices.some((notice) => notice.includes("enclosing repository")));
-		assert.ok(fs.existsSync(path.join(commonDir(repo), "pi_plans", "config.json")));
+		assert.ok(fs.existsSync(path.join(commonDir(repo), "pi-plans", "config.json")));
 		assert.ok(!fs.existsSync(path.join(sub, ".git")));
 	});
 
-	it("supports private planning docs under .git/pi_plans/plans", () => {
+	it("supports private planning docs under .git/pi-plans/plans", () => {
 		const workdir = mkWorkdir("private-artifact-root");
-		setArtifactRoot(workdir, "./.git/pi_plans/plans", "user");
+		setArtifactRoot(workdir, "./.git/pi-plans/plans", "user");
 		const { run } = startRun(workdir, {
 			topic: "Private Docs",
 			skill: "plan-small",
 			requestText: "Plan the example",
 		});
 		assert.ok(fs.statSync(run.artifact_dir).isDirectory());
-		assert.equal(readConfig(workdir).artifact_root, "./.git/pi_plans/plans");
-		assert.equal(run.artifact_dir, path.join(workdir, ".git", "pi_plans", "plans", `${run.created_at.slice(0, 10)}-private-docs`));
+		assert.equal(readConfig(workdir).artifact_root, "./.git/pi-plans/plans");
+		assert.equal(run.artifact_dir, path.join(workdir, ".git", "pi-plans", "plans", `${run.created_at.slice(0, 10)}-private-docs`));
 	});
 
 	it("scrubs leaked GIT_DIR env", () => {
@@ -191,8 +222,8 @@ describe("init", () => {
 			encoding: "utf8",
 		});
 		assert.equal(result.status, 0, result.stderr ?? "");
-		assert.ok(fs.existsSync(path.join(workdir, ".git", "pi_plans", "config.json")));
-		assert.ok(!fs.existsSync(path.join(repoA, ".git", "pi_plans")));
+		assert.ok(fs.existsSync(path.join(workdir, ".git", "pi-plans", "config.json")));
+		assert.ok(!fs.existsSync(path.join(repoA, ".git", "pi-plans")));
 	});
 
 	it("refuses broken .git entries and bare repos", () => {
@@ -256,8 +287,6 @@ describe("runs", () => {
 				artifact_root_updated_at: new Date().toISOString(),
 				schema: 1,
 				language: { tag: null, source: "unset", updated_at: null },
-				reviewer: { mode: "delegated-subagent", model_selector: null, name_prefix: "pi-plans-reviewer", confirmed_at: null },
-				criticizer: { mode: "delegated-subagent", model_selector: null, name_prefix: "pi-plans-criticizer", confirmed_at: null },
 				execution: { model_selector: null, source: "unset", updated_at: null },
 			}, {
 				topic: "" as string,
@@ -275,7 +304,7 @@ describe("legacy execution config", () => {
 		const workdir = mkWorkdir("legacy-exec");
 		git(workdir, "init", "-q");
 		initState(workdir);
-		const configPath = path.join(commonDir(workdir), "pi_plans", "config.json");
+		const configPath = path.join(commonDir(workdir), "pi-plans", "config.json");
 		const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 		config.execution = { model_selector: "zai/glm-5.3-flash:high", source: "user", updated_at: null };
 		fs.writeFileSync(configPath, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
@@ -286,14 +315,40 @@ describe("legacy execution config", () => {
 	});
 });
 
-describe("set-role invariants", () => {
+describe("set-role invariants (global config)", () => {
+	// Each test gets its own throwaway global dir so tests never touch the
+	// developer's real ~/.pi/pi-plans/config.json (F-002).
+	let globalDir: string;
+	let previousGlobalDir: string | undefined;
+
+	before(() => {
+		previousGlobalDir = process.env.PI_PLANS_GLOBAL_DIR;
+		globalDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-global-test-"));
+		process.env.PI_PLANS_GLOBAL_DIR = globalDir;
+	});
+
+	beforeEach(() => {
+		// Each case starts from a pristine global file (no cross-test seeding).
+		fs.rmSync(path.join(globalDir, "config.json"), { force: true });
+	});
+
+	after(() => {
+		if (previousGlobalDir === undefined) delete process.env.PI_PLANS_GLOBAL_DIR;
+		else process.env.PI_PLANS_GLOBAL_DIR = previousGlobalDir;
+		fs.rmSync(globalDir, { recursive: true, force: true });
+	});
+
+	function readGlobal(): Record<string, any> {
+		return JSON.parse(fs.readFileSync(path.join(globalDir, "config.json"), "utf8"));
+	}
+
 	it("mode-only edits never forge or discard confirmations", () => {
 		const workdir = mkWorkdir("roles");
 		git(workdir, "init", "-q");
 		initState(workdir);
 
 		setRole(workdir, { role: "reviewer", mode: "current-session" });
-		let role = readConfig(workdir).reviewer;
+		let role = readGlobal().reviewer;
 		assert.equal(role.mode, "current-session");
 		assert.equal(role.confirmed_at, null);
 
@@ -303,29 +358,87 @@ describe("set-role invariants", () => {
 			modelSelector: "deepseek/deepseek-v4-flash",
 			confirmed: true,
 		});
-		role = readConfig(workdir).reviewer;
+		role = readGlobal().reviewer;
 		assert.equal(role.model_selector, "deepseek/deepseek-v4-flash");
 		const stamped = role.confirmed_at;
 		assert.ok(stamped);
+		// No workspace reviewer key: the global config is the only home.
+		assert.equal("reviewer" in readConfig(workdir), false);
 
 		setRole(workdir, { role: "reviewer", mode: "current-session" });
-		role = readConfig(workdir).reviewer;
+		role = readGlobal().reviewer;
 		assert.equal(role.mode, "current-session");
 		assert.equal(role.model_selector, "deepseek/deepseek-v4-flash");
 		assert.equal(role.confirmed_at, stamped);
 
 		setRole(workdir, { role: "reviewer", resetConfirmation: true });
-		role = readConfig(workdir).reviewer;
+		role = readGlobal().reviewer;
 		assert.equal(role.confirmed_at, null);
 		assert.equal(role.model_selector, "deepseek/deepseek-v4-flash");
 
-		// Confirmed-inherit is distinguishable from never-confirmed.
-		setRole(workdir, { role: "criticizer", confirmed: true });
-		role = readConfig(workdir).criticizer;
-		assert.equal(role.model_selector, null);
-		assert.ok(role.confirmed_at);
-
 		assert.throws(() => setRole(workdir, { role: "reviewer", confirmed: true, resetConfirmation: true }), StateError);
+	});
+
+	it("confirmed requires a concrete selector in delegated mode", () => {
+		const workdir = mkWorkdir("roles-confirm");
+		git(workdir, "init", "-q");
+		initState(workdir);
+		assert.throws(
+			() => setRole(workdir, { role: "reviewer", confirmed: true }),
+			/exact provider\/model selector/,
+		);
+		assert.equal(fs.existsSync(path.join(globalDir, "config.json")), false);
+	});
+
+	it("'inherit' is a full reset and never confirmable", () => {
+		const workdir = mkWorkdir("roles-inherit");
+		git(workdir, "init", "-q");
+		initState(workdir);
+		setRole(workdir, { role: "reviewer", modelSelector: "devin/claude-sonnet-5.5", thinkingLevel: "high", confirmed: true });
+		setRole(workdir, { role: "reviewer", modelSelector: "inherit" });
+		const role = readGlobal().reviewer;
+		assert.equal(role.model_selector, null);
+		assert.equal(role.confirmed_at, null);
+		assert.throws(
+			() => setRole(workdir, { role: "reviewer", modelSelector: "inherit", confirmed: true }),
+			/cannot be combined with confirmed/,
+		);
+	});
+
+	it("current-session mode is confirmable without a model", () => {
+		const workdir = mkWorkdir("roles-current-session");
+		git(workdir, "init", "-q");
+		initState(workdir);
+		setRole(workdir, { role: "reviewer", mode: "current-session", confirmed: true });
+		const role = readGlobal().reviewer;
+		assert.equal(role.mode, "current-session");
+		assert.ok(role.confirmed_at);
+		assert.equal(role.model_selector, null);
+	});
+
+	it("thinkingLevel: 'default' stores null; model switch resets the level unless passed", () => {
+		const workdir = mkWorkdir("roles-thinking");
+		git(workdir, "init", "-q");
+		initState(workdir);
+		setRole(workdir, { role: "reviewer", modelSelector: "devin/glm-5.3", thinkingLevel: "high", confirmed: true });
+		assert.equal(readGlobal().reviewer.thinking_level, "high");
+
+		setRole(workdir, { role: "reviewer", thinkingLevel: "default" });
+		assert.equal(readGlobal().reviewer.thinking_level, null);
+
+		setRole(workdir, { role: "reviewer", thinkingLevel: "off" });
+		assert.equal(readGlobal().reviewer.thinking_level, "off");
+
+		setRole(workdir, { role: "reviewer", modelSelector: "devin/claude-opus-5.5", confirmed: true });
+		assert.equal(readGlobal().reviewer.thinking_level, null, "model switch resets the level");
+
+		setRole(workdir, { role: "reviewer", modelSelector: "devin/glm-5.3", thinkingLevel: "xhigh", confirmed: true });
+		assert.equal(readGlobal().reviewer.thinking_level, "xhigh");
+
+		assert.throws(
+			() => setRole(workdir, { role: "reviewer", thinkingLevel: "ultra" as string }),
+			/thinkingLevel must be one of/,
+		);
 	});
 });
 

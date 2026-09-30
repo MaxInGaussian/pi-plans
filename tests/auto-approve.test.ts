@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerAskChoiceTool } from "../tools/ask-choice.ts";
-import { executeHandoff, setCurrentApi } from "../tools/execute-plan.ts";
+import { executeHandoff } from "../tools/execute-plan.ts";
 import {
 	AUTO_APPROVE_ENV,
 	assertAutoApprovable,
@@ -18,6 +18,7 @@ import {
 	isExternalStateQuestion,
 } from "../src/auto-approve.ts";
 import { getExecution, stopExecution } from "../src/exec.ts";
+import { setMessagingApi } from "../src/messaging.ts";
 
 type ToolDef = {
 	execute: (id: string, params: any, signal: undefined, update: undefined, ctx: any) => Promise<any>;
@@ -55,7 +56,7 @@ function loadTool(): ToolDef {
 function makeCtx(opts: { hasUI?: boolean } = {}): any {
 	selectCalls = 0;
 	confirmCalls = 0;
-	return {
+	const ctx = {
 		cwd: root,
 		hasUI: opts.hasUI ?? false,
 		sessionManager: {},
@@ -74,6 +75,8 @@ function makeCtx(opts: { hasUI?: boolean } = {}): any {
 			theme: { fg: (_kind: string, text: string) => text, bold: (text: string) => text },
 		},
 	};
+	setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
+	return ctx;
 }
 
 const LIFECYCLE_OPTIONS = [
@@ -241,15 +244,9 @@ describe("execute_handoff under auto-approve", () => {
 	});
 
 	function makeExecMocks() {
-		const pi = {
-			appendEntry: () => {},
-			sendMessage: () => {},
-			setModel: async () => true,
-		} as unknown as ExtensionAPI;
-		setCurrentApi(pi);
 		const ctx = makeCtx({ hasUI: false });
 		ctx.cwd = root;
-		return { pi, ctx };
+		return { ctx };
 	}
 
 	it("approves headlessly with an [auto-approve] annotated result and no confirm call", async () => {
@@ -261,7 +258,7 @@ describe("execute_handoff under auto-approve", () => {
 			assert.match(outcome.message, /^\[auto-approve\] Execution approved/);
 			assert.equal(confirmCalls, 0, "no confirm prompt may open");
 		} finally {
-			if (getExecution()) await stopExecution({ appendEntry: () => {}, sendMessage: () => {} } as any, ctx, "cleanup");
+			if (getExecution()) await stopExecution(ctx, "cleanup");
 			setEnv(undefined);
 		}
 	});

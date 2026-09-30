@@ -153,7 +153,7 @@ export async function initGraphCommand(args: string, ctx: CommandContext): Promi
 			"info",
 		);
 		try {
-			const reportPath = generateGraphReport(store, `${paths.gitCommonDir}/pi_plans/graph`, {
+			const reportPath = generateGraphReport(store, `${paths.gitCommonDir}/pi-plans/graph`, {
 				files: report.filesScanned,
 				functions: report.functionsIndexed,
 				ms: report.durationMs,
@@ -441,7 +441,7 @@ async function runChangedPathSync(
 		"info",
 	);
 	try {
-		generateGraphReport(store, `${paths.gitCommonDir}/pi_plans/graph`, {
+		generateGraphReport(store, `${paths.gitCommonDir}/pi-plans/graph`, {
 			files: report.filesScanned,
 			functions: report.functionsIndexed,
 			ms: report.durationMs,

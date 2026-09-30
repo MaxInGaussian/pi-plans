@@ -59,7 +59,7 @@ test("indexer rolls back the whole file batch when an emit step throws", async (
 	};
 	const sqlite = await import("node:sqlite");
 	const commonDir = git(worktreeRoot, ["rev-parse", "--git-common-dir"]);
-	const dbDir = path.join(path.resolve(worktreeRoot, commonDir), "pi_plans");
+	const dbDir = path.join(path.resolve(worktreeRoot, commonDir), "pi-plans");
 	fs.mkdirSync(dbDir, { recursive: true });
 	const dbPath = path.join(dbDir, "code_graph.db");
 	try { fs.unlinkSync(dbPath); } catch { /* ignore */ }

@@ -1,20 +1,35 @@
 /**
- * `refine` tool — reviewer/criticizer refinement rounds via read-only Pi
- * subagents with isolated context.
+ * `refine` tool — reviewer refinement rounds via read-only Pi subagents
+ * with isolated context.
  *
- * Enforces the role-confirmation gate: refuses to spawn while a
- * role's mode is invalid or its model was never confirmed, telling the caller
- * exactly which ask_choice question to ask first.
+ * Enforces the reviewer role gates: the mode question stays agent-mediated
+ * (ask_choice), while first-use model confirmation pops native panels in
+ * TUI (v0.7.0): a /model-style searchable panel, then a /thinking-style
+ * effort panel, persisted to the GLOBAL reviewer config. Esc cancels the
+ * whole gate with a dedicated error (details.cancelled) — do not re-ask.
+ * The reviewer output carries findings AND questions (Q-###); the caller
+ * must ask every question with ask_choice before revising the plan.
  */
 
-import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateHead } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { loadConfig, normalizeWorkdir, readActive, recordSubagent, resolveStateRootOrNull, StateError, type RoleConfig } from "../src/state.ts";
+import {
+	loadConfig,
+	normalizeWorkdir,
+	readActive,
+	recordSubagent,
+	resolveEffectiveReviewer,
+	resolveGlobalConfigPath,
+	resolveStateRootOrNull,
+	reviewerReady,
+	StateError,
+} from "../src/state.ts";
+import { runFirstUseFlow, firstUseCancelledError, firstUseTextGuidance, availableModels, findModel, type FirstUseOutcome, type RolePanelHost } from "../src/role-panels.ts";
+import { roleModelLabel } from "../src/thinking-levels.ts";
 import { uiLanguageFromTag, type UiLanguage } from "../src/ui-language.ts";
 import type { SubagentUsage } from "../src/subagent.ts";
 import { resolveActiveRun } from "../src/run-context.ts";
@@ -25,27 +40,20 @@ import {
 	reusableLaneOutputs,
 	startReviewRound,
 } from "../src/workflow-state.ts";
-import { buildCriticizerTask, buildImplementationCriticizerTask, buildImplementationReviewerTask, buildReviewerTask, reviewerLanes } from "../src/refine-prompts.ts";
+import { buildReviewerTask, reviewerLanes } from "../src/refine-prompts.ts";
 import { graphBlockForRefiner } from "../src/code-graph/prompts.ts";
 import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
 import { RefineOverlayController, refineOverlayContext } from "../src/refine-ui.ts";
 
 
 const RefineParams = Type.Object({
-	role: StringEnum(["reviewer", "criticizer"] as const, { description: "Refinement role to run" }),
 	planPath: Type.String({ description: "Path to the PLAN_vN.md to review (absolute or relative to workdir)" }),
-	target: Type.Optional(
-		StringEnum(["plan", "implementation"] as const, {
-			description:
-				'Review target: "plan" (default) reviews the plan text; "implementation" reviews the implemented worktree against the plan\'s goals and acceptance criteria (post-execution amelioration).',
-		}),
-	),
 	focus: Type.Optional(Type.String({ description: "Specific concerns to direct the pass at" })),
 	reviewers: Type.Optional(
 		Type.Integer({
 			minimum: 1,
 			maximum: 3,
-			description: "Number of independent reviewer subagents (big plans: 3 for the concurrent round). Criticizer is always 1.",
+			description: "Number of independent reviewer subagents (big plans: 3 for the concurrent round).",
 		}),
 	),
 	context: Type.Optional(
@@ -54,27 +62,52 @@ const RefineParams = Type.Object({
 	resumeRoundId: Type.Optional(
 		Type.String({
 			description:
-				'Round id to resume (I-004). Lanes already complete for this round in the run checkpoint are reused from their persisted outputs; only pending/failed/missing lanes run. Never reuse a round id across plan versions.',
+				'Round id to resume. Lanes already complete for this round in the run checkpoint are reused from their persisted outputs; only pending/failed/missing lanes run. Never reuse a round id across plan versions.',
 		}),
 	),
 	workdir: Type.Optional(Type.String({ description: "Target workspace; default current working directory" })),
 });
 
-function roleGateError(role: string, roleConfig: RoleConfig | undefined, problem: "mode" | "confirm"): StateError {
+function roleGateError(problem: "mode" | "confirm", guidance?: string): StateError {
 	if (problem === "mode") {
 		return new StateError(
-			`The ${role} role mode is missing or invalid in .git/pi_plans/config.json. Ask the role-setting question with ask_choice first: 1. Delegated subagent (recommended; read-only pi subprocess with isolated context) 2. Current session (run the pass yourself in this session) 3. Other 4. Auto-complete — then persist with the plans tool (set-role).`,
+			`The reviewer role mode is missing or invalid. Ask the role-setting question with ask_choice first: 1. Delegated subagent (recommended; read-only pi subprocess with isolated context) 2. Current session (run the pass yourself in this session) 3. Other 4. Auto-complete — then persist with the plans tool (set-role). The reviewer role lives in the global config (${resolveGlobalConfigPath()}).`,
 		);
 	}
 	return new StateError(
-		`The ${role} model was never confirmed (confirmed_at is null). Ask the model-confirmation question with ask_choice: 1. Inherit the main agent's model (recommended) 2. Choose a model (list options from the /model picker; persist the exact provider/model selector) 3. Other 4. Auto-complete — then persist with the plans tool (set-role, confirmed: true, modelSelector: the selector or 'inherit').`,
+		guidance ??
+			firstUseTextGuidance([], resolveGlobalConfigPath()),
 	);
+}
+
+/** First-use gate shared by the delegated spawn path: pop panels (TUI) or
+ * menus (hasUI non-TUI), persist on completion, cancel cleanly on Esc.
+ * Returns the role to use for THIS invocation, or throws. */
+async function ensureReviewerReady(
+	toolName: string,
+	host: RolePanelHost,
+	role: { mode: string; model_selector: string | null; thinking_level: string | null; confirmed_at: string | null },
+): Promise<{ mode: string; model_selector: string | null; thinking_level: string | null; confirmed_at: string | null; name_prefix: string }> {
+	if (role.mode === "current-session" || reviewerReady(role as never)) return role as never;
+	let outcome: FirstUseOutcome = await runFirstUseFlow(host, role.thinking_level);
+	if (outcome.status === "confirmed" && outcome.model_selector !== null) {
+		// F-008: validate the freshly chosen selector against the registry when
+		// one is present, so a typo'd manual entry fails here, not at spawn.
+		if (availableModels(host).length > 0 && findModel(host, outcome.model_selector) === null) {
+			outcome = await runFirstUseFlow(host, outcome.role.thinking_level);
+		}
+	}
+	if (outcome.status === "cancelled") throw firstUseCancelledError(toolName);
+	if (outcome.status === "unavailable") {
+		throw roleGateError("confirm", firstUseTextGuidance(availableModels(host), resolveGlobalConfigPath()));
+	}
+	if (outcome.role.model_selector === null) throw roleGateError("confirm", firstUseTextGuidance(availableModels(host), resolveGlobalConfigPath()));
+	return outcome.role;
 }
 
 function setupRefinementExecution(
 	ctx: ExtensionContext,
 	parentSignal: AbortSignal | undefined,
-	role: "reviewer" | "criticizer",
 	lanes: Array<{ id: string; label?: string }>,
 	modelLabel?: string,
 	lang: UiLanguage = "en",
@@ -84,7 +117,7 @@ function setupRefinementExecution(
 	if (parentSignal?.aborted) controller.abort();
 	else parentSignal?.addEventListener("abort", relayAbort, { once: true });
 
-	const overlay = ctx.mode === "tui" ? new RefineOverlayController(role, lanes, relayAbort, lang) : undefined;
+	const overlay = ctx.mode === "tui" ? new RefineOverlayController("reviewer", lanes, relayAbort, lang) : undefined;
 	overlay?.open(refineOverlayContext(ctx), modelLabel);
 
 	return {
@@ -97,20 +130,20 @@ function setupRefinementExecution(
 	};
 }
 
-export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
+export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 	const agentsDir = path.join(baseDir, "agents");
 
-	const loadAgentPrompt = (role: "reviewer" | "criticizer"): string => {
-		const file = path.join(agentsDir, `${role}.md`);
+	const loadAgentPrompt = (): string => {
+		const file = path.join(agentsDir, "reviewer.md");
 		return stripFrontmatter(fs.readFileSync(file, "utf8"));
 	};
 
-	pi.registerTool({
+	ext.registerTool({
 		name: "refine",
 		label: "Refine",
 		description:
-			"Run a reviewer or criticizer refinement round on a PLAN_vN.md (target=\"plan\", default) or on the implemented worktree (target=\"implementation\", post-execution amelioration) via read-only Pi subagents. Reviewer: findings with IDs, severity, evidence, impact, fix, disposition. Criticizer: up to five adaptive questions. Use reviewers: 3 for concurrent reviewer rounds (big-plan plan review; implementation-review rounds honor the run's configured reviewerCount when reviewers is omitted). Refuses to spawn until the role's mode and model are confirmed in .git/pi_plans/config.json (ask via ask_choice, persist via the plans tool).",
-		promptSnippet: "Run reviewer/criticizer plan-refinement rounds",
+			"Run a reviewer refinement round on a PLAN_vN.md via read-only Pi subagents. Each reviewer returns findings (F-###, severity, evidence, impact, fix, disposition) AND questions (Q-1..Q-5) that only the user can settle — after the round you MUST ask every question with ask_choice (one call per question or a batched form, in the configured language, stable questionIds) and record the answers before revising the plan. Use reviewers: 3 for concurrent reviewer rounds (big-plan review). Refuses to spawn until the reviewer mode is set and, for delegated-subagent, a concrete model is confirmed: first use pops native model/effort panels in TUI (persisted to the global reviewer config) instead of an ask_choice question.",
+		promptSnippet: "Run reviewer plan-refinement rounds",
 		parameters: RefineParams,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -122,18 +155,22 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				throw new StateError("no pi-plans state found; run the plans tool (action: init) first");
 			}
 			const config = loadConfig(root);
-			const roleConfig = config[params.role] as RoleConfig | undefined;
-			if (!roleConfig || (roleConfig.mode !== "delegated-subagent" && roleConfig.mode !== "current-session")) {
-				throw roleGateError(params.role, roleConfig, "mode");
-			}
-			if (roleConfig.confirmed_at === null) {
-				throw roleGateError(params.role, roleConfig, "confirm");
-			}
 
-			// Resolve and read the plan.
+			// F-005: cheap validations BEFORE any first-use panel, so a bad planPath
+			// never walks the user through two panels that would then be discarded.
 			const planPath = path.resolve(workdir, params.planPath.replace(/^@/, ""));
 			if (!fs.existsSync(planPath)) throw new StateError(`plan file not found: ${planPath}`);
 			const planText = fs.readFileSync(planPath, "utf8");
+
+			// Effective reviewer: global config first, legacy workspace block
+			// second — resolved read-only, never written here (F-001).
+			const { reviewer: initialRole } = resolveEffectiveReviewer(root);
+			if (initialRole.mode !== "delegated-subagent" && initialRole.mode !== "current-session") {
+				throw roleGateError("mode");
+			}
+			// Model/effort confirmation applies only to delegated-subagent
+			// (decision 10); current-session runs in this session with its model.
+			const roleConfig = await ensureReviewerReady("refine", ctx as unknown as RolePanelHost, initialRole);
 
 			const overlayLang = uiLanguageFromTag(config.language.tag);
 			// Record spawns against the active run when one exists.
@@ -142,10 +179,10 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				if (!active) return;
 				try {
 					recordSubagent(workdir, active.run_id, {
-						role: params.role,
+						role: "reviewer",
 						name,
 						model: model ?? null,
-						// I-010: meter subagent token/cost for benchmark accounting.
+						thinking_level: roleConfig.mode === "current-session" ? null : roleConfig.thinking_level,
 						usage: usage
 							? { input: usage.input, output: usage.output, cache_read: usage.cacheRead, cache_write: usage.cacheWrite, cost: usage.cost }
 							: null,
@@ -155,36 +192,18 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				}
 			};
 
-			const target = params.target ?? "plan";
-			// I-004: durable round bookkeeping. Rounds start (or resume) in the
+			// Durable round bookkeeping. Rounds start (or resume) in the
 			// checkpoint BEFORE any lane spawns; successful outputs are persisted
-			// BEFORE the tool result returns (C-007).
+			// BEFORE the tool result returns.
 			const checkpointLoad = active ? loadCheckpoint(workdir, active.run_id) : null;
 			const useCheckpoint = checkpointLoad?.status === "ok" ? checkpointLoad.checkpoint : null;
-			const roundId =
-				params.resumeRoundId ?? `${target}-${params.role}-r${Date.now().toString(36)}`;
-			// D-4 durable reviewer-count fallback: an implementation-review reviewer
-			// round with an omitted `reviewers` reads the run's configured value
-			// from the checkpoint, so restarts/migrations never silently revert 2/3
-			// to 1. Explicit params always win; plan-review rounds are unchanged.
-			const configuredImplReviewers =
-				target === "implementation" && params.role === "reviewer"
-					? useCheckpoint?.implementationReview?.reviewerCount
-					: undefined;
-			const roundReviewerCount =
-				params.role === "reviewer"
-					? Math.min(3, Math.max(1, params.reviewers ?? configuredImplReviewers ?? 1))
-					: 1;
-			// F-001 (implementation review): the spec MUST carry lanes —
-			// reviewerLanes(count) for reviewer rounds, one lane for criticizer.
-			const roundLanes =
-				params.role === "reviewer"
-					? reviewerLanes(roundReviewerCount).map((lane) => ({ laneId: lane.id, lens: lane.lens ?? undefined }))
-					: [{ laneId: "criticizer" }];
+			const roundId = params.resumeRoundId ?? `plan-reviewer-r${Date.now().toString(36)}`;
+			const roundReviewerCount = Math.min(3, Math.max(1, params.reviewers ?? 1));
+			const roundLanes = reviewerLanes(roundReviewerCount).map((lane) => ({ laneId: lane.id, lens: lane.lens ?? undefined }));
 			const roundSpec = {
 				roundId,
-				role: params.role,
-				target,
+				role: "reviewer" as const,
+				target: "plan" as const,
 				reviewers: roundReviewerCount,
 				planPath,
 				focus: params.focus,
@@ -205,110 +224,43 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 					/* the subagents ledger still records the spawn; resume treats the lane as unfinished */
 				}
 			};
-			const pickTask = (role: "reviewer" | "criticizer", lens: string | null): string => {
-				if (role === "reviewer") {
-					return target === "implementation"
-						? buildImplementationReviewerTask({ planText, planPath, lens, focus: params.focus, context: params.context })
-						: buildReviewerTask({ planText, planPath, lens, focus: params.focus, context: params.context });
-				}
-				return target === "implementation"
-					? buildImplementationCriticizerTask({ planText, planPath, focus: params.focus, context: params.context })
-					: buildCriticizerTask({ planText, planPath, focus: params.focus, context: params.context });
-			};
+			const pickTask = (lens: string | null): string =>
+				buildReviewerTask({ planText, planPath, lens, focus: params.focus, context: params.context });
 
-			const systemPrompt = loadAgentPrompt(params.role);
+			const systemPrompt = loadAgentPrompt();
 			const graphEnabled = config.graph_enabled === true;
 			const subagentTools = graphEnabled ? ["read", "grep", "find", "ls", "code_graph"] : undefined;
 			const graphPrompt = graphBlockForRefiner(graphEnabled);
-			const inheritModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-			const model = roleConfig.model_selector ?? inheritModel;
-			const modelLabel = model ?? "inherit";
+			const model = roleConfig.mode === "current-session" ? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined) : roleConfig.model_selector ?? undefined;
+			const modelLabel = roleModelLabel(model ?? "inherit", roleConfig.mode === "current-session" ? null : roleConfig.thinking_level);
 
 			if (roleConfig.mode === "current-session") {
-				const task = pickTask(params.role, null);
+				const task = pickTask(null);
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Role mode is current-session: perform the read-only ${params.role} pass yourself, in this session, following this brief. Do not spawn anything.\n\n${task}`,
+							text: `Role mode is current-session: perform the read-only reviewer pass yourself, in this session, following this brief. Do not spawn anything. Then surface the findings and ask the Questions section with ask_choice before revising.\n\n${task}`,
 						},
 					],
-					details: { mode: "current-session", role: params.role, planPath, target },
+					details: { mode: "current-session", planPath },
 				};
 			}
 
-			if (params.role === "criticizer") {
-				const laneId = "criticizer";
-				const persisted = reusable[laneId];
-				if (persisted) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `${readReviewOutput(workdir, active!.run_id, persisted)}\n\n---\nReused the persisted criticizer result for round ${roundId} (no re-run). Ask each criticizer question with ask_choice (one call per question, in the configured language), record every answer, then revise the plan only after every question has an answer.`,
-							},
-						],
-						details: { mode: "delegated-subagent", role: params.role, planPath, target, roundId, reused: true },
-					};
-				}
-				const name = `${roleConfig.name_prefix}-criticizer-${Date.now().toString(36)}`;
-				const execution = setupRefinementExecution(ctx, signal, "criticizer", [{ id: name, label: "criticizer" }], modelLabel, overlayLang);
-				try {
-					const result = await runPiSubagent({
-						systemPrompt: `${systemPrompt}\n\n${graphPrompt}`,
-						task: pickTask("criticizer", null),
-						cwd: workdir,
-						model,
-						tools: subagentTools,
-						signal: execution.signal,
-						onProgress: (event) => execution.overlay?.update(name, event),
-					});
-					execution.overlay?.complete(name, result);
-					record(name, result.ok ? result.model ?? model : null, result.usage);
-					persistOutcome(laneId, result.ok ? { ok: true, output: result.output } : { ok: false, error: result.errorMessage });
-					if (!result.ok) {
-						throw new Error(
-							`criticizer subagent failed: ${result.errorMessage ?? "unknown error"}${result.stderr ? `\nstderr: ${result.stderr.slice(0, 2000)}` : ""}`,
-						);
-					}
-					return {
-						content: [
-							{
-								type: "text",
-								text: `${result.output}\n\n---\nAsk each criticizer question with ask_choice (one call per question, in the configured language, with a stable questionId per question), record every answer, then revise the plan only after every question has an answer. After the revision, record the boundary: plans record-checkpoint (checkpoint: { transition: "review-consolidated", roundId: "${roundId}" }).`,
-							},
-						],
-						details: { mode: "delegated-subagent", role: params.role, planPath, target, roundId, model: result.model ?? model },
-					};
-				} finally {
-					await execution.close();
-				}
-			}
-
-			const count = Math.min(3, Math.max(1, params.reviewers ?? configuredImplReviewers ?? 1));
+			const count = roundReviewerCount;
 			const lanes = reviewerLanes(count);
 			const jobs = lanes.map((lane) => {
 				const name = `${roleConfig.name_prefix}-${active?.run_id ?? "adhoc"}-${lane.id}`;
-				const task = pickTask("reviewer", lane.lens);
+				const task = pickTask(lane.lens);
 				return { lane, name, task };
 			});
 
-			// Per-plan amelioration round counter (post-execution loop auditability).
-			const roundsSlot = ctx.sessionManager as unknown as { __ameliorateRounds?: Map<string, number> };
-			const nextRound = (planPath: string): number => {
-				roundsSlot.__ameliorateRounds ??= new Map();
-				const round = (roundsSlot.__ameliorateRounds.get(planPath) ?? 0) + 1;
-				roundsSlot.__ameliorateRounds.set(planPath, round);
-				return round;
-			};
-
-			// Lane-level resume (F-007): completed lanes are reused from their
+			// Lane-level resume: completed lanes are reused from their
 			// persisted outputs; only pending/failed/missing lanes spawn.
 			const runnableJobs = jobs.filter((job) => reusable[job.lane.id] === undefined);
 			const execution = setupRefinementExecution(
 				ctx,
 				signal,
-				"reviewer",
 				runnableJobs.map((job) => ({ id: job.lane.id, label: job.lane.id })),
 				modelLabel,
 				overlayLang,
@@ -322,27 +274,16 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 								task: job.task,
 								cwd: workdir,
 								model,
+								thinkingLevel: roleConfig.thinking_level ?? undefined,
 								tools: subagentTools,
 								signal: execution.signal,
 								onProgress: (event) => execution.overlay?.update(job.lane.id, event),
 							});
 							execution.overlay?.complete(job.lane.id, result);
 							record(job.name, result.ok ? result.model ?? model : null, result.usage);
-							// Persist BEFORE returning (C-007): a crash after this point
+							// Persist BEFORE returning: a crash after this point
 							// still leaves the lane reusable.
 							persistOutcome(job.lane.id, result.ok ? { ok: true, output: result.output } : { ok: false, error: result.errorMessage });
-							if (target === "implementation" && result.ok) {
-								try {
-									pi.appendEntry("pi-plans-ameliorate", {
-										planPath,
-										phase: "round",
-										currentRound: nextRound(planPath),
-										lane: job.lane.id,
-									});
-								} catch {
-									/* appendEntry is best-effort; audit trail survives in subagents.jsonl */
-								}
-							}
 							return { job, result };
 						} catch (error) {
 							record(job.name, null);
@@ -385,7 +326,7 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 				if (failures === results.length && reusedCount === 0) {
 					const first = results[0];
 					throw new Error(
-						`all reviewer subagents failed: ${first?.result.errorMessage ?? "unknown error"}${first?.result.stderr ? `\nstderr: ${first.result.stderr.slice(0, 2000)}` : ""}${model ? `\nIf the model selector "${model}" is unavailable, reset the confirmation (plans set-role --reset-confirmation) and re-ask the model-confirmation question.` : ""}`,
+						`all reviewer subagents failed: ${first?.result.errorMessage ?? "unknown error"}${first?.result.stderr ? `\nstderr: ${first.result.stderr.slice(0, 2000)}` : ""}${model ? `\nIf the model selector "${model}" is unavailable, reset the confirmation (plans set-role, role=reviewer, resetConfirmation: true) — the next refine opens the native model panel to re-confirm.` : ""}`,
 					);
 				}
 
@@ -398,17 +339,17 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 					content: [
 						{
 							type: "text",
-							text: `${text}\n\n---\nConsolidate: merge and dedupe findings into PLAN_vN_reviewer_comments.md${count > 1 ? " (one consolidated file; keep each finding's source reviewer, severity, evidence, and disposition)" : ""}, accept or reject each finding on repo/reference evidence, surface at most five high-priority findings to the user, then immediately ask the next refinement-mode question with ask_choice. Then record the boundary: plans record-checkpoint (checkpoint: { transition: "review-consolidated", roundId: "${roundId}", dispositionArtifact: "<comments file, run-dir relative>" }).${target === "implementation" ? ' When the whole round is disposed, also record (checkpoint: { transition: "implementation-round-finished" }); when the termination condition is met, close with (checkpoint: { transition: "completed", evidence: "<why the condition is satisfied>" }).' : ""}`,
+							text: `${text}\n\n---\nConsolidate: merge and dedupe findings into PLAN_vN_reviewer_comments.md${count > 1 ? " (one consolidated file; keep each finding's source reviewer, severity, evidence, and disposition)" : ""}, accept or reject each finding on repo/reference evidence, merge the Questions sections into one deduped list, surface at most five high-priority findings to the user — then ask EVERY consolidated question with ask_choice (batch them into one questions:[...] form or ask one per call, in the configured language, with stable questionIds), record every answer, and only then revise the plan. After the revision, record the boundary: plans record-checkpoint (checkpoint: { transition: "review-consolidated", roundId: "${roundId}", dispositionArtifact: "<comments file, run-dir relative>" }).`,
 						},
 					],
 					details: {
 						mode: "delegated-subagent",
-						role: "reviewer",
 						planPath,
 						roundId,
 						reusedLanes: Object.keys(reusable),
 						reviewers: count,
 						model,
+						thinkingLevel: roleConfig.thinking_level,
 						outputs: results.map(({ job, result }) => ({ name: job.name, lane: job.lane.id, lens: job.lane.lens, ok: result.ok, output: result.output, stderr: result.stderr, turns: result.turns })),
 					},
 				};
@@ -418,14 +359,10 @@ export function registerRefineTool(pi: ExtensionAPI, baseDir: string): void {
 		},
 
 		renderCall(args, theme) {
-			const count = args.role === "reviewer" ? args.reviewers ?? 1 : 1;
-			let text =
-				theme.fg("toolTitle", theme.bold("refine ")) +
-				theme.fg("accent", args.role) +
-				theme.fg("muted", count > 1 ? ` ×${count}` : "");
+			const count = args.reviewers ?? 1;
+			let text = theme.fg("toolTitle", theme.bold("refine ")) + theme.fg("accent", "reviewer") + theme.fg("muted", count > 1 ? ` ×${count}` : "");
 			const short = args.planPath ? args.planPath.split("/").pop() : "";
 			if (short) text += theme.fg("dim", ` ${short}`);
-			if (args.target === "implementation") text += theme.fg("dim", "  (implementation)");
 			if (args.focus) text += `\n${theme.fg("dim", `  focus: ${args.focus.slice(0, 80)}`)}`;
 			return new Text(text, 0, 0);
 		},

@@ -2,21 +2,18 @@
  * Planning write guard: while a planning run is active (status planning or
  * accepted) and execution has not been approved, edit/write may only target
  * planning artifacts — the pi-plans state dir, the active run's artifact
- * directory, and the pi-plans reference cache.
+ * directory, and the pi-plans reference cache. Other runs' artifact
+ * directories are denied outright, including when they sit inside the state
+ * root (the default artifact root does).
  */
 
 import * as os from "node:os";
 import * as path from "node:path";
 import { activeInfoById } from "./run-context.ts";
-import { getRun, loadConfig, readActive, resolveStateRootOrNull } from "./state.ts";
+import { getRun, listRuns, loadConfig, readActive, resolveStateRootOrNull } from "./state.ts";
 
 const GUARDED_TOOLS = new Set(["write", "edit"]);
 const GUARDED_STATUSES = new Set(["planning", "accepted"]);
-
-/** True when running inside a delegated executor child (PI_PLANS_EXECUTOR=1). */
-export function isExecutorChild(): boolean {
-	return process.env.PI_PLANS_EXECUTOR === "1";
-}
 
 export interface GuardInput {
 	workdir: string;
@@ -29,19 +26,10 @@ export interface GuardInput {
 /** Returns a block reason when the write must be blocked, or null when allowed. */
 export function planningWriteBlockReason(input: GuardInput): string | null {
 	if (!GUARDED_TOOLS.has(input.toolName)) return null;
-	// Delegated executor children write natively with the parent's approval
-	// already recorded — the guard must never block them, even when another
-	// session's planning run is the newest non-terminal run in the workdir.
-	if (isExecutorChild()) return null;
-	// Executor children also pin their run via PI_PLANS_RUN_ID; honor it for
-	// any child that is not marked executor (defense in depth).
-	const envRunId = typeof process.env.PI_PLANS_RUN_ID === "string" ? process.env.PI_PLANS_RUN_ID.trim() : "";
 	const active =
-		envRunId !== ""
-			? activeInfoById(input.workdir, envRunId)
-			: input.activeRunId !== undefined && input.activeRunId !== null
-				? activeInfoById(input.workdir, input.activeRunId)
-				: readActive(input.workdir);
+		input.activeRunId !== undefined && input.activeRunId !== null
+			? activeInfoById(input.workdir, input.activeRunId)
+			: readActive(input.workdir);
 	if (!active) return null;
 	const run = getRun(input.workdir, active.run_id);
 	if (!run || !GUARDED_STATUSES.has(run.status)) return null;
@@ -65,6 +53,17 @@ export function planningWriteBlockReason(input: GuardInput): string | null {
 		}
 	}
 	const allowed = allowedRoots.some((root) => target === root || target.startsWith(`${root}${path.sep}`));
+
+	// The artifact root defaults inside the state root, so the blanket stateRoot
+	// allowance above also covers every other run's plans. Deny those explicitly
+	// before the allowed check: a run's artifacts stay read-only for the session
+	// that is not bound to that run, wherever the artifact root lives.
+	const otherRunArtifactDirs = listRuns(input.workdir)
+		.filter((run) => run.run_id !== active.run_id)
+		.map((run) => path.resolve(input.workdir, run.artifact_dir));
+	if (otherRunArtifactDirs.some((dir) => target === dir || target.startsWith(`${dir}${path.sep}`))) {
+		return `pi-plans: planning artifacts of other runs are read-only while "${active.run_id}" is active. Bind the run you mean via /resume-plans, or pick the run explicitly.`;
+	}
 	if (allowed) return null;
 
 	return `pi-plans: active planning run "${active.run_id}" is read-only outside planning artifacts (this session is not bound to it; if you are operating on a different run, bind it via /resume-plans or pick the run explicitly). Allowed write roots: ${allowedRoots.join(", ")}. Finish planning and get execution approval (execute_plan tool or /plans-execute), or abandon the run (/plans-abandon).`;

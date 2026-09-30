@@ -245,7 +245,7 @@ describe("pi-vcc compaction", () => {
 		assert.match(result.compaction.summary, /Modified: src\/compaction\.ts/);
 		assert.match(result.compaction.summary, /Read: src\/exec\.ts/);
 		assert.match(result.compaction.summary, /\[Outstanding Context\]/);
-		assert.match(result.compaction.summary, /Current implementation item: I-002/);
+		assert.match(result.compaction.summary, /Current task: I-002/);
 		assert.match(result.compaction.summary, /Previous compact summary: Legacy Summary Earlier compact facts\./);
 		assert.match(result.compaction.summary, /\[User Preferences\]/);
 		assert.match(result.compaction.summary, /Always keep ASCII output/);

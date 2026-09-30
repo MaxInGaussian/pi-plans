@@ -28,7 +28,7 @@ export function isAutoApproveEnabled(): boolean {
  * must answer interactively) while a false negative would silently bypass a
  * safety gate. Word-boundary anchored where short words could over-match.
  * NOTE: package *installation inside a disposable benchmark container* is
- * plan-lifecycle (the criticizer legitimately asks about installing deps);
+ * plan-lifecycle (the reviewer legitimately asks about installing deps);
  * only externally-visible state (publish/deploy/merge/push/credentials/...)
  * is hard-rejected. Install-permission waivers are still caught via
  * "waiver". */

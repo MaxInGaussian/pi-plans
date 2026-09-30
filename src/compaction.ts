@@ -994,9 +994,9 @@ function phaseContextLines(context?: PiPlansVccPhaseContext): Partial<Record<typ
 	const outstandingContext: string[] = [];
 	if (context.phase === "execution") {
 		sessionGoal.push(context.planPath ? `Execute accepted plan ${context.planPath}` : "Execute the accepted pi-plans plan");
-		if (context.currentI) outstandingContext.push(`Current implementation item: ${context.currentI}`);
-		if (context.remainingVerifierIds?.length) outstandingContext.push(`Remaining verifier items: ${context.remainingVerifierIds.slice(0, 12).join(", ")}`);
-		if (context.implementationIds?.length) outstandingContext.push(`Implementation items: ${context.implementationIds.slice(0, 16).join(", ")}`);
+		if (context.currentI) outstandingContext.push(`Current task: ${context.currentI}`);
+		if (context.remainingVerifierIds?.length) outstandingContext.push(`Remaining verification checks: ${context.remainingVerifierIds.slice(0, 12).join(", ")}`);
+		if (context.implementationIds?.length) outstandingContext.push(`Plan tasks: ${context.implementationIds.slice(0, 24).join(", ")}`);
 	} else {
 		sessionGoal.push(context.runId ? `Continue active planning run ${context.runId}` : "Continue active pi-plans planning");
 		if (context.planPath) outstandingContext.push(`Latest plan path from session: ${context.planPath}`);

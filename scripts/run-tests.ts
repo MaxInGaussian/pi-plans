@@ -1,13 +1,23 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const testDir = resolve("tests");
 if (!existsSync(testDir)) {
   console.error(`Missing test directory: ${testDir}`);
   process.exit(1);
+}
+
+// Safety net (F-002): unless the caller pinned one, point the pi-plans
+// GLOBAL config at a throwaway directory so concurrent test files can never
+// clobber the developer's real ~/.pi/pi-plans/config.json. Individual suites
+// may still override per-test with their own PI_PLANS_GLOBAL_DIR.
+const env = { ...process.env };
+if (!env.PI_PLANS_GLOBAL_DIR) {
+  env.PI_PLANS_GLOBAL_DIR = mkdtempSync(join(tmpdir(), "pi-plans-global-"));
 }
 
 const tests = readdirSync(testDir)
@@ -22,6 +32,7 @@ if (tests.length === 0) {
 
 const result = spawnSync(process.execPath, ["--experimental-strip-types", "--test", ...tests], {
   stdio: "inherit",
+  env,
 });
 
 if (result.error) {

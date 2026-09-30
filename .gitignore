@@ -4,3 +4,7 @@ scripts/bench/results/
 .package-lock.json
 src/*-hist-*.ts
 .graphi/
+
+# macOS / Python junk
+__pycache__/
+.DS_Store

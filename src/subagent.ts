@@ -34,6 +34,11 @@ export interface SubagentOptions {
 	cwd: string;
 	/** Exact "provider/model" selector; omit to inherit the dispatching session's model. */
 	model?: string;
+	/** Explicit thinking level for the child (e.g. "high", "off"). Omit for
+	 * the default chain (per-model settings → defaultThinkingLevel → medium);
+	 * "default" as a value is NOT valid here — resolve null via
+	 * src/thinking-levels.ts before calling. */
+	thinkingLevel?: string;
 	/** Tool allowlist for the child process. Defaults to read-only tools. */
 	tools?: string[];
 	signal?: AbortSignal;
@@ -41,15 +46,11 @@ export interface SubagentOptions {
 	/** Optional normalized progress sink. Exceptions from the sink are ignored. */
 	onProgress?: (event: SubagentProgressEvent) => void;
 	/**
-	 * Child env marker (v0.6.0): "refiner" (default — read-only reviewer/
-	 * criticizer/ref-analyst children; sets PI_PLANS_REFINER=1, which the code
-	 * graph gates treat as read-only), "executor" (delegated plan executor;
-	 * sets PI_PLANS_EXECUTOR=1 so the write guard and the graph-aware file
-	 * tools bypass staging and run natively), or "none".
+	 * Child env marker: "refiner" (default — read-only reviewer/ref-analyst
+	 * children; sets PI_PLANS_REFINER=1, which the code-graph gates treat as
+	 * read-only) or "none".
 	 */
-	envMarker?: "refiner" | "executor" | "none";
-	/** Pin the run id a delegated executor child operates on (PI_PLANS_RUN_ID). */
-	runId?: string;
+	envMarker?: "refiner" | "none";
 }
 
 export interface SubagentResult {
@@ -294,33 +295,21 @@ function emitProgress(options: SubagentOptions, event: SubagentProgressEvent): v
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 
 /**
- * Build the child process env for a subagent run (v0.6.0): refiner children
- * carry PI_PLANS_REFINER=1, executor children PI_PLANS_EXECUTOR=1 plus an
- * optional PI_PLANS_RUN_ID pin, and marker keys never leak across kinds.
+ * Build the child process env for a subagent run: refiner children carry
+ * PI_PLANS_REFINER=1, and marker keys never leak across kinds.
  */
 export function subagentChildEnv(
-	options: Pick<SubagentOptions, "envMarker" | "runId">,
+	options: Pick<SubagentOptions, "envMarker">,
 	parentEnv: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
 	const childEnv: NodeJS.ProcessEnv = { ...parentEnv };
-	switch (options.envMarker ?? "refiner") {
-		case "refiner":
-			childEnv.PI_PLANS_REFINER = "1";
-			delete childEnv.PI_PLANS_EXECUTOR;
-			delete childEnv.PI_PLANS_RUN_ID;
-			break;
-		case "executor":
-			childEnv.PI_PLANS_EXECUTOR = "1";
-			delete childEnv.PI_PLANS_REFINER;
-			if (options.runId) childEnv.PI_PLANS_RUN_ID = options.runId;
-			else delete childEnv.PI_PLANS_RUN_ID;
-			break;
-		case "none":
-			delete childEnv.PI_PLANS_REFINER;
-			delete childEnv.PI_PLANS_EXECUTOR;
-			delete childEnv.PI_PLANS_RUN_ID;
-			break;
+	if ((options.envMarker ?? "refiner") === "refiner") {
+		childEnv.PI_PLANS_REFINER = "1";
+	} else {
+		delete childEnv.PI_PLANS_REFINER;
 	}
+	delete childEnv.PI_PLANS_EXECUTOR;
+	delete childEnv.PI_PLANS_RUN_ID;
 	return childEnv;
 }
 
@@ -354,6 +343,7 @@ export async function runPiSubagent(options: SubagentOptions): Promise<SubagentR
 
 		const args: string[] = ["--mode", "json", "-p", "--no-session", "--tools", tools.join(",")];
 		if (options.model) args.push("--model", options.model);
+		if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
 		args.push("--append-system-prompt", promptFile);
 		args.push(`Task: ${options.task}`);
 

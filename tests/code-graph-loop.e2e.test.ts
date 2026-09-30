@@ -57,7 +57,7 @@ test("closed loop: init → mutation → apply → drift → final-commit → cl
 	const { root, cleanup } = initRepo();
 	t.after(cleanup);
 
-	const stateRoot = path.join(root, ".git", "pi_plans");
+	const stateRoot = path.join(root, ".git", "pi-plans");
 	fs.mkdirSync(stateRoot, { recursive: true });
 	const dbPath = path.join(stateRoot, "code_graph.db");
 	const store = new Store({ dbPath, worktreeRoot: root, gitCommonDir: path.join(root, ".git") }, runtime.runtime.sqlite);

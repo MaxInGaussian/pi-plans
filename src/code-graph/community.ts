@@ -164,7 +164,7 @@ export function computeCommunities(store: Store): {
 	return { communities: sortedGroups.length, nodes: order.length, godNodes };
 }
 
-/** Render GRAPH_REPORT.md (plan R-005) under `<gitCommonDir>/pi_plans/graph/`. */
+/** Render GRAPH_REPORT.md (plan R-005) under `<gitCommonDir>/pi-plans/graph/`. */
 export function generateGraphReport(store: Store, graphDir: string, baseline?: { files: number; functions: number; ms: number }): string {
 	const stats = computeCommunities(store);
 	const edgeStats = store.read(() =>

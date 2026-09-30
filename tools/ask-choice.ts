@@ -16,13 +16,6 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { disableAutoComplete, enableAutoComplete, isAutoCompleteEnabled, recordAskChoice } from "../src/autocomplete.ts";
 import { assertAutoApprovable, isAutoApproveEnabled } from "../src/auto-approve.ts";
-import {
-	TERMINATION_QUESTION,
-	TERMINATION_OPTIONS,
-	TERMINATION_RECORDING_INSTRUCTIONS,
-	implReviewerCountPromptLine,
-	renderTerminationOptions,
-} from "../src/termination-prompt.ts";
 import { truncateToWidth, visibleWidth } from "../src/refine-ui-helpers.ts";
 import { stripRecommendedMarker } from "../src/ask-form.ts";
 import {
@@ -63,8 +56,8 @@ export const FALLBACK_ROWS = 30;
 /** Minimal-form floor for tiny terminals (stage-3 width). */
 const MINIMAL_LINE_WIDTH = 20;
 /**
- * Truncation floor for fixed tail labels (Other…/Auto-complete/Auto-refine
- * loop): the longest magic prefix ("Auto-refine loop", 16 cols) plus slack.
+ * Truncation floor for fixed tail labels (Other…/Auto-complete): the
+ * longest magic prefix ("Auto-complete", 14 cols) plus slack.
  * These labels drive startsWith() answer routing and must never lose it.
  */
 const FIXED_LABEL_FLOOR = 18;
@@ -74,7 +67,7 @@ export interface PanelItem {
 	core: string;
 	/** Full display label: core + description (degradation stage 0). */
 	display: string;
-	/** Fixed tail labels (Other…/Auto-complete/Auto-refine loop): truncation keeps at least the magic prefix. */
+	/** Fixed tail labels (Other…/Auto-complete): truncation keeps at least the magic prefix. */
 	fixed?: boolean;
 }
 
@@ -212,12 +205,6 @@ export const AskChoiceParams = Type.Object(
 	),
 	purpose: Type.Optional(
 		Type.String({ description: "Short machine-readable purpose (e.g. 'scope', 'termination-condition')." }),
-	),
-	trailing: Type.Optional(
-		StringEnum(["auto-refine-loop"] as const, {
-			description:
-				'Replace the trailing Auto-complete option with "Auto-refine loop" (post-execution amelioration prompt). Selecting it returns instructions to ask the rounds/termination follow-up; Auto-complete is suppressed entirely for this question.',
-		}),
 	),
 	workdir: Type.Optional(Type.String({ description: "Target workspace; default current working directory" })),
 	},
@@ -589,12 +576,12 @@ function formatBatchAnswers(batch: NonNullable<AskChoiceDetails["batch"]>): stri
 }
 const NL = "\n";
 
-export function registerAskChoiceTool(pi: ExtensionAPI): void {
-	pi.registerTool({
+export function registerAskChoiceTool(ext: ExtensionAPI): void {
+	ext.registerTool({
 		name: "ask_choice",
 		label: "Ask Choice",
 		description:
-			"Ask the user planning or refinement questions as numbered choice prompts: recommended option first, alternatives next, then Other and Auto-complete. Two shapes: questions: [...] (2-8 questions) opens ONE tabbed multiple-choice form with a submit page — use it to batch a round of questions (≤8), then think about the answers and follow up in later calls (phased questioning stays agent-driven); question + options asks one question at a time (classic flow). Use ask_choice for every user-facing planning question, the final scope confirmation, refinement-mode questions, language/role/model settings, and the execution handoff. Scope confirmation and the execution handoff MUST stay single-question calls (autoComplete: false); batches reject autoComplete: false items and the termination/questionIds reserved for handoff. The optional trailing parameter swaps the trailing Auto-complete option to Auto-refine loop for the post-execution amelioration prompt. EVERY option you author — including the accept/execute handoff and the implementation-review setup questions — must set description to '✓ <advantage> / ✗ <drawback>' in the configured language, so the user can see what each option gains and what it costs. Other and Auto-complete are appended by this tool and need no description.",
+			"Ask the user planning or refinement questions as numbered choice prompts: recommended option first, alternatives next, then Other and Auto-complete. Two shapes: questions: [...] (2-8 questions) opens ONE tabbed multiple-choice form with a submit page — use it to batch a round of questions (≤8), then think about the answers and follow up in later calls (phased questioning stays agent-driven); question + options asks one question at a time (classic flow). Use ask_choice for every user-facing planning question, the final scope confirmation, refinement-mode questions, language/role/model settings, and the execution handoff. Scope confirmation and the execution handoff MUST stay single-question calls (autoComplete: false); batches reject autoComplete: false items and the questionIds reserved for handoff. EVERY option you author — including the accept/execute handoff — must set description to '✓ <advantage> / ✗ <drawback>' in the configured language, so the user can see what each option gains and what it costs. Other and Auto-complete are appended by this tool and need no description.",
 		promptSnippet: "Ask structured planning questions with recommended/Other/Auto-complete ordering; batch ≤8 questions per form",
 		promptGuidelines: [
 			"Use ask_choice for every pi-plans question to the user instead of plain-text questions; it enforces option ordering and records decisions.",
@@ -605,13 +592,6 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 		executionMode: "sequential",
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			// R-13 (defense-in-depth): a delegated executor child has no user to
-			// answer — refuse instead of blocking a headless run on a UI prompt.
-			if (process.env.PI_PLANS_EXECUTOR === "1") {
-				throw new Error(
-					"ask_choice is unavailable in a delegated executor session: no interactive user. Decide autonomously, proceed, and record the deviation in your final summary.",
-				);
-			}
 			// 0.4.0 batch mode: one tabbed form for a whole round of questions
 			// (2-8). The single-question path below is untouched (C-004).
 			// F-005 (impl review r1): ambiguous shapes fail loudly instead of
@@ -619,9 +599,6 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			if (params.questions !== undefined && params.questions.length > 0) {
 				if (params.question !== undefined || params.options !== undefined) {
 					throw new Error("ask_choice accepts either question+options or questions, not both");
-				}
-				if (params.trailing !== undefined) {
-					throw new Error("ask_choice batch mode does not support trailing (single-question only)");
 				}
 				return executeAskChoiceBatch({ questions: params.questions, workdir: params.workdir }, ctx);
 			}
@@ -661,10 +638,7 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 					/* the decisions ledger already holds the answer; F-005 reconcile covers the gap */
 				}
 			};
-			// Param normalization: a trailing option replaces Auto-complete entirely,
-			// so an erroneously passed autoComplete flag is suppressed here.
-			const trailing = params.trailing;
-			const autoComplete = (params.autoComplete ?? true) && trailing === undefined;
+			const autoComplete = params.autoComplete ?? true;
 			const options = params.options;
 			if (options.length === 0) throw new Error("ask_choice requires at least one option");
 			const recommended = options.find((option) => option.recommended) ?? options[0];
@@ -764,8 +738,6 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 				};
 			}
 
-			const AUTO_REFINE_LOOP_LABEL =
-				"Auto-refine loop  (run refinement rounds until no high-severity finding or the 5-round cap)";
 			const panelItems: PanelItem[] = options.map((option, index) => {
 				const label = stripRecommendedMarker(option.label);
 				const isRec = option === recommended;
@@ -777,7 +749,6 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 			});
 			if (allowOther) panelItems.push({ core: "Other…  (type your own answer)", display: "Other…  (type your own answer)", fixed: true });
 			if (autoComplete) panelItems.push({ core: "Auto-complete  (take the recommended option)", display: "Auto-complete  (take the recommended option)", fixed: true });
-			else if (trailing) panelItems.push({ core: AUTO_REFINE_LOOP_LABEL, display: AUTO_REFINE_LOOP_LABEL, fixed: true });
 
 			const panel = fitAskChoicePanel(
 				params.question,
@@ -817,23 +788,6 @@ export function registerAskChoiceTool(pi: ExtensionAPI): void {
 						},
 					],
 					details: details(recommended.label, "auto-complete"),
-				};
-			}
-
-			if (trailing && selected.startsWith("Auto-refine loop")) {
-				recordAskChoice(ctx, false);
-				record("Auto-refine loop", "user");
-				// Skill-aware reviewer-count default (D-1/D-4): same mapping the
-				// goal-running continuation in src/exec.ts renders.
-				const activeSkill = resolveActiveRun(ctx.sessionManager, workdir)?.skill;
-			return {
-					content: [
-						{
-							type: "text",
-							text: `User selected Auto-refine loop. Immediately ask the follow-up with ask_choice (autoComplete: false, in the session language): "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. ${TERMINATION_RECORDING_INSTRUCTIONS} ${implReviewerCountPromptLine(activeSkill)} Then run the loop per the completion instructions: each round calls refine (role: "reviewer", target: "implementation", reviewers: <configured reviewerCount>), accepts findings on evidence, applies fixes, re-runs relevant tests, and continues until the chosen termination condition — the goal-wait option keeps the loop running until no unpassed VCs remain.`,
-						},
-					],
-					details: details("Auto-refine loop", "user"),
 				};
 			}
 

@@ -58,14 +58,14 @@ export function resetOrdinaryQueryState(ctx: ExtensionContext): void {
 }
 
 export function registerQueryInterviewHooks(
-	pi: ExtensionAPI,
+	ext: ExtensionAPI,
 	suppressForWorkflow: (ctx: ExtensionContext) => boolean,
 ): void {
-	pi.on("input", async (event, ctx) => {
+	ext.on("input", async (event, ctx) => {
 		recordOrdinaryQuery(ctx, event);
 	});
 
-	pi.on("before_agent_start", async (_event, ctx) => {
+	ext.on("before_agent_start", async (_event, ctx) => {
 		if (!consumeOrdinaryQuery(ctx) || suppressForWorkflow(ctx)) return;
 		return {
 			message: {
@@ -76,7 +76,7 @@ export function registerQueryInterviewHooks(
 		};
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	ext.on("session_start", async (_event, ctx) => {
 		resetOrdinaryQueryState(ctx);
 	});
 }

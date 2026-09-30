@@ -51,9 +51,9 @@ async function setupIndexedRepo(): Promise<{ root: string; store: Store; cleanup
 		tsx: makeBackend("tsx", ParserCtor, runtime.runtime.parser.tsx),
 		python: new PythonBackend(ParserCtor, runtime.runtime.parser.python),
 	};
-	fs.mkdirSync(path.join(root, ".git", "pi_plans"), { recursive: true });
+	fs.mkdirSync(path.join(root, ".git", "pi-plans"), { recursive: true });
 	const store = new Store(
-		{ dbPath: path.join(root, ".git", "pi_plans", "code_graph.db"), worktreeRoot: root, gitCommonDir: path.join(root, ".git") },
+		{ dbPath: path.join(root, ".git", "pi-plans", "code_graph.db"), worktreeRoot: root, gitCommonDir: path.join(root, ".git") },
 		runtime.runtime.sqlite,
 	);
 	runIndex({ store, worktreeRoot: root, parsers, reindex: false });

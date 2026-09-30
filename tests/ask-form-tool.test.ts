@@ -15,6 +15,7 @@ import { initState, recordDecision, startRun } from "../src/state.ts";
 import { createCheckpoint, loadCheckpoint } from "../src/workflow-state.ts";
 import { reconcileCheckpointWithLedger } from "../src/resume.ts";
 import { readDecisionLedger } from "../src/resume.ts";
+import { setMessagingApi } from "../src/messaging.ts";
 
 type ToolDef = {
 	execute: (id: string, params: any, signal: undefined, update: undefined, ctx: any) => Promise<any>;
@@ -58,7 +59,7 @@ function startActiveRun(workdir: string) {
 }
 
 function makeCtx(workdir: string, overrides: Record<string, unknown> = {}) {
-	return {
+	const ctx = {
 		cwd: workdir,
 		hasUI: true,
 		sessionManager: {},
@@ -70,6 +71,8 @@ function makeCtx(workdir: string, overrides: Record<string, unknown> = {}) {
 			...overrides,
 		},
 	};
+	setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
+	return ctx;
 }
 
 function recordDecisionEntry(workdir: string, runId: string, entry: Record<string, unknown>): void {
@@ -138,10 +141,6 @@ describe("ask_choice batch validation (R-013b/D-025)", () => {
 		await assert.rejects(
 			() => tool.execute("t", { question: "single?", options: [{ label: "A" }], questions: [Q1, Q2] }, undefined, undefined, ctx),
 			/not both/,
-		);
-		await assert.rejects(
-			() => tool.execute("t", { questions: [Q1, Q2], trailing: "auto-refine-loop" }, undefined, undefined, ctx),
-			/trailing/,
 		);
 	});
 

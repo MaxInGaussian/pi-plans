@@ -12,13 +12,22 @@ import { initState, setRole, setLanguage, startRun, readActive } from "../src/st
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
 
 let tmpRoot: string;
+let globalDir: string;
+let previousGlobalDir: string | undefined;
 
 before(() => {
 	tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-analyze-refs-"));
+	// Isolate the global reviewer config (F-002): never touch ~/.pi/pi-plans.
+	previousGlobalDir = process.env.PI_PLANS_GLOBAL_DIR;
+	globalDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-global-analyze-refs-"));
+	process.env.PI_PLANS_GLOBAL_DIR = globalDir;
 });
 
 after(() => {
+	if (previousGlobalDir === undefined) delete process.env.PI_PLANS_GLOBAL_DIR;
+	else process.env.PI_PLANS_GLOBAL_DIR = previousGlobalDir;
 	fs.rmSync(tmpRoot, { recursive: true, force: true });
+	fs.rmSync(globalDir, { recursive: true, force: true });
 });
 
 function mkWorkdir(name: string): string {
@@ -102,7 +111,7 @@ function subagentLines(workdir: string): Array<any> {
 		.map((line) => JSON.parse(line));
 }
 
-describe("analyze_refs gates", () => {
+	describe("analyze_refs gates", () => {
 	it("refuses when no pi-plans state exists", async () => {
 		const workdir = mkWorkdir("gates-no-state");
 		const tool = loadTool();
@@ -112,35 +121,43 @@ describe("analyze_refs gates", () => {
 		);
 	});
 
-	it("refuses with role-setting guidance when reviewer mode is invalid", async () => {
-		const workdir = mkWorkdir("gates-bad-mode");
-		initState(workdir);
-		const configPath = path.join(workdir, ".git", "pi_plans", "config.json");
-		const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-		config.reviewer.mode = "bogus";
-		fs.writeFileSync(configPath, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
-		const tool = loadTool();
-		await assert.rejects(
-			tool.execute("c1", { refs: [{ id: "ref-1", localPath: "." }] }, undefined, undefined, headlessCtx(workdir)),
-			/reviewer role mode is missing or invalid/,
-		);
-	});
-
-	it("refuses current-session reviewer mode with a switch-to-delegated message", async () => {
-		const workdir = mkWorkdir("gates-current-session");
-		initState(workdir);
-		setRole(workdir, { role: "reviewer", mode: "current-session" });
-		const tool = loadTool();
-		await assert.rejects(
-			tool.execute("c1", { refs: [{ id: "ref-1", localPath: "." }] }, undefined, undefined, headlessCtx(workdir)),
-			/current-session.*delegated-subagent/s,
-		);
-	});
-
-	it("refuses with confirmation guidance when the reviewer model is unconfirmed", async () => {
+	it("refuses with embedded text guidance when the reviewer model is unconfirmed (headless)", async () => {
 		const workdir = mkWorkdir("gates-unconfirmed");
 		initState(workdir);
-		setRole(workdir, { role: "reviewer", mode: "delegated-subagent" });
+		const tool = loadTool();
+		await assert.rejects(
+			tool.execute("c1", { refs: [{ id: "ref-1", localPath: "." }] }, undefined, undefined, headlessCtx(workdir)),
+			/model was never confirmed/,
+		);
+	});
+
+	it("ignores the reviewer mode entirely (Q-4=B): current-session proceeds once a model is confirmed", async () => {
+		const workdir = mkWorkdir("gates-current-session");
+		initState(workdir);
+		setRole(workdir, { role: "reviewer", mode: "current-session", modelSelector: "fake/model", confirmed: true });
+		const refDir = path.join(workdir, "refs", "solo");
+		fs.mkdirSync(refDir, { recursive: true });
+		const restore = withFakePi(
+			fakePiScript(
+				`emit({ type: "message_end", message: { role: "assistant", model: "fake/model", content: [{ type: "text", text: "OK" }] } });`,
+			),
+		);
+		const tool = loadTool();
+		try {
+			const result = await tool.execute("c1", { refs: [{ id: "ref-1", localPath: refDir }] }, undefined, undefined, headlessCtx(workdir));
+			assert.match(result.content[0]!.text, /mode is current-session, but analyze_refs always spawns/);
+			assert.match(result.content[0]!.text, /OK/);
+		} finally {
+			restore();
+		}
+	});
+
+	it("requires a confirmed model even in current-session mode (analysis always spawns)", async () => {
+		const workdir = mkWorkdir("gates-current-session-unconfirmed");
+		initState(workdir);
+		// 'inherit' fully resets selector AND confirmation — the prior test's
+		// confirmed selector must not carry over (the global config is shared).
+		setRole(workdir, { role: "reviewer", mode: "current-session", modelSelector: "inherit" });
 		const tool = loadTool();
 		await assert.rejects(
 			tool.execute("c1", { refs: [{ id: "ref-1", localPath: "." }] }, undefined, undefined, headlessCtx(workdir)),
@@ -310,7 +327,7 @@ describe("analyze_refs fanout", () => {
 			const result = await tool.execute("c1", { refs: [{ id: "ref-1", localPath: refDir }] }, undefined, undefined, headlessCtx(workdir));
 			assert.match(result.content[0]!.text, /### pi-plans-refs-adhoc-ref-1/);
 			assert.equal(readActive(workdir), null);
-			const ledger = path.join(workdir, ".git", "pi_plans", "runs");
+			const ledger = path.join(workdir, ".git", "pi-plans", "runs");
 			const runs = fs.existsSync(ledger) ? fs.readdirSync(ledger) : [];
 			const spawnFiles = runs.flatMap((run) =>
 				fs.existsSync(path.join(ledger, run, "subagents.jsonl")) ? [fs.readFileSync(path.join(ledger, run, "subagents.jsonl"), "utf8")] : [],

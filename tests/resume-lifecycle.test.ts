@@ -25,7 +25,7 @@ import { startExecution } from "../src/exec.ts";
 import { resetRunBindingForTests } from "../src/run-context.ts";
 import { processStartOf } from "../src/run-ownership.ts";
 import { createCheckpoint, loadCheckpoint, mutateCheckpoint, applyQuestionAsked } from "../src/workflow-state.ts";
-import { getRun, initState, startRun } from "../src/state.ts";
+import { DEFAULT_CONFIG, getRun, initState, resolveArtifactRoot, startRun } from "../src/state.ts";
 
 initTheme("dark", false);
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-resume-life-"));
@@ -34,10 +34,15 @@ let serial = 0;
 
 const PLAN_TEXT = `# Plan
 
-## Verifier Checklist
+## Tasks
 
-- [ ] \`VC-001\` covers \`I-001\`; pass condition: first.
-- [ ] \`VC-002\` covers \`I-002\`; pass condition: second.
+- Task-1: first — files: src/a.ts; wave: 1
+- Task-2: second — files: src/b.ts; wave: 1
+
+## Verification Checks
+
+- [ ] \`VC-001\` covers \`Task-1\`; pass condition: first.
+- [ ] \`VC-002\` covers \`Task-2\`; pass condition: second.
 `;
 
 interface Fixture {
@@ -173,6 +178,9 @@ function setupRun(name: string): { cwd: string; runId: string; artifactDir: stri
 	createCheckpoint(cwd, { runId: run.run_id, originWorkdir: cwd, workdir: cwd });
 	fs.mkdirSync(run.artifact_dir, { recursive: true });
 	fs.writeFileSync(path.join(run.artifact_dir, "PLAN_v1.md"), PLAN_TEXT, "utf8");
+	// The artifact dir lives under .git/ and is never tracked; seed a root file so
+	// the "seed" commit exists and resolveHeadAt() yields the approval evidence HEAD.
+	fs.writeFileSync(path.join(cwd, "WORKTREE.md"), "seed worktree marker\n", "utf8");
 	spawnSync("git", ["add", "-A"], { cwd });
 	spawnSync("git", ["commit", "-m", "seed"], { cwd });
 	return { cwd, runId: run.run_id, artifactDir: run.artifact_dir };
@@ -185,12 +193,10 @@ describe("/resume-plans on the real Pi host", () => {
 		async () => {
 			resetRunBindingForTests();
 			const { cwd, runId } = setupRun("cross-session");
-			// Session 1: execution starts, VC-001 lands, then the session ends.
+			// Session 1: execution starts, Task-1 closes via the task tool,
+			// then the session ends.
 			const fixture1: Fixture = {
-				script: [
-					{ kind: "tool" },
-					{ kind: "text", text: "[DONE:VC-001] Partial progress; stopping here." },
-				],
+				script: [{ kind: "text", text: "Partial progress; stopping here." }],
 				calls: [],
 			};
 			const session1 = await makeSession({
@@ -200,10 +206,18 @@ describe("/resume-plans on the real Pi host", () => {
 				extraExtension: ((pi: never) => {
 					const realPi = pi as unknown as import("@earendil-works/pi-coding-agent").ExtensionAPI;
 					realPi.on("session_start", async (_event: unknown, ctx: never) => {
-						await startExecution(realPi, ctx as never, path.join(artifactDirRelative(cwd), "PLAN_v1.md"), [
-							{ id: "VC-001", text: "first", done: false },
-							{ id: "VC-002", text: "second", done: false },
-						]);
+						const planPath = path.join(artifactDirRelative(cwd), "PLAN_v1.md");
+						const planText = fs.readFileSync(planPath, "utf8");
+						const { parsePlanTasks, parseChecklist } = await import("../src/plan.ts");
+						await startExecution(ctx as never, {
+							planPath,
+							planTasks: parsePlanTasks(planText),
+							items: parseChecklist(planText),
+						});
+						const { applyTaskUpdate } = await import("../src/task-tool.ts");
+						const { getExecution, persistTaskProgress } = await import("../src/exec.ts");
+						applyTaskUpdate(getExecution()!.tasks, "Task-1", "complete", "first tests green");
+						persistTaskProgress(ctx as never);
 					});
 				}) as never,
 			});
@@ -214,7 +228,7 @@ describe("/resume-plans on the real Pi host", () => {
 				const mid = loadCheckpoint(cwd, runId);
 				assert.equal(mid.status, "ok");
 				if (mid.status === "ok") {
-					assert.deepEqual(mid.checkpoint.execution?.doneVcIds, ["VC-001"], "progress persisted by session 1");
+					assert.equal(mid.checkpoint.execution?.tasks?.["Task-1"]?.status, "complete", "task progress persisted by session 1");
 					assert.ok(mid.checkpoint.execution?.approval?.headAtApproval, "approval evidence persisted");
 				}
 			} finally {
@@ -225,7 +239,7 @@ describe("/resume-plans on the real Pi host", () => {
 
 			// Session 2: fresh session, resume via the command.
 			const fixture2: Fixture = {
-				script: [{ kind: "text", text: "[DONE:VC-002] All items verified." }],
+				script: [{ kind: "text", text: "Resumed; continuing the remaining task." }],
 				calls: [],
 			};
 			const notifies: string[] = [];
@@ -238,16 +252,15 @@ describe("/resume-plans on the real Pi host", () => {
 				assert.ok(fixture2.calls.length >= 1);
 				const firstPayload = JSON.stringify(fixture2.calls[0]);
 				assert.match(firstPayload, /PI-PLANS RESUME/);
-				assert.match(firstPayload, /VC-001/);
+				assert.match(firstPayload, /plans_update_task/);
 				assert.ok(notifies.some((message) => /Resumed/.test(message)), "resume notification shown");
-				// Both VCs are done; the run advanced to the review phase.
+				// Task-1 stays complete across the session boundary.
 				const final = loadCheckpoint(cwd, runId);
 				assert.equal(final.status, "ok");
 				if (final.status === "ok") {
-					assert.deepEqual(final.checkpoint.execution?.doneVcIds.sort(), ["VC-001", "VC-002"]);
-					assert.equal(final.checkpoint.phase, "implementation-review");
+					assert.equal(final.checkpoint.execution?.tasks?.["Task-1"]?.status, "complete");
+					assert.equal(final.checkpoint.execution?.tasks?.["Task-2"]?.status, undefined);
 				}
-				assert.equal(getRun(cwd, runId)?.status, "done");
 			} finally {
 				session2.session.dispose();
 			}
@@ -313,7 +326,7 @@ describe("/resume-plans on the real Pi host", () => {
 			const child = spawn("sleep", ["30"], { stdio: "ignore" });
 			try {
 				fs.writeFileSync(
-					path.join(cwd, ".git", "pi_plans", "runs", runId, "owner.json"),
+					path.join(cwd, ".git", "pi-plans", "runs", runId, "owner.json"),
 					JSON.stringify({
 						schema: 1,
 						host: os.hostname(),
@@ -369,7 +382,9 @@ describe("/resume-plans on the real Pi host", () => {
 });
 
 function artifactDirRelative(cwd: string): string {
-	const root = path.join(cwd, "docs", "pi-plans");
+	// Resolve through the real default so this fixture follows the configured
+	// artifact root (inside the state dir by default) instead of hardcoding it.
+	const root = resolveArtifactRoot(cwd, DEFAULT_CONFIG.artifact_root);
 	return path.join(root, fs.readdirSync(root)[0]!);
 }
 

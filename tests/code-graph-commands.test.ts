@@ -31,7 +31,7 @@ function initRepo(): { root: string; cleanup: () => void } {
 	fs.writeFileSync(path.join(root, "helper.ts"), "export function twice(n: number): number { return n * 2; }\n");
 	git(root, ["add", "-A"]);
 	git(root, ["commit", "-m", "init"]);
-	fs.mkdirSync(path.join(root, ".git", "pi_plans"), { recursive: true });
+	fs.mkdirSync(path.join(root, ".git", "pi-plans"), { recursive: true });
 	const canonicalRoot = fs.realpathSync(root);
 	return {
 		root: canonicalRoot,
@@ -63,7 +63,7 @@ async function loadParsers() {
 
 function openStore(root: string, sqlite: typeof import("node:sqlite")): Store {
 	const canonicalRoot = fs.realpathSync(root);
-	const dbPath = path.join(canonicalRoot, ".git", "pi_plans", "code_graph.db");
+	const dbPath = path.join(canonicalRoot, ".git", "pi-plans", "code_graph.db");
 	fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 	return new Store({ dbPath, worktreeRoot: canonicalRoot, gitCommonDir: path.join(canonicalRoot, ".git") }, sqlite);
 }

@@ -25,7 +25,7 @@ Usage with harbor::
 
 Fairness (D-010/D-020): both arms share one container image; the only
 difference is the agent-level configuration above. Seeded evaluation state
-lives under ``.git/pi_plans/`` with the artifact root pointed OUTSIDE the
+lives under ``.git/pi-plans/`` with the artifact root pointed OUTSIDE the
 graded tree (``/tmp/pi-plans-bench``); the pre-registered pre-oracle
 snapshot-diff restore was NOT implemented in this run — recorded as a
 limitation (TB oracles read /app artifacts only, so scoring impact is
@@ -63,25 +63,31 @@ TREATMENT_SYSTEM_PROMPT = (
     "it step by step with the verifier checklist."
 )
 
-# D-015 seeded config: deterministic, no first-use Q&A rounds, flash roles,
-# graph off, artifact root outside the graded workspace.
+# D-015 seeded configs: deterministic, no first-use Q&A rounds, graph off,
+# artifact root outside the graded workspace. Since v0.7.0 the reviewer role
+# lives in the GLOBAL config (~/.pi/pi-plans/config.json inside the
+# container) with a CONCRETE provider/model selector (inherit was removed);
+# the workspace config carries no reviewer/criticizer keys at all.
 SEEDED_CONFIG = {
     "schema": 1,
     "artifact_root": "/tmp/pi-plans-bench/docs",
     "artifact_root_source": "user",
     "language": {"tag": "en", "source": "user"},
-    "reviewer": {
-        "mode": "delegated-subagent",
-        "model_selector": None,  # None => inherit the main agent's model (flash)
-        "confirmed_at": "1970-01-01T00:00:00Z",
-    },
-    "criticizer": {
-        "mode": "delegated-subagent",
-        "model_selector": None,
-        "confirmed_at": "1970-01-01T00:00:00Z",
-    },
     "graph_enabled": False,
 }
+
+
+def _seeded_global_config(provider: str, model_id: str) -> dict:
+    return {
+        "schema": 1,
+        "reviewer": {
+            "mode": "delegated-subagent",
+            "model_selector": f"{provider}/{model_id}",
+            "thinking_level": None,  # default: child pi resolves its own chain
+            "name_prefix": "pi-plans-reviewer",
+            "confirmed_at": "1970-01-01T00:00:00Z",
+        },
+    }
 
 
 def _read_text(name: str) -> str:
@@ -199,20 +205,25 @@ class PiPlansBench(Pi):
             filename=".bench-system-prompt.md",
         )
 
-    async def _seed_pi_plans_config(self, environment: BaseEnvironment) -> None:
-        """Write the deterministic pi-plans config into the trial workdir (D-015).
+    async def _seed_pi_plans_config(self, environment: BaseEnvironment, provider: str, model_id: str) -> None:
+        """Write the deterministic pi-plans configs into the trial container (D-015).
 
-        The config lives under ``.git/pi_plans/`` (diff-allowlist path, removed
-        before oracle scoring) with the artifact root pointed at
-        ``/tmp/pi-plans-bench`` so plan artifacts never land in the graded tree.
+        The workspace config lives under ``.git/pi-plans/`` (diff-allowlist
+        path, removed before oracle scoring) with the artifact root pointed at
+        ``/tmp/pi-plans-bench`` so plan artifacts never land in the graded
+        tree. The reviewer role is seeded into the GLOBAL config under the
+        container's ``~/.pi/pi-plans/`` with the exact driver model (v0.7.0:
+        no inherit, no criticizer), so refine gates pass without any panel.
         """
         config = json.dumps(SEEDED_CONFIG, indent=2)
+        global_config = json.dumps(_seeded_global_config(provider, model_id), indent=2)
         await self.exec_as_agent(
             environment,
             command=(
                 "set -euo pipefail; "
-                "mkdir -p .git/pi_plans " f"{BENCH_CONFIG_DIR} && "
-                f"printf {shlex.quote(config)} > .git/pi_plans/config.json"
+                "mkdir -p .git/pi-plans ~/.pi/pi-plans " f"{BENCH_CONFIG_DIR} && "
+                f"printf {shlex.quote(config)} > .git/pi-plans/config.json && "
+                f"printf {shlex.quote(global_config)} > ~/.pi/pi-plans/config.json"
             ),
         )
 
@@ -224,7 +235,7 @@ class PiPlansBench(Pi):
         provider, model_id = self.model_name.split("/", 1)
 
         if self.arm == "treatment":
-            await self._seed_pi_plans_config(environment)
+            await self._seed_pi_plans_config(environment, provider, model_id)
 
         # printf interprets backslash escapes; ship sources base64-encoded so
         # the driver/task bytes survive verbatim.
@@ -291,7 +302,7 @@ class PiPlansBench(Pi):
         if subagent_usage is not None:
             metadata["pi_plans_subagent_usage"] = subagent_usage
             # Fold child tokens/cost into the top-level accounting so treatment
-            # totals are comparable (the extension's reviewer/criticizer calls).
+            # totals are comparable (the extension's reviewer/ref-analyst calls).
             totals = subagent_usage.get("totals") or {}
             context.n_input_tokens = (context.n_input_tokens or 0) + int(totals.get("input", 0))
             context.n_output_tokens = (context.n_output_tokens or 0) + int(totals.get("output", 0))

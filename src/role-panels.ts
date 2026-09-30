@@ -1,0 +1,422 @@
+/**
+ * First-use reviewer model/effort panels (v0.7.0).
+ *
+ * Replaces the old ask_choice-mediated model confirmation: in TUI the gate
+ * pops a /model-style searchable panel (pi's exported
+ * ModelSelectorComponent) followed by a /thinking-style effort panel (a thin
+ * variant of pi's ThinkingSelectorComponent — the exported one cannot carry
+ * the extra "Default" sentinel row). Sessions with a UI but no TUI (RPC,
+ * ACP) get native ui.select menus over the same data; UI-less sessions keep
+ * the agent-mediated text flow in the calling tools.
+ *
+ * The result is persisted to the GLOBAL reviewer config
+ * (`~/.pi/pi-plans/config.json`, PI_PLANS_GLOBAL_DIR override) exactly once,
+ * after BOTH panels complete — Esc on either panel cancels the whole gate
+ * without writing anything (F-005).
+ */
+
+import {
+	DynamicBorder,
+	ModelSelectorComponent,
+	getSelectListTheme,
+	type ModelRuntime,
+} from "@earendil-works/pi-coding-agent";
+import { Container, Input, SelectList, Spacer, Text, fuzzyFilter, getKeybindings, matchesKey } from "@earendil-works/pi-tui";
+import type { Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { DEFAULT_LEVEL_DESCRIPTION, DEFAULT_LEVEL_SENTINEL, levelsForModel } from "./thinking-levels.ts";
+import { setGlobalRole, type GlobalRoleConfig } from "./global-state.ts";
+
+// ---------------------------------------------------------------------------
+// Host abstraction (structural — tools pass their ExtensionContext)
+// ---------------------------------------------------------------------------
+
+/** Narrow structural view of ExtensionContext the panels need. */
+export interface RolePanelHost {
+	mode: string | undefined;
+	hasUI: boolean;
+	model?: { provider: string; id: string } | null;
+	scopedModels?: ReadonlyArray<{ model: unknown; thinkingLevel?: string | undefined }> | null;
+	modelRegistry?: unknown;
+	ui: {
+		custom?: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => unknown, options?: Record<string, unknown>) => Promise<unknown>;
+		select?: (title: string, options: string[], opts?: unknown) => Promise<string | undefined>;
+		notify?: (message: string, type?: "info" | "warning" | "error") => void;
+	};
+}
+
+/**
+ * ModelRuntime adapter (F-010, Q-5=A): PRIMARY path maps the public
+ * ModelRegistry facade (getAvailable/find/getError/refresh — documented as
+ * "facade exposed to extensions") onto the four runtime methods
+ * ModelSelectorComponent uses. The private `(modelRegistry as any).runtime`
+ * field is only a SECONDARY attempt; both failing yields null and callers
+ * fall back to menus.
+ */
+export function adapterModelRuntime(host: RolePanelHost): ModelRuntime | null {
+	const registry = host.modelRegistry as
+		| {
+				getAvailable?: unknown;
+				find?: unknown;
+				getError?: unknown;
+				refresh?: unknown;
+				runtime?: unknown;
+		  }
+		| undefined;
+	if (
+		registry &&
+		typeof registry.getAvailable === "function" &&
+		typeof registry.find === "function" &&
+		typeof registry.getError === "function" &&
+		typeof registry.refresh === "function"
+	) {
+		return {
+			getAvailableSnapshot: () => (registry.getAvailable as () => Model[])(),
+			getModel: (providerId: string, modelId: string) =>
+				(registry.find as (provider: string, id: string) => Model | undefined)(providerId, modelId),
+			getError: () => (registry.getError as () => string | undefined)(),
+			refresh: (options?: unknown) => (registry.refresh as (options?: unknown) => Promise<unknown>)(options),
+		} as unknown as ModelRuntime;
+	}
+	const runtime = registry?.runtime as ModelRuntime | undefined;
+	if (runtime && typeof (runtime as { getAvailableSnapshot?: unknown }).getAvailableSnapshot === "function") {
+		return runtime;
+	}
+	return null;
+}
+
+/** Models from the registry snapshot (menus + availability checks). */
+export function availableModels(host: RolePanelHost): Model[] {
+	const registry = host.modelRegistry as { getAvailable?: () => Model[] } | undefined;
+	if (!registry || typeof registry.getAvailable !== "function") return [];
+	try {
+		return registry.getAvailable() ?? [];
+	} catch {
+		return [];
+	}
+}
+
+/** Find a configured model by exact selector (F-008 pre-spawn check). */
+export function findModel(host: RolePanelHost, selector: string): Model | null {
+	const at = selector.indexOf("/");
+	if (at <= 0) return null;
+	const registry = host.modelRegistry as { find?: (provider: string, id: string) => Model | undefined } | undefined;
+	if (!registry || typeof registry.find !== "function") return null;
+	try {
+		return registry.find(selector.slice(0, at), selector.slice(at + 1)) ?? null;
+	} catch {
+		return null;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Effort panel (thin /thinking variant with a Default sentinel row)
+// ---------------------------------------------------------------------------
+
+const LEVEL_DESCRIPTIONS: Record<string, string> = {
+	off: "No reasoning",
+	minimal: "Very brief reasoning (~1k tokens)",
+	low: "Light reasoning (~2k tokens)",
+	medium: "Moderate reasoning (~8k tokens)",
+	high: "Deep reasoning (~16k tokens)",
+	xhigh: "Extra-high reasoning (~32k tokens)",
+	max: "Maximum reasoning",
+};
+
+const EFFORT_LAYOUT = { minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 32 };
+
+export interface EffortItem {
+	value: string; // "default" or a concrete level
+	label: string;
+	description: string;
+}
+
+/** Panel items for a model: the Default sentinel first, then supported levels. */
+export function effortItems(model: Pick<Model, "reasoning" | "thinkingLevelMap">, currentLevel: string | null): EffortItem[] {
+	const levels = levelsForModel(model);
+	const items: EffortItem[] = [
+		{
+			value: DEFAULT_LEVEL_SENTINEL,
+			label: DEFAULT_LEVEL_SENTINEL,
+			description: DEFAULT_LEVEL_DESCRIPTION,
+		},
+		...levels.map((level: ModelThinkingLevel) => ({
+			value: level,
+			label: level,
+			description: LEVEL_DESCRIPTIONS[level] ?? "",
+		})),
+	];
+	if (currentLevel && !items.some((item) => item.value === currentLevel)) {
+		// Stored level not supported by the newly chosen model: still show it
+		// (marked) so the user sees what was there and can change it.
+		items.push({ value: currentLevel, label: currentLevel, description: `${currentLevel} (not supported by this model)` });
+	}
+	return items;
+}
+
+/**
+ * /thinking-style panel with an extra leading Default row. Mirrors pi's
+ * ThinkingSelectorComponent structure (DynamicBorder + filter Input +
+ * SelectList) minus the Ctrl+S set-as-default affordance, which has no
+ * meaning for the reviewer role.
+ */
+export class EffortPanelComponent extends Container {
+	private searchInput: Input;
+	private selectList: SelectList;
+	private selectListChildIndex: number;
+	private allItems: EffortItem[];
+	private onSelect: (value: string) => void;
+	private onCancel: () => void;
+	private _focused = false;
+
+	get focused(): boolean {
+		return this._focused;
+	}
+
+	set focused(value: boolean) {
+		this._focused = value;
+		this.searchInput.focused = value;
+	}
+
+	constructor(items: EffortItem[], preselect: string, onSelect: (value: string) => void, onCancel: () => void) {
+		super();
+		this.allItems = items;
+		this.onSelect = onSelect;
+		this.onCancel = onCancel;
+		this.addChild(new DynamicBorder());
+		this.addChild(new Spacer(1));
+		this.addChild(new Text("Reviewer Thinking Level", 0, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(new Text("Applies to spawned reviewer subagents only", 0, 0));
+		this.addChild(new Spacer(1));
+		this.searchInput = new Input();
+		this.searchInput.onSubmit = () => this.selectList.handleInput("\r");
+		this.addChild(this.searchInput);
+		this.addChild(new Spacer(1));
+		this.selectList = this.buildSelectList(items, preselect);
+		this.selectListChildIndex = this.children.length;
+		this.addChild(this.selectList);
+		this.addChild(new Spacer(1));
+		this.addChild(new Text("  Enter to select · Esc to cancel (cancels the whole gate)", 0, 0));
+		this.addChild(new DynamicBorder());
+	}
+
+	private buildSelectList(items: EffortItem[], preselect: string): SelectList {
+		const list = new SelectList(items, Math.max(1, items.length), getSelectListTheme(), EFFORT_LAYOUT);
+		const index = items.findIndex((item) => item.value === preselect);
+		if (index !== -1) list.setSelectedIndex(index);
+		list.onSelect = (item: EffortItem) => this.onSelect(item.value);
+		list.onCancel = () => this.onCancel();
+		return list;
+	}
+
+	private applyFilter(query: string): void {
+		const filtered = query
+			? fuzzyFilter(this.allItems, query, (item) => `${item.label} ${item.description ?? ""}`)
+			: this.allItems;
+		const selected = (this.selectList.getSelectedItem() as EffortItem | undefined)?.value;
+		const newList = this.buildSelectList(filtered, selected);
+		this.children[this.selectListChildIndex] = newList;
+		this.selectList = newList;
+	}
+
+	handleInput(keyData: string): void {
+		const kb = getKeybindings();
+		const isNav =
+			kb.matches(keyData, "tui.select.up") ||
+			kb.matches(keyData, "tui.select.down") ||
+			kb.matches(keyData, "tui.select.confirm") ||
+			kb.matches(keyData, "tui.select.cancel");
+		if (isNav) {
+			this.selectList.handleInput(keyData);
+			return;
+		}
+		this.searchInput.handleInput(keyData);
+		this.applyFilter(this.searchInput.getValue());
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Panel + menu flows
+// ---------------------------------------------------------------------------
+
+export type FirstUseOutcome =
+	| {
+			status: "confirmed";
+			modelSelector: string;
+			model: Model | null;
+			thinkingLevel: string | null;
+			role: GlobalRoleConfig;
+			notices: string[];
+			via: "panel" | "menu";
+	  }
+	| { status: "cancelled"; via: "panel" | "menu" }
+	| { status: "unavailable"; reason: "no-custom" | "no-runtime" | "no-models" | "no-select" };
+
+const OVERLAY_OPTIONS = {
+	overlay: true,
+	overlayOptions: {
+		width: "78%",
+		minWidth: 60,
+		maxHeight: "78%",
+		anchor: "top-center",
+		margin: { top: 1, left: 2, right: 2 },
+	},
+};
+
+/** /model-style searchable panel. Returns null when the host cannot show
+ * overlays (RPC custom() returns undefined) — callers fall back to menus. */
+async function pickModelViaPanel(host: RolePanelHost): Promise<Model | null | undefined> {
+	if (typeof host.ui.custom !== "function") return undefined;
+	const runtime = adapterModelRuntime(host);
+	if (runtime === null) return undefined;
+	const scoped = (host.scopedModels ?? []) as never;
+	const currentModel = host.model ? ({ ...host.model } as never) : undefined;
+	return (await host.ui.custom<Model | null>((tui, _theme, _kb, done) => {
+		let settled = false;
+		const finish = (value: Model | null) => {
+			if (settled) return;
+			settled = true;
+			done(value);
+		};
+		const selector = new ModelSelectorComponent(
+			tui as never,
+			currentModel,
+			runtime,
+			scoped,
+			(model) => finish(model as Model),
+			() => {
+				finish(null);
+				(tui as { requestRender?: () => void }).requestRender?.();
+			},
+		);
+		queueMicrotask(() => (tui as { requestRender?: () => void }).requestRender?.());
+		return selector;
+	}, OVERLAY_OPTIONS as never)) as Model | null | undefined;
+}
+
+/** /thinking-style effort panel. Assumes a real TUI (called after the model
+ * panel succeeded). Returns "default" | level | null (Esc). */
+async function pickLevelViaPanel(
+	host: RolePanelHost,
+	model: Model,
+	currentLevel: string | null,
+): Promise<string | null | undefined> {
+	const items = effortItems(model, currentLevel);
+	return (await host.ui.custom<string | null>((_tui, _theme, _kb, done) => {
+		let settled = false;
+		const finish = (value: string | null) => {
+			if (settled) return;
+			settled = true;
+			done(value);
+		};
+		return new EffortPanelComponent(items, currentLevel ?? DEFAULT_LEVEL_SENTINEL, (value) => finish(value), () => finish(null));
+	}, OVERLAY_OPTIONS as never)) as string | null | undefined;
+}
+
+/** Native menus for hasUI-but-not-TUI sessions (Q-2=A) — shared with the
+ * TUI panel-construction fallback. */
+async function pickModelViaMenu(host: RolePanelHost): Promise<string | undefined> {
+	if (typeof host.ui.select !== "function") return undefined;
+	const models = availableModels(host);
+	if (models.length === 0) return undefined;
+	const options = models.map((model) => `${model.provider}/${model.id}`);
+	const picked = await host.ui.select("Reviewer model? (type Other… to enter an exact provider/model string)", options);
+	return typeof picked === "string" ? picked : undefined;
+}
+
+function selectorOf(model: Model): string {
+	return `${model.provider}/${model.id}`;
+}
+
+/** Resolve a selector to a Model for the effort step; menus may pick models
+ * the registry no longer lists, so fall back to a bare selector object. */
+function modelForEffort(host: RolePanelHost, selector: string): Model | null {
+	return findModel(host, selector);
+}
+
+/**
+ * Run the first-use flow and, on full completion, persist the confirmed
+ * role to the global config and return it. Esc anywhere cancels the whole
+ * gate without persisting (F-005). The returned role is what the caller
+ * must use for THIS invocation (never a stale pre-gate snapshot).
+ */
+export async function runFirstUseFlow(host: RolePanelHost, storedLevel: string | null): Promise<FirstUseOutcome> {
+	const tui = host.mode === "tui" && typeof host.ui.custom === "function";
+	if (tui) {
+		let picked: Model | null | undefined;
+		try {
+			picked = await pickModelViaPanel(host);
+		} catch {
+			// Construction/refresh failure (pi upgrade drift, F-010): fall back
+			// to menus instead of failing the gate.
+			picked = undefined;
+		}
+		if (picked === undefined) {
+			// custom() unavailable (RPC) or runtime adapter failed — menu fallback.
+		} else if (picked === null) {
+			return { status: "cancelled", via: "panel" };
+		} else {
+			const level = await pickLevelViaPanel(host, picked, storedLevel);
+			if (level === undefined || level === null) return { status: "cancelled", via: "panel" };
+			return confirmRole(selectorOf(picked), level === DEFAULT_LEVEL_SENTINEL ? null : level, picked, "panel");
+		}
+	}
+	// Menus (hasUI non-TUI, or TUI panel fallback).
+	if (!host.hasUI || typeof host.ui.select !== "function") {
+		return { status: "unavailable", reason: tui ? "no-runtime" : "no-select" };
+	}
+	const models = availableModels(host);
+	if (models.length === 0 && tui) return { status: "unavailable", reason: "no-models" };
+	const selector = await pickModelViaMenu(host);
+	if (selector === undefined) return { status: "cancelled", via: "menu" };
+	const model = modelForEffort(host, selector);
+	if (model) {
+		const items = effortItems(model, storedLevel);
+		const labels = items.map((item) => `${item.label} — ${item.description}`);
+		const picked = await host.ui.select("Reviewer thinking level? (first row = default: no --thinking flag)", labels);
+		if (picked === undefined) return { status: "cancelled", via: "menu" };
+		const index = labels.indexOf(picked);
+		const value = index >= 0 ? items[index]!.value : DEFAULT_LEVEL_SENTINEL;
+		return confirmRole(selector, value === DEFAULT_LEVEL_SENTINEL ? null : value, model, "menu");
+	}
+	// Selector not in the registry (manually entered): confirm as-is with the
+	// default level — spawn-side validation catches typos with a precise error.
+	return confirmRole(selector, null, null, "menu");
+}
+
+function confirmRole(modelSelector: string, thinkingLevel: string | null, model: Model | null, via: "panel" | "menu"): FirstUseOutcome {
+	const applied = setGlobalRole({ modelSelector, thinkingLevel: thinkingLevel ?? "default", confirmed: true });
+	return {
+		status: "confirmed",
+		modelSelector,
+		model,
+		thinkingLevel,
+		role: applied.global.reviewer,
+		notices: applied.notices,
+		via,
+	};
+}
+
+/** Esc-cancelled gate error (F-005): a dedicated message + details marker so
+ * the agent does NOT re-ask via ask_choice or blindly retry. */
+export function firstUseCancelledError(toolName: string): Error {
+	const error = new Error(
+		`The user closed the ${toolName} first-use reviewer model panel without completing it. Do NOT re-ask the model question with ask_choice and do NOT retry ${toolName} unless the user asks. The user can configure the reviewer at any time with /config-pi-plans.`,
+	);
+	(error as Error & { cancelled?: boolean }).cancelled = true;
+	return error;
+}
+
+/** UI-less gate guidance (F-004): embedded model list + exact set-role call. */
+export function firstUseTextGuidance(models: Model[], globalConfigPath: string): string {
+	const sample = models
+		.slice(0, 30)
+		.map((model) => `${model.provider}/${model.id}`)
+		.join(", ");
+	return [
+		"The reviewer model was never confirmed. This session has no interactive UI, so ask the model-confirmation question with ask_choice:",
+		"1. Choose a model — available selectors include: " + (sample || "(none found via the model registry; ask the user for an exact provider/model string)"),
+		"2. Other / 3. Auto-complete — choose a concrete provider/model selector (inherit is no longer supported).",
+		`Then persist with the plans tool: set-role, role=reviewer, modelSelector=<provider/model>, confirmed: true (plus thinkingLevel: high|medium|…|default when the user wants a specific level). The reviewer role lives in the global config (${globalConfigPath}), shared across all workspaces; automation may also pre-write that file directly.`,
+	].join("\n");
+}

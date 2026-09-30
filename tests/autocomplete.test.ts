@@ -14,9 +14,9 @@ import {
 	recordAskChoice,
 	registerAutoCompleteTurnHandlers,
 	restoreAutoCompleteFromSession,
-	setAutoCompleteApi,
 } from "../src/autocomplete.ts";
 import { initState, setRunStatus, startRun } from "../src/state.ts";
+import { setMessagingApi } from "../src/messaging.ts";
 
 let root: string;
 
@@ -46,7 +46,6 @@ before(() => {
 });
 
 after(() => {
-	setAutoCompleteApi(null);
 	fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -54,8 +53,8 @@ describe("Auto-complete state", () => {
 	it("enables only for the active planning run and restores only while planning", () => {
 		const { workdir, runId } = makeRun("restore");
 		const entries: any[] = [];
-		setAutoCompleteApi({ appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }) } as any);
 		const ctx = makeContext(workdir);
+		setMessagingApi({ appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }), sendMessage: () => {}, sendUserMessage: async () => {} });
 
 		assert.equal(enableAutoComplete(ctx), true);
 		assert.equal(autoCompleteStatus(ctx), "enabled");
@@ -79,8 +78,8 @@ describe("Auto-complete state", () => {
 	it("clears explicitly and marks plan writes as a continuation boundary", () => {
 		const { workdir } = makeRun("clear");
 		const entries: any[] = [];
-		setAutoCompleteApi({ appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }) } as any);
 		const ctx = makeContext(workdir);
+		setMessagingApi({ appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }), sendMessage: () => {}, sendUserMessage: async () => {} });
 		enableAutoComplete(ctx);
 		markPlanWritten(ctx);
 		recordAskChoice(ctx, true);
@@ -98,12 +97,10 @@ describe("Auto-complete continuation", () => {
 		const handlers = new Map<string, Function[]>();
 		const pi: any = {
 			on: (name: string, handler: Function) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
-			appendEntry: () => {},
-			sendUserMessage: async (content: string, options: unknown) => sent.push({ content, options }),
 		};
-		setAutoCompleteApi(pi);
 		registerAutoCompleteTurnHandlers(pi);
 		const ctx = makeContext(workdir, session);
+		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async (content: string, options: unknown) => sent.push({ content, options }) });
 		enableAutoComplete(ctx);
 		await handlers.get("turn_start")?.[0]?.({}, ctx);
 		recordAskChoice(ctx, true);
@@ -132,10 +129,10 @@ describe("ask_choice Auto-complete wiring", () => {
 		assert.match(source, /isAutoCompleteEnabled/);
 		assert.match(source, /recordAskChoice\(ctx, true\)/);
 		assert.match(source, /autoComplete && selected\.startsWith\("Auto-complete"\)/);
-		// Trailing option: Auto-refine loop replaces Auto-complete and is suppressed in headless sessions.
-		assert.match(source, /trailing === undefined/);
-		assert.match(source, /AUTO_REFINE_LOOP_LABEL/);
-		assert.match(source, /trailing && selected\.startsWith\("Auto-refine loop"\)/);
+		// v0.6.1: the auto-refine trailing param was removed with the
+		// implementation-review loop.
+		assert.doesNotMatch(source, /auto-refine-loop/);
+		assert.doesNotMatch(source, /AUTO_REFINE_LOOP_LABEL/);
 		const indexSource = fs.readFileSync(path.join(process.cwd(), "index.ts"), "utf8");
 		assert.match(indexSource, /plans-autocomplete-stop/);
 		assert.match(indexSource, /autoCompleteStatus\(ctx\)/);

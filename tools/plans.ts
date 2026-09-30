@@ -8,9 +8,6 @@ import { lintPlanIntoNotices } from "../src/state.ts";
 import { getExecution, markPrePlanCompactPending, refreshUiLanguage } from "../src/exec.ts";
 import { loadVccSettings, scaffoldVccSettings } from "../src/compaction.ts";
 import {
-	applyCompleted,
-	applyImplementationReviewConfigured,
-	applyImplementationRoundFinished,
 	applyPlanWritten,
 	applyReviewConsolidated,
 	createCheckpoint,
@@ -43,11 +40,12 @@ import {
 	setRefsRoot,
 	setRunStatus,
 	setRole,
-	showConfig,
+	showStateView,
 	startRun,
 	StateError,
 	VALID_RUN_STATUSES,
 } from "../src/state.ts";
+import { messaging } from "../src/messaging.ts";
 
 const PlansParams = Type.Object({
 	action: StringEnum(
@@ -77,19 +75,25 @@ const PlansParams = Type.Object({
 	requestText: Type.Optional(Type.String({ description: "start-run: original user request text" })),
 	tag: Type.Optional(Type.String({ description: "set-language: BCP47 tag, e.g. zh-Hans, en" })),
 	languageSource: Type.Optional(StringEnum(["user", "auto"] as const)),
-	artifactRoot: Type.Optional(Type.String({ description: "set-artifact-root: planning docs root, e.g. ./docs/pi-plans" })),
+	artifactRoot: Type.Optional(Type.String({ description: "set-artifact-root: planning docs root, e.g. ./.git/pi-plans/plans" })),
 	artifactRootSource: Type.Optional(StringEnum(["user", "auto"] as const)),
 	refsRoot: Type.Optional(Type.String({ description: "set-refs-root: reference downloads root, e.g. .git/pi-plans/refs" })),
 	refsRootSource: Type.Optional(StringEnum(["user", "auto"] as const)),
 	enabled: Type.Optional(Type.Boolean({ description: "set-graph-enabled: enable/disable the code graph" })),
 	message: Type.Optional(Type.String({ description: "final-commit: commit message body" })),
-	role: Type.Optional(StringEnum(["reviewer", "criticizer"] as const)),
+	role: Type.Optional(StringEnum(["reviewer"] as const)),
 	mode: Type.Optional(StringEnum(["delegated-subagent", "current-session"] as const)),
 	modelSelector: Type.Optional(
-		Type.String({ description: "set-role: exact provider/model selector, or 'inherit' to reset to inherited" }),
+		Type.String({ description: "set-role: exact provider/model selector; 'inherit' resets BOTH the selector and the confirmation" }),
+	),
+	thinkingLevel: Type.Optional(
+		StringEnum(["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
+			description:
+				"set-role: reviewer subagent thinking level in the GLOBAL config; 'default' (null) omits --thinking so the child pi resolves its own default chain; changing modelSelector without this resets the level",
+		}),
 	),
 	confirmed: Type.Optional(
-		Type.Boolean({ description: "set-role: stamp confirmed_at=now (used by the first-use confirmation flow)" }),
+		Type.Boolean({ description: "set-role: stamp confirmed_at=now; requires an exact selector for delegated-subagent" }),
 	),
 	resetConfirmation: Type.Optional(Type.Boolean({ description: "set-role: clear confirmed_at to re-ask" })),
 	runId: Type.Optional(Type.String()),
@@ -121,7 +125,7 @@ const PlansParams = Type.Object({
 	),
 	subagent: Type.Optional(
 		Type.Object({
-			role: StringEnum(["reviewer", "criticizer", "ref-analyst"] as const),
+			role: StringEnum(["reviewer", "ref-analyst"] as const),
 			name: Type.String(),
 			model: Type.Optional(Type.String()),
 			sessionDir: Type.Optional(Type.String()),
@@ -130,40 +134,15 @@ const PlansParams = Type.Object({
 	checkpoint: Type.Optional(
 		Type.Object({
 			/** Whitelisted semantic transition (I-003). State-machine validated; approval cannot be forged here. */
-			transition: StringEnum(
-				[
-					"plan-written",
-					"review-consolidated",
-					"implementation-review-configured",
-					"implementation-round-finished",
-					"completed",
-				] as const,
-			),
+			transition: StringEnum(["plan-written", "review-consolidated"] as const),
 			/** plan-written: absolute or workdir-relative PLAN_vN.md path. */
 			planPath: Type.Optional(Type.String()),
 			/** review-consolidated: round id + optional disposition artifact (run-dir relative). */
 			roundId: Type.Optional(Type.String()),
 			dispositionArtifact: Type.Optional(Type.String()),
-			/** implementation-review-configured: the serialized termination condition chosen by the user. */
-			terminationCondition: Type.Optional(Type.String()),
-			/** implementation-review-configured: concurrent reviewers per round (1-3);
-			 * omit to keep the skill-level default (plan-big / plan-with-refs → 3, others → 1). */
-			reviewerCount: Type.Optional(Type.Integer({ minimum: 1, maximum: 3 })),
-			/** completed: non-empty evidence that the termination condition is satisfied. */
-			evidence: Type.Optional(Type.String()),
 		}),
 	),
 });
-
-// Module-level reference so the start-run action can append a session entry
-// (pi-plans-run-start) at the moment the planning run begins. The ExtensionAPI
-// itself is not in scope for `startRun`, mirroring `setCurrentApi` in
-// tools/execute-plan.ts.
-let runStartAppender: ((runId: string, artifactDir: string) => void) | null = null;
-
-export function setRunStartAppender(appender: ((runId: string, artifactDir: string) => void) | null): void {
-	runStartAppender = appender;
-}
 
 /** plans action final-commit: gate on code-graph drift (zero pending +
  *  invariants (a)/(b) clean), then `git add -A` and commit the plan delivery.
@@ -238,13 +217,10 @@ export function recordCheckpointTransition(
 	workdir: string,
 	runIdArg: string | undefined,
 	checkpoint: {
-		transition: "plan-written" | "review-consolidated" | "implementation-review-configured" | "implementation-round-finished" | "completed";
+		transition: "plan-written" | "review-consolidated";
 		planPath?: string;
 		roundId?: string;
 		dispositionArtifact?: string;
-		terminationCondition?: string;
-		reviewerCount?: number;
-		evidence?: string;
 	},
 ): WorkflowCheckpoint {
 	const runId =
@@ -270,33 +246,15 @@ export function recordCheckpointTransition(
 				applyReviewConsolidated(cp, checkpoint.roundId!, checkpoint.dispositionArtifact),
 			);
 		}
-		case "implementation-review-configured": {
-			if (!checkpoint.terminationCondition) {
-				throw new StateError("implementation-review-configured requires terminationCondition");
-			}
-			return mutateCheckpoint(workdir, runId, (cp) =>
-				applyImplementationReviewConfigured(cp, checkpoint.terminationCondition!, checkpoint.reviewerCount),
-			);
-		}
-		case "implementation-round-finished": {
-			return mutateCheckpoint(workdir, runId, (cp) => applyImplementationRoundFinished(cp));
-		}
-		case "completed": {
-			if (!checkpoint.evidence) throw new StateError("completed requires evidence");
-			return mutateCheckpoint(workdir, runId, (cp) => applyCompleted(cp, checkpoint.evidence!));
-		}
 	}
 }
 
-export function registerPlansTool(pi: ExtensionAPI): void {
-	setRunStartAppender((runId, artifactDir) => {
-		pi.appendEntry("pi-plans-run-start", { runId, artifactDir });
-	});
-	pi.registerTool({
+export function registerPlansTool(ext: ExtensionAPI): void {
+	ext.registerTool({
 		name: "plans",
 		label: "Plans",
 		description:
-			"Manage pi-plans planning state in the target workspace: init/show config, set language and planning docs root plus reviewer/criticizer roles and the code-graph enabled flag, start planning runs, record decisions/refs/subagents, and update run status. Multiple concurrent runs per workdir are supported (registry-derived from runs/; sessions bind to their run). State lives in .git/pi_plans/ inside the resolved git common dir. Actions: init, show, set-language, set-artifact-root, set-refs-root, set-graph-enabled, set-role, start-run, set-status, final-commit, record-decision, record-ref, record-subagent.",
+			"Manage pi-plans planning state in the target workspace: init/show config, set language and planning docs root plus the reviewer role and the code-graph enabled flag, start planning runs, record decisions/refs/subagents, and update run status. Multiple concurrent runs per workdir are supported (registry-derived from runs/; sessions bind to their run). State lives in .git/pi-plans/ inside the resolved git common dir. Actions: init, show, set-language, set-artifact-root, set-refs-root, set-graph-enabled, set-role, start-run, set-status, final-commit, record-decision, record-ref, record-subagent.",
 		promptSnippet: "Manage pi-plans planning state, runs, and ledgers",
 		parameters: PlansParams,
 
@@ -317,10 +275,15 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 						break;
 					}
 					case "show": {
-						const config = showConfig(workdir);
-						const stateRoot = resolveStateRootOrNull(workdir);
-						result = { config, stateRoot };
-						if (config.graph_enabled === null) {
+						const view = showStateView(workdir);
+						result = {
+							config: view.config,
+							stateRoot: view.stateRoot,
+							reviewer: view.reviewer,
+							globalConfigPath: view.globalConfigPath,
+							notices: view.notices,
+						};
+						if (view.config.graph_enabled === null) {
 							result = {
 								...(result as Record<string, unknown>),
 								hint: "graph_enabled is null (never asked). Ask the user once via ask_choice, then persist with plans (action: set-graph-enabled, enabled: true|false).",
@@ -369,10 +332,17 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 							role: params.role,
 							mode: params.mode,
 							modelSelector: params.modelSelector,
+							thinkingLevel: params.thinkingLevel,
 							confirmed: params.confirmed,
 							resetConfirmation: params.resetConfirmation,
 						});
-						result = { config: updated.config, stateRoot: updated.stateRoot, notices: updated.notices };
+						result = {
+							global: updated.global,
+							globalRoot: updated.globalRoot,
+							notices: updated.notices,
+							config: updated.config,
+							stateRoot: updated.stateRoot,
+						};
 						break;
 					}
 					case "start-run": {
@@ -383,8 +353,11 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 							topic: params.topic,
 							skill: params.skill,
 							requestText: params.requestText,
+							// Append the run-start session entry with this call's ctx —
+							// never a registration-time capture (stale after session
+							// replacement).
 							onStart: (run) => {
-								runStartAppender?.(run.run_id, run.artifact_dir);
+								messaging().appendEntry("pi-plans-run-start", { runId: run.run_id, artifactDir: run.artifact_dir });
 							},
 						});
 						// I-002: attribute this session's work to the run it started.
@@ -454,3 +427,4 @@ export function registerPlansTool(pi: ExtensionAPI): void {
 		},
 	});
 }
+

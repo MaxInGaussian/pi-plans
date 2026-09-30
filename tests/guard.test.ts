@@ -48,7 +48,7 @@ describe("planning write guard", () => {
 
 		// State dir writes are allowed; @-prefixed paths are normalized.
 		assert.equal(
-			planningWriteBlockReason({ workdir, toolName: "write", rawPath: ".git/pi_plans/tmp/note" }),
+			planningWriteBlockReason({ workdir, toolName: "write", rawPath: ".git/pi-plans/tmp/note" }),
 			null,
 		);
 		assert.ok(planningWriteBlockReason({ workdir, toolName: "write", rawPath: "@/src/main.ts" }));

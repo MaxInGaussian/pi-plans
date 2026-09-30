@@ -1,10 +1,18 @@
 /**
- * Plan-execution loop: the tracked execution mode for accepted plans.
+ * Plan-execution loop (v0.6.1): the tracked execution mode for accepted
+ * plans, driven by the plan's task tree.
  *
  * When the user approves the execution handoff, the extension switches into
- * execution mode: every agent turn is injected with the remaining verifier
- * checklist, assistant messages are scanned for [DONE:VC-xxx] markers, and
- * progress is reported through the bottom status bar until every item passes.
+ * execution mode: every agent turn is injected with the current wave and
+ * remaining tasks, task progress flows in exclusively through the
+ * `plans_update_task` tool (status + evidence), the task dashboard shows
+ * live progress (compact aboveEditor widget; Ctrl+Shift+T expands the full
+ * tree), a stall watchdog pauses the run when consecutive rounds produce no
+ * task-state change, and when every task reaches a terminal state an
+ * independent completion auditor verifies the plan's verification checks —
+ * failed checks roll their covered tasks back to pending (audit-flow-only
+ * channel), and three failed rounds pause for the user (bounded stopped
+ * termination under auto-approve/headless).
  */
 
 import * as fs from "node:fs";
@@ -37,10 +45,9 @@ import {
 	type VccCompactionStats,
 } from "./compaction.ts";
 import { TERMINAL_RUN_STATUSES, getRun, latestRun, lintPlanIntoNotices, loadConfig, readActive, resolveStateRootOrNull, setRunStatus, StateError, utcNow } from "./state.ts";
-import { execChrome, resolveUiLanguage, type UiLanguage } from "./ui-language.ts";
+import { resolveUiLanguage, type UiLanguage } from "./ui-language.ts";
 import { bindRun, resolveActiveRun } from "./run-context.ts";
-import { runPiSubagent, type SubagentProgressEvent } from "./subagent.ts";
-import { RefineOverlayController, refineOverlayContext } from "./refine-ui.ts";
+import type { SubagentProgressEvent } from "./subagent.ts";
 import { OwnershipError } from "./run-ownership.ts";
 import {
 	applyExecutionApproved,
@@ -48,86 +55,75 @@ import {
 	applyExecutionHeadChanged,
 	applyExecutionProgress,
 	applyExecutionStopped,
-	applyQuestionAsked,
-	applyReviewRoundStarted,
 	createCheckpoint,
 	loadCheckpoint,
 	mutateCheckpoint,
-	StaleCheckpointError,
 	planIdentityOf,
 	resolveHeadAt,
 	resolveWorktreeRoot,
 	sha256File,
+	StaleCheckpointError,
 	type ExecutionApproval,
+	type WorkflowCheckpoint,
 } from "./workflow-state.ts";
 import { graphBlockForExecutor } from "./code-graph/prompts.ts";
-import {
-	PANEL_WIDGET_KEY,
-	derivePanelModel,
-	deriveNextAction,
-	deriveImplReviewLoopModel,
-	formatImplReviewLoopSummaryLine,
-	formatPanelSummaryLine,
-	renderImplReviewLoopLines,
-	renderPanelLines,
-	themeImplReviewLoopLines,
-	themePanelLines,
-} from "./panel.ts";
 import { resolveGraphMode } from "./code-graph/mode.ts";
 import {
-	TERMINATION_QUESTION,
-	TERMINATION_OPTIONS,
-	TERMINATION_RECORDING_INSTRUCTIONS,
-	defaultImplReviewers,
-	implReviewerCountPromptLine,
-	renderTerminationOptions,
-} from "./termination-prompt.ts";
-import {
-	extractCoverage,
-	latestPlanVersion,
 	parseChecklist,
-	parseImplItems,
-	resolveImplStatuses,
-	scanDoneMarkers,
-	scanImplMarkers,
-	scanCurrentIMarkers,
-	resolveCurrentI,
-	inferCurrentI,
-	lintImplItems,
+	parsePlanTasks,
+	flattenTasks,
 	type CheckItem,
-	type ImplItem,
-	type ImplMarkerState,
+	type PlanTasks,
 } from "./plan.ts";
+import {
+	allTasksTerminal,
+	auditRollbackSet,
+	auditableChecks,
+	buildTaskView,
+	currentTask,
+	flattenTaskViews,
+	taskIsTerminal,
+	taskProgress,
+	taskProgressMap,
+	type TaskProgressMap,
+	type TaskView,
+} from "./tasks.ts";
+import { isAutoApproveEnabled as isAutoApproveEnabledLocal } from "./auto-approve.ts";
+import {
+	DASHBOARD_WIDGET_KEY,
+	deriveDashboardModel,
+	formatDashboardSummaryLine,
+	formatElapsed,
+	renderDashboardLines,
+	renderDashboardTreeLines,
+} from "./dashboard.ts";
+import { AUDIT_MAX_ROUNDS, presolvedCheckIds, runCompletionAudit } from "./auditor.ts";
+import { messaging } from "./messaging.ts";
 
 export interface ExecState {
 	planPath: string;
+	/** Verification checks (VC-###) — the audit's contract. */
 	items: CheckItem[];
+	/** Parsed plan task model (kept for re-deriving the view). */
+	planTasks: PlanTasks;
+	/** Live task tree (the single source of progress). */
+	tasks: TaskView[];
+	/** True when the plan parsed through the legacy I-### fallback. */
+	legacyPlan: boolean;
 	startedAt: string;
 	usage: { inToks: number; outToks: number };
-	implItems?: ImplItem[];
-	implStatus?: Record<string, ImplMarkerState>;
-	/** Plan-lint warning backing the panel's implWarning line. */
-	implWarning?: string | null;
-	/** Chrome language for panel/status strings (issue #3); undefined → "en". */
+	/** Chrome language for panel/status strings; undefined → "en". */
 	uiLanguage?: UiLanguage;
-	currentI?: string;
-	goalWait?: GoalWaitState;
-	/** v0.6.0: set while a delegated executor child owns the implementation.
-	 * Persisted subset only (modelSelector + startedAt); the AbortController is
-	 * runtime state kept in delegatedRuntime, never persisted. */
-	delegate?: { modelSelector: string; startedAt: string };
+	/** Stall watchdog (v0.6.1): consecutive settled rounds without a task
+	 * status change; auto-pause at the cap. */
+	stall: { rounds: number; lastSnapshot: string | null; paused: boolean; pausedReason?: string };
+	/** Completion-audit bookkeeping. */
+	audit: { rounds: number; failed: string[]; running: boolean };
 }
 
 /**
- * D-008 (issue #3): re-resolve the chrome language and repaint the panel and
- * status bar. Called by the plans tool right after a successful
- * `set-language` so an executing run switches language without a restart
- * (and without reading config on every render tick).
- *
- * Capability guard (implementation review F-001): partial contexts (some
- * command/test harnesses expose only notify/select/input) may lack
- * setStatus/theme — the refresh must stay a no-op there instead of throwing
- * into the caller's error path (updateStatusWidget assumes a full ui).
+ * D-008 (issue #3): re-resolve the chrome language and repaint the dashboard
+ * and status bar right after a `set-language` change.
  */
 export function refreshUiLanguage(ctx: ExtensionContext): void {
 	if (execution) execution.uiLanguage = resolveUiLanguage(ctx.cwd);
@@ -135,43 +131,35 @@ export function refreshUiLanguage(ctx: ExtensionContext): void {
 	updateStatusWidget(ctx);
 }
 
-export interface GoalWaitState {
-	noProgressRounds: number;
-	waitRounds: number;
-	/** Marker/progress snapshot of the last goal-wait round; null = baseline not set. */
-	lastMarkers: string | null;
-	paused: boolean;
-	pausedReason?: string;
-}
-
-const GOAL_WAIT_MAX_NO_PROGRESS = 3;
-const GOAL_WAIT_MAX_WAITING = 6;
+/** Consecutive no-progress rounds before the watchdog pauses (D-021). */
+const STALL_MAX_ROUNDS = 3;
 
 let execution: ExecState | null = null;
 
-export const GOAL_WAIT_CUSTOM_TYPE = "pi-plans-goal-wait";
+export const EXECUTION_CONTINUE_CUSTOM_TYPE = "pi-plans-exec-continue";
+/** Legacy v0.6.0 continuation message type — filtered on restore. */
+const LEGACY_GOAL_WAIT_CUSTOM_TYPE = "pi-plans-goal-wait";
 
-interface GoalWaitRuntime {
+interface ContinuationRuntime {
 	owner: ExecState;
 	session: ExtensionContext["sessionManager"];
 	handled: boolean;
 	stopReason?: string;
-	text: string;
 	wakeId?: string;
 }
 
-// Dispatch identity belongs to a live session, never to a persisted checklist.
-let goalWaitRuntime: GoalWaitRuntime | null = null;
+// Dispatch identity belongs to a live session, never to a persisted state.
+let continuationRuntime: ContinuationRuntime | null = null;
 
-function resetGoalWaitRuntime(ctx: ExtensionContext): void {
-	goalWaitRuntime = execution
-		? { owner: execution, session: ctx.sessionManager, handled: false, text: "" }
+function resetContinuationRuntime(ctx: ExtensionContext): void {
+	continuationRuntime = execution
+		? { owner: execution, session: ctx.sessionManager, handled: false }
 		: null;
 }
 
-function currentGoalWaitRuntime(ctx: ExtensionContext): GoalWaitRuntime | null {
-	return goalWaitRuntime?.owner === execution && goalWaitRuntime.session === ctx.sessionManager
-		? goalWaitRuntime
+function currentContinuationRuntime(ctx: ExtensionContext): ContinuationRuntime | null {
+	return continuationRuntime?.owner === execution && continuationRuntime.session === ctx.sessionManager
+		? continuationRuntime
 		: null;
 }
 
@@ -185,17 +173,14 @@ export function consumePendingExecutionFlush(): boolean {
 	return pending;
 }
 
-function requestExecutionFlush(_pi: ExtensionAPI, _ctx: ExtensionContext): void {
-	// Unconditional defer. turn_end fires mid-run in a gap between agent
-	// operations where isIdle() reads true; persistence happens only at the
-	// drain points: agent_settled, the next before_agent_start, and stop/complete.
+function requestExecutionFlush(): void {
 	pendingExecutionFlush = true;
 }
 
-export function drainExecutionFlush(pi: ExtensionAPI, ctx: ExtensionContext): void {
+export function drainExecutionFlush(ctx: ExtensionContext): void {
 	if (!execution || !pendingExecutionFlush) return;
 	pendingExecutionFlush = false;
-	persist(pi);
+	persist(ctx);
 	updateStatusWidget(ctx);
 }
 
@@ -209,19 +194,22 @@ export interface CheckpointExecutionLoad {
 	doneVcIds?: string[];
 	reverifyAll?: boolean;
 	pausedReason?: string;
+	/** v0.6.1: true when the checkpoint parsed through the legacy fallback. */
+	legacyPlan?: boolean;
+	/** v0.6.1 (D-020): true when an orphaned v0.6.0 delegated executor was
+	 * detected — resume requires a fresh handoff approval. */
+	legacyDelegate?: boolean;
 	error?: string;
 }
 
 /**
- * Shared restore primitive (I-005/I-006): load the executing state from a run
- * checkpoint into THIS session. Authorization is kept only when the recorded
- * approval matches the current plan digest; a HEAD change keeps the
- * authorization but re-verifies previously verified VCs (D-011/F-001).
- * F-002: the loaded state is persisted to the current session IMMEDIATELY so
- * session_start/session_tree restore paths cannot silently clear it.
+ * Shared restore primitive: load the executing state from a run checkpoint
+ * into THIS session. Authorization is kept only when the recorded approval
+ * matches the current plan digest; a HEAD change keeps the authorization but
+ * re-opens previously closed tasks (D-023: reverifyAll → task statuses are
+ * dropped and re-run).
  */
 export function loadExecutionFromCheckpoint(
-	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	runId: string,
 ): CheckpointExecutionLoad {
@@ -235,9 +223,6 @@ export function loadExecutionFromCheckpoint(
 		return { status: "plan-missing", error: planPath ? `plan file vanished: ${planPath}` : "checkpoint has no plan identity" };
 	}
 	const planText = fs.readFileSync(planPath, "utf8");
-	// F-002 (implementation review): the recorded plan identity is over BYTES —
-	// an in-place edit at the same path must not inherit the authorization or
-	// the verified VCs. Refuse the load and require a fresh handoff.
 	if (sha256File(planPath) !== cp.plan.sha256) {
 		return {
 			status: "plan-mismatch" as const,
@@ -246,74 +231,105 @@ export function loadExecutionFromCheckpoint(
 	}
 	const items = parseChecklist(planText);
 	if (items.length === 0) {
-		return { status: "plan-missing", error: `${planPath} has no parsable verifier checklist` };
+		return { status: "plan-missing", error: `${planPath} has no parsable verification checks` };
 	}
-	const implItems = parseImplItems(planText);
-	const doneIds = new Set(cp.execution.doneVcIds);
-	// D-011/F-001: an unchanged plan digest keeps the recorded authorization;
-	// a changed HEAD under it forces re-verification of previously verified VCs.
-	// F-006 (implementation review): an approval without a resolvable HEAD
-	// recorded an unverifiable code state — re-verify instead of trusting.
+	const planTasks = parsePlanTasks(planText);
+	if (planTasks.tasks.length === 0) {
+		return { status: "plan-missing", error: `${planPath} has no parsable tasks (## Tasks or legacy ## Implementation Items)` };
+	}
 	const headNow = resolveHeadAt(ctx.cwd);
 	const headUnverifiable = cp.execution.approval === null || cp.execution.approval.headAtApproval === null;
 	const headChanged =
 		cp.execution.approval !== null &&
 		cp.execution.approval.headAtApproval !== null &&
 		cp.execution.approval.headAtApproval !== headNow;
+	// D-023: reverifyAll re-opens every closed task (statuses dropped); a
+	// normal restore replays the persisted task progress map.
 	const reverifyAll = cp.execution.reverifyAll === true || headChanged || headUnverifiable;
+	const progress: TaskProgressMap = reverifyAll ? {} : (cp.execution.tasks ?? {});
+	const tasks = buildTaskView(planTasks, progress);
+	// An audit-cap pause grants a fresh audit budget on restore (mirrors
+	// resumeGoalWaitIfPaused) so the first turn can actually re-audit.
+	const wasAuditCapPause = (cp.execution.pausedReason ?? "").startsWith(AUDIT_CAP_PAUSE_PREFIX);
 	if (!reverifyAll) {
-		for (const item of items) {
-			if (doneIds.has(item.id)) item.done = true;
+		for (const id of cp.execution.doneVcIds) {
+			const item = items.find((candidate) => candidate.id === id);
+			if (item) item.done = true;
 		}
 	}
 	execution = {
 		planPath,
 		items,
+		planTasks,
+		tasks,
+		legacyPlan: planTasks.legacy,
 		startedAt: utcNow(),
 		usage: { inToks: cp.execution.usage.inToks, outToks: cp.execution.usage.outToks },
-		implItems,
-		implStatus: { ...cp.execution.implStatus },
-		implWarning: lintImplItems(planText),
 		uiLanguage: resolveUiLanguage(ctx.cwd),
-		currentI: cp.execution.currentI,
-		goalWait: {
-			noProgressRounds: 0,
-			waitRounds: 0,
-			lastMarkers: null,
-			paused: cp.execution.pausedReason !== undefined,
-			pausedReason: cp.execution.pausedReason,
+		// D-020: a paused legacy (or stopped) execution rebuilds unpaused —
+		// the resume itself is the user's intent; the reason is surfaced in
+		// the resume brief instead. An audit-cap pause additionally grants a
+		// fresh audit budget here (mirrors resumeGoalWaitIfPaused), so the
+		// first turn after a cross-session resume can actually re-audit.
+			stall: {
+			rounds: 0,
+			lastSnapshot: null,
+			paused: false,
+			pausedReason: undefined,
+		},
+		audit: {
+			rounds: wasAuditCapPause ? 0 : (cp.execution.audit?.rounds ?? 0),
+			failed: [],
+			running: false,
 		},
 	};
 	executionRunId = runId;
 	bindRun(ctx.sessionManager, ctx.cwd, runId);
-	resetGoalWaitRuntime(ctx);
-	pendingExecutionFlush = false; // restored state: no inherited flush debt
+	resetContinuationRuntime(ctx);
+	pendingExecutionFlush = false;
 	resetExecutionCompactionState(ctx);
-	// v0.6.0 orphaned-delegate detection: a restart never carries a live child.
-	// If the checkpoint/session carries delegate state, surface it so the user
-	// knows the previous executor died mid-run (VC state is intact, resumable).
-	if (cp.execution.delegate) {
+	if (wasAuditCapPause) {
+		withExecutionCheckpoint(ctx, (cp2) =>
+			applyExecutionProgress(cp2, { audit: { rounds: 0, lastResult: undefined }, pausedReason: null }),
+		);
+	}
+	// D-020: an orphaned v0.6.0 delegated executor never survives a restart.
+	// Its checkpoint delegate marker REFUSES the direct load — the run must
+	// re-enter through the execution handoff so the C-006 approval gate
+	// applies; execution restarts from the first task after re-approval.
+	const legacyDelegate = cp.execution.delegate !== undefined;
+	if (legacyDelegate) {
 		try {
 			ctx.ui.notify?.(
-				`pi-plans: the previous delegated executor (${cp.execution.delegate.modelSelector}) did not finish before this session ended. Verified VC state is preserved; resume with /plans-execute.`,
+				"pi-plans: this run was mid-flight under a v0.6.0 delegated executor (removed in v0.6.1). Re-approve via /plans-execute; execution restarts from the first task (the 0.6.0 progress record cannot map onto the task tree).",
 				"warning",
 			);
 		} catch {
-			/* notification is best-effort */
+			/* best-effort */
 		}
+		// Refuse the load: no execution state may activate without the fresh
+		// C-006 handoff approval.
+		execution = null;
+		executionRunId = null;
+		return {
+			status: "no-execution",
+			legacyDelegate: true,
+			error: "orphaned v0.6.0 delegated executor; re-approve via /plans-execute (execution restarts from the first task)",
+		};
 	}
 	if (headChanged) {
 		withExecutionCheckpoint(ctx, (current) => applyExecutionHeadChanged(current));
 	}
-	if (execution.goalWait) execution.goalWait.lastMarkers = goalWaitSnapshot();
-	persist(pi); // F-002: immediate session snapshot
+	persist(ctx);
 	updateStatusWidget(ctx);
 	return {
 		status: "loaded",
 		planPath,
-		doneVcIds: [...doneIds],
+		doneVcIds: [...cp.execution.doneVcIds],
 		reverifyAll,
 		pausedReason: cp.execution.pausedReason,
+		legacyPlan: planTasks.legacy,
+		legacyDelegate,
 	};
 }
 
@@ -327,7 +343,6 @@ interface ExecutionCompactionState {
 	lastSuccessfulUsagePercent: number | null;
 	lastSuccessfulAt: string | null;
 	rearmPending: boolean;
-	/** Terminal failure metadata is retained for diagnostics, not proactive retry. */
 	terminalBackoffTokens: number | null;
 	pendingStats: VccCompactionStats | null;
 	pendingFollowUpPrompt: string | null;
@@ -387,63 +402,21 @@ export function handleExecutionTurnCompaction(ctx: ExtensionContext): void {
 	consumeExecutionCompactionResumeGuard(ctx);
 }
 
-export function computeExecutionProgress(execution: ExecState): { done: number; total: number } {
-	const implItems = execution.implItems ?? [];
-	if (implItems.length) {
-		const statuses = resolveImplStatuses(implItems, execution.items, execution.implStatus);
-		const counted = implItems.filter((impl) =>
-			execution.items.some((item) => extractCoverage(item.text).includes(impl.id)),
-		);
-		const total = counted.length > 0 ? counted.length : implItems.length;
-		const vcDone = counted.filter((impl) => statuses[impl.id] === "vc-passed").length;
-		const currentIndex = execution.currentI
-			? implItems.findIndex((impl) => impl.id === execution.currentI)
-			: -1;
-		return {
-			done: Math.min(total, Math.max(vcDone, currentIndex < 0 ? 0 : currentIndex)),
-			total,
-		};
-	}
-	return {
-		done: execution.items.filter((item) => item.done).length,
-		total: execution.items.length,
-	};
-}
-
-function formatElapsed(startedAt: string): string {
-	const total = Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000));
-	const h = String(Math.floor(total / 3600)).padStart(2, "0");
-	const m = String(Math.floor((total % 3600) / 60)).padStart(2, "0");
-	const sec = String(total % 60).padStart(2, "0");
-	return `${h}:${m}:${sec}`;
-}
-
 function formatToks(tokens: number): string {
 	const n = Math.max(0, Math.round(tokens));
 	return n < 1000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
 }
 
 export function formatExecutionStatusLine(execution: ExecState): string {
-	const progress = computeExecutionProgress(execution);
-	let line = `⌛ plans ${progress.done}/${progress.total}: spent ${formatElapsed(execution.startedAt)} · ${formatToks(execution.usage.inToks)} in-toks · ${formatToks(execution.usage.outToks)} out-toks`;
-	const goalWait = execution.goalWait;
-	if (goalWait?.paused) {
-		line += ` · ⏸ goal-wait paused (${goalWait.pausedReason ?? "paused"})`;
-	} else if (goalWait && (goalWait.noProgressRounds > 0 || goalWait.waitRounds > 0)) {
-		line += execChrome(execution.uiLanguage ?? "en").goalWait(goalWait.noProgressRounds, goalWait.waitRounds);
+	const progress = taskProgress(execution.tasks);
+	let line = `⌛ plans tasks ${progress.done}/${progress.total}: spent ${formatElapsed(execution.startedAt)} · ${formatToks(execution.usage.inToks)} in-toks · ${formatToks(execution.usage.outToks)} out-toks`;
+	if (execution.stall.paused) {
+		line += ` · ⏸ paused (${execution.stall.pausedReason ?? "stalled"})`;
 	}
 	return line;
 }
 
-/** Approximation for "a subprocess is pending" (matches the exec loop's
- *  `/waiting for/` backoff heuristic; F-008). Passed explicitly into the
- *  shared model so the panel, status line and injection text agree. */
-export function executionIsWaiting(execution: ExecState): boolean {
-	const gw = execution.goalWait;
-	return gw !== undefined && !gw.paused && gw.waitRounds > 0;
-}
-
-/** Resolve the run topic for panel headers (falls back to the run id). */
+/** Resolve the run topic for dashboard headers (falls back to the run id). */
 function panelTopic(ctx: ExtensionContext): string {
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (active) {
@@ -454,155 +427,77 @@ function panelTopic(ctx: ExtensionContext): string {
 	return "pi-plans";
 }
 
-/** Run info for the panel activity line (CQ1/D-005). Read by the in-flight
- *  executionRunId so a stale/missing run record degrades to null (the model
- *  then falls back to the bare phase word) instead of showing another run's
- *  status. */
-function panelRunInfo(ctx: ExtensionContext): { status: string; created_at: string; updated_at: string } | null {
-	if (!executionRunId) return null;
-	// D-005 pointer-consistency: if the workdir's active pointer has moved to
-	// another run (second session / external CLI mutation) while this
-	// execution is live, the activity row degrades to the phase word rather
-	// than mixing the new active run's topic (header) with the old run's
-	// status (impl-review r1 F-001).
-	if (resolveActiveRun(ctx.sessionManager, ctx.cwd)?.run_id !== executionRunId) return null;
-	const run = getRun(ctx.cwd, executionRunId);
-	if (!run) return null;
-	return { status: run.status, created_at: run.created_at, updated_at: run.updated_at };
+let dashboardRegistered = false;
+let dashboardExpanded = false;
+
+/** Toggle the dashboard's expanded tree view (Ctrl+Shift+T). */
+export function toggleDashboardExpanded(ctx: ExtensionContext): void {
+	dashboardExpanded = !dashboardExpanded;
+	dashboardRegistered = false; // force re-registration with the new mode
+	updateStatusWidget(ctx);
 }
 
-let panelRegistered = false;
-let loopPanelRegistered = false;
-
-/** Live implementation-review loop state for the panel: the widget stays
- * alive while the active run is done BUT its checkpoint is still in the
- * implementation-review phase (D-3). Read fresh on every call so post-write
- * redraws (index.ts turn-end updateStatusWidget) never show stale rounds
- * (D-8). Returns null once the phase flips to completed. */
-function implReviewLoopState(
-	ctx: ExtensionContext,
-): { topic: string; review: { terminationCondition?: string; reviewerCount?: number; completedRounds: number } } | null {
-	// v0.6.0: resolveActiveRun only returns NON-TERMINAL runs, but this state
-	// is by definition attached to a DONE run — fall back to the newest run of
-	// any status (display-only) when the active resolution is null.
-	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd) ?? (() => {
-		const latest = latestRun(ctx.cwd);
-		return latest === null ? null : { run_id: latest.run_id, artifact_dir: latest.artifact_dir };
-	})();
-	if (!active) return null;
-	if (getRun(ctx.cwd, active.run_id)?.status !== "done") return null;
-	const load = loadCheckpoint(ctx.cwd, active.run_id);
-	if (load.status !== "ok" || load.checkpoint.phase !== "implementation-review") return null;
-	return { topic: panelTopic(ctx), review: load.checkpoint.implementationReview };
+export function isDashboardExpanded(): boolean {
+	return dashboardExpanded;
 }
 
 /**
- * Register/update the fixed tasks' status panel (aboveEditor widget) for the
- * current execution, or unregister it when execution is gone. The panel and
- * the bottom status line share the same pure model (D-003/D-014/D-015). The
- * widget uses the factory form and reads the LIVE theme via `ui.theme` inside
- * render(width) — per-line width math happens on plain text first, then the
- * current theme is applied, so theme hot-swaps and resize never produce stale
- * colors or wrapped rows (F-004).
+ * Register/update the task dashboard (aboveEditor widget) for the current
+ * execution, or unregister it when execution is gone. The compact and the
+ * expanded tree view share one widget key so they never stack.
  */
 function updatePanelWidget(ctx: ExtensionContext): void {
-	// Capability guard: older Pi hosts and test harness mocks may not expose
-	// setWidget (the panel is a UI nicety, never a correctness dependency).
 	if (!ctx.hasUI || typeof ctx.ui.setWidget !== "function") return;
-	// Implementation-review loop widget (D-3): keeps the panel alive after
-	// execution ends while the loop is live; unregisters when the phase
-	// completes. Lives under the same widget key so the two widgets never
-	// stack.
-	const loop = execution === null ? implReviewLoopState(ctx) : null;
-	if (execution === null && loop) {
-		if (!loopPanelRegistered) {
-			ctx.ui.setWidget(
-				PANEL_WIDGET_KEY,
-				(ui, _theme) => ({
-					render(width: number) {
-						const theme = (ui as { theme?: { fg(color: string, text: string): string } }).theme ?? _theme;
-						// D-8 freshness: re-read the loop state per render; a phase flip to
-						// completed renders an empty box until the next turn-end refresh
-						// unregisters it (index.ts always calls updateStatusWidget then).
-						const live = implReviewLoopState(ctx);
-						if (!live) return [];
-						const model = deriveImplReviewLoopModel(live.topic, live.review);
-						const lines = renderImplReviewLoopLines(model, width);
-						return theme ? themeImplReviewLoopLines(lines, theme as never) : lines;
-					},
-				}),
-				{ placement: "aboveEditor" },
-			);
-			loopPanelRegistered = true;
-		}
-	} else if (loopPanelRegistered) {
-		ctx.ui.setWidget(PANEL_WIDGET_KEY, undefined);
-		loopPanelRegistered = false;
-	}
 	if (!execution) {
-		if (panelRegistered) {
-			ctx.ui.setWidget(PANEL_WIDGET_KEY, undefined);
-			panelRegistered = false;
+		if (dashboardRegistered) {
+			ctx.ui.setWidget(DASHBOARD_WIDGET_KEY, undefined);
+			dashboardRegistered = false;
 		}
 		return;
 	}
-	if (!panelRegistered) {
-		ctx.ui.setWidget(
-			PANEL_WIDGET_KEY,
-			(ui, _theme) => ({
-				render(width: number) {
-					const theme = (ui as { theme?: { fg(color: string, text: string): string } }).theme ?? _theme;
-					const current = execution;
-					if (!current) return [];
-					// F-004 (impl review r1): recompute the topic per render so a
-					// cross-run restart without an intervening unregister cannot
-					// show a stale box header.
-					const model = derivePanelModel(current, panelTopic(ctx), executionIsWaiting(current), panelRunInfo(ctx));
-					const lines = renderPanelLines(model, width);
-					// Uniform-gray frame: │ borders never inherit the line color;
-					// accents live between the borders only (themePanelLines).
-					return theme ? themePanelLines(lines, model, theme) : lines;
-				},
-			}),
-			{ placement: "aboveEditor" },
-		);
-		panelRegistered = true;
-	} else {
-		// Factory components are re-created on every registration; content
-		// updates flow through the closure reads at render time, so a no-op
-		// re-set is unnecessary. Trigger one re-render via a cheap status
-		// touch is NOT used — event-driven flush only (D-013).
-	}
+	if (dashboardRegistered) return;
+	ctx.ui.setWidget(
+		DASHBOARD_WIDGET_KEY,
+		(ui, _theme) => ({
+			render(width: number) {
+				const theme = (ui as { theme?: { fg(color: string, text: string): string } }).theme ?? _theme;
+				const current = execution;
+				if (!current) return [];
+				const model = deriveDashboardModel(panelTopic(ctx), current.tasks, current.items, {
+					paused: current.stall.paused,
+					pausedReason: current.stall.pausedReason,
+					auditRounds: current.audit.rounds > 0 || current.audit.running ? current.audit.rounds : null,
+					auditFailed: current.audit.failed,
+					startedAt: current.startedAt,
+					usage: current.usage,
+				});
+				const lines = dashboardExpanded
+					? renderDashboardTreeLines(model, width, theme)
+					: renderDashboardLines(model, width, theme);
+				return lines;
+			},
+		}),
+		{ placement: "aboveEditor" },
+	);
+	dashboardRegistered = true;
 }
 
 export function updateStatusWidget(ctx: ExtensionContext): void {
 	updatePanelWidget(ctx);
-	if (execution) {
-		// D-015: the status line derives from the same panel model.
-		const line = formatPanelSummaryLine(
-			derivePanelModel(execution, panelTopic(ctx), executionIsWaiting(execution), panelRunInfo(ctx)),
-		);
-		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
+	if (execution && typeof ctx.ui.setStatus === "function" && ctx.ui.theme) {
+		const model = deriveDashboardModel(panelTopic(ctx), execution.tasks, execution.items, {
+			paused: execution.stall.paused,
+			pausedReason: execution.stall.pausedReason,
+			auditRounds: execution.audit.rounds > 0 ? execution.audit.rounds : null,
+			auditFailed: execution.audit.failed,
+		});
+		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", formatDashboardSummaryLine(model)));
 		return;
 	}
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
-	if (active) {
-		// Idle indicator depends on the run's lifecycle, not just its existence:
-		// done reads as finished, abandoned as closed, stopped/accepted as paused.
-		// v0.6.0: resolveActiveRun only returns NON-TERMINAL runs; for the pure
-		// display line below, fall back to the newest run of any status so a
-		// finished workdir still shows its last run's outcome.
+	if (active && typeof ctx.ui.setStatus === "function" && ctx.ui.theme) {
 		const status = getRun(ctx.cwd, active.run_id)?.status ?? latestRun(ctx.cwd)?.status;
 		if (status === "done") {
-			// D-3/D-015: while the implementation-review loop is live (checkpoint
-			// still in the implementation-review phase), the status line mirrors
-			// the loop box model instead of a bare "(done)".
-			const loop = implReviewLoopState(ctx);
-			if (loop) {
-				const line = formatImplReviewLoopSummaryLine(deriveImplReviewLoopModel(loop.topic, loop.review));
-				ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
-				return;
-			}
 			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("success", `🎯 plans: ${active.run_id} (done)`));
 			return;
 		}
@@ -618,63 +513,63 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("warning", `⌛ plans: ${active.run_id}`));
 			return;
 		}
+		if (status === "executing") {
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", `⌛ plans: ${active.run_id} (executing)`));
+			return;
+		}
 		if (status === "planning") {
-			// Planning phase: 💬 while still in Q&A, 📝 once a PLAN draft exists
-			// — kept until execution starts (then ⌛ takes over).
-			const emoji = latestPlanVersion(active.artifact_dir) ? "📝" : "💬";
+			const emoji = parseLatestPlanExists(active.artifact_dir) ? "📝" : "💬";
 			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("muted", `${emoji} plans: ${active.run_id}`));
 			return;
 		}
-		// unknown status: no indicator.
 	}
-	// Terminal-only workdir: resolveActiveRun is null, but the display line
-	// still reports the newest run's outcome (done/abandoned, plus its live
-	// implementation-review loop).
-	const terminalLatest = latestRun(ctx.cwd);
-	if (terminalLatest && TERMINAL_RUN_STATUSES.has(terminalLatest.status)) {
-		if (terminalLatest.status === "done") {
-			const loop = implReviewLoopState(ctx);
-			if (loop) {
-				const line = formatImplReviewLoopSummaryLine(deriveImplReviewLoopModel(loop.topic, loop.review));
-				ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", line));
-				return;
+	if (typeof ctx.ui?.setStatus === "function" && ctx.ui.theme) {
+		const terminalLatest = latestRun(ctx.cwd);
+		if (terminalLatest && TERMINAL_RUN_STATUSES.has(terminalLatest.status)) {
+			if (terminalLatest.status === "done") {
+				ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("success", `🎯 plans: ${terminalLatest.run_id} (done)`));
+			} else {
+				ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("error", `🚫 plans: ${terminalLatest.run_id}`));
 			}
-			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("success", `🎯 plans: ${terminalLatest.run_id} (done)`));
-		} else {
-			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("error", `🚫 plans: ${terminalLatest.run_id}`));
+			return;
 		}
-		return;
+		ctx.ui.setStatus("pi-plans", undefined);
 	}
-	ctx.ui.setStatus("pi-plans", undefined);
 }
 
-function persist(pi: ExtensionAPI): void {
+function parseLatestPlanExists(artifactDir: string): boolean {
+	try {
+		const names = fs.readdirSync(artifactDir);
+		return names.some((name) => /^PLAN_v\d+\.(md|markdown)$/i.test(name));
+	} catch {
+		return false;
+	}
+}
+
+function persist(ctx: ExtensionContext): void {
 	if (!execution) return;
-	pi.appendEntry("pi-plans-exec", {
+	messaging().appendEntry("pi-plans-exec", {
 		planPath: execution.planPath,
 		items: execution.items,
+		planTasks: execution.planTasks,
+		tasks: execution.tasks,
+		legacyPlan: execution.legacyPlan,
 		startedAt: execution.startedAt,
 		usage: execution.usage,
-		implItems: execution.implItems,
-		implStatus: execution.implStatus,
-		implWarning: execution.implWarning ?? null,
-		currentI: execution.currentI,
-		goalWait: execution.goalWait,
-		delegate: execution.delegate ?? null,
+		stall: execution.stall,
+		audit: { rounds: execution.audit.rounds, failed: execution.audit.failed },
 	});
 }
 
 /** Checkpoint bookkeeping for the executing run; best-effort for legacy runs
- * without checkpoints (their cross-session resume degrades to R-008 rules). */
-function withExecutionCheckpoint(ctx: ExtensionContext, mutator: (cp: import("./workflow-state.ts").WorkflowCheckpoint) => import("./workflow-state.ts").WorkflowCheckpoint): void {
+ * without checkpoints. */
+function withExecutionCheckpoint(ctx: ExtensionContext, mutator: (cp: WorkflowCheckpoint) => WorkflowCheckpoint): void {
 	if (!execution) return;
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (!active || active.run_id !== executionRunId) return;
 	try {
 		mutateCheckpoint(ctx.cwd, active.run_id, mutator);
 	} catch (error) {
-		// F-005 (implementation review): ownership loss and revision staleness
-		// must stop the advance, not vanish into the catch block.
 		if (error instanceof OwnershipError || error instanceof StaleCheckpointError) throw error;
 		/* legacy run or corrupt checkpoint: session snapshot still carries the loop */
 	}
@@ -682,284 +577,100 @@ function withExecutionCheckpoint(ctx: ExtensionContext, mutator: (cp: import("./
 
 let executionRunId: string | null = null;
 
+export interface StartExecutionInput {
+	planPath: string;
+	planTasks: PlanTasks;
+	items: CheckItem[];
+}
+
 export async function startExecution(
-	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-	planPath: string,
-	items: CheckItem[],
-	implItems?: ImplItem[],
-	opts?: StartExecutionOptions,
+	input: StartExecutionInput,
 ): Promise<void> {
+	const tasks = buildTaskView(input.planTasks);
 	execution = {
-		planPath,
-		items,
+		planPath: input.planPath,
+		items: input.items,
+		planTasks: input.planTasks,
+		tasks,
+		legacyPlan: input.planTasks.legacy,
 		startedAt: utcNow(),
 		usage: { inToks: 0, outToks: 0 },
-		implItems: implItems ?? [],
-		implStatus: {},
 		uiLanguage: resolveUiLanguage(ctx.cwd),
-		// F-001 (impl review r1): derive the plan-lint warning on the live
-		// handoff path too, so the panel shows the ⚠ line immediately for a
-		// zero-parse section instead of only after a checkpoint restore.
-		implWarning: (() => {
-			try {
-				return lintImplItems(fs.readFileSync(planPath, "utf8"));
-			} catch {
-				return null;
-			}
-		})(),
-		goalWait: { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false },
+		stall: { rounds: 0, lastSnapshot: stallSnapshot(), paused: false },
+		audit: { rounds: 0, failed: [], running: false },
 	};
-	// Seed the marker baseline so the first quiet round is counted against a
-	// real snapshot instead of counting unconditionally (F-006).
-	if (execution.goalWait) execution.goalWait.lastMarkers = goalWaitSnapshot();
-	resetGoalWaitRuntime(ctx);
-	pendingExecutionFlush = false; // fresh run: no inherited flush debt
+	resetContinuationRuntime(ctx);
+	pendingExecutionFlush = false;
 	resetExecutionCompactionState(ctx);
-	persist(pi);
+	persist(ctx);
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	executionRunId = active?.run_id ?? null;
 	if (active) {
 		bindRun(ctx.sessionManager, ctx.cwd, active.run_id);
-		// I-005: durable approval evidence — run + plan digest + HEAD at
-		// approval (D-003/D-011). Sets phase executing via the state machine.
 		try {
 			const load = loadCheckpoint(ctx.cwd, active.run_id);
 			if (load.status === "missing") {
 				createCheckpoint(ctx.cwd, { runId: active.run_id, originWorkdir: ctx.cwd, workdir: ctx.cwd });
 			}
 			const approval: ExecutionApproval = {
-				plan: planIdentityOf(path.resolve(planPath), 1),
+				plan: planIdentityOf(path.resolve(input.planPath), 1),
 				worktree: resolveWorktreeRoot(ctx.cwd) ?? path.resolve(ctx.cwd),
 				headAtApproval: resolveHeadAt(ctx.cwd),
 				approvedAt: utcNow(),
 			};
 			mutateCheckpoint(ctx.cwd, active.run_id, (cp) => {
-				// Plan refinement may not have recorded the plan identity yet.
 				const withPlan = cp.plan === null ? { ...cp, plan: approval.plan } : cp;
-				// The checkpoint may not carry accept-execute (legacy flow);
-				// approval here came from the explicit handoff confirmation.
 				const aligned = withPlan.nextAction === "accept-execute"
 					? withPlan
 					: { ...withPlan, nextAction: "accept-execute" as const };
 				return applyExecutionApproved(aligned, approval);
 			});
-			// Plan-lint entry point (execute handoff): a plan whose Implementation
-			// Items section parses to zero items gets a durable run notice so the
-			// execution panel's warning is backed by persisted evidence.
-			lintPlanIntoNotices(ctx.cwd, active.run_id, path.resolve(planPath));
+			lintPlanIntoNotices(ctx.cwd, active.run_id, path.resolve(input.planPath));
 		} catch (error) {
-			// F-002 (implementation review): a plan-digest mismatch between the
-			// recorded checkpoint plan and the approval must fail closed and
-			// visibly — never silently execute without durable approval.
 			if (error instanceof StateError && /does not match/.test(error.message)) throw error;
 			/* legacy/corrupt checkpoint: run status still transitions below */
 		}
 		try {
 			setRunStatus(ctx.cwd, active.run_id, "executing");
 		} catch {
-			/* status bookkeeping is best-effort */
-		}
-	}
-	pi.sendMessage(
-		{
-			customType: "pi-plans-exec-start",
-			content: `**pi-plans: executing** \`${planPath}\` — ${items.length} verifier item(s). Progress appears in the bottom status bar; mark verified items with \`[DONE:VC-xxx]\`.`,
-			display: true,
-		},
-		{ triggerTurn: false },
-	);
-	// Delegated runtime (v0.6.0): one executor child implements the whole plan
-	// while this tool call blocks; the parent mirrors VC progress from the
-	// child's streamed assistant messages (R-9..R-12).
-	updateStatusWidget(ctx);
-	if (opts?.runtime && opts.runtime !== "current-session") {
-		await runDelegatedExecution(pi, ctx, opts.runtime.modelSelector, opts.signal);
-	}
-}
-
-/** Where a chosen execution runs: this session, or a delegated executor child. */
-export type ExecutionRuntime = "current-session" | { modelSelector: string };
-
-export interface StartExecutionOptions {
-	/** "current-session" (default) or a delegated executor model selector. */
-	runtime?: ExecutionRuntime;
-	/** Tool-call abort signal, threaded into the delegated child. */
-	signal?: AbortSignal;
-}
-
-/** Default delegated executor timeout when config omits executor_timeout_minutes. */
-const DELEGATE_DEFAULT_TIMEOUT_MINUTES = 60;
-void DELEGATE_DEFAULT_TIMEOUT_MINUTES;
-
-/** Live AbortController for the delegated executor child (runtime-only state). */
-let delegatedRuntime: AbortController | null = null;
-
-/** Abort the delegated executor child, if one is running (used by /plans-stop). */
-export function abortDelegatedExecutor(): boolean {
-	if (delegatedRuntime === null) return false;
-	delegatedRuntime.abort();
-	return true;
-}
-
-function executorAgentPrompt(): string {
-	try {
-		const agentPath = new URL("../agents/executor.md", import.meta.url);
-		return fs.readFileSync(agentPath, "utf8");
-	} catch {
-		return "You are a delegated plan executor in the pi-plans workflow. Implement the accepted plan autonomously and emit [DONE:VC-xxx] markers in your replies as verifier items pass.";
-	}
-}
-
-function delegatedExecutorTimeoutMs(): number | undefined {
-	try {
-		const stateRoot = resolveStateRootOrNull(process.cwd());
-		if (stateRoot === null) return undefined;
-		const minutes = loadConfig(stateRoot).executor_timeout_minutes;
-		if (typeof minutes !== "number" || minutes <= 0) return undefined;
-		return minutes * 60 * 1000;
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Delegated execution (R-9..R-12): spawn ONE executor child for the whole
- * plan (write-capable tools, chosen model, PI_PLANS_EXECUTOR=1 + pinned run
- * id), stream its progress into the overlay, parse full-text assistant
- * messages for [DONE:VC-xxx]/[I-xxx] markers, and on exit verify the
- * remaining items. Abort/timeout → stopExecution (stopped, resumable);
- * clean exit with items left → stay executing (resumable under either
- * runtime); clean exit complete → normal completion flow.
- */
-async function runDelegatedExecution(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	modelSelector: string,
-	parentSignal: AbortSignal | undefined,
-): Promise<void> {
-	if (!execution) return;
-	const controller = new AbortController();
-	delegatedRuntime = controller;
-	const relayAbort = () => controller.abort();
-	if (parentSignal?.aborted) controller.abort();
-	else parentSignal?.addEventListener("abort", relayAbort, { once: true });
-	const lang = resolveUiLanguage(ctx.cwd);
-	const overlay = ctx.mode === "tui" ? new RefineOverlayController("executor", [{ id: "executor" }], relayAbort, lang) : undefined;
-	if (overlay) {
-		try {
-			overlay.open(refineOverlayContext(ctx), modelSelector);
-		} catch {
-			/* overlay is best-effort; the blocking call itself must not fail */
-		}
-	}
-	execution.delegate = { modelSelector, startedAt: utcNow() };
-	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { delegate: execution?.delegate ?? null }));
-	persist(pi);
-	const runId = executionRunId;
-	const remainingAtStart = execution.items.filter((item) => !item.done).map((item) => item.id);
-	const task = [
-		`Implement the accepted plan at ${execution.planPath} (workdir: ${ctx.cwd}).`,
-		"Read the plan file first; it is the source of truth for scope, sequencing, and verification steps.",
-		remainingAtStart.length > 0
-			? `Verifier items still open: ${remainingAtStart.join(", ")}. Emit [DONE:VC-xxx] markers in your replies as each item's stated evidence passes.`
-			: "All verifier items already passed; verify the plan end-to-end and report.",
-		execution.implItems?.length
-			? `Implementation items: ${execution.implItems.map((item) => item.id).join(", ")} — emit [I-###:implemented]/[I-###:validating] markers as you progress.`
-			: "",
-		"Finish with the structured summary your system prompt specifies.",
-	]
-		.filter((line) => line !== "")
-		.join("\n");
-	let result: Awaited<ReturnType<typeof runPiSubagent>>;
-	try {
-		result = await runPiSubagent({
-			systemPrompt: executorAgentPrompt(),
-			task,
-			cwd: ctx.cwd,
-			model: modelSelector,
-			tools: ["read", "write", "edit", "bash", "grep", "find", "ls"],
-			envMarker: "executor",
-			runId: runId ?? undefined,
-			signal: controller.signal,
-			timeoutMs: delegatedExecutorTimeoutMs(),
-			onProgress: (event: SubagentProgressEvent) => {
-				try {
-					overlay?.update("executor", event);
-			} catch {
-				/* display must not fail the child runner */
-			}
-			if (
-					event.type === "transcript"
-					&& event.phase === "end"
-					&& event.entryType === "assistant-text"
-					&& typeof event.text === "string"
-			) {
-					mirrorDelegateMarkers(pi, ctx, event.text);
-			}
-			},
-		});
-	} finally {
-		delegatedRuntime = null;
-		try {
-			await overlay?.close();
-		} catch {
 			/* best-effort */
 		}
-		parentSignal?.removeEventListener("abort", relayAbort);
 	}
-	if (!result.ok) {
-		const reason = result.timedOut
-			? `delegated executor timed out (${result.errorMessage ?? "no output"})`
-			: result.cancelled || controller.signal.aborted
-				? "delegated executor aborted by user"
-				: `delegated executor failed: ${result.errorMessage ?? "unknown error"}${result.stderr ? `; stderr: ${result.stderr.slice(0, 500)}` : ""}`;
-		await stopExecution(pi, ctx, reason);
-		return;
-	}
-	// Clean exit: land any markers from the final output text, then verify.
-	mirrorDelegateMarkers(pi, ctx, result.output);
-	if (isExecutionComplete()) {
-		await completeExecution(pi, ctx);
-		return;
-	}
-	// Items remain: keep the run executing (resumable via /plans-execute under
-	// either runtime); the delegate bookkeeping is cleared so restarts do not
-	// treat this as an orphaned child.
-	if (execution) {
-		execution.delegate = undefined;
-		withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { delegate: null }));
-		persist(pi);
-	}
-	const remaining = execution?.items.filter((item) => !item.done).map((item) => item.id) ?? [];
-	pi.sendMessage(
+	const progress = taskProgress(tasks);
+	messaging().sendMessage(
 		{
-			customType: "pi-plans-exec-delegate-exit",
-			content: `**pi-plans: delegated executor exited with items remaining** — ${remaining.join(", ") || "(none)"}. Run stays executing; resume with /plans-execute (either runtime). Executor summary:\n${result.output.slice(0, 2000)}`,
+			customType: "pi-plans-exec-start",
+			content: `**pi-plans: executing** \`${input.planPath}\` — ${progress.total} task(s) in ${input.planTasks.legacy ? "legacy" : "task-tree"} mode, ${input.items.length} verification check(s). Report progress with the \`plans_update_task\` tool; the dashboard tracks every task (Ctrl+Shift+T expands the tree).`,
 			display: true,
 		},
 		{ triggerTurn: false },
 	);
-	ctx.ui.notify?.(`Delegated executor exited; ${remaining.length} verifier item(s) remain. Resume with /plans-execute.`, "warning");
 	updateStatusWidget(ctx);
 }
 
-/** Apply VC/I markers parsed from a delegated child's full-text message. Exported for tests. */
-export function mirrorDelegateMarkers(pi: ExtensionAPI, ctx: ExtensionContext, text: string): void {
-	const changedVc = applyDoneMarkers(text);
-	const changedImpl = applyImplMarkers(text);
-	applyCurrentIMarker(text);
-	if (changedVc.length === 0 && changedImpl.length === 0) return;
-	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp));
-	persist(pi);
-	updateStatusWidget(ctx);
+/** Persist the live task progress (called by the task status tool). */
+export function persistTaskProgress(ctx: ExtensionContext): void {
+	if (!execution) return;
+	// Any task-state change resets the stall watchdog baseline.
+	execution.stall.rounds = 0;
+	execution.stall.lastSnapshot = stallSnapshot();
+	withExecutionCheckpoint(ctx, (cp) =>
+		applyExecutionProgress(cp, {
+			tasks: taskProgressMap(execution!.tasks),
+			doneVcIds: execution!.items.filter((item) => item.done).map((item) => item.id),
+			audit: {
+				rounds: execution!.audit.rounds,
+				lastResult: execution!.audit.failed.length > 0 ? execution!.audit.failed.join(",") : undefined,
+			},
+		}),
+	);
+	persist(ctx);
 }
 
-/** Record one assistant turn: accumulate usage and mark any completed items. */
+/** Record one assistant turn: accumulate usage only (markers are gone). */
 export function recordExecutionTurn(
-	pi: ExtensionAPI,
-	_ctx: ExtensionContext,
-	_completedIds: string[],
+	ctx: ExtensionContext,
 	usage?: { input: number; output: number },
 ): void {
 	if (!execution) return;
@@ -967,100 +678,188 @@ export function recordExecutionTurn(
 		execution.usage.inToks += usage.input;
 		execution.usage.outToks += usage.output;
 	}
-	// I-005: mirror progress into the run checkpoint so a different session
-	// can resume with the verified VC/I set (R-004).
-	withExecutionCheckpoint(_ctx, (cp) =>
+	withExecutionCheckpoint(ctx, (cp) =>
 		applyExecutionProgress(cp, {
-			doneVcIds: execution!.items.filter((item) => item.done).map((item) => item.id),
-			implStatus: implStatusSnapshot(),
-			currentI: execution!.currentI,
 			usage: usage ? { inToks: usage.input, outToks: usage.output } : undefined,
 		}),
 	);
-	requestExecutionFlush(pi, _ctx);
-	updateStatusWidget(_ctx);
+	requestExecutionFlush();
+	updateStatusWidget(ctx);
 }
 
-function implStatusSnapshot(): Record<string, string> {
-	const snapshot: Record<string, string> = {};
-	if (!execution?.implItems) return snapshot;
-	for (const item of execution.implItems) {
-		const state = execution.implStatus?.[item.id];
-		if (state) snapshot[item.id] = state;
-	}
-	return snapshot;
+/** Test hook: replace the audit subagent with a deterministic function. */
+let auditRunnerForTests: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null = null;
+
+export function __setAuditRunnerForTests(
+	runner: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null,
+): void {
+	auditRunnerForTests = runner;
 }
 
 export function registerExecutionTurnHandlers(
-	pi: ExtensionAPI,
+	ext: ExtensionAPI,
 	onTurnEnd?: (ctx: ExtensionContext) => Promise<void> | void,
 ): void {
-	// The turn_end projection does not carry usage; message_end delivers the
-	// full assistant message, so cache it here and consume it per turn.
 	let lastAssistantUsage: { input: number; output: number } | null = null;
-	pi.on("agent_start", async (_event, ctx) => {
-		const runtime = currentGoalWaitRuntime(ctx);
+	ext.on("agent_start", async (_event, ctx) => {
+		const runtime = currentContinuationRuntime(ctx);
 		if (!runtime) return;
 		runtime.handled = false;
 		runtime.stopReason = undefined;
-		runtime.text = "";
 	});
-	pi.on("before_agent_start", async (_event, ctx) => {
-		const runtime = currentGoalWaitRuntime(ctx);
+	ext.on("before_agent_start", async (_event, ctx) => {
+		const runtime = currentContinuationRuntime(ctx);
 		if (runtime) runtime.wakeId = undefined;
 	});
-	pi.on("input", async (event, ctx) => {
-		if (event.source === "interactive" || event.source === "rpc") resumeGoalWaitIfPaused(pi, ctx);
+	ext.on("input", async (event, ctx) => {
+		if (event.source === "interactive" || event.source === "rpc") resumeGoalWaitIfPaused(ctx);
 	});
-	pi.on("agent_settled", async (_event, ctx) => {
-		drainExecutionFlush(pi, ctx);
-		maybeGoalWaitFollowUp(pi, ctx);
+	ext.on("agent_settled", async (_event, ctx) => {
+		drainExecutionFlush(ctx);
+		maybeContinuationFollowUp(ctx);
 	});
-	pi.on("session_shutdown", async (_event, ctx) => {
-		drainExecutionFlush(pi, ctx);
+	ext.on("session_shutdown", async (_event, ctx) => {
+		drainExecutionFlush(ctx);
 		execution = null;
 		executionRunId = null;
-		goalWaitRuntime = null;
+		continuationRuntime = null;
 		lastAssistantUsage = null;
 	});
-	pi.on("message_end", async (event) => {
+	ext.on("message_end", async (event) => {
 		const message = event.message as { role?: string; usage?: { input?: number; output?: number } };
 		if (message?.role === "assistant" && message.usage) {
 			lastAssistantUsage = { input: message.usage.input ?? 0, output: message.usage.output ?? 0 };
 		}
 	});
 
-	pi.on("turn_end", async (event, ctx) => {
-		const message = event.message as { role?: string; stopReason?: string; content?: Array<{ type: string; text?: string }> };
+	ext.on("turn_end", async (event, ctx) => {
+		const message = event.message as { role?: string; stopReason?: string };
 		if (!message || message.role !== "assistant") {
 			updateStatusWidget(ctx);
 			return;
 		}
-		const text = (message.content ?? [])
-			.filter((part) => part.type === "text")
-			.map((part) => part.text ?? "")
-			.join("\n");
-		const runtime = currentGoalWaitRuntime(ctx);
-		if (runtime) {
-			runtime.stopReason = message.stopReason;
-			runtime.text = text;
-		}
-		const changedIds = applyDoneMarkers(text);
-		const changedImpls = applyImplMarkers(text);
-		const changedCurrentI = applyCurrentIMarker(text);
+		const runtime = currentContinuationRuntime(ctx);
+		if (runtime) runtime.stopReason = message.stopReason;
 		const projection = (event.message as { usage?: { input?: number; output?: number } }).usage;
 		const raw = projection ?? lastAssistantUsage;
-		lastAssistantUsage = null; // consumed: never re-attribute a stale turn
+		lastAssistantUsage = null;
 		const usage = raw ? { input: raw.input ?? 0, output: raw.output ?? 0 } : undefined;
-		if (usage || changedIds.length > 0 || changedImpls.length > 0 || changedCurrentI) {
-			// Attribute this turn's usage now; `[DONE]` markers still only mark completion.
-			recordExecutionTurn(pi, ctx, changedIds, usage);
-		}
-		if (getExecution() && isExecutionComplete()) {
-			await completeExecution(pi, ctx);
+		if (usage) recordExecutionTurn(ctx, usage);
+		if (getExecution() && allTasksTerminal(execution!.tasks) && !execution!.audit.running) {
+			await runAuditFlow(ctx);
 		}
 		await onTurnEnd?.(ctx);
 	});
+}
+
+/** Audit flow: run the completion auditor, apply pass/rollback, and either
+ *  complete the run, keep iterating (rollback), pause at the round cap
+ *  (interactive), or stop at the cap (auto-approve/headless — D-022).
+ *
+ *  Fail-closed completion: a run completes only when EVERY pending check was
+ *  affirmatively passed (or resolved skipped-pass); checks the auditor failed
+ *  to report count as failed, never as silently passed. */
+async function runAuditFlow(ctx: ExtensionContext): Promise<void> {
+	if (!execution) return;
+	const ex = execution;
+	// Skipped-pass checks resolve without a subagent round.
+	for (const id of presolvedCheckIds(ex.items, ex.tasks)) {
+		const item = ex.items.find((candidate) => candidate.id === id);
+		if (item) item.done = true;
+	}
+	// Only auditable checks (with task coverage) gate completion; checks that
+	// cover no task can never be verified and never block or complete.
+	const pendingChecks = auditableChecks(ex.items, ex.tasks).filter((item) => !item.done);
+	if (pendingChecks.length === 0) {
+		await completeExecution(ctx);
+		return;
+	}
+	if (ex.audit.rounds >= AUDIT_MAX_ROUNDS) {
+		// D-022: interactive sessions pause for the user (state kept, tasks
+		// intact, resumable); auto-approve/headless terminates bounded.
+		if (isInteractiveSession(ctx)) {
+			pauseForStall(
+				ctx,
+				`${AUDIT_CAP_PAUSE_PREFIX} ${AUDIT_MAX_ROUNDS} rounds (failed: ${ex.audit.failed.join(", ") || "unknown"}); review the audit reports and fix the failures, then resume with any message or /plans-execute — resuming grants a fresh three-round audit budget (or close the failed checks' tasks as skipped to pass them as skipped-pass)`,
+			);
+			return;
+		}
+		await stopExecution(ctx, `completion audit exhausted ${AUDIT_MAX_ROUNDS} rounds (failed: ${ex.audit.failed.join(", ") || "unknown"})`);
+		return;
+	}
+	ex.audit.running = true;
+	ex.audit.rounds += 1;
+	updateStatusWidget(ctx);
+	let outcome = null as Awaited<ReturnType<typeof runCompletionAudit>>;
+	try {
+		outcome = auditRunnerForTests
+			? await auditRunnerForTests({ planPath: ex.planPath, checklist: ex.items, tasks: ex.tasks, round: ex.audit.rounds })
+			: await runCompletionAudit(ctx, {
+				planPath: ex.planPath,
+				checklist: ex.items,
+				tasks: ex.tasks,
+				round: ex.audit.rounds,
+				signal: ctx.signal,
+			});
+	} finally {
+		ex.audit.running = false;
+	}
+	// Fail-closed: checks the outcome did not affirmatively pass are failed.
+	const reportedPass = new Set(outcome?.passed ?? []);
+	const failed = pendingChecks
+		.map((item) => item.id)
+		.filter((id) => !reportedPass.has(id));
+	if (failed.length === 0) {
+		ex.audit.failed = [];
+		withExecutionCheckpoint(ctx, (cp) =>
+			applyExecutionProgress(cp, {
+				tasks: taskProgressMap(ex.tasks),
+				doneVcIds: ex.items.filter((item) => item.done).map((item) => item.id),
+				audit: { rounds: ex.audit.rounds, passed: true },
+			}),
+		);
+		await completeExecution(ctx);
+		return;
+	}
+	// Failed checks: roll their covered tasks back (always — an unreported or
+	// infra-failed audit must reopen work so the loop can continue) and
+	// persist progress including checks that passed earlier rounds.
+	for (const id of failed) {
+		const item = ex.items.find((candidate) => candidate.id === id);
+		if (item) item.done = false;
+	}
+	ex.audit.failed = failed;
+	const rolledBack: string[] = [];
+	for (const id of failed) {
+		rolledBack.push(...auditRollbackSet(ex.tasks, ex.items, id));
+	}
+	withExecutionCheckpoint(ctx, (cp) =>
+		applyExecutionProgress(cp, {
+			tasks: taskProgressMap(ex.tasks),
+			doneVcIds: ex.items.filter((item) => item.done).map((item) => item.id),
+			audit: { rounds: ex.audit.rounds, lastResult: failed.join(",") },
+		}),
+	);
+	ex.stall.rounds = 0;
+	ex.stall.lastSnapshot = stallSnapshot();
+	persist(ctx);
+	updateStatusWidget(ctx);
+	const report = outcome?.report ?? "(audit subagent failed to run)";
+	messaging().sendMessage(
+		{
+			customType: "pi-plans-audit-failed",
+			content: `**pi-plans: completion audit round ${ex.audit.rounds} failed** — checks: ${failed.join(", ")}. Rolled back tasks: ${rolledBack.join(", ") || "(none covered)"}. Fix the failures and re-close the rolled-back tasks with \`plans_update_task\`; the audit reruns automatically once all tasks are terminal again.${ex.audit.rounds >= AUDIT_MAX_ROUNDS ? ` This was round ${AUDIT_MAX_ROUNDS} of ${AUDIT_MAX_ROUNDS}: interactive sessions pause for review; the next terminal-task cycle stops or pauses the run.` : ""}\n\n---\n${report.slice(0, 4000)}`,
+			display: true,
+		},
+		{ triggerTurn: false },
+	);
+}
+
+/** True when the session can surface a pause to a human (D-022): interactive
+ *  TUI/RPC sessions that are not running under PI_PLANS_AUTO_APPROVE. */
+function isInteractiveSession(ctx: ExtensionContext): boolean {
+	if ((ctx.mode !== "tui" && ctx.mode !== "rpc") || ctx.hasUI !== true) return false;
+	return !isAutoApproveEnabledLocal();
 }
 
 const EXECUTION_RESUME_CUSTOM_TYPE = "pi-plans-exec-resume";
@@ -1079,12 +878,13 @@ function activeVccSettings(ctx: ExtensionContext, phase: PiPlansCompactionPhase)
 }
 
 function executionVccContext(): PiPlansVccPhaseContext {
+	const current = execution ? currentTask(execution.tasks) : null;
 	return {
 		phase: "execution",
 		planPath: execution?.planPath ?? null,
-		currentI: execution?.currentI ?? null,
+		currentI: current?.id ?? null,
 		remainingVerifierIds: execution?.items.filter((item) => !item.done).map((item) => item.id) ?? [],
-		implementationIds: execution?.implItems?.map((item) => item.id) ?? [],
+		implementationIds: execution ? flattenTaskViews(execution.tasks).map((task) => task.id) : [],
 	};
 }
 
@@ -1128,7 +928,6 @@ export function buildExecutionCompactionResult(event: SessionBeforeCompactEvent,
 }
 
 export function handleExecutionBeforeCompact(
-	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	event: SessionBeforeCompactEvent,
 ): SessionBeforeCompactResult | undefined {
@@ -1159,7 +958,7 @@ export function handleExecutionBeforeCompact(
 	state.pendingStats = built.stats;
 	state.pendingFollowUpPrompt = built.followUpPrompt;
 	state.pendingContinueAfterThresholdCompact = built.settings.continueAfterThresholdCompact;
-	requestExecutionFlush(pi, ctx);
+	requestExecutionFlush();
 	return { compaction: built.compaction };
 }
 
@@ -1167,7 +966,7 @@ function runtimePiVersion(ctx: ExtensionContext): unknown {
 	return (ctx as ExtensionContext & { piVersion?: unknown }).piVersion ?? VERSION;
 }
 
-export async function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactEvent): Promise<void> {
+export async function handleExecutionCompact(ctx: ExtensionContext, event: SessionCompactEvent): Promise<void> {
 	if (!execution) return;
 	const state = ensureExecutionCompactionState(ctx);
 	const stats = state.pendingStats;
@@ -1187,10 +986,10 @@ export async function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionCon
 	if (!event.willRetry && stats) {
 		ctx.ui.notify(formatVccCompactionStats(stats), "info");
 		if (followUpPrompt) {
-			await pi.sendUserMessage?.(followUpPrompt);
+			await messaging().sendUserMessage(followUpPrompt);
 		} else if ((event.reason === "threshold" || event.reason === "overflow") && shouldScheduleAutoContinue(continueAfterThresholdCompact, runtimePiVersion(ctx))) {
 			state.resumeGuard = true;
-			pi.sendMessage(
+			messaging().sendMessage(
 				{
 					customType: EXECUTION_RESUME_CUSTOM_TYPE,
 					content: EXECUTION_COMPACTION_RESUME_MESSAGE,
@@ -1200,18 +999,15 @@ export async function handleExecutionCompact(pi: ExtensionAPI, ctx: ExtensionCon
 			);
 		}
 	}
-	requestExecutionFlush(pi, ctx);
+	requestExecutionFlush();
 	updateStatusWidget(ctx);
 }
 
-
-export function handleExecutionCompactFailed(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactFailedEvent): void {
+export function handleExecutionCompactFailed(ctx: ExtensionContext, event: SessionCompactFailedEvent): void {
 	if (!execution) return;
 	const state = executionCompactionState(ctx);
 	const terminal = isTerminalCompactionFailure(event);
 	if (terminal) {
-		// Pi refused or aborted the compaction. Hold the cooldown and re-arm
-		// only after real growth or high-watermark pressure so the loop stops.
 		if (state) {
 			state.inFlight = false;
 			state.resumeGuard = false;
@@ -1228,7 +1024,7 @@ export function handleExecutionCompactFailed(pi: ExtensionAPI, ctx: ExtensionCon
 			? "pi-plans: compaction found nothing to summarize; backing off until the session grows past the keep-recent window."
 			: "pi-plans: compaction was aborted (provider interruption, user cancel, or a competing manual compact); backing off until the session grows or usage nears the window.";
 		ctx.ui.notify(message, "info");
-		requestExecutionFlush(pi, ctx);
+		requestExecutionFlush();
 		return;
 	}
 	if (state) {
@@ -1245,7 +1041,7 @@ export function handleExecutionCompactFailed(pi: ExtensionAPI, ctx: ExtensionCon
 		`pi-plans: compaction failed (${event.reason}); execution remains active and will wait for the next eligible turn.`,
 		"warning",
 	);
-	requestExecutionFlush(pi, ctx);
+	requestExecutionFlush();
 }
 
 export function filterExecutionResumeMessages<T extends { customType?: string }>(messages: T[]): T[] {
@@ -1255,23 +1051,11 @@ export function filterExecutionResumeMessages<T extends { customType?: string }>
 // ---------------------------------------------------------------------------
 // Planning-phase compaction: Pi core owns scheduling; this hook customizes
 // active planning compact events with the same VCC builder used by execution.
-// The two state machines are kept independent (different memory slot and
-// snapshot key) so execution never bleeds into planning.
 // ---------------------------------------------------------------------------
 
 export const PLANNING_RUN_START_CUSTOM_TYPE = "pi-plans-run-start";
 export const PLANNING_PLAN_WRITTEN_CUSTOM_TYPE = "pi-plans-plan-written";
 const PLANNING_RESUME_CUSTOM_TYPE = "pi-plans-plan-resume";
-
-// ---------------------------------------------------------------------------
-// Pre-plan compaction: right after `plans start-run` creates a new planning
-// run, the extension triggers one VCC compaction so the new plan starts on a
-// lean context (LLM reasoning degrades with longer context; see PLAN
-// preplan-compact). The pending flag is session-scoped and opportunistic: it
-// is set by the start-run tool case and consumed by the plans tool_result
-// hook in index.ts, which requests the extension-context compact action and
-// resumes planning exactly once regardless of success or failure.
-// ---------------------------------------------------------------------------
 
 export { PLANNING_PREPLAN_COMPACT_HINT };
 export const PLANNING_PREPLAN_RESUME_CUSTOM_TYPE = "pi-plans-preplan-resume";
@@ -1292,11 +1076,8 @@ export function consumePrePlanCompactPending(ctx: ExtensionContext): PrePlanComp
 	return pending;
 }
 
-/** Hidden resume message after the pre-plan compaction settles (success or
- *  failure): Pi's manual compaction never continues the aborted turn, so the
- *  planning workflow is continued exactly once from here. */
-export function sendPrePlanCompactResume(pi: ExtensionAPI): void {
-	pi.sendMessage?.(
+export function sendPrePlanCompactResume(ctx: ExtensionContext): void {
+	messaging().sendMessage(
 		{
 			customType: PLANNING_PREPLAN_RESUME_CUSTOM_TYPE,
 			content: "Continue planning.",
@@ -1313,7 +1094,6 @@ interface PlanningCompactionState {
 	lastAttemptReason: "manual" | "threshold" | "overflow" | null;
 	lastSuccessfulUsagePercent: number | null;
 	lastSuccessfulAt: string | null;
-	/** Terminal "nothing to compact" backoff: tokens observed when Pi refused. */
 	terminalBackoffTokens: number | null;
 	pendingStats: VccCompactionStats | null;
 	pendingFollowUpPrompt: string | null;
@@ -1341,8 +1121,6 @@ function isTerminalCompactionFailure(event: { errorMessage?: string; aborted?: b
 	if (message.includes("nothing to compact") || message.includes("already compacted") || message.includes("session too small")) {
 		return { kind: "content" };
 	}
-	// abort/stream class: explicit event names only, so that provider blips
-	// (network down, etc.) stay retryable.
 	const abortPatterns = [
 		"this operation was aborted",
 		"aborted",
@@ -1354,20 +1132,12 @@ function isTerminalCompactionFailure(event: { errorMessage?: string; aborted?: b
 	if (abortPatterns.some((pattern) => message.includes(pattern))) {
 		return { kind: "abort-stream" };
 	}
-	// Aborted with no recognized message: still an abort-class terminal so the
-	// next eligible turn does not immediately retry the same operation.
 	if (event.aborted === true) {
 		return { kind: "abort-stream" };
 	}
 	return null;
 }
 
-/** Session-scoped phase-local "compaction in flight" guard.
- *  - Set on `session_before_compact` for the phase attributed by the custom
- *    instructions hint; auto-compaction (no hint) marks both phases defensively.
- *  - Cleared on `session_compact` and `session_compact_failed`.
- *  - Retained so lifecycle events expose the same phase-local state to tests
- *    and future Pi core schema additions. */
 type CompactionPhase = "planning" | "execution";
 
 function compactionLifecycleStore(ctx: ExtensionContext): {
@@ -1396,18 +1166,11 @@ export function noteCompactionStarted(ctx: ExtensionContext, customInstructions:
 	} else if (isExecutionCustomInstructions(customInstructions)) {
 		store.execution = true;
 	} else {
-		// Auto-compaction (threshold/overflow/manual without our hint) marks both.
 		store.planning = true;
 		store.execution = true;
 	}
 }
 
-/** Pi core's `SessionCompactEvent` / `SessionCompactFailedEvent` do not carry
- *  `customInstructions` in any emission site, so the END side has no way to
- *  know which phase the compaction belonged to. Clearing both phases is the
- *  safe default — the per-phase start side (above) already encodes the hint
- *  attribution. The hint parameter is retained for API symmetry and future
- *  Pi core schema additions. */
 export function noteCompactionEnded(ctx: ExtensionContext, _customInstructions: unknown): void {
 	const store = compactionLifecycleStore(ctx);
 	store.planning = false;
@@ -1431,15 +1194,11 @@ export function consumePlanningCompactionResumeGuard(ctx: ExtensionContext): boo
 }
 
 export function refreshPlanningCompactionCooldown(_ctx: ExtensionContext): void {
-	// Pi core owns scheduling; retained for lifecycle compatibility only.
+	// Retained for lifecycle compatibility only.
 }
 
 export function requestPlanningCompaction(_ctx: ExtensionContext): void {
-	// Generic proactive pi-plans compaction is intentionally disabled. Manual,
-	// threshold, and overflow compactions are handled by session_before_compact.
-	// The single exception is the pre-plan compaction: index.ts requests the
-	// extension-context compact action from the plans tool_result hook right
-	// after start-run (see PLANNING_PREPLAN_COMPACT_HINT).
+	// Manual, threshold, and overflow compactions are handled by session_before_compact.
 }
 
 function buildPlanningVccResult(event: SessionBeforeCompactEvent, ctx: ExtensionContext): VccCompactionBuildResult | null {
@@ -1464,7 +1223,6 @@ export function buildPlanningCompactionResult(event: SessionBeforeCompactEvent, 
 }
 
 export function handlePlanningBeforeCompact(
-	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	event: SessionBeforeCompactEvent,
 ): SessionBeforeCompactResult | undefined {
@@ -1498,7 +1256,7 @@ export function handlePlanningBeforeCompact(
 	return { compaction: built.compaction };
 }
 
-export async function handlePlanningCompact(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactEvent): Promise<void> {
+export async function handlePlanningCompact(ctx: ExtensionContext, event: SessionCompactEvent): Promise<void> {
 	if (getExecution()) return;
 	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
 	const state = session.__planningCompaction;
@@ -1519,10 +1277,10 @@ export async function handlePlanningCompact(pi: ExtensionAPI, ctx: ExtensionCont
 	if (!event.willRetry && stats) {
 		ctx.ui.notify(formatVccCompactionStats(stats), "info");
 		if (followUpPrompt) {
-			await pi.sendUserMessage?.(followUpPrompt);
+			await messaging().sendUserMessage(followUpPrompt);
 		} else if ((event.reason === "threshold" || event.reason === "overflow") && shouldScheduleAutoContinue(continueAfterThresholdCompact, runtimePiVersion(ctx))) {
 			state.resumeGuard = true;
-			pi.sendMessage(
+			messaging().sendMessage(
 				{
 					customType: PLANNING_RESUME_CUSTOM_TYPE,
 					content: "Continue planning.",
@@ -1534,16 +1292,13 @@ export async function handlePlanningCompact(pi: ExtensionAPI, ctx: ExtensionCont
 	}
 }
 
-
-export function handlePlanningCompactFailed(pi: ExtensionAPI, ctx: ExtensionContext, event: SessionCompactFailedEvent): void {
+export function handlePlanningCompactFailed(ctx: ExtensionContext, event: SessionCompactFailedEvent): void {
 	if (getExecution()) return;
 	const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
 	const state = session.__planningCompaction;
 	if (!state) return;
 	const terminal = isTerminalCompactionFailure(event);
 	if (terminal) {
-		// Pi refused or aborted the compaction. Hold the cooldown and re-arm
-		// only after real growth or high-watermark pressure so the loop stops.
 		state.inFlight = false;
 		state.resumeGuard = false;
 		state.cooldownActive = true;
@@ -1576,19 +1331,17 @@ export function filterPlanningResumeMessages<T extends { customType?: string }>(
 	return messages.filter((message) => message.customType !== PLANNING_RESUME_CUSTOM_TYPE && message.customType !== PLANNING_PREPLAN_RESUME_CUSTOM_TYPE);
 }
 
-export async function stopExecution(pi: ExtensionAPI, ctx: ExtensionContext, reason: string): Promise<void> {
+export async function stopExecution(ctx: ExtensionContext, reason: string): Promise<void> {
 	if (!execution) return;
 	resetExecutionCompactionState(ctx);
-	// Final synchronous write: drain any deferred flush and land the last snapshot.
 	pendingExecutionFlush = false;
-	persist(pi);
-	// Checkpoint first: withExecutionCheckpoint guards on the live execution.
+	persist(ctx);
 	withExecutionCheckpoint(ctx, (cp) => applyExecutionStopped(cp, reason));
 	execution = null;
 	executionRunId = null;
-	goalWaitRuntime = null;
-	pi.appendEntry("pi-plans-exec-cleared", { reason });
-	pi.sendMessage(
+	continuationRuntime = null;
+	messaging().appendEntry("pi-plans-exec-cleared", { reason });
+	messaging().sendMessage(
 		{
 			customType: "pi-plans-exec-stop",
 			content: `**pi-plans: execution stopped** — ${reason}`,
@@ -1607,84 +1360,31 @@ export async function stopExecution(pi: ExtensionAPI, ctx: ExtensionContext, rea
 	updateStatusWidget(ctx);
 }
 
-/** Apply [DONE:VC-xxx] markers from an assistant message. Returns changed ids. */
-export function applyDoneMarkers(text: string): string[] {
-	if (!execution) return [];
-	const changed: string[] = [];
-	for (const id of scanDoneMarkers(text)) {
-		const item = execution.items.find((candidate) => candidate.id === id && !candidate.done);
-		if (item) {
-			item.done = true;
-			changed.push(id);
-		}
-	}
-	return changed;
-}
-
-/**
- * Apply [I-xxx:implemented|validating] markers from an assistant message.
- * Unknown I-ids are silently ignored; later markers overwrite earlier ones.
- * Returns the ids whose state actually changed.
- */
-export function applyImplMarkers(text: string): string[] {
-	if (!execution?.implItems?.length) return [];
-	const known = new Set(execution.implItems.map((impl) => impl.id));
-	execution.implStatus ??= {};
-	const changed: string[] = [];
-	for (const marker of scanImplMarkers(text)) {
-		if (!known.has(marker.id)) continue;
-		const previous = execution.implStatus[marker.id];
-		execution.implStatus[marker.id] = marker.state;
-		if (previous !== marker.state) changed.push(marker.id);
-	}
-	return changed;
-}
-
-export function applyCurrentIMarker(text: string): boolean {
-	if (!execution?.implItems?.length) return false;
-	const markers = scanCurrentIMarkers(text);
-	const resolved = resolveCurrentI(execution.implItems, markers, execution.currentI);
-	if (!resolved || resolved === execution.currentI) return false;
-	execution.currentI = resolved;
-	return true;
-}
-
-export function isExecutionComplete(): boolean {
-	return execution !== null && execution.items.length > 0 && execution.items.every((item) => item.done);
-}
-
-function goalWaitSnapshot(): string {
+function stallSnapshot(): string {
 	if (!execution) return "";
-	return JSON.stringify({
-		done: execution.items
-			.filter((item) => item.done)
-			.map((item) => item.id)
-			.sort()
-			.join("|"),
-		implStatus: execution.implStatus ?? {},
-		currentI: execution.currentI ?? null,
-	});
+	return JSON.stringify(taskProgressMap(execution.tasks));
 }
 
-function pauseGoalWait(pi: ExtensionAPI, ctx: ExtensionContext, reason: string): void {
+function pauseForStall(ctx: ExtensionContext, reason: string): void {
 	const ex = getExecution();
-	if (!ex?.goalWait) return;
-	ex.goalWait.paused = true;
-	ex.goalWait.pausedReason = reason;
-	persist(pi);
+	if (!ex) return;
+	ex.stall.paused = true;
+	ex.stall.pausedReason = reason;
+	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { pausedReason: reason }));
+	persist(ctx);
 	ctx.ui.notify?.(
-		`pi-plans: goal-wait paused (${reason}). Send any message or run /plans-execute to resume.`,
+		`pi-plans: execution paused (${reason}). Send any message or run /plans-execute to resume.`,
 		"warning",
 	);
 	updateStatusWidget(ctx);
 }
 
-function canWakeExecution(ctx: ExtensionContext, runtime: GoalWaitRuntime): boolean {
+function canWakeExecution(ctx: ExtensionContext, runtime: ContinuationRuntime): boolean {
 	const compaction = executionCompactionState(ctx);
-	return currentGoalWaitRuntime(ctx) === runtime
+	return currentContinuationRuntime(ctx) === runtime
 		&& (ctx.mode === "tui" || ctx.mode === "rpc")
-		&& !isExecutionComplete()
-		&& !runtime.owner.goalWait?.paused
+		&& !allTasksTerminal(runtime.owner.tasks)
+		&& !runtime.owner.stall.paused
 		&& ctx.isIdle()
 		&& !ctx.hasPendingMessages()
 		&& !ctx.signal?.aborted
@@ -1694,15 +1394,14 @@ function canWakeExecution(ctx: ExtensionContext, runtime: GoalWaitRuntime): bool
 		&& compaction?.pendingFollowUpPrompt == null;
 }
 
-function sendGoalWaitWake(pi: ExtensionAPI, ctx: ExtensionContext, runtime: GoalWaitRuntime): boolean {
+function sendContinuationWake(ctx: ExtensionContext, runtime: ContinuationRuntime): boolean {
 	if (!canWakeExecution(ctx, runtime)) return false;
 	try {
-		// Custom messages bypass before_agent_start, so carry fresh execution rules.
 		const content = executionContextMessage(ctx);
 		if (!content) return false;
 		runtime.wakeId = randomUUID();
-		pi.sendMessage({
-			customType: GOAL_WAIT_CUSTOM_TYPE,
+		messaging().sendMessage({
+			customType: EXECUTION_CONTINUE_CUSTOM_TYPE,
 			content,
 			display: false,
 			details: { wakeId: runtime.wakeId },
@@ -1710,120 +1409,118 @@ function sendGoalWaitWake(pi: ExtensionAPI, ctx: ExtensionContext, runtime: Goal
 		return true;
 	} catch (error) {
 		runtime.wakeId = undefined;
-		pauseGoalWait(pi, ctx, `continuation failed: ${String(error)}`);
+		pauseForStall(ctx, `continuation failed: ${String(error)}`);
 		return false;
 	}
 }
 
 /** Only a fully settled agent run can need an extra wake, never a tool turn. */
-function maybeGoalWaitFollowUp(pi: ExtensionAPI, ctx: ExtensionContext): void {
-	const runtime = currentGoalWaitRuntime(ctx);
+function maybeContinuationFollowUp(ctx: ExtensionContext): void {
+	const runtime = currentContinuationRuntime(ctx);
 	if (!runtime || runtime.handled || !ctx.isIdle()) return;
 	if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
 	if (runtime.stopReason === "error" || runtime.stopReason === "aborted" || ctx.signal?.aborted) {
 		runtime.handled = true;
-		pauseGoalWait(pi, ctx, runtime.stopReason === "error" ? "agent failed" : "agent interrupted");
+		pauseForStall(ctx, runtime.stopReason === "error" ? "agent failed" : "agent interrupted");
 		return;
 	}
 	if (runtime.stopReason !== "stop" || !canWakeExecution(ctx, runtime)) return;
 	runtime.handled = true;
 	const ex = runtime.owner;
-	ex.goalWait ??= { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false };
-	const goalWait = ex.goalWait;
-	const snapshot = goalWaitSnapshot();
-	const changed = goalWait.lastMarkers !== null && snapshot !== goalWait.lastMarkers;
-	goalWait.lastMarkers = snapshot;
+	const snapshot = stallSnapshot();
+	const changed = ex.stall.lastSnapshot !== null && snapshot !== ex.stall.lastSnapshot;
+	ex.stall.lastSnapshot = snapshot;
 	if (changed) {
-		goalWait.noProgressRounds = 0;
-		goalWait.waitRounds = 0;
-	} else if (/waiting for/i.test(runtime.text)) {
-		goalWait.waitRounds += 1;
+		ex.stall.rounds = 0;
 	} else {
-		goalWait.noProgressRounds += 1;
+		ex.stall.rounds += 1;
 	}
-	if (goalWait.noProgressRounds >= GOAL_WAIT_MAX_NO_PROGRESS) {
-		pauseGoalWait(pi, ctx, `no progress in ${goalWait.noProgressRounds} rounds`);
+	if (ex.stall.rounds >= STALL_MAX_ROUNDS) {
+		pauseForStall(ctx, `no task-status change in ${ex.stall.rounds} rounds`);
 		return;
 	}
-	if (goalWait.waitRounds >= GOAL_WAIT_MAX_WAITING) {
-		pauseGoalWait(pi, ctx, `waiting without progress for ${goalWait.waitRounds} rounds`);
-		return;
-	}
-	persist(pi);
+	persist(ctx);
 	updateStatusWidget(ctx);
-	// No await between the live gate and dispatch: another input cannot interleave.
-	sendGoalWaitWake(pi, ctx, runtime);
+	sendContinuationWake(ctx, runtime);
 }
 
 export function filterGoalWaitMessages<T extends { customType?: string; details?: unknown }>(messages: T[]): T[] {
-	return messages.filter((message) => message.customType !== GOAL_WAIT_CUSTOM_TYPE
-		|| (goalWaitRuntime?.owner === execution && goalWaitRuntime?.wakeId !== undefined
-			&& (message.details as { wakeId?: unknown } | undefined)?.wakeId === goalWaitRuntime.wakeId));
+	// v0.6.1: continuation wakes are one-shot; stale ones (including the
+	// legacy v0.6.0 goal-wait type) never replay after a restart.
+	return messages.filter((message) => message.customType !== EXECUTION_CONTINUE_CUSTOM_TYPE
+		&& message.customType !== LEGACY_GOAL_WAIT_CUSTOM_TYPE);
 }
 
-/** Called only for genuine user input or an explicit same-execution resume. */
-export function resumeGoalWaitIfPaused(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
+export function filterContinuationMessages<T extends { customType?: string; details?: unknown }>(messages: T[]): T[] {
+	return filterGoalWaitMessages(messages);
+}
+
+/** Prefix of the stall reason used for the audit-cap pause (D-022). */
+const AUDIT_CAP_PAUSE_PREFIX = "completion audit exhausted";
+
+/** Called for genuine user input or an explicit same-execution resume.
+ * Resuming an audit-cap pause grants a fresh audit budget (three more
+ * rounds): the user's explicit resume IS the decision to keep auditing —
+ * without this reset the cap pause could never be lifted productively. */
+export function resumeGoalWaitIfPaused(ctx: ExtensionContext): boolean {
 	const ex = getExecution();
-	if (!ex?.goalWait?.paused || !currentGoalWaitRuntime(ctx)) return false;
-	ex.goalWait.paused = false;
-	ex.goalWait.pausedReason = undefined;
-	ex.goalWait.noProgressRounds = 0;
-	ex.goalWait.waitRounds = 0;
-	ex.goalWait.lastMarkers = goalWaitSnapshot();
-	persist(pi);
+	if (!ex?.stall.paused || !currentContinuationRuntime(ctx)) return false;
+	const wasAuditCap = (ex.stall.pausedReason ?? "").startsWith(AUDIT_CAP_PAUSE_PREFIX);
+	ex.stall.paused = false;
+	ex.stall.pausedReason = undefined;
+	ex.stall.rounds = 0;
+	ex.stall.lastSnapshot = stallSnapshot();
+	if (wasAuditCap) {
+		ex.audit.rounds = 0;
+		ex.audit.failed = [];
+		withExecutionCheckpoint(ctx, (cp) =>
+			applyExecutionProgress(cp, {
+				tasks: taskProgressMap(ex.tasks),
+				audit: { rounds: 0, lastResult: undefined },
+				pausedReason: null,
+			}),
+		);
+	} else {
+		withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { pausedReason: null }));
+	}
+	persist(ctx);
 	updateStatusWidget(ctx);
 	return true;
 }
 
-export function resumeActiveExecution(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
-	if (!resumeGoalWaitIfPaused(pi, ctx)) return false;
-	const runtime = currentGoalWaitRuntime(ctx)!;
+export function resumeActiveExecution(ctx: ExtensionContext): boolean {
+	if (!resumeGoalWaitIfPaused(ctx)) return false;
+	const runtime = currentContinuationRuntime(ctx)!;
 	if (canWakeExecution(ctx, runtime)) {
 		runtime.handled = true;
-		sendGoalWaitWake(pi, ctx, runtime);
+		sendContinuationWake(ctx, runtime);
 	}
 	return true;
 }
 
-export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 	if (!execution) return;
 	resetExecutionCompactionState(ctx);
-	// Final synchronous write: drain any deferred flush and land the last snapshot.
 	pendingExecutionFlush = false;
-	persist(pi);
-
-	const summary = execution.items.map((item) => `- ✅ \`${item.id}\` ${item.text.split(";")[0]}`).join("\n");
+	persist(ctx);
+	const flat = flattenTaskViews(execution.tasks);
+	const summary = flat
+		.map((task) => `- ${taskIsTerminal(task) && task.status === "skipped" ? "~" : "✓"} \`${task.id}\` ${task.title}`)
+		.join("\n");
 	const planPath = execution.planPath;
-	// Checkpoint first (live-execution guard), then clear the session state.
 	withExecutionCheckpoint(ctx, (cp) => applyExecutionCompleted(cp));
 	execution = null;
 	executionRunId = null;
-	goalWaitRuntime = null;
-	pi.appendEntry("pi-plans-exec-cleared", { reason: "complete" });
-	// Post-execution goal-running continuation: in interactive sessions, attach
-	// the continuation block and trigger a new turn so the agent immediately
-	// enters the implementation-review loop. Headless sessions keep the silent
-	// completion behavior. Both completeExecution call sites (turn_end and the
-	// restoreFromSession recovery path) share this behavior.
-	const interactive = ctx.hasUI === true;
-	// Skill-aware continuation: the reviewer-count default follows the active
-	// run's skill (D-1/D-4), so the prompt names the run's own recommended
-	// count instead of a static guess.
-	const activeRunForPrompt = resolveActiveRun(ctx.sessionManager, ctx.cwd);
-	const content = interactive
-		? `**Plan complete!** ✅ \`${planPath}\`\n\n${summary}\n\n${ameliorationPromptText(activeRunForPrompt?.skill)}`
-		: `**Plan complete!** ✅ \`${planPath}\`\n\n${summary}`;
-	pi.sendMessage(
+	continuationRuntime = null;
+	messaging().appendEntry("pi-plans-exec-cleared", { reason: "complete" });
+	messaging().sendMessage(
 		{
 			customType: "pi-plans-complete",
-			content,
+			content: `**Plan complete!** ✅ \`${planPath}\` — completion audit passed.\n\n${summary}`,
 			display: true,
 		},
-		{ triggerTurn: interactive },
+		{ triggerTurn: false },
 	);
-	if (interactive) {
-		pi.appendEntry("pi-plans-ameliorate", { planPath, phase: "goal-started", rounds: null, currentRound: 0 });
-	}
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (active) {
 		try {
@@ -1835,55 +1532,45 @@ export async function completeExecution(pi: ExtensionAPI, ctx: ExtensionContext)
 	updateStatusWidget(ctx);
 }
 
-/** Instructions appended to the post-execution completion message in
- * interactive sessions, telling the agent to enter the goal-running
- * implementation-review loop. Skill-aware: the reviewer-count question's
- * recommended option follows the run's skill (plan-big / plan-with-refs → 3,
- * others → 1). Termination options are single-sourced from
- * src/termination-prompt.ts (shared with the ask_choice trailing branch). */
-export function ameliorationPromptText(skill: string | undefined): string {
-	return `---
-Goal-running continuation: immediately ask the user now via ask_choice (autoComplete: false, in the session language) the termination question: "${TERMINATION_QUESTION}" Options (recommended first): ${renderTerminationOptions()}. ${TERMINATION_RECORDING_INSTRUCTIONS} ${implReviewerCountPromptLine(skill)} Then keep running the implementation-review loop without asking whether to continue; the goal-wait option keeps the loop running until no unpassed VCs remain.`;
-}
-
 /** Injection text for before_agent_start while executing. */
 export function executionContextMessage(ctx: ExtensionContext): string | null {
 	if (!execution) return null;
-	const remaining = execution.items.filter((item) => !item.done);
-	const list =
-		remaining.map((item) => `- \`${item.id}\` ${item.text}`).join("\n") || "(none — report completion now)";
-	// Live read: the injected guidance and the tool wrappers share the same
-	// tri-state, so they can never contradict each other mid-run.
+	const flat = flattenTaskViews(execution.tasks);
+	const open = flat.filter((task) => !taskIsTerminal(task));
+	const cur = currentTask(execution.tasks);
+	const currentWave = cur?.wave ?? 1;
+	const inWave = open.filter((task) => task.wave === currentWave);
+	const waveList = inWave.map((task) => `- ${task.id}${task.children.length ? ` (${task.children.map((c) => c.id).join(", ")})` : ""}: ${task.title}${task.files.length ? ` — files: ${task.files.join(", ")}` : ""}`).join("\n") || "(none — take the next wave)";
+	const progress = taskProgress(execution.tasks);
+	const vcDone = execution.items.filter((item) => item.done).length;
 	const mode = resolveGraphMode(ctx?.cwd ?? process.cwd());
 	const graphLine =
 		mode === "config-unavailable"
-			? `${graphBlockForExecutor(false)}\n[pi-plans: config unreadable this turn; graph features are off until .git/pi_plans/config.json is repaired]`
+			? `${graphBlockForExecutor(false)}\n[pi-plans: config unreadable this turn; graph features are off until .git/pi-plans/config.json is repaired]`
 			: graphBlockForExecutor(mode === "enabled");
-	// F-002 (impl review r1): the next-action line is hoisted out of the
-	// implItems ternary so plans without implementation items get the same
-	// same-source guidance the panel shows.
-	const nextActionLine = `\nSuggested next action (displayed in the pi-plans panel): ${deriveNextAction(execution, executionIsWaiting(execution), resolveImplStatuses(execution.implItems ?? [], execution.items, execution.implStatus), remaining, execution.currentI)}`;
-	const implementationItems = execution.implItems?.length
-		? `\nImplementation items: ${execution.implItems.map((item) => item.id).join(", ")}${execution.currentI ? `\nCurrent implementation item: \`${execution.currentI}\`` : ""}\nWhen beginning an implementation item, emit its current anchor exactly once as \`[I-###:current]\`; then use \`[I-###:implemented]\` or \`[I-###:validating]\` for progress.`
+	const rollbackNote = execution.audit.failed.length > 0
+		? `\nCompletion audit round ${execution.audit.rounds} failed checks: ${execution.audit.failed.join(", ")} — the covered tasks were rolled back to pending; re-close them with evidence after fixing the failures.`
 		: "";
 	return `[PI-PLANS EXECUTION — write access enabled]
-Implement the accepted plan at ${execution.planPath} (${execution.items.length - remaining.length}/${execution.items.length} verifier items done).
+Implement the accepted plan at ${execution.planPath} (tasks ${progress.done}/${progress.total}${execution.legacyPlan ? " · legacy I-### mapping" : ""} · VC ${vcDone}/${execution.items.length}).
 
-Remaining verifier items:
-${list}${implementationItems}${nextActionLine}
+Current wave ${currentWave} open tasks:
+${waveList}
+
+Remaining open tasks (all waves): ${open.map((task) => task.id).join(", ") || "(none)"}.${rollbackNote}
 
 ${graphLine}
 
 Execution rules:
-- Implement implementation items in dependency order; grow the change in layers — smallest end-to-end slice first, then stack each new capability on top of what already works.
-- Report implementation-item progress with lightweight markers in your reply: write \`[I-001:implemented]\` when an item's code is done, \`[I-001:validating]\` when you start verifying it. The execution status bar tracks these states.
-- For subprocess-backed verification, when a step starts a subprocess and needs its result before verifying, use literal \`waiting for\` with backoff \`5s -> 10s -> 20s -> 40s -> 80s\`, then keep polling at 80s; restart at 5s for each new subprocess.
-- Simplest implementation that fully meets the item: no speculative abstractions, configuration, or indirection; keep components modular with clearly separated concerns.
-- Architectural decisions are for the long term: no stopgaps. Do not add backward-compatibility layers, fallbacks, or migrations — remove the obsolete paths this change obsoletes.
-- Prefer established, well-maintained libraries when they reduce complexity or improve reliability; before writing your own implementation or adding a package, check the project's existing dependencies (docs and types) — never reimplement common functionality without a clear reason.
-- MINIMUM tests: trivial one-liners get no test; non-trivial logic gets exactly one minimal check; reuse the repo's test runner when one exists; when unsure, skip and emit \`[test skipped: <name>, add when <trigger>]\`.
-- After verifying an item's pass condition with its stated evidence, include \`[DONE:VC-xxx]\` in your reply.
-- When every item is done, report a completion summary.`;
+- Work through tasks in wave order (earlier waves first); within a wave, follow the listed dependency order. Wave grouping encodes which tasks could run in parallel — keep their file sets disjoint.
+- Report progress ONLY through the \`plans_update_task\` tool: status "complete" with evidence (test command output / file paths), or "skipped" with a skipReason. One call per task; statuses are immutable once set.
+- Close subtasks before their parent; a parent is auditable only when every child is terminal.
+- When every task is terminal, the independent completion auditor verifies the plan's verification checks (${execution.items.map((item) => item.id).join(", ")}); failed checks roll their covered tasks back automatically.
+- Simplest implementation that fully meets the task: no speculative abstractions, configuration, or indirection; keep components modular with clearly separated concerns.
+- Architectural decisions are for the long term: no stopgaps. Remove the obsolete paths this change obsoletes.
+- Prefer established, well-maintained libraries when they reduce complexity; check the project's existing dependencies before adding a package or reimplementing common functionality.
+- MINIMUM tests: trivial one-liners get no test; non-trivial logic gets exactly one minimal check; reuse the repo's test runner when one exists.
+- For subprocess-backed verification, when a step needs a subprocess result before proceeding, poll with backoff \`5s -> 10s -> 20s -> 40s -> 80s\`, then keep polling at 80s.`;
 }
 
 interface SessionEntry {
@@ -1895,24 +1582,21 @@ interface SessionEntry {
 
 /**
  * Rebuild execution state from the session on start/resume. Finds the last
- * pi-plans-exec snapshot, then re-scans assistant messages after it for
- * [DONE:VC-xxx] markers so progress survives restarts.
+ * pi-plans-exec snapshot; the task tree is rebuilt from the persisted
+ * snapshot (tool-driven progress survives restarts without text replay).
  */
-export async function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext, entries: SessionEntry[]): Promise<void> {
-	pendingExecutionFlush = false; // no flush debt survives a restart
-	goalWaitRuntime = null;
+export async function restoreFromSession(ctx: ExtensionContext, entries: SessionEntry[]): Promise<void> {
+	pendingExecutionFlush = false;
+	continuationRuntime = null;
 	resetExecutionCompactionState(ctx);
-	let snapshotIndex = -1;
 	let snapshot: ExecState | null = null;
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.type === "custom" && entry.customType === "pi-plans-exec" && entry.data) {
 			snapshot = entry.data;
-			snapshotIndex = i;
 			break;
 		}
 		if (entry.type === "custom" && entry.customType === "pi-plans-exec-cleared") {
-			// Execution was explicitly stopped or completed after the last snapshot.
 			execution = null;
 			updateStatusWidget(ctx);
 			return;
@@ -1923,78 +1607,45 @@ export async function restoreFromSession(pi: ExtensionAPI, ctx: ExtensionContext
 		updateStatusWidget(ctx);
 		return;
 	}
-	// Ignore stale plans whose file vanished.
 	if (!fs.existsSync(snapshot.planPath)) {
 		execution = null;
 		updateStatusWidget(ctx);
 		return;
 	}
-	execution = {
-		planPath: snapshot.planPath,
-		items: snapshot.items.map((item) => ({ ...item })),
-		startedAt: snapshot.startedAt,
-		usage: snapshot.usage ?? { inToks: 0, outToks: 0 },
-		implItems: snapshot.implItems ?? [],
-		implStatus: { ...(snapshot.implStatus ?? {}) },
-		// D-008: chrome language is re-resolved at restore time from the
-		// CURRENT config rather than trusted from the snapshot, so a
-		// `plans set-language` change survives restarts.
-		uiLanguage: resolveUiLanguage(ctx.cwd),
-		currentI: snapshot.currentI ?? inferCurrentI(snapshot.implItems, snapshot.items, snapshot.implStatus),
-		goalWait: snapshot.goalWait
-			? { ...snapshot.goalWait }
-			: { noProgressRounds: 0, waitRounds: 0, lastMarkers: null, paused: false },
-	};
-	// Distrust the snapshot's implItems: re-parse + re-lint from the plan
-	// file so a stale empty list (older parse or format drift at snapshot
-	// time) cannot freeze a fake "I 0/0" panel after a restart.
+	// Re-derive the task tree from the plan file (fresh parse) merged with
+	// the snapshot's persisted statuses — a stale parse cannot freeze progress.
+	let tasks: TaskView[];
+	let items: CheckItem[] = snapshot.items.map((item) => ({ ...item }));
+	let planTasks = snapshot.planTasks;
 	try {
 		const planText = fs.readFileSync(snapshot.planPath, "utf8");
-		execution.implItems = parseImplItems(planText);
-		execution.implWarning = lintImplItems(planText);
+		planTasks = parsePlanTasks(planText);
+		const snapshotProgress = taskProgressMap(snapshot.tasks ?? []);
+		tasks = buildTaskView(planTasks, snapshotProgress);
+		items = parseChecklist(planText);
 	} catch {
-		/* plan file unreadable mid-restore: keep the snapshot values */
+		tasks = snapshot.tasks;
 	}
-	for (let i = snapshotIndex + 1; i < entries.length; i++) {
-		const entry = entries[i];
-		if (entry.type === "custom" && entry.customType === "pi-plans-exec-cleared") {
-			execution = null;
-			break;
-		}
-		const message = entry.message;
-		if (message && message.role === "assistant") {
-			const text = message.content
-				.filter((part) => part.type === "text")
-				.map((part) => part.text ?? "")
-				.join("\n");
-			applyDoneMarkers(text);
-			applyImplMarkers(text);
-			applyCurrentIMarker(text);
-		}
-	}
-	if (execution) {
-		resetGoalWaitRuntime(ctx);
-		// Rebind the run identity after a restart so the panel's activity row
-		// (and any run-status mirroring) resolves to the active run instead of
-		// staying null until the next startExecution (CQ1/D-005 wiring gap).
-		const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
-		executionRunId = active?.run_id ?? null;
-		if (active) bindRun(ctx.sessionManager, ctx.cwd, active.run_id);
-		// D-010: replay may have advanced progress past the persisted baseline.
-		// Recompute the goal-wait markers; new progress resets the guard counters.
-		if (execution.goalWait) {
-			const markerSnapshot = goalWaitSnapshot();
-			if (markerSnapshot !== execution.goalWait.lastMarkers) {
-				execution.goalWait.lastMarkers = markerSnapshot;
-				execution.goalWait.noProgressRounds = 0;
-				execution.goalWait.waitRounds = 0;
-			}
-		}
-		persist(pi); // refresh snapshot so the next resume has less to rescan
-		if (isExecutionComplete()) {
-			// Completed during the rescan: restore the planning model on the way out.
-			await completeExecution(pi, ctx);
-		}
+	execution = {
+		planPath: snapshot.planPath,
+		items,
+		planTasks,
+		tasks,
+		legacyPlan: snapshot.legacyPlan,
+		startedAt: snapshot.startedAt,
+		usage: snapshot.usage ?? { inToks: 0, outToks: 0 },
+		uiLanguage: resolveUiLanguage(ctx.cwd),
+		stall: { ...snapshot.stall, lastSnapshot: stallSnapshot(), rounds: 0 },
+		audit: { rounds: snapshot.audit?.rounds ?? 0, failed: snapshot.audit?.failed ?? [], running: false },
+	};
+	resetContinuationRuntime(ctx);
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	executionRunId = active?.run_id ?? null;
+	if (active) bindRun(ctx.sessionManager, ctx.cwd, active.run_id);
+	persist(ctx);
+	if (allTasksTerminal(execution.tasks) && !execution.items.every((item) => item.done)) {
+		// Terminal tasks without a passing audit: rerun the audit flow.
+		await runAuditFlow(ctx);
 	}
 	updateStatusWidget(ctx);
 }

@@ -7,14 +7,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
-	applyCompleted,
 	applyExecutionApproved,
 	applyExecutionCompleted,
 	applyExecutionProgress,
 	applyExecutionHeadChanged,
 	applyExecutionStopped,
-	applyImplementationReviewConfigured,
-	applyImplementationRoundFinished,
 	applyLaneResult,
 	applyMigration,
 	applyPlanWritten,
@@ -331,33 +328,21 @@ describe("state machine reducers", () => {
 		assert.throws(() => applyLaneResult(staged, "r2", "l1", { ok: true }), StateError);
 	});
 
-	it("implementation review: condition first, rounds counted, completed needs evidence (F-004)", () => {
-		const { workdir, runId } = setupRun("sm-impl");
+	it("implementation-review write side is gone; legacy checkpoints stay readable (D-018)", () => {
+		const { workdir, runId } = setupRun("sm-impl-legacy");
 		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
 		let cp = baseCheckpoint(workdir, runId);
-		const planPath = path.join(path.dirname(checkpointFilePath(workdir, runId)!), "PLAN_v1.md");
-		fs.writeFileSync(planPath, "# plan", "utf8");
-		const plan = planIdentityOf(planPath, 1);
-		cp = { ...cp, plan, phase: "implementation-review", nextAction: "ask-question" };
-		assert.throws(
-			() => applyReviewRoundStarted(cp, { roundId: "i1", role: "reviewer", target: "implementation", reviewers: 1, lanes: [{ laneId: "l1" }] }),
-			StateError,
-		);
-		cp = applyImplementationReviewConfigured(cp, "until-no-high");
-		assert.throws(() => applyImplementationReviewConfigured(cp, "again"), StateError);
-		cp = applyReviewRoundStarted(cp, { roundId: "i1", role: "reviewer", target: "implementation", reviewers: 1, lanes: [{ laneId: "l1" }] });
-		const file = writeReviewOutput(workdir, runId, "i1", "l1", "out");
-		cp = applyLaneResult(cp, "i1", "l1", { ok: true, resultFile: file });
-		assert.throws(() => applyImplementationRoundFinished(cp), StateError);
-		cp = applyReviewConsolidated(cp, "i1");
-		cp = applyImplementationRoundFinished(cp);
+		// Simulate a persisted 0.6.0 checkpoint in the legacy phase with its
+		// review bookkeeping — the schema still parses it read-only.
+		cp = {
+			...cp,
+			phase: "implementation-review",
+			nextAction: "run-review",
+			implementationReview: { terminationCondition: "until-no-high", reviewerCount: 2, completedRounds: 1 },
+		};
+		const round = applyReviewRoundStarted(cp, { roundId: "i1", role: "reviewer", target: "implementation", reviewers: 2, lanes: [{ laneId: "l1" }] });
+		assert.equal(round.reviewRounds.length, 1);
 		assert.equal(cp.implementationReview?.completedRounds, 1);
-		// Completion requires evidence AND a termination condition.
-		assert.throws(() => applyCompleted({ ...cp, implementationReview: undefined }, "evidence"), StateError);
-		assert.throws(() => applyCompleted(cp, "   "), StateError);
-		const done = applyCompleted(cp, "no findings in final round");
-		assert.equal(done.phase, "completed");
-		assert.equal(done.nextAction, "none");
 	});
 
 	it("execution approval and progress (D-003/D-011)", () => {
@@ -394,10 +379,12 @@ describe("state machine reducers", () => {
 		assert.equal(cp.execution?.pausedReason, "stopped by user");
 		const resumed = applyExecutionProgress(cp, { pausedReason: null });
 		assert.equal(resumed.execution?.pausedReason, undefined);
-		// Completion hands over to the implementation-review phase (R-005).
+		// Completion: v0.6.1 passes a completed audit straight to the terminal
+		// phase (the implementation-review loop is gone, D-018).
 		const finished = applyExecutionCompleted(cp);
-		assert.equal(finished.phase, "implementation-review");
-		assert.equal(finished.nextAction, "ask-question");
+		assert.equal(finished.phase, "completed");
+		assert.equal(finished.nextAction, "none");
+		assert.equal(finished.execution?.audit?.passed, true);
 	});
 
 	it("migration resets rounds and approval, keeps termination (F-003)", () => {
@@ -431,72 +418,3 @@ describe("state machine reducers", () => {
 	});
 });
 
-describe("implementationReview.reviewerCount (0.5.4)", () => {
-	it("configured persists reviewerCount and survives checkpoint roundtrip", () => {
-		const { workdir, runId } = setupRun("rc-persist");
-		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
-		let cp = baseCheckpoint(workdir, runId);
-		cp = { ...cp, phase: "implementation-review", nextAction: "ask-question" };
-		cp = applyImplementationReviewConfigured(cp, "until-no-high", 2);
-		assert.equal(cp.implementationReview?.reviewerCount, 2);
-		assert.equal(cp.nextAction, "run-review");
-		mutateCheckpoint(workdir, runId, () => cp);
-		const reloaded = loadCheckpoint(workdir, runId);
-		assert.ok(reloaded.status === "ok");
-		assert.equal(reloaded.checkpoint.implementationReview?.reviewerCount, 2);
-	});
-
-	it("omitted reviewerCount stays undefined (legacy checkpoints unchanged)", () => {
-		const { workdir, runId } = setupRun("rc-legacy");
-		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
-		let cp = baseCheckpoint(workdir, runId);
-		cp = { ...cp, phase: "implementation-review", nextAction: "ask-question" };
-		cp = applyImplementationReviewConfigured(cp, "1 round");
-		assert.equal(cp.implementationReview?.reviewerCount, undefined);
-		mutateCheckpoint(workdir, runId, () => cp);
-		assert.ok(loadCheckpoint(workdir, runId).status === "ok");
-	});
-
-	it("rejects out-of-range and non-integer reviewerCount on load", () => {
-		const { workdir, runId } = setupRun("rc-invalid");
-		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
-		const file = checkpointFilePath(workdir, runId)!;
-		const base = JSON.parse(fs.readFileSync(file, "utf8")) as { implementationReview?: unknown };
-		for (const bad of [0, 4, "3", 1.5]) {
-			const doc = {
-				...base,
-				implementationReview: {
-					terminationCondition: "1 round",
-					reviewerCount: bad,
-					completedRounds: 0,
-				},
-			};
-			fs.writeFileSync(file, JSON.stringify(doc), "utf8");
-			const loaded = loadCheckpoint(workdir, runId);
-			assert.ok(loaded.status === "corrupt", `reviewerCount ${JSON.stringify(bad)} rejected`);
-		}
-		// Corrupt bytes refuse overwrite (mutateCheckpoint guard), which is the
-		// intended fail-loud behavior — no restore attempted here.
-	});
-
-	it("applyMigration preserves an explicit reviewerCount (CQ1/D-4)", () => {
-		const { workdir, runId } = setupRun("rc-migrate");
-		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
-		let cp = baseCheckpoint(workdir, runId);
-		cp = { ...cp, phase: "implementation-review", nextAction: "run-review" };
-		cp = applyImplementationReviewConfigured(cp, "until-no-high", 3);
-		cp = applyReviewRoundStarted(cp, { roundId: "i1", role: "reviewer", target: "implementation", reviewers: 3, lanes: [{ laneId: "l1" }] });
-		const migrated = applyMigration(cp, { workdir: "/target/wt", worktreeRoot: "/target/wt", commonDir: "/target/.git" });
-		assert.equal(migrated.implementationReview?.reviewerCount, 3);
-		assert.equal(migrated.implementationReview?.completedRounds, 0);
-	});
-
-	it("second configuration write is rejected even with identical values (replay guard)", () => {
-		const { workdir, runId } = setupRun("rc-replay");
-		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
-		let cp = baseCheckpoint(workdir, runId);
-		cp = { ...cp, phase: "implementation-review", nextAction: "ask-question" };
-		cp = applyImplementationReviewConfigured(cp, "until-no-high", 3);
-		assert.throws(() => applyImplementationReviewConfigured(cp, "until-no-high", 3), StateError);
-	});
-});

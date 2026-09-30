@@ -63,7 +63,7 @@ test("runIndex indexes files, writes rows, and screening excludes full_code", as
 	};
 	const sqlite = await import("node:sqlite");
 	const commonDir = git(worktreeRoot, ["rev-parse", "--git-common-dir"]);
-	const dbDir = path.join(path.resolve(worktreeRoot, commonDir), "pi_plans");
+	const dbDir = path.join(path.resolve(worktreeRoot, commonDir), "pi-plans");
 	fs.mkdirSync(dbDir, { recursive: true });
 	const dbPath = path.join(dbDir, "code_graph.db");
 	try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
@@ -151,7 +151,7 @@ test("runIndex with opts.paths indexes only hit paths and purges missing ones", 
 		tsx: makeBackend("tsx", ParserCtor, runtime.runtime.parser.tsx),
 		python: new PythonBackend(ParserCtor, runtime.runtime.parser.python),
 	};
-	const stateRoot = path.join(worktreeRoot, ".git", "pi_plans");
+	const stateRoot = path.join(worktreeRoot, ".git", "pi-plans");
 	fs.mkdirSync(stateRoot, { recursive: true });
 	const store = new Store({ dbPath: path.join(stateRoot, "code_graph.db"), worktreeRoot, gitCommonDir: path.join(worktreeRoot, ".git") }, runtime.runtime.sqlite);
 	t.after(() => store.close());

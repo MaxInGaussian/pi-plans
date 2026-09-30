@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
-	applyImplementationReviewConfigured,
+
 	applyLaneResult,
 	applyReviewConsolidated,
 	createCheckpoint,
@@ -19,8 +19,11 @@ import {
 	startReviewRound,
 } from "../src/workflow-state.ts";
 import { initState, startRun } from "../src/state.ts";
+import { setMessagingApi } from "../src/messaging.ts";
 
 let tmpRoot: string;
+let globalDir: string;
+let previousGlobalDir: string | undefined;
 
 function setupRun(name: string): { workdir: string; runId: string; artifactDir: string } {
 	const workdir = path.join(tmpRoot, name);
@@ -35,9 +38,17 @@ function setupRun(name: string): { workdir: string; runId: string; artifactDir: 
 
 before(() => {
 	tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-rr-"));
+	// Isolate the global reviewer config (F-002): setRole writes the global
+	// file; tests must never touch the developer's ~/.pi/pi-plans.
+	previousGlobalDir = process.env.PI_PLANS_GLOBAL_DIR;
+	globalDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-global-rr-"));
+	process.env.PI_PLANS_GLOBAL_DIR = globalDir;
 });
 
 after(() => {
+	if (previousGlobalDir === undefined) delete process.env.PI_PLANS_GLOBAL_DIR;
+	else process.env.PI_PLANS_GLOBAL_DIR = previousGlobalDir;
+	fs.rmSync(globalDir, { recursive: true, force: true });
 	fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
@@ -194,6 +205,7 @@ describe("implementation-review round 1 fixes", () => {
 			hasUI: false,
 			ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } },
 		};
+		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
 		const result = await tool!.execute("t1", { role: "reviewer", planPath, reviewers: 2 }, undefined, undefined, ctx);
 		assert.match(result.content[0]?.text ?? "", /current-session/);
 		// The durable round exists WITH lanes — the pre-fix crash site.
@@ -236,9 +248,9 @@ describe("implementation-review round 1 fixes", () => {
 		// Edit the plan in place — same path, different bytes.
 		fs.writeFileSync(planPath, "# plan (edited)\n\n## Verifier Checklist\n\n- [ ] `VC-001` covers `I-001`; pass condition: x.\n", "utf8");
 		const { loadExecutionFromCheckpoint } = await import("../src/exec.ts");
-		const pi = { appendEntry: () => {}, sendMessage: () => {} } as never;
 		const ctx = { cwd: workdir, sessionManager: {}, ui: { setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } } };
-		const load = loadExecutionFromCheckpoint(pi, ctx, run.run_id);
+		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
+		const load = loadExecutionFromCheckpoint(ctx as never, run.run_id);
 		assert.equal(load.status, "plan-mismatch");
 		assert.match((load as { error?: string }).error ?? "", /changed since the approval/);
 	});
@@ -266,9 +278,9 @@ describe("implementation-review round 1 fixes", () => {
 		});
 		mutateCheckpoint(workdir, run.run_id, (cp) => applyExecutionProgress(cp, { doneVcIds: ["VC-001"] }));
 		const { loadExecutionFromCheckpoint } = await import("../src/exec.ts");
-		const pi = { appendEntry: () => {}, sendMessage: () => {} } as never;
 		const ctx = { cwd: workdir, sessionManager: {}, ui: { setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } } };
-		const load = loadExecutionFromCheckpoint(pi, ctx, run.run_id);
+		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
+		const load = loadExecutionFromCheckpoint(ctx as never, run.run_id);
 		assert.equal(load.status, "loaded");
 		assert.equal((load as { reverifyAll?: boolean }).reverifyAll, true, "unverifiable HEAD re-verifies");
 	});
@@ -285,7 +297,7 @@ describe("implementation-review round 1 fixes", () => {
 		const owner = acquireOwnership(workdir, run.run_id);
 		// Another process takes over (fabricated record with a reused/dead pid).
 		fs.writeFileSync(
-			path.join(workdir, ".git", "pi_plans", "runs", run.run_id, "owner.json"),
+			path.join(workdir, ".git", "pi-plans", "runs", run.run_id, "owner.json"),
 			JSON.stringify({ ...owner, pid: process.pid, pidStart: "bogus-start", processToken: "someone-else", generation: owner.generation + 1 }),
 			"utf8",
 		);
@@ -323,7 +335,7 @@ describe("implementation-review round 1 fixes", () => {
 	});
 });
 
-describe("implementation-review reviewer-count fallback (0.5.4, D-4)", () => {
+describe("plan-review reviewer-count defaults (v0.6.1 single-reviewer)", () => {
 	async function setupLoopRun(name: string, skill: string, reviewerCount?: number) {
 		const workdir = path.join(tmpRoot, name);
 		fs.mkdirSync(workdir, { recursive: true });
@@ -336,16 +348,6 @@ describe("implementation-review reviewer-count fallback (0.5.4, D-4)", () => {
 		fs.mkdirSync(run.artifact_dir, { recursive: true });
 		const planPath = path.join(run.artifact_dir, "PLAN_v1.md");
 		fs.writeFileSync(planPath, "# plan\n\n## Verifier Checklist\n\n- [ ] `VC-001` covers `I-001`; pass condition: x.\n", "utf8");
-		// refine's round-start guard requires a recorded termination condition
-		// before any implementation round, so the loop is always configured;
-		// reviewerCount may legitimately be absent (skill default applies).
-		mutateCheckpoint(workdir, run.run_id, (cp) =>
-			applyImplementationReviewConfigured(
-				{ ...cp, phase: "implementation-review", nextAction: "ask-question" },
-				"1 round",
-				reviewerCount,
-			),
-		);
 		return { workdir, runId: run.run_id, planPath };
 	}
 
@@ -373,13 +375,14 @@ describe("implementation-review reviewer-count fallback (0.5.4, D-4)", () => {
 			hasUI: false,
 			ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } },
 		};
-		const result = await tool.execute("t1", { role: "reviewer", target: "implementation", planPath }, undefined, undefined, ctx);
+		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
+		const result = await tool.execute("t1", { planPath, reviewers: 3 }, undefined, undefined, ctx);
 		assert.match(result.content[0]?.text ?? "", /current-session/);
 		const loaded = loadCheckpoint(workdir, runId);
 		assert.ok(loaded.status === "ok");
 		const round = loaded.checkpoint.reviewRounds.at(-1);
 		assert.ok(round, "round recorded");
-		assert.equal(round!.reviewers, 3, "configured reviewerCount used as fallback");
+		assert.equal(round!.reviewers, 3, "explicit reviewers=3 honored");
 		assert.equal(round!.lanes.length, 3, "three lanes spawned");
 	});
 
@@ -394,7 +397,8 @@ describe("implementation-review reviewer-count fallback (0.5.4, D-4)", () => {
 			hasUI: false,
 			ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } },
 		};
-		await tool.execute("t1", { role: "reviewer", target: "implementation", planPath, reviewers: 1 }, undefined, undefined, ctx);
+		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
+		await tool.execute("t1", { planPath, reviewers: 1 }, undefined, undefined, ctx);
 		const loaded = loadCheckpoint(workdir, runId);
 		assert.ok(loaded.status === "ok");
 		const round = loaded.checkpoint.reviewRounds.at(-1);
@@ -413,11 +417,12 @@ describe("implementation-review reviewer-count fallback (0.5.4, D-4)", () => {
 			hasUI: false,
 			ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } },
 		};
-		await tool.execute("t1", { role: "reviewer", target: "implementation", planPath }, undefined, undefined, ctx);
+		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
+		await tool.execute("t1", { planPath }, undefined, undefined, ctx);
 		const loaded = loadCheckpoint(workdir, runId);
 		assert.ok(loaded.status === "ok");
 		const round = loaded.checkpoint.reviewRounds.at(-1);
-		assert.equal(round!.lanes.length, 1, "no configuration and no param → 1 lane");
+		assert.equal(round!.lanes.length, 1, "no param → 1 lane default");
 	});
 
 	it("count=2 consolidation text carries the source-reviewer contract (D-7)", async () => {

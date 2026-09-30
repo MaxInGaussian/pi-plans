@@ -51,7 +51,7 @@ test("updateFunction propagates offsets, rebuilds source exactly, and applies by
 	if (!runtime.status.parserAvailable || !runtime.status.sqliteAvailable) return;
 	const { root, cleanup } = initRepo();
 	t.after(cleanup);
-	const stateRoot = path.join(root, ".git", "pi_plans");
+	const stateRoot = path.join(root, ".git", "pi-plans");
 	fs.mkdirSync(stateRoot, { recursive: true });
 	const store = new Store({ dbPath: path.join(stateRoot, "g.db"), worktreeRoot: root, gitCommonDir: path.join(root, ".git") }, runtime.runtime.sqlite);
 	t.after(() => store.close());

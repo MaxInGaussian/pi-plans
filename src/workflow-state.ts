@@ -145,8 +145,15 @@ export interface ExecutionCheckpoint {
 	/** True when this approval/progress was produced in a different (origin) worktree. */
 	originWorktree?: string;
 	/** v0.6.0: set while a delegated executor child owns the implementation;
-	 * stale after a restart (orphaned delegate — the child died with the parent). */
+	 * stale after a restart (orphaned delegate — the child died with the parent).
+	 * Removed with delegated execution in v0.6.1; read-tolerated on legacy checkpoints. */
 	delegate?: { modelSelector: string; startedAt: string };
+	/** v0.6.1: task-tree progress (task id → status/evidence), the primary
+	 * progress record. doneVcIds stays for legacy checkpoints and the final
+	 * audit pass. */
+	tasks?: Record<string, { status: string; evidence?: string; skipReason?: string }>;
+	/** v0.6.1: completion-audit bookkeeping (rounds, last failed set, pass). */
+	audit?: { rounds: number; lastResult?: string; passed?: boolean };
 }
 
 export interface OwnerInfo {
@@ -454,7 +461,7 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	const record = asRecord(value, label);
 	rejectExtraKeys(
 		record,
-		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate"]),
+		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "audit"]),
 		label,
 	);
 	const execution: ExecutionCheckpoint = {
@@ -483,6 +490,30 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 			modelSelector: asString(delegate.modelSelector, `${label}.delegate.modelSelector`),
 			startedAt: asString(delegate.startedAt, `${label}.delegate.startedAt`),
 		};
+	}
+	if (record.tasks !== undefined && record.tasks !== null) {
+		const tasksRecord = asRecord(record.tasks, `${label}.tasks`);
+		const tasks: NonNullable<ExecutionCheckpoint["tasks"]> = {};
+		for (const [id, raw] of Object.entries(tasksRecord)) {
+			const entry = asRecord(raw, `${label}.tasks.${id}`);
+			rejectExtraKeys(entry, new Set(["status", "evidence", "skipReason"]), `${label}.tasks.${id}`);
+			const status = asEnum(entry.status, new Set(["pending", "complete", "skipped"]), `${label}.tasks.${id}.status`);
+			const item: { status: string; evidence?: string; skipReason?: string } = { status };
+			if (entry.evidence !== undefined) item.evidence = asString(entry.evidence, `${label}.tasks.${id}.evidence`);
+			if (entry.skipReason !== undefined) item.skipReason = asString(entry.skipReason, `${label}.tasks.${id}.skipReason`);
+			tasks[id] = item;
+		}
+		execution.tasks = tasks;
+	}
+	if (record.audit !== undefined && record.audit !== null) {
+		const audit = asRecord(record.audit, `${label}.audit`);
+		rejectExtraKeys(audit, new Set(["rounds", "lastResult", "passed"]), `${label}.audit`);
+		const parsed: { rounds: number; lastResult?: string; passed?: boolean } = {
+			rounds: asInt(audit.rounds, `${label}.audit.rounds`, 0),
+		};
+		if (audit.lastResult !== undefined) parsed.lastResult = asString(audit.lastResult, `${label}.audit.lastResult`);
+		if (audit.passed !== undefined) parsed.passed = asBool(audit.passed, `${label}.audit.passed`);
+		execution.audit = parsed;
 	}
 	return execution;
 }
@@ -1000,19 +1031,6 @@ export function applyReviewConsolidated(cp: WorkflowCheckpoint, roundId: string,
 	return { ...cp, reviewRounds: cp.reviewRounds.map((entry) => (entry.roundId === roundId ? nextRound : entry)) };
 }
 
-/** F-004: `completed` requires explicit evidence; approval cannot be forged by state writes. */
-export function applyCompleted(cp: WorkflowCheckpoint, evidence: string): WorkflowCheckpoint {
-	if (cp.phase !== "implementation-review") {
-		throw new StateError(`cannot complete from phase "${cp.phase}"`);
-	}
-	const review = cp.implementationReview;
-	if (!review || review.terminationCondition === undefined) {
-		throw new StateError("cannot complete without a recorded termination condition");
-	}
-	if (evidence.trim() === "") throw new StateError("completion requires non-empty evidence");
-	return { ...cp, phase: "completed", nextAction: "none" };
-}
-
 export function applyExecutionApproved(cp: WorkflowCheckpoint, approval: ExecutionApproval): WorkflowCheckpoint {
 	// F-007 (implementation review): terminal and review phases cannot approve
 	// execution; a re-approval (stop/migration reset approval to null) is legal
@@ -1036,6 +1054,8 @@ export function applyExecutionApproved(cp: WorkflowCheckpoint, approval: Executi
 			doneVcIds: [],
 			implStatus: {},
 			usage: { inToks: 0, outToks: 0 },
+			tasks: {},
+			audit: { rounds: 0 },
 		},
 	};
 }
@@ -1048,6 +1068,10 @@ export interface ExecutionProgressInput {
 	pausedReason?: string | null;
 	/** v0.6.0: set/clear the delegated-executor record; null clears it. */
 	delegate?: { modelSelector: string; startedAt: string } | null;
+	/** v0.6.1: task-tree progress snapshot (authoritative). */
+	tasks?: Record<string, { status: string; evidence?: string; skipReason?: string }>;
+	/** v0.6.1: completion-audit bookkeeping update. */
+	audit?: { rounds: number; lastResult?: string; passed?: boolean };
 }
 
 export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: ExecutionProgressInput): WorkflowCheckpoint {
@@ -1066,6 +1090,8 @@ export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: Executi
 	else if (progress.pausedReason !== undefined) execution.pausedReason = progress.pausedReason;
 	if (progress.delegate === null) delete execution.delegate;
 	else if (progress.delegate !== undefined) execution.delegate = progress.delegate;
+	if (progress.tasks !== undefined) execution.tasks = progress.tasks;
+	if (progress.audit !== undefined) execution.audit = progress.audit;
 	return { ...cp, execution };
 }
 
@@ -1077,45 +1103,18 @@ export function applyExecutionHeadChanged(cp: WorkflowCheckpoint): WorkflowCheck
 
 export function applyExecutionCompleted(cp: WorkflowCheckpoint): WorkflowCheckpoint {
 	if (cp.phase !== "executing" || !cp.execution) throw new StateError("requires phase \"executing\"");
+	// v0.6.1 (D-018): the post-execution amelioration loop is gone; a
+	// completed audit passes the run straight to the terminal phase.
 	return {
 		...cp,
-		phase: "implementation-review",
-		nextAction: "ask-question",
-		execution: { ...cp.execution, pausedReason: undefined },
-	};
-}
-
-export function applyImplementationReviewConfigured(
-	cp: WorkflowCheckpoint,
-	terminationCondition: string,
-	reviewerCount?: number,
-): WorkflowCheckpoint {
-	if (cp.phase !== "implementation-review") throw new StateError("requires phase \"implementation-review\"");
-	if (cp.implementationReview?.terminationCondition !== undefined) {
-		throw new StateError("termination condition already configured; do not re-ask");
-	}
-	return {
-		...cp,
-		implementationReview: {
-			terminationCondition,
-			reviewerCount,
-			completedRounds: cp.implementationReview?.completedRounds ?? 0,
+		phase: "completed",
+		nextAction: "none",
+		execution: {
+			...cp.execution,
+			pausedReason: undefined,
+			delegate: undefined,
+			audit: { ...(cp.execution.audit ?? { rounds: 0 }), passed: true },
 		},
-		nextAction: "run-review",
-	};
-}
-
-export function applyImplementationRoundFinished(cp: WorkflowCheckpoint): WorkflowCheckpoint {
-	if (cp.phase !== "implementation-review" || !cp.implementationReview) {
-		throw new StateError("requires phase \"implementation-review\"");
-	}
-	const review = cp.implementationReview;
-	if (review.currentRoundId === undefined) throw new StateError("no current round to finish");
-	const round = cp.reviewRounds.find((entry) => entry.roundId === review.currentRoundId);
-	if (!round || !round.consolidated) throw new StateError("current round is not consolidated");
-	return {
-		...cp,
-		implementationReview: { ...review, completedRounds: review.completedRounds + 1, currentRoundId: undefined },
 	};
 }
 
@@ -1135,12 +1134,16 @@ export function applyMigration(
 		migration: { fromWorktree: cp.worktreeRoot, migratedAt: utcNow() },
 		execution: cp.execution
 			? {
-					approval: null,
-					doneVcIds: [],
-					implStatus: {},
-					usage: cp.execution.usage,
-					originWorktree: cp.execution.originWorktree ?? cp.worktreeRoot,
-				}
+				approval: null,
+				doneVcIds: [],
+				implStatus: {},
+				usage: cp.execution.usage,
+				originWorktree: cp.execution.originWorktree ?? cp.worktreeRoot,
+				// v0.6.1: task progress and audit state do not survive a worktree
+				// migration (same rule as VC validity).
+				tasks: {},
+				audit: { rounds: 0 },
+			}
 			: undefined,
 		implementationReview: cp.implementationReview
 			? {
@@ -1164,7 +1167,9 @@ function migrationNextAction(cp: WorkflowCheckpoint): NextAction {
 export function applyExecutionStopped(cp: WorkflowCheckpoint, reason: string): WorkflowCheckpoint {
 	if (cp.phase !== "executing" || !cp.execution) throw new StateError("requires phase \"executing\"");
 	const { delegate: _delegate, ...execution } = cp.execution;
-	return { ...cp, execution: { ...execution, pausedReason: reason } };
+	// A stop also revokes any outstanding audit-rollback authorization.
+	const audit = execution.audit ? { ...execution.audit } : undefined;
+	return { ...cp, execution: { ...execution, audit, pausedReason: reason } };
 }
 
 // ---------------------------------------------------------------------------

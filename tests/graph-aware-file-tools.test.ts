@@ -63,7 +63,7 @@ async function loadParsers() {
 
 function openStore(root: string, sqlite: typeof import("node:sqlite")): Store {
 	const canonicalRoot = fs.realpathSync(root);
-	const dbPath = path.join(canonicalRoot, ".git", "pi_plans", "code_graph.db");
+	const dbPath = path.join(canonicalRoot, ".git", "pi-plans", "code_graph.db");
 	fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 	return new Store({ dbPath, worktreeRoot: canonicalRoot, gitCommonDir: path.join(canonicalRoot, ".git") }, sqlite);
 }
@@ -145,7 +145,7 @@ function makeRepoWith(files: Record<string, string>): { root: string } {
 	}
 	git(root0, ["add", "-A"]);
 	git(root0, ["commit", "-m", "init"]);
-	fs.mkdirSync(path.join(root0, ".git", "pi_plans"), { recursive: true });
+	fs.mkdirSync(path.join(root0, ".git", "pi-plans"), { recursive: true });
 	return { root: fs.realpathSync(root0) };
 }
 
@@ -285,14 +285,14 @@ test("graph read marks unexpected fallbacks and stays silent for flag-off", asyn
 	assert.doesNotMatch(off, /^\[graph-read fallback/);
 	assert.match(off, /return a \+ b;/);
 
-	fs.writeFileSync(path.join(root, ".git", "pi_plans", "config.json"), "{broken");
+	fs.writeFileSync(path.join(root, ".git", "pi-plans", "config.json"), "{broken");
 	const broken = firstText(await tools.read.execute("f4", { path: "math.ts" }, undefined, undefined, ctx));
 	assert.match(broken, /^\[graph-read fallback: config read failed → native\]/);
 
 	// runtime unavailable: DB whose stored worktree is another directory.
 	// ensureRuntime caches by db path within a process, so probe in a child
 	// process with fresh module state: checkWorktree must reject the foreign DB.
-	fs.writeFileSync(path.join(root, ".git", "pi_plans", "config.json"), JSON.stringify({ schema: 1, graph_enabled: true }));
+	fs.writeFileSync(path.join(root, ".git", "pi-plans", "config.json"), JSON.stringify({ schema: 1, graph_enabled: true }));
 	const otherRoot0 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-graph-other-"));
 	git(otherRoot0, ["init", "--initial-branch=main"]);
 	const otherRoot = fs.realpathSync(otherRoot0);
@@ -301,7 +301,7 @@ test("graph read marks unexpected fallbacks and stays silent for flag-off", asyn
 		runtime.runtime.sqlite,
 	);
 	foreignStore.close();
-	fs.copyFileSync(path.join(otherRoot, "foreign.db"), path.join(root, ".git", "pi_plans", "code_graph.db"));
+	fs.copyFileSync(path.join(otherRoot, "foreign.db"), path.join(root, ".git", "pi-plans", "code_graph.db"));
 	fs.writeFileSync(path.join(root, "math.ts"), "export function add(a: number, b: number): number { return a + b; }\n");
 	const probeScript = [
 		"const fs = await import('node:fs');",

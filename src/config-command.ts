@@ -1,5 +1,16 @@
 import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_CONFIG, readActive, resolveStateRootOrNull, showConfig, type PlansConfig, utcNow, VALID_ROLE_MODES, updateConfig } from "./state.ts";
+import {
+	readActive,
+	showStateView,
+	setRole,
+	type PlansConfig,
+	utcNow,
+	VALID_ROLE_MODES,
+	updateConfig,
+	type GlobalRoleConfig,
+} from "./state.ts";
+import { DEFAULT_LEVEL_SENTINEL } from "./thinking-levels.ts";
+import { effortItems, runFirstUseFlow, type RolePanelHost } from "./role-panels.ts";
 import { refreshUiLanguage } from "./exec.ts";
 
 interface ModelLike {
@@ -10,12 +21,15 @@ interface ModelLike {
 export interface ConfigCommandContext {
 	cwd: string;
 	hasUI: boolean;
+	mode?: string;
 	model?: unknown;
 	scopedModels?: Array<{ model?: unknown }>;
 	modelRegistry?: {
 		getAvailable?: () => unknown[];
+		find?: (provider: string, id: string) => unknown;
 	};
-	ui: Pick<ExtensionContext["ui"], "notify" | "select" | "input">;
+	ui: Pick<ExtensionContext["ui"], "notify" | "select" | "input"> &
+		Partial<Pick<ExtensionContext["ui"], "custom">>;
 }
 
 type ChoiceResult<T> =
@@ -142,7 +156,7 @@ async function promptLanguage(ctx: ConfigCommandContext, current: string | null)
 
 async function promptArtifactRoot(ctx: ConfigCommandContext, current: string): Promise<ChoiceResult<string>> {
 	const options: Array<MenuOption<string>> = [{ label: `Keep current (${current})`, value: current }];
-	for (const root of ["./docs/pi-plans", "./.git/pi_plans/plans"]) {
+	for (const root of ["./.git/pi-plans/plans", "./docs/pi-plans"]) {
 		if (root === current) continue;
 		options.push({ label: root, value: root });
 	}
@@ -188,7 +202,7 @@ async function promptGraphEnabled(ctx: ConfigCommandContext, current: boolean | 
 	return promptMenu(ctx, "Code graph?", options);
 }
 
-async function promptRoleMode(ctx: ConfigCommandContext, role: "reviewer" | "criticizer", current: string): Promise<ChoiceResult<string>> {
+async function promptRoleMode(ctx: ConfigCommandContext, current: string): Promise<ChoiceResult<string>> {
 	if (!VALID_ROLE_MODES.has(current)) {
 		current = "delegated-subagent";
 	}
@@ -202,56 +216,115 @@ async function promptRoleMode(ctx: ConfigCommandContext, role: "reviewer" | "cri
 				{ label: "Keep current-session", value: "current-session" },
 				{ label: "Switch to delegated-subagent", value: "delegated-subagent" },
 			];
-	return promptMenu(ctx, `${role[0].toUpperCase()}${role.slice(1)} mode?`, options);
+	return promptMenu(ctx, "Reviewer mode?", options);
 }
 
-async function promptRoleModel(
+async function promptRoleModelEntry(
 	ctx: ConfigCommandContext,
-	role: "reviewer" | "criticizer",
-	currentSelector: string | null,
-): Promise<ChoiceResult<string | null>> {
-	const currentLiveSelector = modelSelectorOf(ctx.model);
-	const options: Array<MenuOption<string | null>> = [
-		{
-			label: currentSelector
-				? `Keep current default (${currentSelector})`
-				: currentLiveSelector
-					? `Keep current default (inherit live model: ${currentLiveSelector})`
-					: "Keep current default (inherit)",
-			value: currentSelector,
-		},
+	role: GlobalRoleConfig,
+): Promise<ChoiceResult<"keep" | "change">> {
+	const level = role.thinking_level ?? DEFAULT_LEVEL_SENTINEL;
+	const keepLabel =
+		role.model_selector !== null && role.confirmed_at !== null
+			? `Keep current (${role.model_selector} · ${level})`
+			: "Keep current (unconfirmed; first refine will ask)";
+	const options: Array<MenuOption<"keep" | "change">> = [
+		{ label: keepLabel, value: "keep" },
+		{ label: "Choose model & thinking level…", value: "change" },
 	];
-	if (currentLiveSelector && currentLiveSelector !== currentSelector) {
-		options.push({ label: `Use current session model (${currentLiveSelector})`, value: currentLiveSelector });
+	return promptMenu(ctx, "Reviewer model?", options);
+}
+
+/** Change flow (Q-3=A): TUI pops the native panels via runFirstUseFlow
+ * (which persists to the global config on completion); other UI modes use
+ * menus (model list → effort list). Esc anywhere keeps the current role —
+ * the wizard continues instead of discarding earlier answers (F-011). */
+async function changeReviewerRole(
+	ctx: ConfigCommandContext,
+	role: GlobalRoleConfig,
+): Promise<{ role: GlobalRoleConfig; changed: boolean; error?: string }> {
+	const host = ctx as unknown as RolePanelHost;
+	if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") {
+		const outcome = await runFirstUseFlow(host, role.thinking_level);
+		if (outcome.status === "confirmed") return { role: outcome.role, changed: true };
+		if (outcome.status === "cancelled") {
+			ctx.ui.notify("Reviewer change cancelled — keeping the current role.", "warning");
+			return { role, changed: false };
+		}
+		return { role, changed: false, error: "native panels unavailable in this session" };
 	}
+	// Menus: model list (live model first, then scoped/registry), then effort.
+	const currentSelector = role.model_selector;
+	const selectors: string[] = [];
+	const live = modelSelectorOf(ctx.model);
+	if (live) selectors.push(live);
 	for (const selector of collectModelSelectors(ctx, currentSelector)) {
-		if (selector === currentLiveSelector) continue;
-		options.push({ label: `Use available model (${selector})`, value: selector });
+		if (selector === live) continue;
+		selectors.push(selector);
 	}
-	options.push({
-		label: "Other...",
-		parse: parseModelSelector,
-		prompt: `${role[0].toUpperCase()}${role.slice(1)} model selector:`,
-		errorMessage: "Model selector must be an exact provider/model string.",
-	});
-	return promptMenu(ctx, `${role[0].toUpperCase()}${role.slice(1)} model?`, options);
+	const modelLabels = [...selectors.map((selector) => `Use ${selector}`), "Other..."];
+	const picked = await ctx.ui.select("Reviewer model?", modelLabels);
+	if (picked === undefined) {
+		ctx.ui.notify("Reviewer change cancelled — keeping the current role.", "warning");
+		return { role, changed: false };
+	}
+	let selector: string | null = null;
+	if (picked === "Other...") {
+		const raw = await ctx.ui.input("Reviewer model selector:");
+		if (raw === undefined) {
+			ctx.ui.notify("Reviewer change cancelled — keeping the current role.", "warning");
+			return { role, changed: false };
+		}
+		selector = parseModelSelector(raw);
+		if (selector === null) {
+			ctx.ui.notify("Model selector must be an exact provider/model string.", "error");
+			return { role, changed: false, error: "invalid model selector" };
+		}
+	} else {
+		selector = picked.replace(/^Use /, "");
+	}
+	// Effort menu: default sentinel + the chosen model's supported levels.
+	const found =
+		typeof ctx.modelRegistry?.find === "function"
+			? ((ctx.modelRegistry.find(selector.split("/")[0]!, selector.split("/")[1]!) as never) ?? null)
+			: null;
+	const items = found ? effortItems(found, role.thinking_level) : [{ value: DEFAULT_LEVEL_SENTINEL, label: DEFAULT_LEVEL_SENTINEL, description: "no --thinking flag" }];
+	const levelLabels = items.map((item) => `${item.label} — ${item.description}`);
+	const levelPicked = await ctx.ui.select("Reviewer thinking level? (first row = default: no --thinking flag)", levelLabels);
+	const levelValue = levelPicked === undefined ? DEFAULT_LEVEL_SENTINEL : items[levelLabels.indexOf(levelPicked)]?.value ?? DEFAULT_LEVEL_SENTINEL;
+	try {
+		const applied = setRole(ctx.cwd, {
+			role: "reviewer",
+			modelSelector: selector,
+			thinkingLevel: levelValue,
+			confirmed: true,
+		});
+		return { role: applied.global.reviewer, changed: true };
+	} catch (error) {
+		return { role, changed: false, error: (error as Error).message };
+	}
 }
 
-function currentConfig(workdir: string): PlansConfig {
-	const stateRoot = resolveStateRootOrNull(workdir);
-	if (!stateRoot) return structuredClone(DEFAULT_CONFIG);
-	return showConfig(workdir);
+interface WizardCurrent {
+	config: PlansConfig;
+	reviewer: GlobalRoleConfig;
 }
 
-function summarizeConfig(config: PlansConfig): string[] {
+function currentConfig(workdir: string): WizardCurrent {
+	const view = showStateView(workdir);
+	return { config: view.config, reviewer: view.reviewer };
+}
+
+function summarizeConfig(config: PlansConfig, reviewer: GlobalRoleConfig): string[] {
+	const level = reviewer.thinking_level ?? DEFAULT_LEVEL_SENTINEL;
+	const model = reviewer.model_selector ?? (reviewer.mode === "current-session" ? "(in-session)" : "(unconfirmed)");
 	return [
 		"pi-plans config updated.",
 		`Language: ${config.language.tag ?? "(unset)"}`,
 		`Artifact root: ${config.artifact_root}`,
 		`Refs root: ${config.refs_root ?? "(unset)"}`,
 		`Code graph: ${config.graph_enabled === true ? "enabled" : config.graph_enabled === false ? "disabled" : "unset"}`,
-		`Reviewer: ${config.reviewer.mode} / ${config.reviewer.model_selector ?? "inherit"}`,
-		`Criticizer: ${config.criticizer.mode} / ${config.criticizer.model_selector ?? "inherit"}`,
+		`Reviewer (global): ${reviewer.mode} / ${model}${reviewer.mode === "current-session" ? "" : ` · ${level}`}`,
 	];
 }
 
@@ -264,8 +337,10 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 	try {
 		const workdir = ctx.cwd;
 		const current = currentConfig(workdir);
+		let reviewer = current.reviewer;
+		const workspace = current.config;
 
-		const language = await promptLanguage(ctx, current.language.tag);
+		const language = await promptLanguage(ctx, workspace.language.tag);
 		if (language.cancelled) {
 			if (language.reason === "user") {
 				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
@@ -273,7 +348,7 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 			return;
 		}
 
-		const artifactRoot = await promptArtifactRoot(ctx, current.artifact_root);
+		const artifactRoot = await promptArtifactRoot(ctx, workspace.artifact_root);
 		if (artifactRoot.cancelled) {
 			if (artifactRoot.reason === "user") {
 				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
@@ -281,7 +356,7 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 			return;
 		}
 
-		const refsRoot = await promptRefsRoot(ctx, current.refs_root);
+		const refsRoot = await promptRefsRoot(ctx, workspace.refs_root);
 		if (refsRoot.cancelled) {
 			if (refsRoot.reason === "user") {
 				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
@@ -289,7 +364,7 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 			return;
 		}
 
-		const graphEnabled = await promptGraphEnabled(ctx, current.graph_enabled);
+		const graphEnabled = await promptGraphEnabled(ctx, workspace.graph_enabled);
 		if (graphEnabled.cancelled) {
 			if (graphEnabled.reason === "user") {
 				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
@@ -297,36 +372,40 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 			return;
 		}
 
-		const reviewerMode = await promptRoleMode(ctx, "reviewer", current.reviewer.mode);
+		const reviewerMode = await promptRoleMode(ctx, reviewer.mode);
 		if (reviewerMode.cancelled) {
 			if (reviewerMode.reason === "user") {
 				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
 			}
 			return;
 		}
-
-		const reviewerModel = await promptRoleModel(ctx, "reviewer", current.reviewer.model_selector);
-		if (reviewerModel.cancelled) {
-			if (reviewerModel.reason === "user") {
-				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
+		if (reviewerMode.value !== reviewer.mode) {
+			// Mode lives in the global role: persist the switch immediately;
+			// the model/thinking level stays untouched.
+			try {
+				const applied = setRole(workdir, { role: "reviewer", mode: reviewerMode.value });
+				reviewer = applied.global.reviewer;
+			} catch (error) {
+				ctx.ui.notify(`Failed to switch the reviewer mode: ${(error as Error).message}`, "error");
 			}
-			return;
 		}
 
-		const criticizerMode = await promptRoleMode(ctx, "criticizer", current.criticizer.mode);
-		if (criticizerMode.cancelled) {
-			if (criticizerMode.reason === "user") {
-				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
+		// Q-3=A: current-session never uses a spawned model — skip the model
+		// step entirely (and never clear an existing selector).
+		let reviewerError: string | undefined;
+		if (reviewer.mode === "delegated-subagent") {
+			const entry = await promptRoleModelEntry(ctx, reviewer);
+			if (entry.cancelled) {
+				if (entry.reason === "user") {
+					ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
+				}
+				return;
 			}
-			return;
-		}
-
-		const criticizerModel = await promptRoleModel(ctx, "criticizer", current.criticizer.model_selector);
-		if (criticizerModel.cancelled) {
-			if (criticizerModel.reason === "user") {
-				ctx.ui.notify("Configuration wizard cancelled. No changes were written.", "warning");
+			if (entry.value === "change") {
+				const changed = await changeReviewerRole(ctx, reviewer);
+				reviewer = changed.role;
+				reviewerError = changed.error;
 			}
-			return;
 		}
 
 		const updated = updateConfig(workdir, (config) => {
@@ -340,18 +419,9 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 			config.refs_root_updated_at = now;
 			config.graph_enabled = graphEnabled.value;
 			config.graph_enabled_updated_at = now;
-			config.reviewer = {
-				...config.reviewer,
-				mode: reviewerMode.value,
-				model_selector: reviewerModel.value,
-				confirmed_at: now,
-			};
-			config.criticizer = {
-				...config.criticizer,
-				mode: criticizerMode.value,
-				model_selector: criticizerModel.value,
-				confirmed_at: now,
-			};
+			// The reviewer role lives in the GLOBAL config since v0.7.0 — the
+			// wizard only strips a legacy workspace key, never writes one.
+			delete config.reviewer;
 			return config;
 		});
 
@@ -362,7 +432,10 @@ export async function configPiPlansCommand(_args: string, ctx: ConfigCommandCont
 		// Display-only consumer (F-006): deliberately keeps the shared active
 		// pointer — the wizard summarizes repo state, not session attribution.
 		const active = readActive(workdir);
-		const lines = summarizeConfig(updated.config);
+		const lines = summarizeConfig(updated.config, reviewer);
+		if (reviewerError) {
+			lines.push(`Reviewer change failed (${reviewerError}); the reviewer role is unchanged. Workspace settings above were still written.`);
+		}
 		if (active) {
 			lines.push(`Active run left unchanged: ${active.run_id}`);
 		}

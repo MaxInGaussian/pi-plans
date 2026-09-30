@@ -4,7 +4,7 @@
  * pinned to the pi extension hooks — started by /watch-graph (or session_start
  * when the enabled marker is set), stopped by /unwatch-graph, disable-graph,
  * and an idempotent session_shutdown handler. A PID+heartbeat lock under
- * .git/pi_plans/graph/watch keeps a single writer per worktree across pi
+ * .git/pi-plans/graph/watch keeps a single writer per worktree across pi
  * sessions; per-file single-flight dedupes apply-trigger vs watch events.
  */
 
@@ -32,7 +32,7 @@ interface ActiveWatcher {
 const activeWatchers = new Map<string, ActiveWatcher>();
 
 function graphDir(paths: WorktreePaths): string {
-	return path.join(paths.gitCommonDir, "pi_plans", "graph");
+	return path.join(paths.gitCommonDir, "pi-plans", "graph");
 }
 
 function lockPath(paths: WorktreePaths): string {

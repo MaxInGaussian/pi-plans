@@ -3,6 +3,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getRun, readActive } from "./state.ts";
 import { resolveActiveRun } from "./run-context.ts";
+import { messaging, tryMessaging } from "./messaging.ts";
 
 export const AUTOCOMPLETE_ENTRY = "pi-plans-autocomplete";
 const AUTOCOMPLETE_CONTINUE = "Continue the current planning workflow. Raise the next relevant question with ask_choice; do not stop after an auto-completed answer.";
@@ -22,12 +23,6 @@ type SessionWithAutoComplete = ExtensionContext["sessionManager"] & {
 	__piPlansAutoComplete?: AutoCompleteState;
 };
 
-let api: ExtensionAPI | null = null;
-
-export function setAutoCompleteApi(next: ExtensionAPI | null): void {
-	api = next;
-}
-
 function sessionState(ctx: ExtensionContext): AutoCompleteState | undefined {
 	return (ctx.sessionManager as SessionWithAutoComplete).__piPlansAutoComplete;
 }
@@ -39,9 +34,17 @@ function activePlanningRun(ctx: ExtensionContext): { runId: string } | null {
 	return run?.status === "planning" ? { runId: run.run_id } : null;
 }
 
-function appendState(runId: string, enabled: boolean, reason?: string): void {
-	if (!api) return;
-	api.appendEntry(AUTOCOMPLETE_ENTRY, { runId, enabled, ...(reason ? { reason } : {}) });
+function appendState(ctx: ExtensionContext, runId: string, enabled: boolean, reason?: string): void {
+	// Best-effort persistence: the in-memory session state is authoritative for
+	// the live turn; never let an unwired (tests) or stale (session swap) messaging
+	// surface break the ask_choice / handoff flows that call this.
+	const m = tryMessaging();
+	if (!m) return;
+	try {
+		m.appendEntry(AUTOCOMPLETE_ENTRY, { runId, enabled, ...(reason ? { reason } : {}) });
+	} catch {
+		/* session swap in flight; the entry is optional */
+	}
 }
 
 export function enableAutoComplete(ctx: ExtensionContext): boolean {
@@ -57,7 +60,7 @@ export function enableAutoComplete(ctx: ExtensionContext): boolean {
 		autoChoiceCount: 0,
 		planWritten: false,
 	};
-	appendState(run.runId, true);
+	appendState(ctx, run.runId, true);
 	return true;
 }
 
@@ -67,7 +70,7 @@ export function disableAutoComplete(ctx: ExtensionContext, reason = "disabled"):
 	const runId = state?.runId ?? run?.runId;
 	if (!runId && !state?.enabled) return false;
 	if (state) state.enabled = false;
-	if (runId) appendState(runId, false, reason);
+	if (runId) appendState(ctx, runId, false, reason);
 	return true;
 }
 
@@ -110,12 +113,12 @@ export function shouldContinueAutoComplete(ctx: ExtensionContext): boolean {
 }
 
 export async function continueAutoComplete(ctx: ExtensionContext): Promise<boolean> {
-	if (!api || !shouldContinueAutoComplete(ctx)) return false;
+	if (!shouldContinueAutoComplete(ctx)) return false;
 	const state = sessionState(ctx);
 	if (!state) return false;
 	state.pendingFollowUp = true;
 	try {
-		await api.sendUserMessage(AUTOCOMPLETE_CONTINUE, { deliverAs: "followUp" });
+		await messaging().sendUserMessage(AUTOCOMPLETE_CONTINUE, { deliverAs: "followUp" });
 		return true;
 	} catch {
 		state.pendingFollowUp = false;
@@ -123,12 +126,11 @@ export async function continueAutoComplete(ctx: ExtensionContext): Promise<boole
 	}
 }
 
-export function registerAutoCompleteTurnHandlers(pi: ExtensionAPI): void {
-	setAutoCompleteApi(pi);
-	pi.on("turn_start", async (_event, ctx) => {
+export function registerAutoCompleteTurnHandlers(ext: ExtensionAPI): void {
+	ext.on("turn_start", async (_event, ctx) => {
 		resetAutoCompleteTurn(ctx);
 	});
-	pi.on("turn_end", async (event, ctx) => {
+	ext.on("turn_end", async (event, ctx) => {
 		const message = event.message as { role?: string } | undefined;
 		if (message?.role === "assistant") await continueAutoComplete(ctx);
 	});

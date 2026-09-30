@@ -91,7 +91,7 @@ describe("recordSubagent usage persistence (I-010)", () => {
 			});
 			assert.equal(entry.usage?.input, 11);
 			const line = fs
-				.readFileSync(path.join(dir, ".git", "pi_plans", "runs", startRunId, "subagents.jsonl"), "utf8")
+				.readFileSync(path.join(dir, ".git", "pi-plans", "runs", startRunId, "subagents.jsonl"), "utf8")
 				.trim()
 				.split("\n")
 				.map((l) => JSON.parse(l))

@@ -11,7 +11,8 @@ import { migrateRunIntoCurrentWorktree, resumePlansCommand } from "../src/resume
 import { createCheckpoint, loadCheckpoint, mutateCheckpoint, applyQuestionAsked, applyQuestionAnswered } from "../src/workflow-state.ts";
 import { acquireOwnership, processStartOf } from "../src/run-ownership.ts";
 import { resetRunBindingForTests } from "../src/run-context.ts";
-import { initState, setRunStatus, startRun, StateError } from "../src/state.ts";
+import { initState, setArtifactRoot, setRunStatus, startRun, StateError } from "../src/state.ts";
+import { setMessagingApi } from "../src/messaging.ts";
 
 let tmpRoot: string;
 
@@ -63,7 +64,7 @@ function makeCtx(cwd: string, overrides: Partial<CtxMock> = {}): CtxMock {
 }
 
 function ctxAdapter(mock: CtxMock): unknown {
-	return {
+	const ctx = {
 		cwd: mock.cwd,
 		hasUI: mock.hasUI,
 		isIdle: () => mock.isIdleResult,
@@ -84,21 +85,16 @@ function ctxAdapter(mock: CtxMock): unknown {
 			setStatus: () => {},
 		},
 	};
-}
-
-function makePi(mock: CtxMock): unknown {
-	return {
-		sendUserMessage: async (content: string) => {
-			mock.userMessages.push(content);
-		},
+	setMessagingApi({
 		appendEntry: (customType: string, data?: unknown) => {
 			mock.entries.push({ customType, data });
 		},
 		sendMessage: () => {},
-		on: () => {},
-		setModel: async () => true,
-		setThinkingLevel: () => {},
-	};
+		sendUserMessage: async (content: string) => {
+			mock.userMessages.push(content);
+		},
+	});
+	return ctx;
 }
 
 const BASE_DIR = path.resolve(import.meta.dirname, "..");
@@ -168,7 +164,7 @@ describe("candidate discovery", () => {
 		const run = startRun(workdir, { topic: "corrupt", skill: "plan-normal", requestText: "a" }).run;
 		createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
 		fs.writeFileSync(
-			path.join(workdir, ".git", "pi_plans", "runs", run.run_id, "checkpoint.json"),
+			path.join(workdir, ".git", "pi-plans", "runs", run.run_id, "checkpoint.json"),
 			"{ broken",
 			"utf8",
 		);
@@ -182,27 +178,27 @@ describe("/resume-plans command", () => {
 	it("refuses non-interactive and busy sessions, notifies when nothing is resumable", async () => {
 		const workdir = setupRepo("guards");
 		const noUI = makeCtx(workdir, { hasUI: false });
-		await resumePlansCommand(makePi(noUI) as never, ctxAdapter(noUI) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(noUI) as never, BASE_DIR);
 		assert.ok(noUI.notifies.some((n) => /interactive/.test(n.message)));
 
 		const busy = makeCtx(workdir, { isIdleResult: false });
-		await resumePlansCommand(makePi(busy) as never, ctxAdapter(busy) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(busy) as never, BASE_DIR);
 		assert.ok(busy.notifies.some((n) => /busy/.test(n.message)));
 		assert.equal(busy.userMessages.length, 0);
 
 		const empty = setupRepo("empty-repo");
 		const emptyCtx = makeCtx(empty);
-		await resumePlansCommand(makePi(emptyCtx) as never, ctxAdapter(emptyCtx) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(emptyCtx) as never, BASE_DIR);
 		assert.ok(emptyCtx.notifies.some((n) => /No resumable/.test(n.message)));
 	});
 
 	it("corrupt checkpoints report and change nothing", async () => {
 		const workdir = setupRepo("corrupt-cmd");
 		const run = startRun(workdir, { topic: "corruptcmd", skill: "plan-normal", requestText: "a" }).run;
-		const cpPath = path.join(workdir, ".git", "pi_plans", "runs", run.run_id, "checkpoint.json");
+		const cpPath = path.join(workdir, ".git", "pi-plans", "runs", run.run_id, "checkpoint.json");
 		fs.writeFileSync(cpPath, "{ broken", "utf8");
 		const mock = makeCtx(workdir);
-		await resumePlansCommand(makePi(mock) as never, ctxAdapter(mock) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(mock) as never, BASE_DIR);
 		assert.ok(mock.notifies.some((n) => /corrupt/.test(n.message)));
 		assert.equal(mock.userMessages.length, 0);
 		assert.equal(fs.readFileSync(cpPath, "utf8"), "{ broken");
@@ -225,7 +221,7 @@ describe("/resume-plans command", () => {
 		void cp;
 
 		const mock = makeCtx(workdir);
-		await resumePlansCommand(makePi(mock) as never, ctxAdapter(mock) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(mock) as never, BASE_DIR);
 		assert.equal(mock.userMessages.length, 1, "exactly one kickoff");
 		const brief = mock.userMessages[0]!;
 		assert.match(brief, /PI-PLANS RESUME/);
@@ -244,7 +240,7 @@ describe("/resume-plans command", () => {
 		const latest = startRun(workdir, { topic: "three", skill: "plan-normal", requestText: "c" }).run;
 		setRunStatus(workdir, latest.run_id, "abandoned");
 		const mock = makeCtx(workdir, { selectAnswer: null });
-		await resumePlansCommand(makePi(mock) as never, ctxAdapter(mock) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(mock) as never, BASE_DIR);
 		assert.equal(mock.userMessages.length, 0);
 		assert.ok(mock.notifies.some((n) => /Cancelled/.test(n.message)));
 		assert.equal(mock.selects.length, 1);
@@ -257,7 +253,7 @@ describe("/resume-plans command", () => {
 		const child = spawn("sleep", ["30"], { stdio: "ignore" });
 		try {
 			fs.writeFileSync(
-				path.join(workdir, ".git", "pi_plans", "runs", run.run_id, "owner.json"),
+				path.join(workdir, ".git", "pi-plans", "runs", run.run_id, "owner.json"),
 				JSON.stringify({
 					schema: 1,
 					host: os.hostname(),
@@ -271,7 +267,7 @@ describe("/resume-plans command", () => {
 				"utf8",
 			);
 			const mock = makeCtx(workdir);
-			await resumePlansCommand(makePi(mock) as never, ctxAdapter(mock) as never, BASE_DIR);
+			await resumePlansCommand(ctxAdapter(mock) as never, BASE_DIR);
 			assert.ok(mock.notifies.some((n) => /actively owned/.test(n.message)));
 			assert.equal(mock.userMessages.length, 0);
 		} finally {
@@ -280,8 +276,11 @@ describe("/resume-plans command", () => {
 	});
 
 	it("cross-worktree: cancel changes nothing; confirm migrates artifacts and resets approval", async () => {
-		// Source worktree holds the artifacts inside its own tree.
+		// Source worktree holds the artifacts inside its own tree. D-007 only
+		// applies to a per-worktree root, so pin one; the default root lives in
+		// the shared git common dir and is never migrated.
 		const source = setupRepo("xwt-source", { commit: true });
+		setArtifactRoot(source, "./docs/pi-plans", "user");
 		const run = startRun(source, { topic: "xwt", skill: "plan-normal", requestText: "a" }).run;
 		const cp = createCheckpoint(source, { runId: run.run_id, originWorkdir: source, workdir: source });
 		void cp;
@@ -294,12 +293,12 @@ describe("/resume-plans command", () => {
 		spawnSync("git", ["worktree", "add", target], { cwd: source });
 
 		const cancelMock = makeCtx(target, { confirmAnswer: false });
-		await resumePlansCommand(makePi(cancelMock) as never, ctxAdapter(cancelMock) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(cancelMock) as never, BASE_DIR);
 		assert.equal(cancelMock.userMessages.length, 0);
 		assert.ok(cancelMock.confirmShown.length >= 1);
 
 		const goMock = makeCtx(target, { confirmAnswer: true });
-		await resumePlansCommand(makePi(goMock) as never, ctxAdapter(goMock) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(goMock) as never, BASE_DIR);
 		assert.equal(goMock.userMessages.length, 1, "one kickoff after migration");
 		// Artifacts copied into the target worktree's artifact root.
 		const copied = path.join(target, "docs", "pi-plans", path.basename(run.artifact_dir));
@@ -323,7 +322,7 @@ describe("/resume-plans command", () => {
 		fs.mkdirSync(run.artifact_dir, { recursive: true });
 		fs.writeFileSync(path.join(run.artifact_dir, "PLAN_v1.md"), "# plan", "utf8");
 		const mock = makeCtx(workdir, { confirmAnswer: true });
-		await resumePlansCommand(makePi(mock) as never, ctxAdapter(mock) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(mock) as never, BASE_DIR);
 		assert.equal(mock.userMessages.length, 1);
 		assert.match(mock.userMessages[0]!, /re-run the execution handoff/);
 		assert.ok(mock.confirmShown.some((c) => /Legacy execution run/.test(c.title)));
@@ -331,6 +330,7 @@ describe("/resume-plans command", () => {
 
 	it("migrateRunIntoCurrentWorktree aborts on differing conflicts (F-003)", () => {
 		const source = setupRepo("mig-overwrite", { commit: true });
+		setArtifactRoot(source, "./docs/pi-plans", "user");
 		const run = startRun(source, { topic: "mig", skill: "plan-normal", requestText: "a" }).run;
 		createCheckpoint(source, { runId: run.run_id, originWorkdir: source, workdir: source });
 		fs.mkdirSync(run.artifact_dir, { recursive: true });
@@ -376,7 +376,7 @@ describe("F-004 ledger reconcile (crash window)", () => {
 			questionId: "q-x",
 		});
 		const mock = makeCtx(workdir);
-		await resumePlansCommand(makePi(mock) as never, ctxAdapter(mock) as never, BASE_DIR);
+		await resumePlansCommand(ctxAdapter(mock) as never, BASE_DIR);
 		assert.equal(mock.userMessages.length, 1);
 		const brief = mock.userMessages[0]!;
 		assert.doesNotMatch(brief, /PENDING question/, "answered ledger entry wins");
@@ -386,58 +386,10 @@ describe("F-004 ledger reconcile (crash window)", () => {
 	});
 });
 
-describe("impl-review config crash-window recovery (0.5.4, D-5)", () => {
-	it("both answers in the ledger, none persisted: everything recovers, nothing missing", async () => {
-		const { resolveImplReviewConfig } = await import("../src/resume-command.ts");
-		const ledger = [
-			{ questionId: "termination-condition", answer: "1 round" },
-			{ questionId: "impl-review-reviewer-count", answer: "3" },
-		];
-		const resolved = resolveImplReviewConfig({ completedRounds: 0 }, ledger);
-		assert.equal(resolved.condition, "1 round");
-		assert.ok(resolved.conditionFromLedger);
-		assert.equal(resolved.reviewerCount, 3);
-		assert.ok(resolved.reviewerCountFromLedger);
-		assert.deepEqual(resolved.missing, []);
-	});
-
-	it("only termination answered: reviewer-count is the single missing question", async () => {
-		const { resolveImplReviewConfig } = await import("../src/resume-command.ts");
-		const resolved = resolveImplReviewConfig({ completedRounds: 0 }, [
-			{ questionId: "termination-condition", answer: "goal wait" },
-		]);
-		assert.equal(resolved.condition, "goal wait");
-		assert.equal(resolved.reviewerCount, undefined);
-		assert.deepEqual(resolved.missing, ["impl-review-reviewer-count"]);
-	});
-
-	it("persisted checkpoint wins over the ledger; latest ledger entry wins", async () => {
-		const { resolveImplReviewConfig } = await import("../src/resume-command.ts");
-		const resolved = resolveImplReviewConfig(
-			{ terminationCondition: "1 round", reviewerCount: 2, completedRounds: 0 },
-			[
-				{ questionId: "termination-condition", answer: "goal wait" },
-				{ questionId: "impl-review-reviewer-count", answer: "1" },
-			],
-		);
-		assert.equal(resolved.condition, "1 round");
-		assert.ok(!resolved.conditionFromLedger);
-		assert.equal(resolved.reviewerCount, 2);
-		assert.deepEqual(resolved.missing, []);
-		const staleThenFresh = resolveImplReviewConfig({ completedRounds: 0 }, [
-			{ questionId: "termination-condition", answer: "old" },
-			{ questionId: "termination-condition", answer: "new" },
-		]);
-		assert.equal(staleThenFresh.condition, "new", "latest ledger entry wins");
-	});
-
-	it("non-integer or out-of-range ledger counts are ignored, not adopted", async () => {
-		const { resolveImplReviewConfig } = await import("../src/resume-command.ts");
-		for (const bad of ["0", "4", "three"]) {
-			const resolved = resolveImplReviewConfig({ terminationCondition: "1 round", completedRounds: 0 }, [
-				{ questionId: "impl-review-reviewer-count", answer: bad },
-			]);
-			assert.equal(resolved.reviewerCount, undefined, `ledger answer ${bad} ignored`);
-		}
+describe("impl-review crash-window recovery (removed in v0.6.1)", () => {
+	it("the resolver is gone with the loop: the helper no longer exists", async () => {
+		const mod = await import("../src/resume-command.ts");
+		assert.equal("resolveImplReviewConfig" in mod, false);
 	});
 });
+

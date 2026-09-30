@@ -1,16 +1,16 @@
 /**
  * pi-plans — human-in-the-loop planning for the Pi coding agent.
  *
- * Researched, refined Markdown plans before any code changes. The five
+ * Researched, refined Markdown plans before any code changes. The six
  * planning skills are contributed via resources_discover; the extension
  * provides the supporting machinery:
  *
- *   - `plans` tool      — workspace state (config, runs, ledgers) in .git/pi_plans/
+ *   - `plans` tool      — workspace state (config, runs, ledgers) in .git/pi-plans/
  *   - `ask_choice` tool — the choice-prompt contract (Other / Auto-complete rules)
- *   - `refine` tool     — reviewer/criticizer rounds via read-only pi subagents
+ *   - `refine` tool     — reviewer rounds (findings + questions) via read-only pi subagents
  *   - `execute_plan`    — execution handoff into the tracked execution loop
  *   - write guard       — planning runs may only write planning artifacts
- *   - execution loop    — checklist injection, [DONE:VC-xxx] tracking, progress status
+ *   - execution loop    — task-tree injection, plans_update_task tracking, dashboard, audit
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -44,7 +44,7 @@ import {
 	requestPlanningCompaction,
 	restoreFromSession,
 	stopExecution,
-	abortDelegatedExecutor,
+	toggleDashboardExpanded,
 	updateStatusWidget,
 	shouldTriggerPlanningCompaction,
 } from "./src/exec.ts";
@@ -82,9 +82,12 @@ import { abandonCandidates, resolveCommandRun } from "./src/run-picker.ts";
 import { applyPlanWritten, mutateCheckpoint, planIdentityOf } from "./src/workflow-state.ts";
 import { registerAskChoiceTool } from "./tools/ask-choice.ts";
 import { executeCommand, registerExecutePlanTool } from "./tools/execute-plan.ts";
+import { registerTaskStatusTool } from "./src/task-tool.ts";
+import { flattenTaskViews, taskIsTerminal, taskProgress } from "./src/tasks.ts";
 import { registerPlansTool } from "./tools/plans.ts";
 import { registerRefineTool } from "./tools/refine.ts";
 import { registerAnalyzeRefsTool } from "./tools/analyze-refs.ts";
+import { messaging, setMessagingApi } from "./src/messaging.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
 
@@ -127,11 +130,17 @@ function hasActivePlanningWorkflow(ctx: Parameters<typeof updateStatusWidget>[0]
 }
 
 export default function piPlansExtension(pi: ExtensionAPI): void {
+	setMessagingApi(pi);
 	registerPlansTool(pi);
 	registerAskChoiceTool(pi);
 	registerRefineTool(pi, baseDir);
 	registerAnalyzeRefsTool(pi, baseDir);
 	registerExecutePlanTool(pi);
+	registerTaskStatusTool(pi);
+	pi.registerShortcut("ctrl+shift+t", {
+		description: "Expand/collapse the pi-plans task dashboard",
+		handler: (ctx) => toggleDashboardExpanded(ctx),
+	});
 	registerQueryInterviewHooks(pi, hasActivePlanningWorkflow);
 	registerCodeGraphTool(pi);
 	registerGraphAwareFileTools(pi);
@@ -178,7 +187,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			handler: async (args, ctx) => {
 				const invocation = args.trim() ? `/skill:${name} ${args.trim()}` : `/skill:${name}`;
 				try {
-					pi.sendUserMessage(invocation, { expandPromptTemplates: true });
+					messaging().sendUserMessage(invocation, { expandPromptTemplates: true });
 				} catch {
 					ctx.ui.notify("Agent is busy; try again once the current turn finishes.", "error");
 				}
@@ -208,7 +217,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			if (active) {
 				const latest = latestPlanVersion(active.artifact_dir);
 				if (latest && path.resolve(ctx.cwd, rawPath) === path.resolve(ctx.cwd, latest.path)) {
-					pi.appendEntry(PLANNING_PLAN_WRITTEN_CUSTOM_TYPE, {
+					messaging().appendEntry(PLANNING_PLAN_WRITTEN_CUSTOM_TYPE, {
 						runId: active.run_id,
 						planPath: latest.path,
 					});
@@ -254,14 +263,14 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		if (event.toolName !== "plans") return;
 		if (!consumePrePlanCompactPending(ctx)) return;
 		if (typeof ctx.compact !== "function") {
-			sendPrePlanCompactResume(pi);
+			sendPrePlanCompactResume(ctx);
 			return;
 		}
 		let resumed = false;
 		const resumeOnce = () => {
 			if (resumed) return;
 			resumed = true;
-			sendPrePlanCompactResume(pi);
+			sendPrePlanCompactResume(ctx);
 		};
 		ctx.compact({
 			customInstructions: PLANNING_PREPLAN_COMPACT_HINT,
@@ -313,18 +322,18 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		noteCompactionStarted(ctx, event.customInstructions);
-		const executionResult = await handleExecutionBeforeCompact(pi, ctx, event);
+		const executionResult = await handleExecutionBeforeCompact(ctx, event);
 		if (executionResult) return executionResult;
-		return handlePlanningBeforeCompact(pi, ctx, event);
+		return handlePlanningBeforeCompact(ctx, event);
 	});
 	pi.on("session_compact", async (event, ctx) => {
-		await handleExecutionCompact(pi, ctx, event);
-		await handlePlanningCompact(pi, ctx, event);
+		await handleExecutionCompact(ctx, event);
+		await handlePlanningCompact(ctx, event);
 		noteCompactionEnded(ctx, event.customInstructions);
 	});
 	pi.on("session_compact_failed", async (event, ctx) => {
-		handleExecutionCompactFailed(pi, ctx, event);
-		handlePlanningCompactFailed(pi, ctx, event);
+		handleExecutionCompactFailed(ctx, event);
+		handlePlanningCompactFailed(ctx, event);
 		noteCompactionEnded(ctx, event.customInstructions);
 	});
 
@@ -332,7 +341,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// Execution loop: inject remaining checklist each turn, track markers.
 	// -----------------------------------------------------------------------
 	pi.on("before_agent_start", async (_event, ctx) => {
-		drainExecutionFlush(pi, ctx);
+		drainExecutionFlush(ctx);
 		const content = executionContextMessage(ctx);
 		if (!content) {
 			if (!getExecution() && shouldTriggerPlanningCompaction(ctx)) {
@@ -372,7 +381,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 
 	pi.registerCommand("init-graph", {
-		description: "Index the worktree into .git/pi_plans/code_graph.db. If a graph DB already exists, prompt to rebuild or sync changed paths via /update-graph; `--reindex` and non-interactive runs stay on the rebuild path.",
+		description: "Index the worktree into .git/pi-plans/code_graph.db. If a graph DB already exists, prompt to rebuild or sync changed paths via /update-graph; `--reindex` and non-interactive runs stay on the rebuild path.",
 		handler: async (args, ctx) => {
 			await initGraphCommand(args, ctx);
 		},
@@ -460,15 +469,16 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 				lines.push(`State: ${resolveStateRootOrNull(ctx.cwd) ?? "(no repo)"}`);
 			}
 			// One-time active.json deprecation note (v0.6.0 registry migration).
-			if (fs.existsSync(path.join(resolveStateRootOrNull(ctx.cwd) ?? ".git/pi_plans", "active.json"))) {
+			if (fs.existsSync(path.join(resolveStateRootOrNull(ctx.cwd) ?? ".git/pi-plans", "active.json"))) {
 				lines.push("Note: active.json is deprecated — the run registry now derives from runs/*/run.json; the legacy file is ignored.");
 			}
 			const execution = getExecution();
 			if (execution) {
-				const done = execution.items.filter((item) => item.done).length;
-				lines.push(`Execution: ${execution.planPath} — ${done}/${execution.items.length} verifier items done`);
-				for (const item of execution.items) {
-					lines.push(`  ${item.done ? "☑" : "☐"} ${item.id}`);
+				const progress = taskProgress(execution.tasks);
+				const vcDone = execution.items.filter((item) => item.done).length;
+				lines.push(`Execution: ${execution.planPath} — tasks ${progress.done}/${progress.total} · VC ${vcDone}/${execution.items.length}`);
+				for (const task of flattenTaskViews(execution.tasks)) {
+					lines.push(`  ${taskIsTerminal(task) ? (task.status === "skipped" ? "~" : "☑") : "☐"} ${task.id}`);
 				}
 			}
 			lines.push(`Auto-complete: ${autoCompleteStatus(ctx)}`);
@@ -478,7 +488,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("config-pi-plans", {
-		description: "Re-ask and update pi-plans workspace config: language, artifact root, graph, reviewer, and criticizer defaults",
+		description: "Re-ask and update pi-plans workspace config: language, artifact root, graph, and reviewer defaults",
 		handler: async (args, ctx) => {
 			await configPiPlansCommand(args, ctx);
 		},
@@ -554,7 +564,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 					`${doneIds.length}/${execution.items.length} verifier item(s) already verified; their work stays. Remaining items return to planning.`,
 				);
 				if (!ok) return;
-				await stopExecution(pi, ctx, "interrupted by /update-plan");
+				await stopExecution(ctx, "interrupted by /update-plan");
 			}
 
 			// Return the run to planning so refinement rules and guards apply again.
@@ -602,7 +612,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 				"Follow the original planning-skill contract for revisions: collect needed clarifications via ask_choice (one question at a time, recorded), apply evidence-based revisions only, then ask the next merged accept/execute question (autoComplete: false — ✓ Accept & execute now / Accept, don't execute yet / another round) and call execute_plan pointing at the new version on accept.",
 			);
 
-			await pi.sendUserMessage(lines.join("\n"));
+			await messaging().sendUserMessage(lines.join("\n"));
 		},
 	});
 
@@ -613,12 +623,9 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("No execution in progress.", "info");
 				return;
 			}
-			const ok = await ctx.ui.confirm("Stop execution?", "Remaining verifier items will be left unfinished.");
+			const ok = await ctx.ui.confirm("Stop execution?", "Open tasks will be left unfinished.");
 			if (!ok) return;
-			// v0.6.0: a delegated executor child is killed via its AbortController
-			// before the shared stop path clears the state.
-			abortDelegatedExecutor();
-			await stopExecution(pi, ctx, "stopped by user via /plans-stop");
+			await stopExecution(ctx, "stopped by user via /plans-stop");
 			ctx.ui.notify("Execution stopped.", "info");
 		},
 	});
@@ -627,7 +634,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		description:
 			"Resume the working plan in this repository: unfinished planning / reviewing / execution / implementation review, across sessions and linked worktrees, in the current session.",
 		handler: async (_args, ctx) => {
-			await resumePlansCommand(pi, ctx, baseDir);
+			await resumePlansCommand(ctx, baseDir);
 		},
 	});
 
@@ -654,8 +661,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			// Abandon must end execution first so the planning model is restored.
 			disableAutoComplete(ctx, "run abandoned");
 			if (abandoningBound && getExecution()) {
-				abortDelegatedExecutor();
-				await stopExecution(pi, ctx, "run abandoned via /plans-abandon");
+				await stopExecution(ctx, "run abandoned via /plans-abandon");
 			}
 			try {
 				setRunStatus(ctx.cwd, chosen.run_id, "abandoned");
@@ -671,7 +677,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// Session lifecycle
 	// -----------------------------------------------------------------------
 	pi.on("session_tree", async (_event, ctx) => {
-		await restoreFromSession(pi, ctx, ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreFromSession>[2]);
+		await restoreFromSession(ctx, ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreFromSession>[1]);
 		restoreRunBindingFromSession(
 			ctx.sessionManager,
 			ctx.cwd,
@@ -679,7 +685,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		);
 	});
 	pi.on("session_start", async (_event, ctx) => {
-		await restoreFromSession(pi, ctx, ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreFromSession>[2]);
+		await restoreFromSession(ctx, ctx.sessionManager.getBranch() as unknown as Parameters<typeof restoreFromSession>[1]);
 		restoreAutoCompleteFromSession(ctx, ctx.sessionManager.getEntries() as unknown as Parameters<typeof restoreAutoCompleteFromSession>[1]);
 		restoreRunBindingFromSession(
 			ctx.sessionManager,
@@ -688,3 +694,4 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		);
 	});
 }
+

@@ -1,9 +1,12 @@
 /**
  * `analyze_refs` tool — plan-with-refs per-reference analysis via read-only Pi
  * subagents with isolated context. One lane per reference (cwd = the ref's own
- * directory), reusing the reviewer role gates from `.git/pi_plans/config.json`
- * and the concurrent refinement overlay (title "Refs"). Batches are capped at
- * three concurrent lanes; larger ref sets run as sequential batches.
+ * directory), reusing the reviewer model confirmation from the GLOBAL config
+ * (`~/.pi/pi-plans/config.json`) and the concurrent overlay (title "Refs").
+ * analyze_refs is spawn-only by nature, so the reviewer MODE is deliberately
+ * not consulted here (Q-4=B): a current-session reviewer still gets spawned
+ * ref-analyst lanes, with a one-time notice in the result. Batches are capped
+ * at three concurrent lanes; larger ref sets run as sequential batches.
  *
  * Recording is best-effort: spawns land in `subagents.jsonl` (role
  * `ref-analyst`) only when an active planning run exists. Analysis output is
@@ -17,7 +20,18 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { loadConfig, normalizeWorkdir, readActive, recordSubagent, resolveStateRootOrNull, StateError } from "../src/state.ts";
+import {
+	loadConfig,
+	normalizeWorkdir,
+	readActive,
+	recordSubagent,
+	resolveEffectiveReviewer,
+	resolveGlobalConfigPath,
+	resolveStateRootOrNull,
+	StateError,
+} from "../src/state.ts";
+import { runFirstUseFlow, firstUseCancelledError, firstUseTextGuidance, availableModels, findModel, type RolePanelHost } from "../src/role-panels.ts";
+import { roleModelLabel } from "../src/thinking-levels.ts";
 import type { SubagentUsage } from "../src/subagent.ts";
 import { resolveActiveRun } from "../src/run-context.ts";
 import { buildRefAnalystTask, type RefAnalystTaskInput } from "../src/refine-prompts.ts";
@@ -45,23 +59,37 @@ const AnalyzeRefsParams = Type.Object({
 	workdir: Type.Optional(Type.String({ description: "Target workspace; default current working directory" })),
 });
 
-function gateError(problem: "state" | "mode" | "current-session" | "confirm"): StateError {
+function gateError(problem: "state" | "confirm", guidance?: string): StateError {
 	if (problem === "state") {
 		return new StateError("no pi-plans state found; run the plans tool (action: init) first");
 	}
-	if (problem === "mode") {
-		return new StateError(
-			"The reviewer role mode is missing or invalid in .git/pi_plans/config.json (analyze_refs reuses the reviewer gates). Ask the role-setting question with ask_choice first: 1. Delegated subagent (recommended; read-only pi subprocess with isolated context) 2. Current session 3. Other 4. Auto-complete — then persist with the plans tool (set-role, role=reviewer).",
-		);
-	}
-	if (problem === "current-session") {
-		return new StateError(
-			"The reviewer role mode is current-session, but analyze_refs only spawns delegated read-only subagents (one per reference). Ask the user to switch the reviewer mode to delegated-subagent via ask_choice, persist with the plans tool (set-role, role=reviewer, mode=delegated-subagent), then retry analyze_refs.",
-		);
-	}
 	return new StateError(
-		"The reviewer model was never confirmed (confirmed_at is null); analyze_refs reuses the reviewer confirmation. Ask the model-confirmation question with ask_choice: 1. Inherit the main agent's model (recommended) 2. Choose a model (list options from the /model picker; persist the exact provider/model selector) 3. Other 4. Auto-complete — then persist with the plans tool (set-role, role=reviewer, confirmed: true, modelSelector: the selector or 'inherit').",
+		guidance ??
+			firstUseTextGuidance([], resolveGlobalConfigPath()),
 	);
+}
+
+/** First-use model confirmation for the spawn-only ref-analyst path: native
+ * panels in TUI, menus for hasUI non-TUI, embedded text guidance otherwise.
+ * The reviewer MODE is not consulted (Q-4=B), but because analysis always
+ * spawns, a confirmed CONCRETE model is required even when the stored mode
+ * is current-session (model confirmation “as usual”). */
+async function ensureRefAnalystModelReady(
+	host: RolePanelHost,
+	role: { mode: string; model_selector: string | null; thinking_level: string | null; confirmed_at: string | null },
+): Promise<{ mode: string; model_selector: string | null; thinking_level: string | null; confirmed_at: string | null; name_prefix: string }> {
+	if (role.confirmed_at !== null && role.model_selector !== null) return role as never;
+	let outcome = await runFirstUseFlow(host, role.thinking_level);
+	if (outcome.status === "confirmed" && outcome.model_selector !== null && availableModels(host).length > 0 && findModel(host, outcome.model_selector) === null) {
+		// F-008: a manually entered selector that the registry does not know —
+		// one re-pick, then let spawn-side errors surface precisely.
+		outcome = await runFirstUseFlow(host, outcome.role.thinking_level);
+	}
+	if (outcome.status === "cancelled") throw firstUseCancelledError("analyze_refs");
+	const guidance = firstUseTextGuidance(availableModels(host), resolveGlobalConfigPath());
+	if (outcome.status === "unavailable") throw gateError("confirm", guidance);
+	if (outcome.role.model_selector === null) throw gateError("confirm", guidance);
+	return outcome.role;
 }
 
 interface AnalysisJob {
@@ -72,14 +100,14 @@ interface AnalysisJob {
 	missing: string | null;
 }
 
-export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void {
+export function registerAnalyzeRefsTool(ext: ExtensionAPI, baseDir: string): void {
 	const agentPrompt = stripFrontmatter(fs.readFileSync(path.join(baseDir, "agents", "ref-analyst.md"), "utf8"));
 
-	pi.registerTool({
+	ext.registerTool({
 		name: "analyze_refs",
 		label: "Analyze Refs",
 		description:
-			"plan-with-refs: analyze downloaded references via independent read-only Pi subagents — one lane per reference (cwd = the ref directory), reusing the reviewer role gates and the concurrent overlay. Batches of at most 3 lanes run sequentially; results are structured per-reference sections for REF_ANALYSIS.md. Recording into subagents.jsonl is best-effort (active run only); refs.jsonl stays owned by the main agent via the plans record-ref action. Refuses until the reviewer mode/model gates pass in .git/pi_plans/config.json.",
+			"plan-with-refs: analyze downloaded references via independent read-only Pi subagents — one lane per reference (cwd = the ref directory), reusing the reviewer model confirmation from the global config and the concurrent overlay. Batches of at most 3 lanes run sequentially; results are structured per-reference sections for REF_ANALYSIS.md. Recording into subagents.jsonl is best-effort (active run only); refs.jsonl stays owned by the main agent via the plans record-ref action. The reviewer mode is not consulted (spawn-only); first use pops native model/effort panels in TUI.",
 		promptSnippet: "Analyze plan-with-refs references with per-ref read-only subagents",
 		parameters: AnalyzeRefsParams,
 
@@ -92,16 +120,21 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 				throw gateError("state");
 			}
 			const config = loadConfig(root);
-			const reviewer = config.reviewer;
-			if (!reviewer || (reviewer.mode !== "delegated-subagent" && reviewer.mode !== "current-session")) {
-				throw gateError("mode");
+
+			// F-005: cheap validations BEFORE any first-use panel.
+			if (params.refs.length === 0) {
+				throw new StateError("analyze_refs requires at least one reference");
 			}
-			if (reviewer.mode === "current-session") {
-				throw gateError("current-session");
-			}
-			if (reviewer.confirmed_at === null) {
-				throw gateError("confirm");
-			}
+
+			// Effective reviewer from the global config (mode NOT consulted —
+			// analyze_refs is spawn-only, Q-4=B; a notice surfaces when the stored
+			// mode is current-session so the switch is never silent).
+			const { reviewer: initialReviewer } = resolveEffectiveReviewer(root);
+			const modeIgnoredNotice =
+				initialReviewer.mode === "current-session"
+					? `note: the reviewer mode is ${initialReviewer.mode}, but analyze_refs always spawns read-only subagents; the mode is ignored here and unchanged.`
+					: null;
+			const reviewer = await ensureRefAnalystModelReady(ctx as unknown as RolePanelHost, initialReviewer);
 
 			// Resolve refs and validate directories up front; missing ones become
 			// FAILED sections instead of aborting the whole batch.
@@ -122,7 +155,7 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 			}
 
 			const model = reviewer.model_selector ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
-			const modelLabel = model ?? "inherit";
+			const modelLabel = roleModelLabel(model ?? "inherit", reviewer.thinking_level);
 			let languageTag: string | null = null;
 			if (active) {
 				try {
@@ -140,6 +173,7 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 						role: "ref-analyst",
 						name,
 						model: okModel ?? model ?? null,
+						thinking_level: reviewer.thinking_level,
 						// I-010: meter subagent token/cost for benchmark accounting.
 						usage: usage
 							? { input: usage.input, output: usage.output, cache_read: usage.cacheRead, cache_write: usage.cacheWrite, cost: usage.cost }
@@ -160,6 +194,7 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 						task: buildRefAnalystTask({ ...job.input, languageTag }),
 						cwd: job.dir,
 						model,
+						thinkingLevel: reviewer.thinking_level ?? undefined,
 						tools: READ_ONLY_TOOLS,
 						signal: relay.signal,
 						onProgress: (event) => overlay?.update(job.laneId, event),
@@ -224,7 +259,7 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 
 			if (failures === jobs.length) {
 				throw new Error(
-					`all reference analysis subagents failed (${failures}/${jobs.length})${model ? `\nIf the model selector "${model}" is unavailable, reset the reviewer confirmation (plans set-role, role=reviewer, resetConfirmation: true) and re-ask the model-confirmation question.` : ""}`,
+					`all reference analysis subagents failed (${failures}/${jobs.length})${model ? `\nIf the model selector "${model}" is unavailable, reset the reviewer confirmation (plans set-role, role=reviewer, resetConfirmation: true) — the next analyze_refs opens the native model panel to re-confirm.` : ""}`,
 				);
 			}
 
@@ -237,13 +272,13 @@ export function registerAnalyzeRefsTool(pi: ExtensionAPI, baseDir: string): void
 				content: [
 					{
 						type: "text",
-						text: `${text}\n\n---\nPersist: paste each reference's analysis into REF_ANALYSIS.md, call the plans tool (record-ref) per reference with coverage and gaps filled from the analysis, then ask at least three ref-specific adoption questions per reference with ask_choice before using its ideas in PLAN_v1.md.`,
+						text: `${modeIgnoredNotice ? `${modeIgnoredNotice}\n\n` : ""}${text}\n\n---\nPersist: paste each reference's analysis into REF_ANALYSIS.md, call the plans tool (record-ref) per reference with coverage and gaps filled from the analysis, then ask at least three ref-specific adoption questions per reference with ask_choice before using its ideas in PLAN_v1.md.`,
 					},
 				],
 				details: {
 					mode: "delegated-subagent",
 					role: "ref-analyst",
-					reviewerGates: { mode: reviewer.mode, model },
+					reviewerGates: { mode: initialReviewer.mode, modeIgnored: modeIgnoredNotice !== null, model, thinkingLevel: reviewer.thinking_level },
 					batches: Math.ceil(jobs.length / BATCH_SIZE),
 					model,
 					outputs,
