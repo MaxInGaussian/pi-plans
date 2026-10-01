@@ -71,18 +71,11 @@ Documentation duty: if your change alters behavior or the public API, update `RE
 
 ## Commit messages
 
-Follow the existing style: `type: short imperative description` (a scope is optional, e.g. `fix(form): ...`).
-
-- `feat:` new feature
-- `fix:` bug fix
-- `docs:` documentation
-- `refactor:` no behavior change
-- `perf:` performance
-- `test:` tests only
-- `chore:` housekeeping
-- `ci:` CI changes
-
-Use the imperative mood ("fix race in ...", not "fixed ..."), keep the subject short, and use the body for motivation and evidence. Do not add generator or `Co-Authored-By` trailers.
+Commit-message format and the repository's documentation-language rule are
+specified in [`AGENTS.md`](AGENTS.md), which is authoritative for both. In short:
+subject **and** body are English, in the style `type: short imperative
+description` (a scope is optional, e.g. `fix(form): ...`), with the body used
+for motivation and evidence and no generator or `Co-Authored-By` trailers.
 
 ## Issues and pull requests
 
