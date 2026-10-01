@@ -10,11 +10,30 @@
 const ELLIPSIS = "…";
 
 /**
- * ECMA-48 CSI sequence: ESC [ parameter bytes (0x30-0x3F), intermediate bytes
- * (0x20-0x2F), final byte (0x40-0x7E). Matched atomically so styling payloads
- * never leak into width math and are never split mid-sequence.
+ * ECMA-48 escape sequences. ALL of them render at zero width, so styling and
+ * control payloads must never leak into width math nor be split mid-sequence.
+ *
+ * Three families are recognised:
+ *  - CSI: `ESC [ params intermediates final`           (SGR colours, cursor moves)
+ *  - String-terminated: `ESC ] _ P X ^` … `BEL`|`ST`  (OSC, APC, DCS, SOS, PM)
+ *  - Simple: `ESC` intermediates `final`               (`ESC c`, `ESC (B`, `ESC 7`)
+ *
+ * The string family matters beyond colour: pi's `CURSOR_MARKER` is an APC
+ * sequence (`ESC _ pi:c BEL`). Counting its payload as visible text made every
+ * row carrying the marker — e.g. a focused search Input — measure several
+ * columns too wide, which pushed that row's right-hand border out of
+ * alignment. The terminator is required: a well-formed sequence always has
+ * one, and refusing malformed ones keeps the fallback (the simple family)
+ * from swallowing real text.
  */
-const CSI_PATTERN = /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/g;
+const ESCAPE_PATTERN = new RegExp(
+	[
+		"\\x1b\\[[\\x30-\\x3f]*[\\x20-\\x2f]*[\\x40-\\x7e]", // CSI
+		"\\x1b[\\]PX^_][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)", // OSC / APC / DCS / SOS / PM
+		"\\x1b[\\x20-\\x2f]*[\\x30-\\x7e]", // simple escapes
+	].join("|"),
+	"g",
+);
 
 interface AnsiPart {
 	kind: "csi" | "text";
@@ -24,7 +43,7 @@ interface AnsiPart {
 function splitAnsi(text: string): AnsiPart[] {
 	const parts: AnsiPart[] = [];
 	let last = 0;
-	for (const match of text.matchAll(CSI_PATTERN)) {
+	for (const match of text.matchAll(ESCAPE_PATTERN)) {
 		const start = match.index ?? 0;
 		if (start > last) parts.push({ kind: "text", value: text.slice(last, start) });
 		parts.push({ kind: "csi", value: match[0] });

@@ -16,15 +16,16 @@
  */
 
 import {
-	DynamicBorder,
 	ModelSelectorComponent,
 	getSelectListTheme,
 	type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Input, SelectList, Spacer, Text, fuzzyFilter, getKeybindings, matchesKey } from "@earendil-works/pi-tui";
+import type { Component, TuiMouseDispatchResult, TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { DEFAULT_LEVEL_DESCRIPTION, DEFAULT_LEVEL_SENTINEL, levelsForModel } from "./thinking-levels.ts";
 import { setGlobalRole, type GlobalRoleConfig } from "./global-state.ts";
+import { truncateToWidth, visibleWidth } from "./refine-ui-helpers.ts";
 
 // ---------------------------------------------------------------------------
 // Host abstraction (structural — tools pass their ExtensionContext)
@@ -124,6 +125,119 @@ const LEVEL_DESCRIPTIONS: Record<string, string> = {
 
 const EFFORT_LAYOUT = { minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 32 };
 
+/** Minimal shape of pi's theme needed to paint a border. */
+export type BorderColor = (text: string) => string;
+
+const identityColor: BorderColor = (text) => text;
+
+/** Build a border painter from the `theme` the ui.custom factory hands us.
+ *  Falls back to plain text when the host passes no (or a partial) theme. */
+export function borderColorFrom(theme: unknown): BorderColor {
+	const fg = (theme as { fg?: (color: string, text: string) => string } | null | undefined)?.fg;
+	if (typeof fg !== "function") return identityColor;
+	return (text) => {
+		try {
+			return fg("border", text);
+		} catch {
+			return identityColor(text);
+		}
+	};
+}
+
+/** Strip ANSI, then report whether the line is nothing but a horizontal rule
+ *  (the shape pi's DynamicBorder emits: `─` repeated across the width). */
+function isRuleLine(line: string): boolean {
+	// eslint-disable-next-line no-control-regex
+	const plain = line.replace(/\x1b\[[0-9;]*m/g, "").trim();
+	return plain.length > 0 && /^─+$/.test(plain);
+}
+
+/**
+ * v0.7.1: wrap a panel in a FULL box (left/right rules included).
+ *
+ * pi's `DynamicBorder` — used by ModelSelectorComponent, ThinkingSelector and
+ * our EffortPanelComponent — renders only a horizontal line, so the first-use
+ * gate panels had top/bottom borders but no sides, while the reviewer panel
+ * (refine-ui.ts) already drew a complete box. This wrapper makes the gate
+ * panels consistent with the rest of pi-plans.
+ *
+ * The inner component's own rule lines are stripped, so the total line count is
+ * unchanged and the overlay's `maxHeight` budget is unaffected.
+ *
+ * Focus, keyboard and mouse are forwarded to the inner component: the TUI only
+ * sets `focused` on the component it mounts, so the wrapper must relay it for
+ * the inner search Input to keep the hardware cursor (CURSOR_MARKER).
+ */
+export class BorderedPanel implements Component {
+	private readonly inner: Component;
+	private readonly color: BorderColor;
+
+	constructor(inner: Component, color?: BorderColor) {
+		this.inner = inner;
+		this.color = color ?? identityColor;
+	}
+
+	/** The wrapped component (exposed for tests / unwrapping). */
+	get content(): Component {
+		return this.inner;
+	}
+
+	get focused(): boolean {
+		return (this.inner as { focused?: boolean }).focused === true;
+	}
+
+	set focused(value: boolean) {
+		(this.inner as { focused?: boolean }).focused = value;
+	}
+
+	render(width: number): string[] {
+		const innerWidth = Math.max(1, width - 2);
+		let lines = this.inner.render(innerWidth);
+		// Drop the inner component's own top/bottom rules so we don't draw two.
+		while (lines.length > 0 && isRuleLine(lines[0]!)) lines = lines.slice(1);
+		while (lines.length > 0 && isRuleLine(lines[lines.length - 1]!)) lines = lines.slice(0, -1);
+		const boxed = lines.map((line) => {
+			const body = truncateToWidth(line, innerWidth, "");
+			const filler = innerWidth > visibleWidth(body) ? " ".repeat(innerWidth - visibleWidth(body)) : "";
+			return `${this.color("│")}${body}${filler}${this.color("│")}`;
+		});
+		return [
+			this.color(`┌${"─".repeat(innerWidth)}┐`),
+			...boxed,
+			this.color(`└${"─".repeat(innerWidth)}┘`),
+		];
+	}
+
+	handleInput(data: string): void {
+		this.inner.handleInput?.(data);
+	}
+
+	/** Translate the box-local mouse event into the inner component's
+	 *  coordinate space (one rule column on each side, one rule row on top). */
+	handleMouse(event: TuiMouseEvent): TuiMouseDispatchResult | undefined {
+		const inner = this.inner as { handleMouse?: (e: TuiMouseEvent) => TuiMouseDispatchResult | undefined };
+		if (!inner.handleMouse) return undefined;
+		const innerY = event.y - 1;
+		const innerHeight = Math.max(0, event.height - 2);
+		if (innerY < 0 || innerY >= innerHeight) return undefined;
+		return inner.handleMouse({
+			...event,
+			x: event.x - 1,
+			y: innerY,
+			width: Math.max(1, event.width - 2),
+			height: innerHeight,
+		} as TuiMouseEvent);
+	}
+
+	invalidate(): void {
+		this.inner.invalidate?.();
+	}
+
+	dispose(): void {
+		(this.inner as { dispose?: () => void }).dispose?.();
+	}
+}
+
 export interface EffortItem {
 	value: string; // "default" or a concrete level
 	label: string;
@@ -155,9 +269,14 @@ export function effortItems(model: Pick<Model, "reasoning" | "thinkingLevelMap">
 
 /**
  * /thinking-style panel with an extra leading Default row. Mirrors pi's
- * ThinkingSelectorComponent structure (DynamicBorder + filter Input +
- * SelectList) minus the Ctrl+S set-as-default affordance, which has no
- * meaning for the reviewer role.
+ * ThinkingSelectorComponent structure (filter Input + SelectList) minus the
+ * Ctrl+S set-as-default affordance, which has no meaning for the reviewer role.
+ *
+ * v0.7.1: the surrounding box comes from BorderedPanel, so this component no
+ * longer adds DynamicBorder children. That also removes a latent crash — a
+ * no-arg DynamicBorder reads pi's global `theme`, which is undefined when the
+ * extension is loaded through jiti (its own source warns about exactly this).
+ * It must therefore always be mounted inside a BorderedPanel.
  */
 export class EffortPanelComponent extends Container {
 	private searchInput: Input;
@@ -182,7 +301,6 @@ export class EffortPanelComponent extends Container {
 		this.allItems = items;
 		this.onSelect = onSelect;
 		this.onCancel = onCancel;
-		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 		this.addChild(new Text("Reviewer Thinking Level", 0, 0));
 		this.addChild(new Spacer(1));
@@ -197,7 +315,6 @@ export class EffortPanelComponent extends Container {
 		this.addChild(this.selectList);
 		this.addChild(new Spacer(1));
 		this.addChild(new Text("  Enter to select · Esc to cancel (cancels the whole gate)", 0, 0));
-		this.addChild(new DynamicBorder());
 	}
 
 	private buildSelectList(items: EffortItem[], preselect: string): SelectList {
@@ -271,7 +388,7 @@ async function pickModelViaPanel(host: RolePanelHost): Promise<Model | null | un
 	if (runtime === null) return undefined;
 	const scoped = (host.scopedModels ?? []) as never;
 	const currentModel = host.model ? ({ ...host.model } as never) : undefined;
-	return (await host.ui.custom<Model | null>((tui, _theme, _kb, done) => {
+	return (await host.ui.custom<Model | null>((tui, theme, _kb, done) => {
 		let settled = false;
 		const finish = (value: Model | null) => {
 			if (settled) return;
@@ -290,7 +407,9 @@ async function pickModelViaPanel(host: RolePanelHost): Promise<Model | null | un
 			},
 		);
 		queueMicrotask(() => (tui as { requestRender?: () => void }).requestRender?.());
-		return selector;
+		// v0.7.1: pi's ModelSelectorComponent draws only a horizontal rule; wrap
+		// it so the gate panel has a full box like the reviewer panel.
+		return new BorderedPanel(selector, borderColorFrom(theme));
 	}, OVERLAY_OPTIONS as never)) as Model | null | undefined;
 }
 
@@ -302,14 +421,15 @@ async function pickLevelViaPanel(
 	currentLevel: string | null,
 ): Promise<string | null | undefined> {
 	const items = effortItems(model, currentLevel);
-	return (await host.ui.custom<string | null>((_tui, _theme, _kb, done) => {
+	return (await host.ui.custom<string | null>((_tui, theme, _kb, done) => {
 		let settled = false;
 		const finish = (value: string | null) => {
 			if (settled) return;
 			settled = true;
 			done(value);
 		};
-		return new EffortPanelComponent(items, currentLevel ?? DEFAULT_LEVEL_SENTINEL, (value) => finish(value), () => finish(null));
+		const panel = new EffortPanelComponent(items, currentLevel ?? DEFAULT_LEVEL_SENTINEL, (value) => finish(value), () => finish(null));
+		return new BorderedPanel(panel, borderColorFrom(theme));
 	}, OVERLAY_OPTIONS as never)) as string | null | undefined;
 }
 
