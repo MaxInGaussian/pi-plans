@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Execution-review loop with overlay visibility (v0.8).** The post-execution completion audit no longer blocks the settle handler for minutes in silence. When every task reaches a terminal state, the run status moves to `verifying` and a detached read-only reviewer round runs in the background (interactive modes); its live tool progress renders in a dedicated overlay (Esc closes it; Ctrl+Shift+R reopens the in-flight round with its accumulated transcript). Headless `print`/`json` modes keep awaiting the round inline so runtime teardown cannot kill it. The loop is bounded at five COMMITTED rounds replacing the three-round cap: discarded fingerprint-mismatch attempts and cancellations burn nothing, undeterminable rounds self-schedule their retry without waking the agent, and two consecutive discards commit as one undeterminable round. Every attempt persists a per-check report under `<run-dir>/execution-review/round-<budgetRound>-attempt-<k>.md`.
+
+- **Round-cap pause is fail-closed and budget-faithful.** Exhaustion pauses the run in EVERY mode (the old headless `stopped` termination is gone) with an in-band `pi-plans-review-paused` message. Ordinary user input and session restores never lift the pause or refill the budget — the only fresh-budget surface is `/plans-execute`, whose explicit confirmation grants five more rounds. Checkpoints paused by older builds stay recognized through a dual-matched legacy prefix.
+
+- **Reviewer-role pinning and round timeout.** A confirmed delegated reviewer role pins the round's model and thinking level (the overlay shows the role label); an unconfirmed or `current-session` role inherits the session default labeled `session default` — a detached round never opens the interactive first-use panel. Rounds carry an explicit minutes-scale timeout instead of the 60-minute subagent default, and a missing reviewer agent definition is now a hard error instead of silently swapping in an inline prompt.
+
+- **Round lifecycle hardening.** Each round owns a session-scoped abort controller (aborted on session shutdown, stop, fresh handoff, and session-tree restores — never the turn-scoped `ctx.signal`), outcomes are guarded by execution identity, and a fingerprint (plan digest + git HEAD + covered-file mtimes) discards rounds whose subject moved underneath them.
+
+- **Terminology: completion auditor -> execution reviewer.** The rename covers `agents/execution-reviewer.md` (loaded with a hard-fail), the reviewer-facing strings in `src/`/`tools/`, the dashboard tree line, README, and the references; the persisted protocol surface (`execution.audit` checkpoint keys, `pi-plans-audit-*` message types, the legacy pause prefix) is deliberately un-renamed for compatibility.
+
+- **Dashboard round-1 mis-cue fixed.** The compact panel rendered `audit complete ✓` for the entire duration of a running audit because the model had no running field and the round counter was pre-incremented. The panel now renders `review: round n/5 running` while a round is in flight and never shows the completion tick while a round runs or checks are still owed.
+
 ### Fixed
 
 - **Audit-stall self-healing in the execution loop.** A run whose task tree reached terminal state but whose completion audit never settled left the dashboard stuck at `0/2` and the loop parked forever — the exact failure seen on run `2026-09-30-worktree-test-fix` (VC-002 returned `verdict: fail`, tasks reverted to `0/2`, no repair attempted, no further wake). Two defects combined: `runCompletionAudit` had no bound on how long a reviewer subagent may take to settle, and the watchdog treated "settled but nothing changed" as activity. Fixes: an `agent_before_settle` backstop guarantees the audit cannot hang past its own timeout, and a per-settle latch records whether anything actually changed before the watchdog is consulted. Tests in `tests/exec.test.ts` assert the self-healing path (round increments, checkpoint `phase === "completed"`) and the single-wake path (exactly one wake message).

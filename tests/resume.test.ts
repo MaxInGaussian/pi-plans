@@ -112,6 +112,9 @@ describe("candidate discovery", () => {
 	it("lists resumable runs, excludes terminal ones, registry hint first", () => {
 		const workdir = setupRepo("discovery");
 		const planning = startRun(workdir, { topic: "alpha", skill: "plan-normal", requestText: "a" }).run;
+		const verifying = startRun(workdir, { topic: "zeta", skill: "plan-normal", requestText: "f" }).run;
+		setRunStatus(workdir, verifying.run_id, "executing");
+		setRunStatus(workdir, verifying.run_id, "verifying");
 		const stopped = startRun(workdir, { topic: "beta", skill: "plan-normal", requestText: "b" }).run;
 		setRunStatus(workdir, stopped.run_id, "executing");
 		setRunStatus(workdir, stopped.run_id, "stopped");
@@ -129,6 +132,9 @@ describe("candidate discovery", () => {
 		assert.ok(ids.includes(planning.run_id));
 		assert.ok(ids.includes(stopped.run_id));
 		assert.ok(ids.includes(doneWithReview.run_id), "done with review artifacts resumable");
+		assert.ok(ids.includes(verifying.run_id), "verifying runs are resumable");
+		const verifyingCandidate = candidates.find((candidate) => candidate.runId === verifying.run_id);
+		assert.equal(verifyingCandidate?.phaseLabel, "verifying", "verifying runs keep a distinct resume label even though checkpoint.phase stays executing");
 		assert.equal(ids.includes(abandoned.run_id), false);
 		assert.equal(ids.includes(done.run_id), false, "plain done excluded");
 

@@ -135,10 +135,12 @@ function previewTranscriptText(entry: RefineTranscriptEntry, width: number): { l
 	return { lines: lines.slice(-STREAMING_PREVIEW_LINES), truncated: true };
 }
 
-function footerText(laneCount: number, lang: UiLanguage): string {
+function footerText(laneCount: number, lang: UiLanguage, role: RefineOverlayRole = "reviewer"): string {
 	const chrome = refineChrome(lang);
 	const parts = [chrome.close, chrome.scroll, chrome.page];
 	if (laneCount > 1) parts.push(chrome.switchLane);
+	// Auditor overlay only: the reopen shortcut is the way back after ESC.
+	if (role === "auditor") parts.push(chrome.reopen);
 	return parts.join(" · ");
 }
 
@@ -166,7 +168,7 @@ function summaryFor(role: RefineOverlayRole, lanes: RefineLaneState[], modelLabe
 	const complete = lanes.filter((lane) => lane.status === "complete").length;
 	const terminal = lanes.filter((lane) => ["complete", "failed", "cancelled"].includes(lane.status)).length;
 	const running = lanes.filter((lane) => lane.status === "running").length;
-	const title = role === "reviewer" ? "Reviewer" : "Refs";
+	const title = role === "reviewer" ? "Reviewer" : role === "auditor" ? "Execution review" : "Refs";
 	const visibleTitle = modelLabel ? `${title} (${modelLabel})` : title;
 	const state = terminal === lanes.length ? "done" : running > 0 ? `${running} running` : "queued";
 	return `${visibleTitle} · ${complete}/${lanes.length} done · ${state}`;
@@ -250,7 +252,7 @@ export class RefineOverlayComponent implements Component {
 				lines.push(...this.renderPane(this.lanes[index]!, innerWidth, paneHeight, index === this.selectedLane));
 			}
 		}
-		lines.push(renderRow(this.theme, this.theme.fg("dim", footerText(this.lanes.length, this.lang)), innerWidth));
+		lines.push(renderRow(this.theme, this.theme.fg("dim", footerText(this.lanes.length, this.lang, this.role)), innerWidth));
 		lines.push(renderBorderLine(this.theme, innerWidth, "bottom"));
 		return lines.map((line) => fitLine(line, width));
 	}
@@ -350,6 +352,20 @@ export class RefineOverlayController {
 			)
 			.then(() => undefined)
 			.catch(() => undefined);
+	}
+
+	/** Repaint without a progress event (the engine mutates lane state directly). */
+	rerender(): void {
+		if (this.closed) return;
+		this.tui?.requestRender();
+	}
+
+	/** Replace the lane with a matching id with engine-held state — used by the
+	 * execution-review reopen path so a fresh controller continues the SAME
+	 * transcript (one-shot controllers can never re-open themselves). */
+	seedLane(state: RefineLaneState): void {
+		const index = this.lanes.findIndex((lane) => lane.id === state.id);
+		if (index >= 0) this.lanes[index] = state;
 	}
 
 	update(laneId: string, event: SubagentProgressEvent): void {

@@ -300,11 +300,21 @@ async function buildBrief(
 			const reverify = load.reverifyAll
 				? `\nThe code state (HEAD) changed since approval: the authorization is KEPT, but every previously closed task was re-opened and must be re-done. Historically verified checks (evidence only): ${doneList}.`
 				: `\nPreviously verified and still valid: ${doneList}.`;
-			const paused = load.pausedReason ? `\nExecution had been paused: ${load.pausedReason} — the pause is cleared by this resume; continue from where it stopped.` : "";
+			// v0.8: a review-cap pause is NOT cleared by this resume — only
+			// /plans-execute (an explicit user confirmation) grants a fresh
+			// five-round budget; ordinary resumes and input keep it paused.
+			const paused = load.pausedReason
+				? load.pausedReason.startsWith("execution review exhausted") || load.pausedReason.startsWith("completion audit exhausted")
+					? `\nExecution had been paused: ${load.pausedReason} — this pause survives the resume; run /plans-execute to grant a fresh five-round review budget.`
+					: `\nExecution had been paused: ${load.pausedReason} — the pause is cleared by this resume; continue from where it stopped.`
+				: "";
 			const legacy = load.legacyPlan ? "\nThis plan parses through the legacy I-### compatibility mapping; upgrade it to the ## Tasks format at the next revision." : "";
+			// v0.8: a verifying run keeps checkpoint phase "executing" but the run
+			// STATUS is verifying — surface which loop owns the run right now.
+			const verifying = run.status === "verifying";
 			return {
-				phaseLabel: "executing",
-				text: `[PI-PLANS RESUME] Execution of run ${runId} continues in this session.\nPlan: ${load.planPath}${reverify}${paused}${legacy}\nFollow the execution-loop contract: work through tasks in wave order, report every task with the plans_update_task tool (status + evidence / skipReason), and let the completion auditor verify the checks. The current wave and remaining tasks are injected each turn.`,
+				phaseLabel: verifying ? "verifying" : "executing",
+				text: `[PI-PLANS RESUME] ${verifying ? "Execution review of" : "Execution of"} run ${runId} continues in this session.\nPlan: ${load.planPath}${reverify}${paused}${legacy}\n${verifying ? "The task tree is terminal and the execution-review loop owns the run: when all tasks are terminal and checks are still owed, a read-only reviewer round runs automatically (status verifying → done when every check passes). If a check fails, its tasks roll back to pending — fix and re-close them with plans_update_task." : "Follow the execution-loop contract: work through tasks in wave order, report every task with the plans_update_task tool (status + evidence / skipReason), and let the execution reviewer verify the checks. The current wave and remaining tasks are injected each turn."}`,
 			};
 		}
 		if (load.legacyDelegate) {

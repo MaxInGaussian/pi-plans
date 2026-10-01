@@ -30,7 +30,7 @@ One paragraph summarizing the user's request.
 
 ## Execution Handoff Notes
 
-Ordering, files to avoid, verification commands, and anything the executor must know. The handoff still requires explicit user approval (`ask_choice` with `autoComplete: false`, then the `execute_plan` tool) and is never auto-completed. Once approved, execution mode tracks every task through the `plans_update_task` tool (status + evidence); when all tasks are terminal, the independent completion auditor verifies each check above before the run completes.
+Ordering, files to avoid, verification commands, and anything the executor must know. The handoff still requires explicit user approval (`ask_choice` with `autoComplete: false`, then the `execute_plan` tool) and is never auto-completed. Once approved, execution mode tracks every task through the `plans_update_task` tool (status + evidence); when all tasks are terminal, the independent execution reviewer verifies each check above before the run completes.
 
 ## Revision Ledger
 
@@ -70,6 +70,16 @@ review rounds, refs), not in the plan file. `## Execution Handoff Notes` and
 - `covers` accepts multiple targets and `Task-N.M` subtask ids; the clause ends
   at the first `;`. Checks covering zero tasks never enter the completion
   audit; a check whose covered tasks are ALL skipped passes as skipped-pass.
+- Write each check so its condition can be judged from the worktree alone: a
+  check whose evidence is not reachable with read-only tools comes back
+  `undeterminable`, not `pass`, and an unreadable round never completes the run.
+- A check that fails the audit rolls its covered tasks back to pending. The
+  tasks keep the `evidence` from the attempt that was rolled back (re-reporting
+  overwrites it), so evidence is the record of what was already tried — do not
+  expect a clean slate, and do not re-report a rolled-back task until you have
+  actually changed something. `skipReason` is cleared, because the audit
+  overturned the skip. A rollback also clears the satisfied state of any other
+  check covering the reopened work.
 
 ### Lint and compatibility
 

@@ -119,6 +119,7 @@ export const VALID_RUN_STATUSES = new Set([
 	"planning",
 	"accepted",
 	"executing",
+	"verifying",
 	"stopped",
 	"abandoned",
 	"done",

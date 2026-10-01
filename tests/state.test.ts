@@ -263,6 +263,10 @@ describe("runs", () => {
 		const updated = setRunStatus(workdir, run.run_id, "accepted");
 		assert.equal(updated.status, "accepted");
 		assert.equal(getRun(workdir, run.run_id)?.status, "accepted");
+		// v0.8: verifying is a valid non-terminal lifecycle status (execution-review loop).
+		const verifying = setRunStatus(workdir, run.run_id, "verifying");
+		assert.equal(verifying.status, "verifying");
+		assert.equal(getRun(workdir, run.run_id)?.status, "verifying");
 		assert.throws(() => setRunStatus(workdir, run.run_id, "bogus"), StateError);
 	});
 

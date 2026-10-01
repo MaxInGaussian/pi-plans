@@ -103,6 +103,8 @@ export interface RefineChrome {
 	scroll: string;
 	page: string;
 	switchLane: string;
+	/** Auditor overlay only (v0.8): the shortcut that reopens the in-flight round. */
+	reopen: string;
 }
 
 const REFINE_CHROME: Record<UiLanguage, RefineChrome> = {
@@ -111,12 +113,14 @@ const REFINE_CHROME: Record<UiLanguage, RefineChrome> = {
 		scroll: "↑/↓ 滚动",
 		page: "PgUp/PgDn 翻页",
 		switchLane: "Tab & Shift + Tab 切换 lane",
+		reopen: "Ctrl+Shift+R 重开评审面板",
 	},
 	en: {
 		close: "Esc close",
 		scroll: "↑/↓ scroll",
 		page: "PgUp/PgDn page",
 		switchLane: "Tab & Shift + Tab switch lane",
+		reopen: "Ctrl+Shift+R reopen review overlay",
 	},
 };
 

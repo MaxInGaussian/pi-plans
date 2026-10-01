@@ -16,6 +16,7 @@
  */
 
 import type { CheckItem } from "./plan.ts";
+import { REVIEW_MAX_ROUNDS } from "./auditor.ts";
 import { truncateToWidth, visibleWidth } from "./refine-ui-helpers.ts";
 import {
 	allTasksTerminal,
@@ -38,15 +39,24 @@ export interface DashboardModel {
 	/** Audit round counter; null = audit not yet started. */
 	auditRounds: number | null;
 	auditFailed: string[];
+	/** Checks whose verdict the auditor could not be read for. Neither passed
+	 * nor failed: shown so the run does not read as finished. */
+	auditUndeterminable: string[];
+	/** v0.8: true while an execution-review round is in flight. The panel must
+	 * never render `audit complete ✓` while this is set — the round-1 mis-cue
+	 * showed the tick for the whole duration of a running audit. */
+	reviewRunning: boolean;
 	startedAt: string;
 	usage: { inToks: number; outToks: number };
 }
 
-/** Tree marker for one task row. */
+/** Tree marker for one task row. A rolled-back task is `pending` but still
+ * carries the evidence of its previous attempt, so it gets its own marker
+ * rather than reading as untouched work. */
 export function taskMarker(task: TaskView, currentId: string | null): string {
 	if (taskIsTerminal(task)) return task.status === "skipped" ? "~" : "✓";
 	if (task.id === currentId) return "▸";
-	return "·";
+	return task.evidence === undefined ? "·" : "↺";
 }
 
 /** Truncate to at most `max` display columns, ellipsis when clipped. */
@@ -157,15 +167,38 @@ export function renderDashboardLines(model: DashboardModel, width: number, theme
 			lines.push(boxRow("│", `   ${clip(cur.files.join(", "), inner - 4)}`, " ", width));
 		}
 	} else if (allTasksTerminal(model.tasks)) {
-		const auditLine = model.auditFailed.length > 0
-			? `audit: ${model.auditFailed.length} check(s) failed — rollback pending`
-			: model.auditRounds !== null
-				? "audit complete ✓"
-				: "all tasks terminal — audit pending";
+		// v0.8 mis-cue guard: `audit complete ✓` ONLY when nothing is running
+		// and nothing is owed. A running or owed review shows its round number
+		// instead — the panel must look alive, never finished-then-silent.
+		const owed = model.checklist.some((item) => !item.done);
+		const nextRound = (model.auditRounds ?? 0) + 1;
+		const auditLine = model.reviewRunning
+			? `review: round ${nextRound}/${REVIEW_MAX_ROUNDS} running — read-only reviewer verifying`
+			: model.auditFailed.length > 0
+				? `audit: ${model.auditFailed.length} check(s) failed — rollback pending`
+				: model.auditUndeterminable.length > 0
+					? `audit: ${model.auditUndeterminable.length} check(s) undeterminable — verdict unreadable`
+					: owed
+						? `review: round ${nextRound}/${REVIEW_MAX_ROUNDS} — verdict pending`
+						: model.auditRounds !== null
+							? "audit complete ✓"
+							: "all tasks terminal — audit pending";
 		lines.push(boxRow("│", ` ${clip(auditLine, inner - 2)}`, " ", width));
 	}
 	if (!narrow && model.auditFailed.length > 0) {
 		lines.push(boxRow("│", ` ✗ ${clip(model.auditFailed.join(", "), inner - 3)}`, " ", width));
+	}
+	if (!narrow && model.auditUndeterminable.length > 0) {
+		lines.push(boxRow("│", ` ? ${clip(model.auditUndeterminable.join(", "), inner - 3)}`, " ", width));
+	}
+	// Rolled-back work keeps the evidence of the attempt that was rolled back.
+	// The tree view shows it per row; the compact panel has room for a summary
+	// and must show it too, otherwise the retention is invisible outside the
+	// expanded view. Capped at two rows to protect the fixed panel height.
+	for (const rolled of flattenTaskViews(model.tasks)
+		.filter((task) => task.status === "pending" && task.evidence !== undefined)
+		.slice(0, 2)) {
+		lines.push(boxRow("│", ` ↺ ${rolled.id} ${clip(rolled.evidence!, inner - 6)}`, " ", width));
 	}
 	lines.push(boxRow("└", "─ Ctrl+Shift+T tree", "─", width, "┘"));
 	// The title row carries its own colours; every other row is muted.
@@ -183,7 +216,7 @@ export function deriveDashboardModel(
 	topic: string,
 	tasks: TaskView[],
 	checklist: CheckItem[],
-	extra?: { paused?: boolean; pausedReason?: string; auditRounds?: number | null; auditFailed?: string[]; startedAt?: string; usage?: { inToks: number; outToks: number } },
+	extra?: { paused?: boolean; pausedReason?: string; auditRounds?: number | null; auditFailed?: string[]; auditUndeterminable?: string[]; reviewRunning?: boolean; startedAt?: string; usage?: { inToks: number; outToks: number } },
 ): DashboardModel {
 	return {
 		topic,
@@ -193,6 +226,8 @@ export function deriveDashboardModel(
 		pausedReason: extra?.pausedReason,
 		auditRounds: extra?.auditRounds ?? null,
 		auditFailed: extra?.auditFailed ?? [],
+		auditUndeterminable: extra?.auditUndeterminable ?? [],
+		reviewRunning: extra?.reviewRunning ?? false,
 		startedAt: extra?.startedAt ?? new Date().toISOString(),
 		usage: extra?.usage ?? { inToks: 0, outToks: 0 },
 	};
@@ -226,6 +261,9 @@ export function renderDashboardTreeLines(model: DashboardModel, width: number, t
 		if (wide && task.deps.length > 0) line += `  (deps: ${task.deps.join(", ")})`;
 		if (task.status === "skipped" && task.skipReason) line += `  ~${task.skipReason}`;
 		if (task.status === "complete" && task.evidence) line += `  ✓${clip(task.evidence, 40)}`;
+		// Rolled-back work keeps its evidence, and that evidence is the only
+		// record of what the previous attempt did.
+		if (task.status === "pending" && task.evidence) line += `  ↺${clip(task.evidence, 40)}`;
 		lines.push(line);
 		for (const child of task.children) row(child, depth + 1);
 	};	for (const task of model.tasks) row(task, 0);
@@ -235,9 +273,17 @@ export function renderDashboardTreeLines(model: DashboardModel, width: number, t
 		const mark = model.auditFailed.includes(item.id) ? "✗" : item.done ? "☑" : "☐";
 		lines.push(`  ${mark} ${item.id}${wide ? ` ${clip(item.text.split(";")[1] ?? item.text, Math.min(80, width))}` : ""}`);
 	}
-	if (model.auditRounds !== null) {
+	if (model.reviewRunning) {
 		lines.push("");
-		lines.push(`Completion audit: round ${model.auditRounds}${model.auditFailed.length > 0 ? ` — failed: ${model.auditFailed.join(", ")}` : " — passed ✓"}`);
+		lines.push(`Execution review: round ${(model.auditRounds ?? 0) + 1}/${REVIEW_MAX_ROUNDS} running`);
+	} else if (model.auditRounds !== null) {
+		lines.push("");
+		const verdict = model.auditFailed.length > 0
+			? ` — failed: ${model.auditFailed.join(", ")}`
+			: model.auditUndeterminable.length > 0
+				? ` — undeterminable: ${model.auditUndeterminable.join(", ")}`
+				: " — passed ✓";
+		lines.push(`Execution review: round ${model.auditRounds}${verdict}`);
 	}
 	const painted = theme ? lines.map((line) => theme.fg("muted", line)) : lines;
 	return clampLines(painted, width);

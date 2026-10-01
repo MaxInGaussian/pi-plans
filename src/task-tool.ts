@@ -64,7 +64,7 @@ export function registerTaskStatusTool(ext: ExtensionAPI): void {
 		name: "plans_update_task",
 		label: "Update task",
 		description:
-			'Report execution progress for one task of the accepted plan: set status "complete" (with evidence) or "skipped" (with skipReason). Fails outside pi-plans execution mode. Statuses are immutable once set — the independent completion auditor handles any rollback.',
+			'Report execution progress for one task of the accepted plan: set status "complete" (with evidence) or "skipped" (with skipReason). Fails outside pi-plans execution mode. Statuses are immutable once set — the independent execution reviewer handles any rollback.',
 		promptSnippet: "Report plan task completion",
 		parameters: UpdateTaskParams,
 

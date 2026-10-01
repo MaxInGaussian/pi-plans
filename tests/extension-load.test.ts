@@ -4,7 +4,7 @@
  * WITHOUT typechecking — duplicate type/interface declarations pass silently.
  * pi's extension loader parses TypeScript for real and refused the whole
  * extension ("Identifier 'RoleConfig' has already been declared"), which made
- * every spawned subagent (including the completion auditor) fail while the
+ * every spawned subagent (including the execution reviewer) fail while the
  * whole suite stayed green.
  *
  * Guard: spawn `pi` from the repo root with a deliberately missing model.

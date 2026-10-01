@@ -1,6 +1,6 @@
 import type { SubagentProgressEvent, SubagentResult } from "./subagent.ts";
 
-export type RefineOverlayRole = "reviewer" | "refs";
+export type RefineOverlayRole = "reviewer" | "refs" | "auditor";
 export type RefineLaneStatus = "queued" | "running" | "complete" | "failed" | "cancelled";
 export type RefineTranscriptEntryType = "assistant-text" | "thinking" | "tool-call" | "tool-result" | "diagnostic";
 

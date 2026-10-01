@@ -99,7 +99,7 @@ const PlansParams = Type.Object({
 	runId: Type.Optional(Type.String()),
 	status: Type.Optional(
 		StringEnum(
-			["planning", "accepted", "executing", "stopped", "abandoned", "done"] as const,
+			["planning", "accepted", "executing", "verifying", "stopped", "abandoned", "done"] as const,
 			{ description: "set-status: run lifecycle status" },
 		),
 	),

@@ -134,7 +134,7 @@ describe("expanded tree rendering", () => {
 		m.auditRounds = 2;
 		m.auditFailed = ["VC-001"];
 		const lines = renderDashboardTreeLines(m, 100);
-		assert.ok(lines.some((line) => line.includes("Completion audit: round 2")));
+		assert.ok(lines.some((line) => line.includes("Execution review: round 2")));
 	});
 });
 
@@ -263,6 +263,140 @@ describe("width invariant (TUI crash regression)", () => {
 		// silently reintroduces the overflow, so pin the glyph set.
 		for (const glyph of ["┌", "┐", "└", "┘", "│", "─", "⏸", "▸", "·", "✗", "✓", "☑", "☐", "█", "░", "—", "…", "~"]) {
 			assert.equal(localVisibleWidth(glyph), visibleWidth(glyph), `glyph width mismatch for ${JSON.stringify(glyph)}`);
+		}
+	});
+});
+
+describe("rolled-back task rendering", () => {
+	const CHECKS = () => [
+		{ id: "VC-001", text: "`VC-001` covers `Task-1`; pass condition: x", done: false },
+		{ id: "VC-002", text: "`VC-002` covers `Task-3`; pass condition: y", done: false },
+	];
+
+	function withProgress(progress: Record<string, { status: "complete" | "skipped" | "pending"; evidence?: string }>) {
+		return deriveDashboardModel("demo-run", buildTaskView(parsePlanTasks(PLAN), progress), CHECKS(), {
+			startedAt: new Date().toISOString(),
+		});
+	}
+
+	it("marks a rolled-back task distinctly from untouched pending work", () => {
+		// A rollback keeps the task's evidence (Task-2.1), so "pending with
+		// evidence" is the observable signature of work that was reopened.
+		const tasks = withProgress({
+			"Task-1": { status: "pending" },
+			"Task-2": { status: "pending", evidence: "wired the tool" },
+		}).tasks;
+		const rolled = tasks.find((t) => t.id === "Task-2")!;
+		const untouched = tasks.find((t) => t.id === "Task-1")!;
+		assert.equal(taskMarker(rolled, null), "↺");
+		assert.equal(taskMarker(untouched, null), "·");
+		// The current-task indicator still wins over the rollback marker.
+		assert.equal(taskMarker(rolled, "Task-2"), "▸");
+	});
+
+	it("shows the retained evidence on a rolled-back row in the tree view", () => {
+		const tree = renderDashboardTreeLines(
+			withProgress({
+				"Task-1": { status: "pending" },
+				"Task-2": { status: "pending", evidence: "wired the tool" },
+			}),
+			100,
+		).join("\n");
+		assert.match(tree, /↺ Task-2/, "the rolled-back row carries its own marker");
+		assert.match(tree, /wired the tool/, "the previous attempt's evidence is visible");
+	});
+
+	const terminal = (extra: { auditRounds?: number; auditFailed?: string[]; auditUndeterminable?: string[]; reviewRunning?: boolean }) => {
+		const base = withProgress({
+			"Task-1": { status: "complete", evidence: "done" },
+			"Task-2": { status: "complete", evidence: "done" },
+			"Task-3": { status: "complete", evidence: "done" },
+			"Task-3.1": { status: "complete", evidence: "done" },
+			"Task-3.2": { status: "complete", evidence: "done" },
+		});
+		return deriveDashboardModel("demo-run", base.tasks, base.checklist, { startedAt: base.startedAt, ...extra });
+	};
+
+	it("shows the undeterminable count instead of a completion tick", () => {
+		const owed = terminal({ auditRounds: 2, auditUndeterminable: ["VC-001", "VC-002"] });
+		const panel = renderDashboardLines(owed, 80);
+		assert.ok(panel.some((l) => /undeterminable/.test(l)), "panel reports undeterminable");
+		assert.ok(!panel.some((l) => /audit complete/.test(l)), "no false completion tick");
+		const tree = renderDashboardTreeLines(owed, 100).join("\n");
+		assert.match(tree, /undeterminable: VC-001, VC-002/);
+		assert.doesNotMatch(tree, /passed ✓/);
+	});
+
+	it("shows the retained evidence for rolled-back work in the COMPACT view too", () => {
+		// VC-006 requires the evidence in both views. The first implementation
+		// only added it to the tree, which the execution review caught.
+		const m = withProgress({
+			"Task-1": { status: "pending", evidence: "rewrote src/plan.ts" },
+			"Task-2": { status: "complete", evidence: "wired the tool" },
+		});
+		const panel = renderDashboardLines(m, 90).join("\n");
+		assert.match(panel, /\u21ba Task-1/, "compact panel marks the rolled-back task");
+		assert.match(panel, /rewrote src\/plan\.ts/, "compact panel shows the retained evidence");
+		const tree = renderDashboardTreeLines(m, 100).join("\n");
+		assert.match(tree, /rewrote src\/plan\.ts/, "tree view still shows it");
+	});
+
+	it("keeps every compact row inside the width budget with rollback rows present", () => {
+		const m = deriveDashboardModel(
+			"demo-run",
+			buildTaskView(parsePlanTasks(PLAN), {
+				"Task-1": { status: "pending", evidence: "a very long piece of evidence that must be clipped to fit the panel width" },
+				"Task-2": { status: "pending", evidence: "another long evidence string for the second rolled-back task" },
+				"Task-3": { status: "pending", evidence: "a third one that must be capped out of the panel" },
+			}),
+			CHECKS(),
+			{ startedAt: new Date().toISOString(), auditRounds: 1, auditFailed: ["VC-001"], auditUndeterminable: ["VC-002"] },
+		);
+		for (const width of [46, 64, 80, 120]) {
+			for (const row of renderDashboardLines(m, width)) {
+				assert.ok(visibleWidth(row) <= width, `width ${width}: ${JSON.stringify(row)}`);
+			}
+		}
+		const rows = renderDashboardLines(m, 90).filter((l) => /\u21ba /.test(l));
+		assert.equal(rows.length, 2, "rollback rows are capped so the panel height stays bounded");
+	});
+
+	it("never shows the completion tick while a review round runs or checks are owed (v0.8)", () => {
+		// The v0.7 mis-cue: `audit complete ✓` rendered for the whole duration
+		// of a running round (auditRounds was pre-incremented, the model had no
+		// running field). Now the running/owed states render their round number.
+		const running = terminal({ auditRounds: 1, reviewRunning: true });
+		const runningPanel = renderDashboardLines(running, 80).join("\n");
+		assert.match(runningPanel, /review: round 2\/5 running/, "the running round is visible with its number");
+		assert.doesNotMatch(runningPanel, /audit complete/, "no tick while a round runs");
+		const runningTree = renderDashboardTreeLines(running, 100).join("\n");
+		assert.match(runningTree, /Execution review: round 2\/5 running/);
+		const owed = terminal({ auditRounds: 1 });
+		const owedPanel = renderDashboardLines(owed, 80).join("\n");
+		assert.doesNotMatch(owedPanel, /audit complete/, "no tick while checks are still owed");
+		assert.match(owedPanel, /review: round 2\/5 — verdict pending/, "the owed state shows the pending round");
+	});
+
+	it("shows the completion tick only when every check is really done", () => {
+		const settled = terminal({ auditRounds: 1 });
+		const model = { ...settled, checklist: settled.checklist.map((item) => ({ ...item, done: true })) };
+		assert.ok(renderDashboardLines(model, 80).some((l) => /audit complete/.test(l)));
+	});
+
+	it("still reports real failures ahead of undeterminable ones", () => {
+		const mixed = terminal({ auditRounds: 2, auditFailed: ["VC-001"], auditUndeterminable: ["VC-002"] });
+		const tree = renderDashboardTreeLines(mixed, 100).join("\n");
+		assert.match(tree, /failed: VC-001/, "a real failure takes the tree audit line");
+		assert.doesNotMatch(tree, /undeterminable:/, "and suppresses the softer outcome there");
+		const panel = renderDashboardLines(mixed, 80);
+		assert.ok(panel.some((l) => /check\(s\) failed/.test(l)));
+		assert.ok(panel.some((l) => /\? VC-002/.test(l)), "the unreadable checks still get their own panel row");
+	});
+
+	it("keeps the width invariant with the new rows", () => {
+		const rows = renderDashboardLines(terminal({ auditRounds: 2, auditFailed: ["VC-001"], auditUndeterminable: ["VC-002"] }), 46);
+		for (const row of rows) {
+			assert.ok(visibleWidth(row) <= 46, `row too wide: ${JSON.stringify(row)}`);
 		}
 	});
 });

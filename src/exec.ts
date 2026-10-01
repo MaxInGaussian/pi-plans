@@ -9,15 +9,16 @@
  * live progress (compact aboveEditor widget; Ctrl+Shift+T expands the full
  * tree), a stall watchdog pauses the run when consecutive rounds produce no
  * task-state change, and when every task reaches a terminal state an
- * independent completion auditor verifies the plan's verification checks —
- * failed checks roll their covered tasks back to pending (audit-flow-only
- * channel), and three failed rounds pause for the user (bounded stopped
- * termination under auto-approve/headless).
+ * independent execution reviewer verifies the plan's verification checks in
+ * a detached, overlay-visible loop — failed checks roll their covered tasks
+ * back to pending (audit-flow-only channel), and five committed rounds pause
+ * the run for the user in every mode (fail-closed, never a silent stop).
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { execSync } from "node:child_process";
 import type {
 	CompactionResult,
 	ExtensionAPI,
@@ -44,7 +45,7 @@ import {
 	type VccCompactionBuildResult,
 	type VccCompactionStats,
 } from "./compaction.ts";
-import { TERMINAL_RUN_STATUSES, getRun, latestRun, lintPlanIntoNotices, loadConfig, readActive, resolveStateRootOrNull, setRunStatus, StateError, utcNow } from "./state.ts";
+import { TERMINAL_RUN_STATUSES, getRun, latestRun, lintPlanIntoNotices, loadConfig, readActive, resolveStateRootOrNull, runDirPath, setRunStatus, StateError, utcNow } from "./state.ts";
 import { resolveUiLanguage, type UiLanguage } from "./ui-language.ts";
 import { bindRun, resolveActiveRun } from "./run-context.ts";
 import type { SubagentProgressEvent } from "./subagent.ts";
@@ -82,6 +83,7 @@ import {
 	buildTaskView,
 	currentTask,
 	flattenTaskViews,
+	invalidateChecksForRolledBackTasks,
 	taskIsTerminal,
 	taskProgress,
 	taskProgressMap,
@@ -97,8 +99,13 @@ import {
 	renderDashboardLines,
 	renderDashboardTreeLines,
 } from "./dashboard.ts";
-import { AUDIT_MAX_ROUNDS, presolvedCheckIds, runCompletionAudit } from "./auditor.ts";
+import { REVIEW_MAX_ROUNDS, presolvedCheckIds, runCompletionAudit, writeReviewRoundReport, type AuditRoundResult } from "./auditor.ts";
+import { staleReloadHint as probeStaleReload } from "./staleness.ts";
 import { messaging } from "./messaging.ts";
+import { RefineOverlayController, refineOverlayContext } from "./refine-ui.ts";
+import { applyRefineProgress, applyRefineResult, type RefineLaneState } from "./refine-ui-state.ts";
+import { resolveReviewerSpawn } from "./thinking-levels.ts";
+import { loadGlobalConfig, reviewerReady } from "./global-state.ts";
 
 export interface ExecState {
 	planPath: string;
@@ -117,13 +124,31 @@ export interface ExecState {
 	/** Stall watchdog (v0.6.1): consecutive settled rounds without a task
 	 * status change; auto-pause at the cap. */
 	stall: { rounds: number; lastSnapshot: string | null; paused: boolean; pausedReason?: string };
-	/** Completion-audit bookkeeping. */
-	audit: { rounds: number; failed: string[]; running: boolean };
+	/** Completion-audit bookkeeping. `rounds` is the BUDGET counter — charged
+	 * only when a round outcome commits (never on discard/cancel) — and is the
+	 * only piece persisted. */
+	audit: { rounds: number; failed: string[]; undeterminable: string[]; running: boolean };
+	/** Execution-review loop (v0.8), memory-only: the attempt index names the
+	 * per-round report files; consecutiveDiscards bounds the fingerprint
+	 * re-run loop; inFlight owns the round's abort lifecycle. */
+	review: { attempts: number; consecutiveDiscards: number; inFlight: InFlightReview | null };
 	/** Per-settle audit latch (v0.7.1): a settled round fires the completion
 	 * audit at most once, so the turn_end / agent_before_settle / resume entry
 	 * points cannot double-consume a round when several land in one settle.
 	 * Created on demand by auditLatchOf(); every construction path may omit it. */
 	auditLatch?: { auditedThisSettle: boolean; activity: number };
+}
+
+/** One in-flight review round: owns its abort lifecycle, its fingerprint of
+ * the audited subject, and the per-round one-shot wake token (v0.8). */
+interface InFlightReview {
+	controller: AbortController;
+	/** Budget round this attempt belongs to (audit.rounds + 1 at spawn). */
+	budgetRound: number;
+	/** Monotonic attempt ordinal; names the round report file. */
+	attempt: number;
+	fingerprint: string;
+	wakeSent: boolean;
 }
 
 /**
@@ -253,9 +278,12 @@ export function loadExecutionFromCheckpoint(
 	const reverifyAll = cp.execution.reverifyAll === true || headChanged || headUnverifiable;
 	const progress: TaskProgressMap = reverifyAll ? {} : (cp.execution.tasks ?? {});
 	const tasks = buildTaskView(planTasks, progress);
-	// An audit-cap pause grants a fresh audit budget on restore (mirrors
-	// resumeGoalWaitIfPaused) so the first turn can actually re-audit.
-	const wasAuditCapPause = (cp.execution.pausedReason ?? "").startsWith(AUDIT_CAP_PAUSE_PREFIX);
+	// v0.8: a review-cap pause SURVIVES the restore — the budget must stay
+	// bounded across restarts; only /plans-execute grants a fresh one. The
+	// legacy v0.7 prefix stays dual-matched for one release.
+	const wasReviewCapPause = isReviewCapPause(cp.execution.pausedReason);
+	// Any live round from the replaced session graph dies here (CF2-002).
+	abortInFlightReview();
 	if (!reverifyAll) {
 		for (const id of cp.execution.doneVcIds) {
 			const item = items.find((candidate) => candidate.id === id);
@@ -271,22 +299,24 @@ export function loadExecutionFromCheckpoint(
 		startedAt: utcNow(),
 		usage: { inToks: cp.execution.usage.inToks, outToks: cp.execution.usage.outToks },
 		uiLanguage: resolveUiLanguage(ctx.cwd),
-		// D-020: a paused legacy (or stopped) execution rebuilds unpaused —
-		// the resume itself is the user's intent; the reason is surfaced in
-		// the resume brief instead. An audit-cap pause additionally grants a
-		// fresh audit budget here (mirrors resumeGoalWaitIfPaused), so the
-		// first turn after a cross-session resume can actually re-audit.
-			stall: {
-			rounds: 0,
+		// D-020: a paused legacy (or stopped) execution rebuilds unpaused — the
+		// resume itself is the user's intent; the reason is surfaced in the
+		// resume brief instead. EXCEPT a review-cap pause (v0.8): it must
+		// survive restores paused and at its committed round count, or the
+		// 5-round budget would never bound anything across restarts.
+		stall: {
+			rounds: cp.execution.stallRounds ?? 0,
 			lastSnapshot: null,
-			paused: false,
-			pausedReason: undefined,
+			paused: wasReviewCapPause,
+			pausedReason: wasReviewCapPause ? (cp.execution.pausedReason ?? undefined) : undefined,
 		},
 		audit: {
-			rounds: wasAuditCapPause ? 0 : (cp.execution.audit?.rounds ?? 0),
+			rounds: cp.execution.audit?.rounds ?? 0,
 			failed: [],
+			undeterminable: cp.execution.audit?.undeterminable ?? [],
 			running: false,
 		},
+		review: { attempts: 0, consecutiveDiscards: 0, inFlight: null },
 		auditLatch: { auditedThisSettle: false, activity: 0 },
 	};
 	execution.stall.lastSnapshot = stallSnapshot();
@@ -295,11 +325,6 @@ export function loadExecutionFromCheckpoint(
 	resetContinuationRuntime(ctx);
 	pendingExecutionFlush = false;
 	resetExecutionCompactionState(ctx);
-	if (wasAuditCapPause) {
-		withExecutionCheckpoint(ctx, (cp2) =>
-			applyExecutionProgress(cp2, { audit: { rounds: 0, lastResult: undefined }, pausedReason: null }),
-		);
-	}
 	// D-020: an orphaned v0.6.0 delegated executor never survives a restart.
 	// Its checkpoint delegate marker REFUSES the direct load — the run must
 	// re-enter through the execution handoff so the C-006 approval gate
@@ -475,6 +500,8 @@ function updatePanelWidget(ctx: ExtensionContext): void {
 					pausedReason: current.stall.pausedReason,
 					auditRounds: current.audit.rounds > 0 || current.audit.running ? current.audit.rounds : null,
 					auditFailed: current.audit.failed,
+					auditUndeterminable: current.audit.undeterminable,
+					reviewRunning: current.audit.running === true || current.review.inFlight !== null,
 					startedAt: current.startedAt,
 					usage: current.usage,
 				});
@@ -497,6 +524,8 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 			pausedReason: execution.stall.pausedReason,
 			auditRounds: execution.audit.rounds > 0 ? execution.audit.rounds : null,
 			auditFailed: execution.audit.failed,
+			auditUndeterminable: execution.audit.undeterminable,
+			reviewRunning: execution.audit.running === true || execution.review.inFlight !== null,
 		});
 		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", formatDashboardSummaryLine(model)));
 		return;
@@ -522,6 +551,10 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 		}
 		if (status === "executing") {
 			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", `⌛ plans: ${active.run_id} (executing)`));
+			return;
+		}
+		if (status === "verifying") {
+			ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", `🔎 plans: ${active.run_id} (verifying)`));
 			return;
 		}
 		if (status === "planning") {
@@ -594,6 +627,8 @@ export async function startExecution(
 	ctx: ExtensionContext,
 	input: StartExecutionInput,
 ): Promise<void> {
+	// A fresh handoff replaces any live run — abort its in-flight review round first.
+	abortInFlightReview();
 	const tasks = buildTaskView(input.planTasks);
 	execution = {
 		planPath: input.planPath,
@@ -605,7 +640,8 @@ export async function startExecution(
 		usage: { inToks: 0, outToks: 0 },
 		uiLanguage: resolveUiLanguage(ctx.cwd),
 		stall: { rounds: 0, lastSnapshot: null, paused: false },
-		audit: { rounds: 0, failed: [], running: false },
+		audit: { rounds: 0, failed: [], undeterminable: [], running: false },
+		review: { attempts: 0, consecutiveDiscards: 0, inFlight: null },
 		auditLatch: { auditedThisSettle: false, activity: 0 },
 	};
 	// Seed the watchdog baseline only after `execution` points at the new state
@@ -670,9 +706,11 @@ export function persistTaskProgress(ctx: ExtensionContext): void {
 		applyExecutionProgress(cp, {
 			tasks: taskProgressMap(execution!.tasks),
 			doneVcIds: execution!.items.filter((item) => item.done).map((item) => item.id),
+			stallRounds: execution!.stall.rounds,
 			audit: {
 				rounds: execution!.audit.rounds,
 				lastResult: execution!.audit.failed.length > 0 ? execution!.audit.failed.join(",") : undefined,
+				undeterminable: execution!.audit.undeterminable.length > 0 ? execution!.audit.undeterminable : undefined,
 			},
 		}),
 	);
@@ -746,15 +784,17 @@ export function registerExecutionTurnHandlers(
 			maybeContinuationFollowUp(ctx);
 			return;
 		}
-		// Fully settled and still owed an audit: run it now. The audit's own
-		// pass/fail message drives the rest (pass completes the run; fail
-		// triggers a fix turn), so no extra continuation is requested here —
-		// pendingAudit() is false once paused, which bounds any loop.
+		// Fully settled and still owed a review: launch the round under the
+		// mode rule — tui/rpc detach (the settle returns NOW and the overlay
+		// carries progress); print/json await inline so runtime teardown cannot
+		// kill the child. The round's own outcome routing drives the rest.
 		latchAuditThisSettle();
-		await runAuditFlow(ctx);
+		const chain = launchReviewRound(ctx);
+		if (chain) await chain;
 	});
 	ext.on("session_shutdown", async (_event, ctx) => {
 		drainExecutionFlush(ctx);
+		abortInFlightReview();
 		execution = null;
 		executionRunId = null;
 		continuationRuntime = null;
@@ -795,20 +835,205 @@ export function registerExecutionTurnHandlers(
 		if (usage) recordExecutionTurn(ctx, usage);
 		if (getExecution() && pendingAudit() && !auditLatchOf(execution!).auditedThisSettle) {
 			latchAuditThisSettle();
-			await runAuditFlow(ctx);
+			const chain = launchReviewRound(ctx);
+			if (chain) await chain;
 		}
 		await onTurnEnd?.(ctx);
 	});
 }
 
-/** Audit flow: run the completion auditor, apply pass/rollback, and either
- *  complete the run, keep iterating (rollback), pause at the round cap
- *  (interactive), or stop at the cap (auto-approve/headless — D-022).
+/** ==== Execution-review loop (v0.8) ====
  *
- *  Fail-closed completion: a run completes only when EVERY pending check was
- *  affirmatively passed (or resolved skipped-pass); checks the auditor failed
- *  to report count as failed, never as silently passed. */
-async function runAuditFlow(ctx: ExtensionContext): Promise<void> {
+ *  When every task is terminal and checks are still owed, the run enters the
+ *  `verifying` status and a DETACHED read-only reviewer round runs in the
+ *  background (tui/rpc): the settle handler returns immediately and the
+ *  executor is truly idle while the overlay shows live progress. In print/json
+ *  modes the settle handler keeps AWAITING the round inline — runtime
+ *  teardown at settle would otherwise kill a detached child and swallow the
+ *  pause signal.
+ *
+ *  Budget: `audit.rounds` counts COMMITTED rounds only (pass, fail, or
+ *  undeterminable); discards and cancellations burn nothing. Undeterminable
+ *  rounds self-schedule the retry inside the loop (no wake). Two consecutive
+ *  fingerprint discards commit as an undeterminable round so the loop stays
+ *  bounded. Exhaustion pauses in EVERY mode (fail-closed) with an in-band
+ *  `pi-plans-review-paused` message; the ONLY fresh-budget surface is
+ *  /plans-execute — ordinary input and session restores never refill.
+ *
+ *  Lifecycle: each round owns a session-scoped AbortController (never
+ *  ctx.signal, which is turn-scoped), aborted from session_shutdown,
+ *  stopExecution, startExecution, and restoreFromSession. Outcomes are
+ *  guarded by execution identity (`execution !== owner` → silent discard).
+ *
+ *  Completion stays fail-closed AND never fail-open: a run completes only
+ *  when every pending check was affirmatively passed. */
+const REVIEW_CAP_PAUSE_PREFIX = "execution review exhausted";
+/** v0.7 protocol value — dual-matched for one release so checkpoints written
+ * by older builds keep their cap pause recognized on restore. */
+const LEGACY_AUDIT_CAP_PAUSE_PREFIX = "completion audit exhausted";
+
+function isReviewCapPause(reason: string | undefined | null): boolean {
+	if (!reason) return false;
+	return reason.startsWith(REVIEW_CAP_PAUSE_PREFIX) || reason.startsWith(LEGACY_AUDIT_CAP_PAUSE_PREFIX);
+}
+
+/** The currently-running (or self-scheduling) review chain; the sanctioned
+ * test seam awaits this. */
+let activeReviewChain: Promise<void> | null = null;
+
+function abortInFlightReview(): void {
+	const inFlight = execution?.review.inFlight;
+	if (inFlight) {
+		try {
+			inFlight.controller.abort();
+		} catch {
+			/* already aborted */
+		}
+		if (execution) execution.review.inFlight = null;
+	}
+	activeReviewChain = null;
+}
+
+function reviewOwed(ex: ExecState): boolean {
+	return allTasksTerminal(ex.tasks) && auditableChecks(ex.items, ex.tasks).some((item) => !item.done);
+}
+
+function runDirOf(ctx: ExtensionContext): string | null {
+	const runId = executionRunId ?? resolveActiveRun(ctx.sessionManager, ctx.cwd)?.run_id ?? null;
+	return runId ? runDirPath(ctx.cwd, runId) : null;
+}
+
+function setRunStatusForReview(ctx: ExtensionContext, status: "verifying" | "executing"): void {
+	const runId = executionRunId ?? resolveActiveRun(ctx.sessionManager, ctx.cwd)?.run_id ?? null;
+	if (!runId) return;
+	try {
+		const current = getRun(ctx.cwd, runId)?.status;
+		if (current !== status && current !== "done" && current !== "abandoned") {
+			setRunStatus(ctx.cwd, runId, status);
+		}
+	} catch {
+		/* best-effort */
+	}
+}
+
+/** Round fingerprint (Q-fingerprint-scope): plan digest + git HEAD +
+ * covered-file mtimes. A change between round start and resolve means the
+ * reviewer judged a subject that no longer exists — discard and re-run. */
+function captureReviewFingerprint(ctx: ExtensionContext, ex: ExecState): string {
+	const parts: string[] = [];
+	try {
+		parts.push(createHash("sha256").update(fs.readFileSync(ex.planPath, "utf8")).digest("hex"));
+	} catch {
+		parts.push("plan-unreadable");
+	}
+	try {
+		parts.push(execSync("git rev-parse HEAD", { cwd: ctx.cwd, stdio: ["ignore", "pipe", "pipe"] }).toString().trim());
+	} catch {
+		parts.push("no-head");
+	}
+	const covered = new Set<string>();
+	for (const task of flattenTaskViews(ex.tasks)) {
+		for (const file of task.files ?? []) covered.add(file);
+	}
+	const mtimes: string[] = [];
+	for (const file of [...covered].sort()) {
+		try {
+			mtimes.push(`${file}:${fs.statSync(path.resolve(ctx.cwd, file)).mtimeMs}`);
+		} catch {
+			mtimes.push(`${file}:missing`);
+		}
+	}
+	parts.push(mtimes.join("|"));
+	return createHash("sha256").update(parts.join("\u0000")).digest("hex");
+}
+
+/** Round timeout: a committed round is minutes, never the 60-min subagent
+ * default — a hung child must surface as a spawn-failure round, not park the
+ * run in verifying for an hour (CF2-010). */
+const REVIEW_ROUND_TIMEOUT_MS = 20 * 60 * 1000;
+
+/** Reviewer-role pinning (Q-role-fallback): a CONFIRMED delegated role pins
+ * the spawn's model+thinking and labels the overlay with the role; an
+ * unconfirmed or current-session role inherits the session default with the
+ * "session default" label — a detached round NEVER opens the interactive
+ * first-use panel. */
+function reviewSpawnProfile(): { model?: string; thinkingLevel?: string; label: string } {
+	try {
+		const reviewer = loadGlobalConfig().config.reviewer;
+		if (reviewer.mode !== "current-session" && reviewerReady(reviewer)) {
+			const spawn = resolveReviewerSpawn(reviewer);
+			if (spawn.modelSelector) {
+				return { model: spawn.modelSelector, thinkingLevel: spawn.thinkingLevel ?? undefined, label: spawn.label };
+			}
+		}
+	} catch {
+		/* fall through to the session default */
+	}
+	return { label: "session default" };
+}
+
+/** Engine-held lane state for the in-flight round: the reopen path builds a
+ * fresh one-shot controller seeded from THIS object, so the accumulated
+ * transcript survives ESC + reopen (CF2-001 / Q-reopen-seed). */
+let reviewLane: RefineLaneState | null = null;
+let reviewOverlay: RefineOverlayController | null = null;
+let reviewModelLabel: string | undefined;
+
+function freshReviewLane(attempt: number): RefineLaneState {
+	return {
+		id: `review-round-${attempt}`,
+		label: `Execution review round ${attempt}`,
+		status: "queued",
+		phase: "queued",
+		detail: "",
+		transcript: [],
+		currentTurnIndex: 0,
+		scrollOffset: 0,
+		followTranscript: true,
+		viewportHeight: 1,
+	};
+}
+
+/** Fresh controller per round (the controller is one-shot: closed latch,
+ * overlayPromise bail, terminal-lane early return — reuse drops progress).
+ * A UI failure must NEVER kill the round itself — best-effort only. */
+function openReviewOverlay(ctx: ExtensionContext, lane: RefineLaneState, lang: "en" | "zh" | undefined, modelLabel: string): RefineOverlayController | null {
+	if (ctx.mode !== "tui" || ctx.hasUI !== true) return null;
+	try {
+		const controller = new RefineOverlayController("auditor", [{ id: lane.id, label: lane.label }], () => {}, lang ?? "en");
+		controller.seedLane(lane);
+		controller.open(refineOverlayContext(ctx), modelLabel);
+		return controller;
+	} catch {
+		return null;
+	}
+}
+
+/** The reopen surface (Task-3.4): rebuilds the overlay from engine-held lane
+ * state; inert when no round is in flight. */
+export function reopenReviewOverlay(ctx: ExtensionContext): void {
+	if (!execution?.review.inFlight || !reviewLane) return;
+	const controller = openReviewOverlay(ctx, reviewLane, execution.uiLanguage, reviewModelLabel ?? "session default");
+	if (controller) reviewOverlay = controller;
+}
+
+function pauseReviewCap(ctx: ExtensionContext, ex: ExecState): void {
+	const detail =
+		ex.audit.failed.length > 0
+			? `failed: ${ex.audit.failed.join(", ")}`
+			: `unreadable verdicts: ${ex.audit.undeterminable.join(", ") || "unknown"}`;
+	const reason = `${REVIEW_CAP_PAUSE_PREFIX} ${REVIEW_MAX_ROUNDS} rounds (${detail}). Only /plans-execute — an explicit user confirmation — grants a fresh five-round budget; ordinary messages and session restores do not. (Or close the failed checks' tasks as skipped to pass them as skipped-pass.)`;
+	pauseForStall(ctx, reason);
+	// In-band, headless-visible pause signal (the pi-plans-exec-stop pattern):
+	// pauseForStall's ui.notify is optional and absent headless, so the pause
+	// must also land in the session stream every mode can read.
+	messaging().sendMessage(
+		{ customType: "pi-plans-review-paused", content: `**pi-plans: ${reason}**`, display: true },
+		{ triggerTurn: false },
+	);
+}
+
+async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 	if (!execution) return;
 	const ex = execution;
 	// Skipped-pass checks resolve without a subagent round.
@@ -823,43 +1048,194 @@ async function runAuditFlow(ctx: ExtensionContext): Promise<void> {
 		await completeExecution(ctx);
 		return;
 	}
-	if (ex.audit.rounds >= AUDIT_MAX_ROUNDS) {
-		// D-022: interactive sessions pause for the user (state kept, tasks
-		// intact, resumable); auto-approve/headless terminates bounded.
-		if (isInteractiveSession(ctx)) {
-			pauseForStall(
-				ctx,
-				`${AUDIT_CAP_PAUSE_PREFIX} ${AUDIT_MAX_ROUNDS} rounds (failed: ${ex.audit.failed.join(", ") || "unknown"}); review the audit reports and fix the failures, then resume with any message or /plans-execute — resuming grants a fresh three-round audit budget (or close the failed checks' tasks as skipped to pass them as skipped-pass)`,
-			);
-			return;
-		}
-		await stopExecution(ctx, `completion audit exhausted ${AUDIT_MAX_ROUNDS} rounds (failed: ${ex.audit.failed.join(", ") || "unknown"})`);
+	if (ex.stall.paused || ex.review.inFlight) return;
+	if (ex.audit.rounds >= REVIEW_MAX_ROUNDS) {
+		pauseReviewCap(ctx, ex);
 		return;
 	}
-	ex.audit.running = true;
-	ex.audit.rounds += 1;
+	// Phase transition: the executor is done with its tasks; the review loop
+	// owns the run until it converges (or pauses at the cap).
+	setRunStatusForReview(ctx, "verifying");
+	const round: InFlightReview = {
+		controller: new AbortController(),
+		budgetRound: ex.audit.rounds + 1,
+		attempt: ex.review.attempts + 1,
+		fingerprint: captureReviewFingerprint(ctx, ex),
+		wakeSent: false,
+	};
+	ex.review.attempts = round.attempt;
+	ex.review.inFlight = round;
+	ex.audit.running = true; // dashboard mirror (the v0.8 model lands with the overlay task)
+	const spawn = reviewSpawnProfile();
+	reviewModelLabel = spawn.label;
+	const lane = freshReviewLane(round.attempt);
+	reviewLane = lane;
+	reviewOverlay = openReviewOverlay(ctx, lane, ex.uiLanguage, spawn.label);
 	updateStatusWidget(ctx);
-	let outcome = null as Awaited<ReturnType<typeof runCompletionAudit>>;
+	let result: AuditRoundResult;
 	try {
-		outcome = auditRunnerForTests
-			? await auditRunnerForTests({ planPath: ex.planPath, checklist: ex.items, tasks: ex.tasks, round: ex.audit.rounds })
+		result = auditRunnerForTests
+			? await auditRunnerForTests({ planPath: ex.planPath, checklist: ex.items, tasks: ex.tasks, round: round.attempt })
 			: await runCompletionAudit(ctx, {
 				planPath: ex.planPath,
 				checklist: ex.items,
 				tasks: ex.tasks,
-				round: ex.audit.rounds,
-				signal: ctx.signal,
+				round: round.attempt,
+				model: spawn.model,
+				thinkingLevel: spawn.thinkingLevel,
+				timeoutMs: REVIEW_ROUND_TIMEOUT_MS,
+				signal: round.controller.signal,
+				onProgress: (event) => {
+					// The engine owns the lane state; the live controller only repaints.
+					applyRefineProgress(lane, event);
+					reviewOverlay?.rerender();
+				},
 			});
-	} finally {
-		ex.audit.running = false;
+	} catch (error) {
+		if (ex.review.inFlight === round) {
+			ex.review.inFlight = null;
+			ex.audit.running = false;
+		}
+		void reviewOverlay?.close();
+		reviewOverlay = null;
+		messaging().sendMessage(
+			{ customType: "pi-plans-review-error", content: `pi-plans: execution review round threw: ${String(error)}`, display: true },
+			{ triggerTurn: false },
+		);
+		updateStatusWidget(ctx);
+		return;
 	}
-	// Fail-closed: checks the outcome did not affirmatively pass are failed.
-	const reportedPass = new Set(outcome?.passed ?? []);
-	const failed = pendingChecks
-		.map((item) => item.id)
-		.filter((id) => !reportedPass.has(id));
-	if (failed.length === 0) {
+	// Overlay terminal state + close (the controller is one-shot; the engine-held
+	// lane keeps the transcript for a later reopen within this round).
+	const cancelledResult = result !== null && typeof result === "object" && "cancelled" in result;
+	try {
+		applyRefineResult(lane, {
+			ok: !cancelledResult,
+			output: result && "report" in result ? result.report : "",
+			stderr: "",
+			turns: 0,
+			...(cancelledResult ? { cancelled: true as const } : {}),
+		});
+	} catch {
+		/* cosmetic only */
+	}
+	void reviewOverlay?.close();
+	reviewOverlay = null;
+	await handleReviewOutcome(ctx, ex, round, result, pendingChecks.map((item) => item.id));
+}
+
+async function handleReviewOutcome(
+	ctx: ExtensionContext,
+	owner: ExecState,
+	round: InFlightReview,
+	result: AuditRoundResult,
+	pendingIds: string[],
+): Promise<void> {
+	// Identity guard: a restore, stop, or fresh handoff replaced the run —
+	// drop this outcome silently (CF2-002).
+	if (execution !== owner) return;
+	if (owner.review.inFlight !== round) return;
+	owner.review.inFlight = null;
+	owner.audit.running = false;
+	if (result !== null && typeof result === "object" && "cancelled" in result) {
+		// Aborted by shutdown/stop/restore/tree-switch: no round, no budget, no wake.
+		updateStatusWidget(ctx);
+		return;
+	}
+	const outcome = result;
+	const reportText = outcome?.report ?? "(review subagent failed to run)";
+	const fingerprintNow = captureReviewFingerprint(ctx, owner);
+	const coveredTaskIds = flattenTaskViews(owner.tasks).map((task) => task.id);
+	if (fingerprintNow !== round.fingerprint) {
+		// The audited subject moved under the reviewer (Q-C): discard, re-run
+		// without budget burn; two consecutive discards commit as undeterminable
+		// so a mutating user cannot loop the loop for free (Q-discard-bound).
+		owner.review.consecutiveDiscards += 1;
+		const runDir = runDirOf(ctx);
+		if (runDir) {
+			writeReviewRoundReport(runDir, {
+				budgetRound: round.budgetRound,
+				attempt: round.attempt,
+				outcome: "discarded",
+				passed: [],
+				failed: [],
+				undeterminable: pendingIds,
+				discardedReason: "fingerprint changed between round start and resolve (worktree/plan moved under the reviewer)",
+				fingerprintCaptured: round.fingerprint,
+				fingerprintFound: fingerprintNow,
+				coveredTaskIds,
+				report: reportText,
+			});
+		}
+		if (owner.review.consecutiveDiscards >= 2) {
+			owner.review.consecutiveDiscards = 0;
+			await commitReviewOutcome(
+				ctx,
+				owner,
+				round,
+				{ passed: [], failed: [], undeterminable: pendingIds, report: `(two consecutive fingerprint discards — committed as an undeterminable round)\n\n${reportText}` },
+				pendingIds,
+			);
+			return;
+		}
+		persist(ctx);
+		updateStatusWidget(ctx);
+		await maybeContinueReview(ctx, owner);
+		return;
+	}
+	owner.review.consecutiveDiscards = 0;
+	await commitReviewOutcome(ctx, owner, round, outcome, pendingIds);
+}
+
+async function commitReviewOutcome(
+	ctx: ExtensionContext,
+	ex: ExecState,
+	round: InFlightReview,
+	outcome: { passed: string[]; failed: string[]; undeterminable: string[]; report: string } | null,
+	pendingIds: string[],
+): Promise<void> {
+	// The budget is charged only when an outcome commits — never on discard
+	// or cancellation (CF2-003).
+	ex.audit.rounds = round.budgetRound;
+	const passed = pendingIds.filter((id) => (outcome?.passed ?? []).includes(id));
+	const failed = pendingIds.filter((id) => (outcome?.failed ?? []).includes(id));
+	// Anything the round neither passed nor failed is undeterminable: the
+	// report omitted the check, spelled the verdict unreadably, or the
+	// subagent never ran.
+	const undeterminable = pendingIds.filter((id) => !passed.includes(id) && !failed.includes(id));
+	const coveredTaskIds = flattenTaskViews(ex.tasks).map((task) => task.id);
+	const reportText = outcome?.report ?? "(review subagent failed to run)";
+	{
+		const runDir = runDirOf(ctx);
+		if (runDir) {
+			writeReviewRoundReport(runDir, {
+				budgetRound: round.budgetRound,
+				attempt: round.attempt,
+				outcome: outcome === null
+					? "spawn-failed"
+					: failed.length > 0
+						? "failed"
+						: undeterminable.length > 0 ? "undeterminable" : "passed",
+				passed,
+				failed,
+				undeterminable,
+				fingerprintCaptured: round.fingerprint,
+				coveredTaskIds,
+				report: reportText,
+			});
+		}
+	}
+
+	// Fail-closed completion: every pending check affirmatively passed. An
+	// all-undeterminable round yields failed === [] — completing here would be
+	// fail-open, marking a run done with nothing verified.
+	if (passed.length === pendingIds.length) {
 		ex.audit.failed = [];
+		ex.audit.undeterminable = [];
+		for (const id of passed) {
+			const item = ex.items.find((candidate) => candidate.id === id);
+			if (item) item.done = true;
+		}
 		withExecutionCheckpoint(ctx, (cp) =>
 			applyExecutionProgress(cp, {
 				tasks: taskProgressMap(ex.tasks),
@@ -870,18 +1246,21 @@ async function runAuditFlow(ctx: ExtensionContext): Promise<void> {
 		await completeExecution(ctx);
 		return;
 	}
-	// Failed checks: roll their covered tasks back (always — an unreported or
-	// infra-failed audit must reopen work so the loop can continue) and
-	// persist progress including checks that passed earlier rounds.
-	for (const id of failed) {
+	// Partial progress counts: a check affirmed this round is done even when a
+	// sibling failed, so a later round only re-judges what is still open.
+	for (const id of passed) {
 		const item = ex.items.find((candidate) => candidate.id === id);
-		if (item) item.done = false;
+		if (item) item.done = true;
 	}
 	ex.audit.failed = failed;
+	ex.audit.undeterminable = undeterminable;
 	const rolledBack: string[] = [];
 	for (const id of failed) {
 		rolledBack.push(...auditRollbackSet(ex.tasks, ex.items, id));
 	}
+	// A rollback reopens work other checks were verifying; those checks must
+	// stop claiming the run is satisfied there.
+	if (rolledBack.length > 0) invalidateChecksForRolledBackTasks(ex.items, ex.tasks, rolledBack);
 	withExecutionCheckpoint(ctx, (cp) =>
 		applyExecutionProgress(cp, {
 			tasks: taskProgressMap(ex.tasks),
@@ -889,29 +1268,95 @@ async function runAuditFlow(ctx: ExtensionContext): Promise<void> {
 			audit: { rounds: ex.audit.rounds, lastResult: failed.join(",") },
 		}),
 	);
-	ex.stall.rounds = 0;
-	ex.stall.lastSnapshot = stallSnapshot();
+	if (rolledBack.length > 0) {
+		// Rolling back is itself forward progress for the watchdog, but NOT for
+		// audit.rounds: that counter stays monotonic so the repair loop is
+		// bounded. The repair belongs to the executor — back to executing.
+		ex.stall.rounds = 0;
+		ex.stall.lastSnapshot = stallSnapshot();
+		setRunStatusForReview(ctx, "executing");
+	}
 	persist(ctx);
 	updateStatusWidget(ctx);
-	const report = outcome?.report ?? "(audit subagent failed to run)";
-	// v0.7.1: the failure notification now wakes the agent so it can fix the
-	// rolled-back work without the user having to poke the run (root cause of
-	// the observed stall). The wake is the ONLY turn this settle emits — the
-	// rollback below also marks the runtime handled so the continuation path
-	// cannot add a second EXECUTION_CONTINUE wake for the same settle (Q-2).
-	const stranded = rolledBack.length === 0;
-	messaging().sendMessage(
-		{
-			customType: "pi-plans-audit-failed",
-			content: `**pi-plans: completion audit round ${ex.audit.rounds} failed** — checks: ${failed.join(", ")}. Rolled back tasks: ${rolledBack.join(", ") || "(none covered)"}. Fix the failures and re-close the rolled-back tasks with \`plans_update_task\`; the audit reruns automatically once all tasks are terminal again.${ex.audit.rounds >= AUDIT_MAX_ROUNDS ? ` This was round ${AUDIT_MAX_ROUNDS} of ${AUDIT_MAX_ROUNDS}: interactive sessions pause for review; the next terminal-task cycle stops or pauses the run.` : ""}${stranded ? ` No task covers the failed check(s), so the task tree stayed terminal — the next settle re-runs the audit automatically.` : ""}\n\n---\n${report.slice(0, 4000)}`,
-			display: true,
-		},
-		{ triggerTurn: true },
-	);
-	// Q-2 (single wake): this message owns the settle's only turn. Mark the
-	// runtime handled so maybeContinuationFollowUp stays silent.
-	const runtime = currentContinuationRuntime(ctx);
-	if (runtime) runtime.handled = true;
+	if (failed.length > 0) {
+		// v0.8 wake: per-round one-shot token — exactly one triggerTurn per
+		// committed failed outcome, even when the round resolves long after the
+		// settle that spawned it. The continuation runtime is deliberately
+		// untouched: detached rounds outlive their settle.
+		if (!round.wakeSent) {
+			round.wakeSent = true;
+			const openTasks = flattenTaskViews(ex.tasks)
+				.filter((task) => !taskIsTerminal(task))
+				.map((task) => task.id);
+			const stranded = rolledBack.length === 0;
+			const content = `**pi-plans: execution review round ${ex.audit.rounds} failed** — checks: ${failed.join(", ")}. Rolled back tasks: ${rolledBack.join(", ") || "(none covered)"}. Fix the failures and re-close the rolled-back tasks with \`plans_update_task\`; the review reruns automatically once all tasks are terminal again.${ex.audit.rounds >= REVIEW_MAX_ROUNDS ? ` This was round ${REVIEW_MAX_ROUNDS} of ${REVIEW_MAX_ROUNDS}: the next terminal-task cycle pauses the run for review.` : ""}${stranded ? ` No task covers the failed check(s), so the task tree stayed terminal — the next settle re-runs the review automatically.` : ""}`;
+			messaging().sendMessage(
+				{
+					customType: "pi-plans-audit-failed",
+					content: `${content}\n\nStill open: ${openTasks.join(", ") || "(none — the tree is terminal)"}\n\n---\n${reportText.slice(0, 4000)}`,
+					display: true,
+				},
+				{ triggerTurn: true },
+			);
+		}
+		return; // The agent repairs; the next settle re-enters the loop.
+	}
+	// Undeterminable-only round: the loop self-schedules the retry (Q-B) — no
+	// wake, no message; the dashboard/overlay carries the round counter.
+	await maybeContinueReview(ctx, ex);
+}
+
+async function maybeContinueReview(ctx: ExtensionContext, ex: ExecState): Promise<void> {
+	if (execution !== ex) return;
+	if (!reviewOwed(ex)) return;
+	if (ex.stall.paused) return;
+	if (ex.audit.rounds >= REVIEW_MAX_ROUNDS) {
+		pauseReviewCap(ctx, ex);
+		return;
+	}
+	await startReviewRound(ctx);
+}
+
+/** Launch a review round under the mode rule: detached (fire-and-forget with
+ *  the chain tracked for the test seam) in tui/rpc; awaited inline otherwise
+ *  (print/json settle must hold the runtime open through the round). Returns
+ *  the chain when the caller must await it, null when detached. */
+function launchReviewRound(ctx: ExtensionContext): Promise<void> | null {
+	const detach = ctx.mode === "tui" || ctx.mode === "rpc";
+	const chain = (async () => {
+		await startReviewRound(ctx);
+	})();
+	activeReviewChain = chain;
+	if (detach) {
+		chain.catch(() => {
+			/* surfaced via the review messages */
+		});
+		return null;
+	}
+	return chain;
+}
+
+/** Deterministic seam: await the in-flight (or self-scheduling) review chain. */
+export function __awaitReviewRoundForTests(): Promise<void> {
+	return activeReviewChain ?? Promise.resolve();
+}
+
+/** When this module graph was first imported into the running pi process.
+ * pi loads extensions once, so a fix written to disk mid-session stays
+ * invisible until /reload — which is exactly why an unreadable audit verdict
+ * deserves a /reload hint rather than a bare retry. */
+const extensionModuleLoadedAt = new Date();
+
+/** The /reload advice when the extension on disk is newer than the copy this
+ * process loaded, else null. Shared with /plans via src/staleness.ts so both
+ * report the same answer from one probe. */
+function staleReloadHint(): string | null {
+	try {
+		const root = path.dirname(path.dirname(new URL(import.meta.url).pathname));
+		return probeStaleReload(root, extensionModuleLoadedAt);
+	} catch {
+		return null;
+	}
 }
 
 /** True when the session can surface a pause to a human (D-022): interactive
@@ -931,7 +1376,7 @@ function activeVccSettings(ctx: ExtensionContext, phase: PiPlansCompactionPhase)
 	const run = getRun(ctx.cwd, active.run_id);
 	if (!run) return null;
 	if (phase === "planning" && run.status !== "planning") return null;
-	if (phase === "execution" && run.status !== "executing") return null;
+	if (phase === "execution" && run.status !== "executing" && run.status !== "verifying") return null;
 	scaffoldVccSettings(stateRoot);
 	return { settings: loadVccSettings(stateRoot), runId: run.run_id, artifactDir: run.artifact_dir };
 }
@@ -1392,6 +1837,9 @@ export function filterPlanningResumeMessages<T extends { customType?: string }>(
 
 export async function stopExecution(ctx: ExtensionContext, reason: string): Promise<void> {
 	if (!execution) return;
+	// A stopped run's in-flight review round dies with it (typed cancelled —
+	// no budget, no wake).
+	abortInFlightReview();
 	resetExecutionCompactionState(ctx);
 	pendingExecutionFlush = false;
 	persist(ctx);
@@ -1437,7 +1885,7 @@ function stallSnapshot(): string {
 }
 
 /**
- * v0.7.1: shared "the completion audit is owed" predicate. Every entry point
+ * v0.7.1: shared "the execution review is owed" predicate. Every entry point
  * that can start the audit (turn_end, agent_before_settle, restoreFromSession,
  * the resume path) goes through this so they can never disagree.
  *
@@ -1446,11 +1894,11 @@ function stallSnapshot(): string {
  */
 function pendingAudit(ex: ExecState | null = execution): ex is ExecState {
 	if (!ex) return false;
-	// A paused run is never self-driven: the stall / audit-cap pause is an
+	// A paused run is never self-driven: the stall / review-cap pause is an
 	// explicit "hand control back" signal, and resuming it is the user's call.
 	// This also bounds the zero-input continue loop in agent_before_settle.
 	if (ex.stall.paused) return false;
-	if (ex.audit.running) return false;
+	if (ex.review.inFlight) return false;
 	return allTasksTerminal(ex.tasks) && auditableChecks(ex.items, ex.tasks).some((item) => !item.done);
 }
 
@@ -1564,48 +2012,76 @@ export function filterContinuationMessages<T extends { customType?: string; deta
 	return filterGoalWaitMessages(messages);
 }
 
-/** Prefix of the stall reason used for the audit-cap pause (D-022). */
-const AUDIT_CAP_PAUSE_PREFIX = "completion audit exhausted";
-
 /** Called for genuine user input or an explicit same-execution resume.
- * Resuming an audit-cap pause grants a fresh audit budget (three more
- * rounds): the user's explicit resume IS the decision to keep auditing —
- * without this reset the cap pause could never be lifted productively. */
+ * v0.8: a REVIEW-CAP pause is never lifted here — ordinary input must not
+ * refill the five-round budget (CF2-004); only /plans-execute
+ * (resumeActiveExecution) is the explicit confirmation surface. Genuine
+ * stall pauses still clear on input as before. */
 export function resumeGoalWaitIfPaused(ctx: ExtensionContext): boolean {
 	const ex = getExecution();
 	if (!ex?.stall.paused || !currentContinuationRuntime(ctx)) return false;
-	const wasAuditCap = (ex.stall.pausedReason ?? "").startsWith(AUDIT_CAP_PAUSE_PREFIX);
+	if (isReviewCapPause(ex.stall.pausedReason)) {
+		// Surfaced once per input so the user is not left guessing why the run
+		// stays paused; the pause itself and the budget survive untouched.
+		ctx.ui.notify?.(
+			"pi-plans: the review-round budget is exhausted — run /plans-execute to grant a fresh five-round budget (that confirmation is the only surface that does).",
+			"warning",
+		);
+		return false;
+	}
 	ex.stall.paused = false;
 	ex.stall.pausedReason = undefined;
 	ex.stall.rounds = 0;
 	ex.stall.lastSnapshot = stallSnapshot();
-	if (wasAuditCap) {
-		ex.audit.rounds = 0;
-		ex.audit.failed = [];
-		withExecutionCheckpoint(ctx, (cp) =>
-			applyExecutionProgress(cp, {
-				tasks: taskProgressMap(ex.tasks),
-				audit: { rounds: 0, lastResult: undefined },
-				pausedReason: null,
-			}),
-		);
-	} else {
-		withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { pausedReason: null }));
-	}
+	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { pausedReason: null }));
 	persist(ctx);
 	updateStatusWidget(ctx);
 	return true;
 }
 
 export function resumeActiveExecution(ctx: ExtensionContext): boolean {
+	// v0.8: /plans-execute is THE explicit confirmation surface for a
+	// review-cap pause — the only place a fresh five-round budget is granted
+	// (Q-confirm-surface). Ordinary input and session restores never refill.
+	const pausedEx = getExecution();
+	if (pausedEx?.stall.paused && isReviewCapPause(pausedEx.stall.pausedReason)) {
+		pausedEx.stall.paused = false;
+		pausedEx.stall.pausedReason = undefined;
+		pausedEx.stall.rounds = 0;
+		pausedEx.stall.lastSnapshot = stallSnapshot();
+		pausedEx.audit.rounds = 0;
+		pausedEx.audit.failed = [];
+		pausedEx.audit.undeterminable = [];
+		withExecutionCheckpoint(ctx, (cp) =>
+			applyExecutionProgress(cp, {
+				tasks: taskProgressMap(pausedEx.tasks),
+				audit: { rounds: 0, lastResult: undefined },
+				pausedReason: null,
+			}),
+		);
+		persist(ctx);
+		updateStatusWidget(ctx);
+		messaging().sendMessage(
+			{
+				customType: "pi-plans-review-budget-granted",
+				content: "**pi-plans: fresh five-round review budget granted** — the execution review resumes now.",
+				display: true,
+			},
+			{ triggerTurn: false },
+		);
+		const grantChain = launchReviewRound(ctx);
+		if (grantChain) void grantChain.catch(() => { /* surfaced via the review messages */ });
+		return true;
+	}
 	// v0.7.1 (root cause A): a terminal-but-unaudited run used to fall through
 	// to `return false` here, so `/plans-execute` answered "already executing"
 	// and the run stayed stranded until a full re-entry or a session restore.
 	// It is not paused, so the pause path below cannot see it — check it first
-	// and run the owed audit instead of reporting "nothing to resume".
+	// and run the owed review instead of reporting "nothing to resume".
 	if (!execution?.stall.paused && pendingAudit()) {
 		latchAuditThisSettle();
-		void runAuditFlow(ctx).catch(() => { /* surfaced via the audit message */ });
+		const chain = launchReviewRound(ctx);
+		if (chain) void chain.catch(() => { /* surfaced via the review messages */ });
 		return true;
 	}
 	if (!resumeGoalWaitIfPaused(ctx)) return false;
@@ -1635,7 +2111,7 @@ export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 	messaging().sendMessage(
 		{
 			customType: "pi-plans-complete",
-			content: `**Plan complete!** ✅ \`${planPath}\` — completion audit passed.\n\n${summary}`,
+			content: `**Plan complete!** ✅ \`${planPath}\` — execution review passed.\n\n${summary}`,
 			display: true,
 		},
 		{ triggerTurn: false },
@@ -1668,7 +2144,7 @@ export function executionContextMessage(ctx: ExtensionContext): string | null {
 			? `${graphBlockForExecutor(false)}\n[pi-plans: config unreadable this turn; graph features are off until .git/pi-plans/config.json is repaired]`
 			: graphBlockForExecutor(mode === "enabled");
 	const rollbackNote = execution.audit.failed.length > 0
-		? `\nCompletion audit round ${execution.audit.rounds} failed checks: ${execution.audit.failed.join(", ")} — the covered tasks were rolled back to pending; re-close them with evidence after fixing the failures.`
+		? `\nExecution review round ${execution.audit.rounds} failed checks: ${execution.audit.failed.join(", ")} — the covered tasks were rolled back to pending; re-close them with evidence after fixing the failures.`
 		: "";
 	return `[PI-PLANS EXECUTION — write access enabled]
 Implement the accepted plan at ${execution.planPath} (tasks ${progress.done}/${progress.total}${execution.legacyPlan ? " · legacy I-### mapping" : ""} · VC ${vcDone}/${execution.items.length}).
@@ -1684,7 +2160,7 @@ Execution rules:
 - Work through tasks in wave order (earlier waves first); within a wave, follow the listed dependency order. Wave grouping encodes which tasks could run in parallel — keep their file sets disjoint.
 - Report progress ONLY through the \`plans_update_task\` tool: status "complete" with evidence (test command output / file paths), or "skipped" with a skipReason. One call per task; statuses are immutable once set.
 - Close subtasks before their parent; a parent is auditable only when every child is terminal.
-- When every task is terminal, the independent completion auditor verifies the plan's verification checks (${execution.items.map((item) => item.id).join(", ")}); failed checks roll their covered tasks back automatically.
+- When every task is terminal, the independent execution reviewer verifies the plan's verification checks (${execution.items.map((item) => item.id).join(", ")}); failed checks roll their covered tasks back automatically.
 - Simplest implementation that fully meets the task: no speculative abstractions, configuration, or indirection; keep components modular with clearly separated concerns.
 - Architectural decisions are for the long term: no stopgaps. Remove the obsolete paths this change obsoletes.
 - Prefer established, well-maintained libraries when they reduce complexity; check the project's existing dependencies before adding a package or reimplementing common functionality.
@@ -1745,6 +2221,9 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 	} catch {
 		tasks = snapshot.tasks;
 	}
+	// The snapshot cannot carry an in-flight round (it is memory-only); abort
+	// any live one from the previous session graph and rebuild fresh (CF2-002).
+	abortInFlightReview();
 	execution = {
 		planPath: snapshot.planPath,
 		items,
@@ -1754,8 +2233,14 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 		startedAt: snapshot.startedAt,
 		usage: snapshot.usage ?? { inToks: 0, outToks: 0 },
 		uiLanguage: resolveUiLanguage(ctx.cwd),
-		stall: { ...snapshot.stall, lastSnapshot: null, rounds: 0 },
-		audit: { rounds: snapshot.audit?.rounds ?? 0, failed: snapshot.audit?.failed ?? [], running: false },
+		stall: { ...snapshot.stall, lastSnapshot: null },
+		audit: {
+			rounds: snapshot.audit?.rounds ?? 0,
+			failed: snapshot.audit?.failed ?? [],
+			undeterminable: [],
+			running: false,
+		},
+		review: { attempts: 0, consecutiveDiscards: 0, inFlight: null },
 		auditLatch: { auditedThisSettle: false, activity: 0 },
 	};
 	execution.stall.lastSnapshot = stallSnapshot();
@@ -1765,9 +2250,12 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 	if (active) bindRun(ctx.sessionManager, ctx.cwd, active.run_id);
 	persist(ctx);
 	if (pendingAudit()) {
-		// Terminal tasks without a passing audit: rerun the audit flow.
+		// Self-heal (v0.8): a verifying run with pending checks restarts its
+		// round exactly once per resume — the full predicate (paused, in-flight,
+		// budget) lives inside startReviewRound. Restores never grant budget.
 		latchAuditThisSettle();
-		await runAuditFlow(ctx);
+		const chain = launchReviewRound(ctx);
+		if (chain) await chain;
 	}
 	updateStatusWidget(ctx);
 }

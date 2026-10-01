@@ -11,6 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
+	__awaitReviewRoundForTests,
 	__setAuditRunnerForTests,
 	executionContextMessage,
 	getExecution,
@@ -23,6 +24,7 @@ import {
 	toggleDashboardExpanded,
 	updateStatusWidget,
 } from "../src/exec.ts";
+import { REVIEW_MAX_ROUNDS } from "../src/auditor.ts";
 import { setMessagingApi } from "../src/messaging.ts";
 import { applyTaskUpdate } from "../src/task-tool.ts";
 import { flattenTaskViews } from "../src/tasks.ts";
@@ -157,7 +159,6 @@ describe("task-tree execution core", () => {
 				return item.id;
 			}),
 			failed: [],
-			rolledBack: [],
 			report: "all pass",
 		}));
 		const { workdir, planPath, runId } = freshWorkdir();
@@ -186,7 +187,7 @@ describe("task-tree execution core", () => {
 			round += 1;
 			const failed = checklist.filter((item) => item.id === "VC-002").map((item) => item.id);
 			// Simulate the pure outcome: VC-002 fails; its covered tasks roll back.
-			return { round, passed: ["VC-001"], failed, rolledBack: [], report: "VC-002 fails" };
+			return { round, passed: ["VC-001"], failed, report: "VC-002 fails" };
 		});
 		const { workdir, planPath, runId } = freshWorkdir();
 		const { ctx } = await start(planPath, workdir);
@@ -300,7 +301,7 @@ describe("task-tree execution core", () => {
 			// Mirror applyAuditOutcome: passed checks are marked done.
 			const vc1 = checklist.find((item) => item.id === "VC-001");
 			if (vc1) vc1.done = true;
-			return { round: 1, passed: ["VC-001"], failed: ["VC-002"], rolledBack: [], report: "VC-002 fails: core tests missing" };
+			return { round: 1, passed: ["VC-001"], failed: ["VC-002"], report: "VC-002 fails: core tests missing" };
 		});
 		const { workdir, planPath, runId } = freshWorkdir();
 		const { ctx } = await start(planPath, workdir);
@@ -323,10 +324,10 @@ describe("task-tree execution core", () => {
 		await stopExecution(ctx, "test teardown");
 	});
 
-	it("audit round cap: interactive sessions pause, headless stops", async () => {
+	it("review round cap: every mode pauses with an in-band signal (v0.8)", async () => {
 		__setAuditRunnerForTests(async ({ checklist }) => {
 			const failed = checklist.filter((item) => !["VC-001"].includes(item.id)).map((item) => item.id);
-			return { round: 1, passed: ["VC-001"], failed, rolledBack: [], report: "still failing" };
+			return { round: 1, passed: ["VC-001"], failed, report: "still failing" };
 		});
 		const interactive = await (async () => {
 			const { workdir, planPath, runId } = freshWorkdir();
@@ -335,36 +336,43 @@ describe("task-tree execution core", () => {
 				applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
 				persistTaskProgress(ctx);
 			}
-			// Simulate three exhausted rounds persisted from earlier attempts.
-			getExecution()!.audit.rounds = 3;
+			// Simulate an exhausted budget persisted from earlier attempts.
+			getExecution()!.audit.rounds = REVIEW_MAX_ROUNDS;
 			getExecution()!.audit.failed = ["VC-002"];
-			mutateCheckpoint(workdir, runId!, (cp) => applyExecutionProgress(cp, { audit: { rounds: 3, lastResult: "VC-002" } }));
+			mutateCheckpoint(workdir, runId!, (cp) => applyExecutionProgress(cp, { audit: { rounds: REVIEW_MAX_ROUNDS, lastResult: "VC-002" } }));
 			const snapshot = getExecution();
 			const ctxUi = { ...makeCtx(workdir), mode: "tui" as const };
 			await restoreFromSession(ctxUi, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
+			await __awaitReviewRoundForTests(); // detached chain: pause lands inside it
 			const ex = getExecution()!;
-			// hasUI ctx → interactive pause, execution state kept.
+			// v0.8 (Q-A): interactive AND headless both pause — fail-closed, never a silent stop.
 			assert.equal(ex.stall.paused, true, "interactive cap pauses");
-			assert.match(ex.stall.pausedReason ?? "", /exhausted 3 rounds/);
+			assert.match(ex.stall.pausedReason ?? "", /execution review exhausted 5 rounds/);
+			assert.ok(
+				ctxUi.entries.some((e) => e.customType === "pi-plans-review-paused"),
+				"the pause lands as an in-band message every mode can read",
+			);
 			await stopExecution(ctxUi, "test teardown");
 			return loadCheckpoint(workdir, runId!);
 		})();
 		assert.ok(interactive.status === "ok");
-		// Headless: no UI → bounded stop.
+		// Headless: same pause, execution state kept (no more bounded stop).
 		const { workdir: wd2, planPath: pp2, runId: r2 } = freshWorkdir();
 		const { ctx: ctx3 } = await start(pp2, wd2);
 		for (const id of ["Task-1", "Task-2", "Task-3"]) {
 			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
 			persistTaskProgress(ctx3);
 		}
-		getExecution()!.audit.rounds = 3;
+		getExecution()!.audit.rounds = REVIEW_MAX_ROUNDS;
 		getExecution()!.audit.failed = ["VC-002"];
 		const headlessCtx = { ...makeCtx(wd2), hasUI: false } as never;
 		await restoreFromSession(headlessCtx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
-		assert.equal(getExecution(), null, "headless cap stops and clears execution");
-		const stopped = loadCheckpoint(wd2, r2!);
-		assert.ok(stopped.status === "ok");
-		assert.match(stopped.checkpoint.execution?.pausedReason ?? "", /exhausted 3 rounds/);
+		assert.notEqual(getExecution(), null, "headless cap pauses and keeps execution state");
+		assert.equal(getExecution()!.stall.paused, true, "headless pauses too (v0.8)");
+		const paused = loadCheckpoint(wd2, r2!);
+		assert.ok(paused.status === "ok");
+		assert.match(paused.checkpoint.execution?.pausedReason ?? "", /execution review exhausted 5 rounds/);
+		await stopExecution(makeCtx(wd2), "test teardown");
 		__setAuditRunnerForTests(null);
 	});
 
@@ -383,9 +391,10 @@ describe("task-tree execution core", () => {
 		assert.equal(getExecution(), null, "delegate orphans never resume without a fresh handoff");
 	});
 
-	it("resuming an audit-cap pause grants a fresh audit budget and completes", async () => {
-		// Round 2 F-001 regression nail: cap → pause → resume resets rounds →
-		// the audit runs again and can now complete the run.
+	it("resuming a review-cap pause via /plans-execute grants a fresh budget and completes (v0.8)", async () => {
+		// Round 2 F-001 regression nail, v0.8 form: cap → pause → the explicit
+		// /plans-execute surface (resumeActiveExecution) resets rounds → the
+		// review runs again and can now complete the run. Ordinary input must NOT.
 		let runnerCalls = 0;
 		__setAuditRunnerForTests(async ({ checklist }) => {
 			runnerCalls += 1;
@@ -396,7 +405,6 @@ describe("task-tree execution core", () => {
 					return item.id;
 				}),
 				failed: [],
-				rolledBack: [],
 				report: "all pass",
 			};
 		});
@@ -406,30 +414,40 @@ describe("task-tree execution core", () => {
 			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
 			persistTaskProgress(ctx);
 		}
-		// Exhaust the budget, then pause at the cap exactly like runAuditFlow.
-		getExecution()!.audit.rounds = 3;
+		// Exhaust the budget, then pause at the cap exactly like the loop does.
+		getExecution()!.audit.rounds = REVIEW_MAX_ROUNDS;
 		getExecution()!.audit.failed = ["VC-001", "VC-002"];
 		const ctxTui = { ...makeCtx(workdir), mode: "tui" as const };
 		const snapshot = getExecution();
 		await restoreFromSession(ctxTui, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
-		const ex = getExecution()!;
-		assert.equal(ex.stall.paused, true, "cap pauses interactively");
-		assert.match(ex.stall.pausedReason ?? "", /^completion audit exhausted/);
-		// User resumes: the budget resets and the next audit flow completes.
+		await __awaitReviewRoundForTests();
+		let ex = getExecution()!;
+		assert.equal(ex.stall.paused, true, "cap pauses");
+		assert.match(ex.stall.pausedReason ?? "", /^execution review exhausted/);
+		// Ordinary input does NOT lift a review-cap pause (CF2-004).
+		const beforeRounds = ex.audit.rounds;
+		const { resumeGoalWaitIfPaused } = await import("../src/exec.ts");
+		const viaInput = resumeGoalWaitIfPaused(ctxTui);
+		assert.equal(viaInput, false, "input never lifts a review-cap pause");
+		assert.equal(getExecution()!.stall.paused, true, "still paused after input");
+		assert.equal(getExecution()!.audit.rounds, beforeRounds, "budget survives input");
+		// The explicit surface grants the fresh budget and completes the run.
 		const { resumeActiveExecution } = await import("../src/exec.ts");
 		const resumed = resumeActiveExecution(ctxTui);
 		assert.equal(resumed, true);
-		assert.equal(getExecution()!.audit.rounds, 0, "resume grants a fresh audit budget");
-		const snapshot2 = getExecution();
-		await restoreFromSession(ctxTui, [{ type: "custom", customType: "pi-plans-exec", data: snapshot2 }]);
-		assert.equal(runnerCalls, 1, "audit re-ran after the resume (fresh budget)");
+		assert.equal(getExecution()!.audit.rounds, 0, "resume grants a fresh review budget");
+		await __awaitReviewRoundForTests(); // detached grant chain completes the run
+		assert.equal(runnerCalls, 1, "review re-ran after the resume (fresh budget)");
 		const final = loadCheckpoint(workdir, runId!);
 		assert.ok(final.status === "ok");
 		assert.equal(final.checkpoint.phase, "completed");
 		__setAuditRunnerForTests(null);
 	});
 
-	it("a null audit outcome (infra failure) fails every pending check closed", async () => {
+	it("a null review outcome stays undeterminable, self-schedules to the cap, and pauses (v0.8)", async () => {
+		// An infra failure is not evidence of bad work: it must not complete the
+		// run, roll work back, or accuse the agent — and the loop retries it
+		// internally until the budget is spent, then pauses fail-closed.
 		__setAuditRunnerForTests(async () => null);
 		const { workdir, planPath, runId } = freshWorkdir();
 		const { ctx } = await start(planPath, workdir);
@@ -440,25 +458,36 @@ describe("task-tree execution core", () => {
 		const snapshot = getExecution();
 		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
 		const ex = getExecution()!;
-		assert.deepEqual(ex.audit.failed, ["VC-001", "VC-002"], "unreported checks fail closed");
+		assert.deepEqual(ex.audit.undeterminable, ["VC-001", "VC-002"], "unreported checks are undeterminable");
+		assert.deepEqual(ex.audit.failed, [], "nothing was judged wrong");
 		for (const id of ["Task-1", "Task-2", "Task-3"]) {
-			assert.equal(ex.tasks.find((t) => t.id === id)?.status, "pending", `${id} rolled back`);
+			assert.equal(ex.tasks.find((t) => t.id === id)?.status, "complete", `${id} not rolled back`);
 		}
+		assert.equal(ex.audit.rounds, REVIEW_MAX_ROUNDS, "the retry chain spent the whole budget");
+		assert.equal(ex.stall.paused, true, "the loop pauses at the cap");
+		assert.match(ex.stall.pausedReason ?? "", /execution review exhausted 5 rounds/);
+		assert.equal(
+			ctx.entries.filter((e) => e.customType === "pi-plans-audit-undeterminable").length,
+			0,
+			"undeterminable rounds never wake the agent (self-scheduled retries)",
+		);
+		assert.ok(ctx.entries.some((e) => e.customType === "pi-plans-review-paused"), "the pause is in-band");
 		const load = loadCheckpoint(workdir, runId!);
 		assert.ok(load.status === "ok");
-		assert.equal(load.checkpoint.execution?.audit?.rounds, 1);
-		assert.match(load.checkpoint.execution?.audit?.lastResult ?? "", /VC-001/);
+		assert.equal(load.checkpoint.phase, "executing", "an unreadable round must not complete the run");
+		assert.equal(load.checkpoint.execution?.audit?.rounds, REVIEW_MAX_ROUNDS);
 		__setAuditRunnerForTests(null);
 		await stopExecution(ctx, "test teardown");
 	});
 
-	it("a runner passing a strict subset fails the unreported checks closed", async () => {
+	it("a runner passing a strict subset credits the pass and keeps the rest undeterminable", async () => {
 		// The runner reports VC-001 passed and claims zero failures — VC-002
-		// is simply missing from its report and must NOT complete the run.
+		// is simply missing from its report, so it must NOT complete the run,
+		// must NOT be called failed, and must NOT roll Task-3 back.
 		__setAuditRunnerForTests(async ({ checklist }) => {
 			const vc1 = checklist.find((item) => item.id === "VC-001");
 			if (vc1) vc1.done = true;
-			return { round: 1, passed: ["VC-001"], failed: [], rolledBack: [], report: "partial report" };
+			return { round: 1, passed: ["VC-001"], failed: [], undeterminable: ["VC-002"], report: "partial report" };
 		});
 		const { workdir, planPath } = freshWorkdir();
 		const { ctx } = await start(planPath, workdir);
@@ -469,10 +498,135 @@ describe("task-tree execution core", () => {
 		const snapshot = getExecution();
 		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
 		const ex = getExecution()!;
-		assert.deepEqual(ex.audit.failed, ["VC-002"], "unreported check fails despite failed: []");
-		assert.equal(ex.tasks.find((t) => t.id === "Task-3")?.status, "pending");
+		assert.deepEqual(ex.audit.undeterminable, ["VC-002"], "the unreported check stays pending judgement");
+		assert.deepEqual(ex.audit.failed, []);
+		assert.equal(ex.tasks.find((t) => t.id === "Task-3")?.status, "complete", "partial pass does not roll back");
 		__setAuditRunnerForTests(null);
 		await stopExecution(ctx, "test teardown");
+	});
+
+	it("an emphasized pass verdict completes the run with no rollback", async () => {
+		// The production incident: the auditor wrote `verdict: **pass**` for
+		// every check and the run rolled everything back. Emphasis must parse,
+		// and a fully-passing round must complete rather than pause.
+		__setAuditRunnerForTests(async ({ checklist }) => ({
+			round: 1,
+			passed: checklist.map((item) => item.id),
+			failed: [],
+			undeterminable: [],
+			report: "- `VC-001` — verdict: **pass**\n- `VC-002` — verdict: **pass**",
+		}));
+		const { workdir, planPath, runId } = freshWorkdir();
+		const { ctx } = await start(planPath, workdir);
+		for (const id of ["Task-1", "Task-2", "Task-3"]) {
+			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
+			persistTaskProgress(ctx);
+		}
+		const snapshot = getExecution();
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
+		const load = loadCheckpoint(workdir, runId!);
+		assert.ok(load.status === "ok");
+		assert.equal(load.checkpoint.phase, "completed", "a fully-passing round completes the run");
+		assert.equal(load.checkpoint.execution?.audit?.passed, true);
+		__setAuditRunnerForTests(null);
+		await stopExecution(makeCtx(workdir), "test teardown");
+	});
+
+	it("an all-undeterminable round completes nothing, rolls nothing back, and never wakes (v0.8)", async () => {
+		// Fail-open guard: `undeterminable` is neither a pass nor a failure, so
+		// an all-undeterminable round must leave failed === [] AND must not take
+		// the completion branch. v0.8: retries self-schedule (Q-B) — zero wakes.
+		__setAuditRunnerForTests(async ({ checklist }) => ({
+			round: 1,
+			passed: [],
+			failed: [],
+			undeterminable: checklist.map((item) => item.id),
+			report: "## Findings\n\n- `F-001` — severity: high; verdict-free reviewer output\n\n## Questions\n\nNone.",
+		}));
+		const { workdir, planPath, runId } = freshWorkdir();
+		const { ctx } = await start(planPath, workdir);
+		for (const id of ["Task-1", "Task-2", "Task-3"]) {
+			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
+			persistTaskProgress(ctx);
+		}
+		const snapshot = getExecution();
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
+		const ex = getExecution()!;
+		assert.deepEqual(ex.audit.failed, []);
+		assert.deepEqual(ex.audit.undeterminable.sort(), ["VC-001", "VC-002"]);
+		for (const id of ["Task-1", "Task-2", "Task-3"]) {
+			assert.equal(ex.tasks.find((t) => t.id === id)?.status, "complete", `${id} not rolled back`);
+		}
+		assert.equal(ex.audit.rounds, REVIEW_MAX_ROUNDS, "self-scheduled retries spent the budget");
+		assert.equal(ex.stall.paused, true, "paused at the cap");
+		const load = loadCheckpoint(workdir, runId!);
+		assert.ok(load.status === "ok");
+		assert.equal(load.checkpoint.phase, "executing", "never fail-open into completed");
+		// Undeterminable rounds never wake the agent (Q-B); only the pause is announced.
+		const wakes = ctx.entries.filter((e) => e.customType === "pi-plans-audit-undeterminable");
+		assert.equal(wakes.length, 0, "undeterminable rounds send no wake");
+		assert.ok(ctx.entries.some((e) => e.customType === "pi-plans-review-paused"), "the cap pause is in-band");
+		__setAuditRunnerForTests(null);
+		await stopExecution(ctx, "test teardown");
+	});
+
+	it("the audit budget is monotonic: an agent repair re-close does not refund a round", async () => {
+		// The unbounded-loop guard. The agent's repair is a forward transition
+		// (pending -> complete); if that reset the audit budget, the sequence
+		// fail -> repair -> fail would never reach the cap.
+		let call = 0;
+		__setAuditRunnerForTests(async ({ checklist, round }) => {
+			call += 1;
+			return call === 1
+				? { round, passed: ["VC-001"], failed: ["VC-002"], report: "first attempt fails" }
+				: { round, passed: ["VC-001"], failed: ["VC-002"], report: "still failing" };
+		});
+		const { workdir, planPath } = freshWorkdir();
+		const { ctx } = await start(planPath, workdir);
+		for (const id of ["Task-1", "Task-2", "Task-3"]) {
+			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
+			persistTaskProgress(ctx);
+		}
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		assert.equal(getExecution()!.audit.rounds, 1);
+		// The agent repairs the rolled-back work and re-closes it: a forward
+		// transition, exactly what a naive budget reset would reward.
+		for (const id of ["Task-2", "Task-3"]) {
+			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence again`);
+			persistTaskProgress(ctx);
+		}
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		assert.equal(getExecution()!.audit.rounds, 2, "the second attempt costs a second round");
+		__setAuditRunnerForTests(null);
+		await stopExecution(makeCtx(workdir), "test teardown");
+	});
+
+	it("the audit round cap test still pauses an interactive session", async () => {
+		// Unchanged intent: exhausting the budget pauses interactively. The
+		// seam moved (getExecution()!.audit.rounds), so it is pinned here.
+		__setAuditRunnerForTests(async ({ checklist }) => ({
+			round: 1,
+			passed: [],
+			failed: checklist.filter((item) => !["VC-001"].includes(item.id)).map((item) => item.id),
+			undeterminable: [],
+			report: "still failing",
+		}));
+		const { workdir, planPath } = freshWorkdir();
+		const { ctx } = await start(planPath, workdir);
+		for (const id of ["Task-1", "Task-2", "Task-3"]) {
+			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
+			persistTaskProgress(ctx);
+		}
+		getExecution()!.audit.rounds = REVIEW_MAX_ROUNDS;
+		getExecution()!.audit.failed = ["VC-002"];
+		const ctxUi = { ...makeCtx(workdir), mode: "tui" as const };
+		await restoreFromSession(ctxUi, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.equal(ex.stall.paused, true, "the review cap pauses an interactive session");
+		assert.match(ex.stall.pausedReason ?? "", /execution review exhausted 5 rounds/);
+		__setAuditRunnerForTests(null);
+		await stopExecution(ctxUi, "test teardown");
 	});
 
 	it("toggleDashboardExpanded flips the expanded mode", () => {
@@ -557,10 +711,10 @@ describe("v0.7.1 execution-loop fixes (event-driven)", () => {
 			round += 1;
 			if (round === 1) {
 				const failed = checklist.filter((i) => i.id === "VC-002").map((i) => i.id);
-				return { round, passed: ["VC-001"], failed, rolledBack: [], report: "VC-002 fails" };
+				return { round, passed: ["VC-001"], failed, report: "VC-002 fails" };
 			}
 			for (const item of checklist) item.done = true;
-			return { round, passed: checklist.map((i) => i.id), failed: [], rolledBack: [], report: "all pass" };
+			return { round, passed: checklist.map((i) => i.id), failed: [], report: "all pass" };
 		});
 		const { workdir, planPath, runId } = freshWorkdir();
 		const ctx = await startTui(planPath, workdir);
@@ -598,7 +752,7 @@ describe("v0.7.1 execution-loop fixes (event-driven)", () => {
 		__setAuditRunnerForTests(async ({ checklist }) => {
 			calls += 1;
 			for (const item of checklist) item.done = true;
-			return { round: 1, passed: checklist.map((i) => i.id), failed: [], rolledBack: [], report: "all pass" };
+			return { round: 1, passed: checklist.map((i) => i.id), failed: [], report: "all pass" };
 		});
 		const { workdir, planPath } = freshWorkdir();
 		const ctx = await startTui(planPath, workdir);
@@ -630,7 +784,7 @@ describe("v0.7.1 execution-loop fixes (event-driven)", () => {
 	it("root cause A: an audit failure wakes the agent exactly once", async () => {
 		__setAuditRunnerForTests(async ({ checklist }) => {
 			const failed = checklist.filter((i) => i.id === "VC-002").map((i) => i.id);
-			return { round: 1, passed: ["VC-001"], failed, rolledBack: [], report: "VC-002 fails" };
+			return { round: 1, passed: ["VC-001"], failed, report: "VC-002 fails" };
 		});
 		const { workdir, planPath } = freshWorkdir();
 		const ctx = await startTui(planPath, workdir);

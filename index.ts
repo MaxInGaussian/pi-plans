@@ -88,6 +88,7 @@ import { registerPlansTool } from "./tools/plans.ts";
 import { registerRefineTool } from "./tools/refine.ts";
 import { registerAnalyzeRefsTool } from "./tools/analyze-refs.ts";
 import { messaging, setMessagingApi } from "./src/messaging.ts";
+import { stalenessLine } from "./src/staleness.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
 
@@ -96,29 +97,11 @@ const baseDir = dirname(fileURLToPath(import.meta.url));
 // (code on disk newer than the loaded copy) is immediately visible.
 const extensionLoadedAt = new Date();
 
+// The probe itself lives in src/staleness.ts so the execution reviewer can ask
+// the same question when it cannot read a verdict (see exec.ts) without
+// importing index.ts, which already imports exec.ts.
 function extensionStalenessLine(): string {
-	try {
-		const dirs = [baseDir, path.join(baseDir, "src"), path.join(baseDir, "tools")];
-		const stack: string[] = [...dirs];
-		let newest = 0;
-		while (stack.length) {
-			const dir = stack.pop()!;
-			for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-				const full = path.join(dir, entry.name);
-				if (entry.isDirectory()) stack.push(full);
-				else if (entry.isFile() && entry.name.endsWith(".ts")) {
-					const mtime = fs.statSync(full).mtimeMs;
-					if (mtime > newest) newest = mtime;
-				}
-			}
-		}
-		if (newest > extensionLoadedAt.getTime() + 2000) {
-			return `⚠ extension code on disk is newer than the loaded copy (loaded ${extensionLoadedAt.toISOString()}); run /reload to pick it up`;
-		}
-		return `Extension loaded: ${extensionLoadedAt.toISOString()} (up to date)`;
-	} catch {
-		return `Extension loaded: ${extensionLoadedAt.toISOString()}`;
-	}
+	return stalenessLine(baseDir, extensionLoadedAt);
 }
 
 function hasActivePlanningWorkflow(ctx: Parameters<typeof updateStatusWidget>[0]): boolean {
@@ -126,7 +109,7 @@ function hasActivePlanningWorkflow(ctx: Parameters<typeof updateStatusWidget>[0]
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	if (!active) return false;
 	const status = getRun(ctx.cwd, active.run_id)?.status;
-	return status === "planning" || status === "accepted" || status === "executing";
+	return status === "planning" || status === "accepted" || status === "executing" || status === "verifying";
 }
 
 export default function piPlansExtension(pi: ExtensionAPI): void {
@@ -140,6 +123,13 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	pi.registerShortcut("ctrl+shift+t", {
 		description: "Expand/collapse the pi-plans task dashboard",
 		handler: (ctx) => toggleDashboardExpanded(ctx),
+	});
+	// v0.8: reopen the in-flight execution-review overlay after ESC (the
+	// controller is one-shot; the engine re-seeds a fresh one from its held
+	// lane state). Inert when no round is in flight.
+	pi.registerShortcut("ctrl+shift+r", {
+		description: "Reopen the pi-plans execution-review overlay",
+		handler: (ctx) => reopenReviewOverlay(ctx),
 	});
 	registerQueryInterviewHooks(pi, hasActivePlanningWorkflow);
 	registerCodeGraphTool(pi);

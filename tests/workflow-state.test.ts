@@ -418,3 +418,68 @@ describe("state machine reducers", () => {
 	});
 });
 
+
+describe("blocking budget persistence", () => {
+	function executingCheckpoint(workdir: string, runId: string) {
+		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
+		// planIdentityOf hashes the file, so it has to exist.
+		const planPath = path.join(workdir, "PLAN_v1.md");
+		fs.writeFileSync(planPath, "# PLAN_v1 - demo\n", "utf8");
+		const plan = planIdentityOf(planPath, 1);
+		let cp = applyPlanWritten(baseCheckpoint(workdir, runId), plan);
+		cp = { ...cp, nextAction: "accept-execute" };
+		cp = applyExecutionApproved(cp, {
+			plan,
+			worktree: cp.worktreeRoot,
+			headAtApproval: null,
+			approvedAt: cp.updatedAt,
+		});
+		return applyExecutionProgress(cp, { tasks: { "Task-1": { status: "pending" } } });
+	}
+
+	it("round-trips the watchdog budget and the undeterminable set", () => {
+		// Without this the budget lived only in memory: a session restart
+		// silently handed a stalled run three fresh rounds.
+		const { workdir, runId } = setupRun("budget-roundtrip");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), {
+			stallRounds: 2,
+			audit: { rounds: 1, undeterminable: ["VC-002", "VC-003"] },
+		});
+		mutateCheckpoint(workdir, runId, () => cp);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		assert.equal(loaded.checkpoint.execution?.stallRounds, 2);
+		assert.deepEqual(loaded.checkpoint.execution?.audit?.undeterminable, ["VC-002", "VC-003"]);
+		assert.equal(loaded.checkpoint.execution?.audit?.rounds, 1);
+	});
+
+	it("loads a checkpoint written before either field existed", () => {
+		// Backward compatibility: the loader whitelists keys, so an older
+		// checkpoint lacking stallRounds / undeterminable must still load.
+		const { workdir, runId } = setupRun("budget-legacy");
+		const cp = executingCheckpoint(workdir, runId);
+		mutateCheckpoint(workdir, runId, () => cp);
+		const filePath = checkpointFilePath(workdir, runId)!;
+		const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as Record<string, unknown>;
+		delete (parsed.execution as Record<string, unknown>).stallRounds;
+		delete ((parsed.execution as Record<string, unknown>).audit as Record<string, unknown>).undeterminable;
+		fs.writeFileSync(filePath, JSON.stringify(parsed), "utf8");
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok", "legacy checkpoint still loads");
+		assert.equal(loaded.checkpoint.execution?.stallRounds, undefined);
+		assert.equal(loaded.checkpoint.execution?.audit?.undeterminable, undefined);
+		assert.equal(loaded.checkpoint.execution?.audit?.rounds, 0);
+	});
+
+	it("still rejects an unknown execution key", () => {
+		const { workdir, runId } = setupRun("budget-unknown-key");
+		const cp = executingCheckpoint(workdir, runId);
+		mutateCheckpoint(workdir, runId, () => cp);
+		const filePath = checkpointFilePath(workdir, runId)!;
+		const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as Record<string, unknown>;
+		(parsed.execution as Record<string, unknown>).mysteryField = 1;
+		fs.writeFileSync(filePath, JSON.stringify(parsed), "utf8");
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.equal(loaded.status, "corrupt", "the closed schema is still enforced");
+	});
+});

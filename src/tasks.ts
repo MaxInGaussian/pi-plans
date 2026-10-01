@@ -2,7 +2,7 @@
  * Task-tree runtime model (v0.6.1): the execution phase tracks plan tasks
  * (`## Tasks`) as the unit of progress. Status flows in exclusively through
  * the task status tool; completion of the whole run is gated by the
- * independent completion auditor over the plan's verification checks.
+ * independent execution reviewer over the plan's verification checks.
  */
 
 import type { CheckItem, PlanTasks, TaskNode, WaveEntry } from "./plan.ts";
@@ -77,11 +77,13 @@ export function allTasksTerminal(tasks: TaskView[]): boolean {
 	return flattenTaskViews(tasks).length > 0 && flattenTaskViews(tasks).every((task) => taskIsTerminal(task));
 }
 
-/** Snapshot of statuses for persistence and stall detection. */
+/** Snapshot of statuses for persistence and stall detection. Every task gets
+ * a record: a rolled-back task must stay visible with the evidence from its
+ * previous attempt, otherwise a rollback erases the run's history and the
+ * agent can no longer tell "done and rolled back" from "never started". */
 export function taskProgressMap(tasks: TaskView[]): TaskProgressMap {
 	const map: TaskProgressMap = {};
 	for (const task of flattenTaskViews(tasks)) {
-		if (task.status === "pending" && task.evidence === undefined && task.skipReason === undefined) continue;
 		map[task.id] = {
 			status: task.status,
 			evidence: task.evidence,
@@ -132,7 +134,13 @@ export function canTransition(task: TaskView, next: TaskStatus): boolean {
 
 /** Rollback set for a failed verification check: every task in its covers
  * clause (parents cascade to their children, skipped tasks reopen too).
- * Returns the ids that actually reopen. */
+ * Returns the ids that actually reopen.
+ *
+ * The task's `evidence` is deliberately kept. It records what the previous
+ * attempt actually did, which is the one thing the agent cannot reconstruct
+ * once it reopens the task; re-reporting overwrites it. `skipReason` is
+ * cleared because it described a deliberate skip that the audit has now
+ * overturned. */
 export function auditRollbackSet(
 	tasks: TaskView[],
 	checklist: CheckItem[],
@@ -146,7 +154,6 @@ export function auditRollbackSet(
 	const reopenNode = (node: TaskView): void => {
 		if (node.status !== "pending") {
 			node.status = "pending";
-			node.evidence = undefined;
 			node.skipReason = undefined;
 			reopen.push(node.id);
 		}
@@ -156,6 +163,33 @@ export function auditRollbackSet(
 		if (covered.has(node.id)) reopenNode(node);
 	}
 	return reopen;
+}
+
+/** Checks that lose their satisfied state because a rollback reopened work
+ * they were verifying. Returns the ids whose `done` flag was cleared.
+ *
+ * A check can be presolved without an audit round (skipped-pass), or affirmed
+ * in an earlier round, and stay `done` while another check's rollback reopens
+ * one of its covered tasks. Left alone it renders as "check passed" next to a
+ * task that is open again with stale evidence. The caller owns this: it runs
+ * after the rollback set is known. */
+export function invalidateChecksForRolledBackTasks(
+	checklist: CheckItem[],
+	tasks: TaskView[],
+	reopenedIds: string[],
+): string[] {
+	if (reopenedIds.length === 0) return [];
+	const reopened = new Set(reopenedIds);
+	const cleared: string[] = [];
+	for (const item of checklist) {
+		if (!item.done) continue;
+		const covered = extractTaskCoverage(item.text);
+		if (covered.some((id) => reopened.has(id))) {
+			item.done = false;
+			cleared.push(item.id);
+		}
+	}
+	return cleared;
 }
 
 /** Verification checks that cover no task are excluded from audit (their

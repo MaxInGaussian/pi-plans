@@ -27,7 +27,7 @@ export interface ResumeCandidate {
 	updatedAt: string;
 }
 
-const RESUMABLE_RUN_STATUSES = new Set(["planning", "accepted", "executing", "stopped"]);
+const RESUMABLE_RUN_STATUSES = new Set(["planning", "accepted", "executing", "verifying", "stopped"]);
 
 /** Terminal runs are resumable only when unfinished implementation-review evidence exists (D-008). */
 function legacyDoneResumable(run: RunInfo, checkpoint: WorkflowCheckpoint | null): boolean {
@@ -52,6 +52,10 @@ function legacyDoneResumable(run: RunInfo, checkpoint: WorkflowCheckpoint | null
 }
 
 function phaseLabelOf(run: RunInfo, checkpoint: WorkflowCheckpoint | null): string {
+	// A verifying run keeps checkpoint.phase === "executing" (the execution
+	// state machine's phase is unchanged); surface the run status instead so
+	// the resume list never hides the verification loop behind "executing".
+	if (run.status === "verifying") return "verifying";
 	if (checkpoint !== null) return checkpoint.phase;
 	if (run.status === "stopped") return "executing (stopped)";
 	return run.status;

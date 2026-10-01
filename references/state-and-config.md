@@ -93,7 +93,7 @@ Rules:
 - `confirmed_at` is stamped only by a real confirmation. `reviewerReady(role)` = current-session, or delegated with `confirmed_at` set AND a concrete `model_selector` — a confirmed null selector can never pass (the old confirmed-inherit state is unreachable).
 - A corrupt or wrong-schema global file yields defaults plus a notice and is NEVER clobbered by reads.
 - Migration (Q-1=A): the first mutating pi-plans call in a workspace with a legacy intent block (`confirmed_at` set, an explicit selector, or a non-default mode) seeds the global file once — first touched workspace wins; other workspaces get a one-time "ignored" notice. A confirmed-inherit block seeds with the selector null and NO confirmation, so the next `refine` re-asks once via the native panel. Scaffold-only blocks are dropped silently.
-- The completion auditor's spawns are NOT governed by this role: it runs its own model; `subagents.jsonl` records the reviewer/ref-analyst thinking level actually passed (`thinking_level` field, older entries have none).
+- The execution reviewer's spawn IS governed by this role when it is confirmed: the round pins the configured model and thinking level and labels its overlay with the role. An unconfirmed or `current-session` role inherits the session default (labeled `session default`) — a detached round never opens the interactive first-use panel. Rounds are timeout-bounded (minutes, not the subagent default), so a hung child surfaces as a spawn-failure round instead of parking the run.
 
 ## VCC Compact Config
 
@@ -203,11 +203,11 @@ One run directory per planning request: `<git-common-dir>/pi-plans/runs/<YYYYMMD
 
 ## Workflow Checkpoints (`/resume-plans`)
 
-Each run may carry a `checkpoint.json` — the durable, cross-session workflow state that `/resume-plans` restores in the current session. It records: logical `phase` (`planning | reviewing | executing | completed`; the legacy 0.6.0 `implementation-review` phase is read-tolerated and maps to done), `nextAction`, the exact plan identity (path + version + SHA-256), pending/answered questions (stable `questionId`), review rounds with per-lane status and result-file references, execution approval evidence (plan digest, worktree, `git rev-parse HEAD` at approval, task progress map, audit rounds, verified VC set, usage), and ownership metadata. Full review outputs live in separate `reviews/` files; the checkpoint keeps only validated references.
+Each run may carry a `checkpoint.json` — the durable, cross-session workflow state that `/resume-plans` restores in the current session. It records: logical `phase` (`planning | reviewing | executing | completed`; the legacy 0.6.0 `implementation-review` phase is read-tolerated and maps to done), `nextAction`, the exact plan identity (path + version + SHA-256), pending/answered questions (stable `questionId`), review rounds with per-lane status and result-file references, execution approval evidence (plan digest, worktree, `git revparse HEAD` at approval, task progress map, audit rounds with the failed and undeterminable check sets, the watchdog budget counter, verified VC set, usage), and ownership metadata. Full review outputs live in separate `reviews/` files; the checkpoint keeps only validated references.
 
 Rules:
 
-- Validation is explicit: unknown schema versions, malformed shapes, and unexpected keys are rejected; missing and corrupt checkpoints are distinct, and corrupt files are never silently overwritten.
+- Validation is explicit: unknown schema versions, malformed shapes, and unexpected keys are rejected; missing and corrupt checkpoints are distinct, and corrupt files are never silently overwritten. Keys added by a later version (`execution.stallRounds`, `execution.audit.undeterminable`) are optional on read, so checkpoints written before them keep loading.
 - Writes are atomic with monotonic revisions; writers may require ownership (token + generation) or an expected revision.
 - Model-driven boundaries (plan written, review consolidated, termination condition recorded, implementation round finished, completed) go through the whitelisted `plans record-checkpoint` action, which enforces state-machine preconditions — it cannot set execution approval, mark VCs passed, or forge terminal states.
 - `ask_choice` accepts `questionId`/`purpose`; a pending question is durable before the panel opens and the answer before it returns. When a crash leaves a question both answered (ledger) and pending (checkpoint), the answered entry wins.

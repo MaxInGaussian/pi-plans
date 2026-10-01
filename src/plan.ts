@@ -503,7 +503,7 @@ export function lintPlanTasks(planText: string): string | null {
 		}
 	}
 	// Covers references must point at known tasks; a check with zero covers
-	// never enters the completion audit — surface that exemption loudly.
+	// never enters the execution review — surface that exemption loudly.
 	for (const item of parseChecklist(planText)) {
 		const covered = extractTaskCoverage(item.text);
 		if (covered.length === 0) {

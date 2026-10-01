@@ -152,8 +152,12 @@ export interface ExecutionCheckpoint {
 	 * progress record. doneVcIds stays for legacy checkpoints and the final
 	 * audit pass. */
 	tasks?: Record<string, { status: string; evidence?: string; skipReason?: string }>;
+	/** v0.7.1: watchdog round counter. Persisted so a session restart cannot
+	 * silently hand a stalled run a fresh budget; optional so checkpoints
+	 * written before this field keep loading. */
+	stallRounds?: number;
 	/** v0.6.1: completion-audit bookkeeping (rounds, last failed set, pass). */
-	audit?: { rounds: number; lastResult?: string; passed?: boolean };
+	audit?: { rounds: number; lastResult?: string; passed?: boolean; undeterminable?: string[] };
 }
 
 export interface OwnerInfo {
@@ -461,7 +465,7 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	const record = asRecord(value, label);
 	rejectExtraKeys(
 		record,
-		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "audit"]),
+		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "stallRounds", "audit"]),
 		label,
 	);
 	const execution: ExecutionCheckpoint = {
@@ -505,14 +509,20 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 		}
 		execution.tasks = tasks;
 	}
+	if (record.stallRounds !== undefined && record.stallRounds !== null) {
+		execution.stallRounds = asInt(record.stallRounds, `${label}.stallRounds`, 0);
+	}
 	if (record.audit !== undefined && record.audit !== null) {
 		const audit = asRecord(record.audit, `${label}.audit`);
-		rejectExtraKeys(audit, new Set(["rounds", "lastResult", "passed"]), `${label}.audit`);
-		const parsed: { rounds: number; lastResult?: string; passed?: boolean } = {
+		rejectExtraKeys(audit, new Set(["rounds", "lastResult", "passed", "undeterminable"]), `${label}.audit`);
+		const parsed: { rounds: number; lastResult?: string; passed?: boolean; undeterminable?: string[] } = {
 			rounds: asInt(audit.rounds, `${label}.audit.rounds`, 0),
 		};
 		if (audit.lastResult !== undefined) parsed.lastResult = asString(audit.lastResult, `${label}.audit.lastResult`);
 		if (audit.passed !== undefined) parsed.passed = asBool(audit.passed, `${label}.audit.passed`);
+		if (audit.undeterminable !== undefined) {
+			parsed.undeterminable = asStringArray(audit.undeterminable, `${label}.audit.undeterminable`);
+		}
 		execution.audit = parsed;
 	}
 	return execution;
@@ -1071,7 +1081,9 @@ export interface ExecutionProgressInput {
 	/** v0.6.1: task-tree progress snapshot (authoritative). */
 	tasks?: Record<string, { status: string; evidence?: string; skipReason?: string }>;
 	/** v0.6.1: completion-audit bookkeeping update. */
-	audit?: { rounds: number; lastResult?: string; passed?: boolean };
+	audit?: { rounds: number; lastResult?: string; passed?: boolean; undeterminable?: string[] };
+	/** v0.7.1: watchdog budget counter, so a restart cannot refresh it. */
+	stallRounds?: number;
 }
 
 export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: ExecutionProgressInput): WorkflowCheckpoint {
@@ -1091,6 +1103,7 @@ export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: Executi
 	if (progress.delegate === null) delete execution.delegate;
 	else if (progress.delegate !== undefined) execution.delegate = progress.delegate;
 	if (progress.tasks !== undefined) execution.tasks = progress.tasks;
+	if (progress.stallRounds !== undefined) execution.stallRounds = progress.stallRounds;
 	if (progress.audit !== undefined) execution.audit = progress.audit;
 	return { ...cp, execution };
 }

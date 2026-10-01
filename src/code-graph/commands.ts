@@ -284,7 +284,12 @@ export async function applyGraphCommand(args: string, ctx: CommandContext): Prom
 		errors > 0 ? "error" : "info",
 	);
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
-	if (active) setRunStatus(ctx.cwd, active.run_id, "executing");
+	if (active) {
+		// Never demote a verifying run back to executing: the execution-review
+		// loop owns the status until it converges (or pauses at the round cap).
+		const current = getRun(ctx.cwd, active.run_id)?.status;
+		if (current !== "verifying") setRunStatus(ctx.cwd, active.run_id, "executing");
+	}
 }
 
 export async function graphStatusCommand(_args: string, ctx: CommandContext): Promise<void> {

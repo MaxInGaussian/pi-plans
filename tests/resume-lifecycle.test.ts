@@ -259,7 +259,11 @@ describe("/resume-plans on the real Pi host", () => {
 				assert.equal(final.status, "ok");
 				if (final.status === "ok") {
 					assert.equal(final.checkpoint.execution?.tasks?.["Task-1"]?.status, "complete");
-					assert.equal(final.checkpoint.execution?.tasks?.["Task-2"]?.status, undefined);
+					// Every task now carries a record: an untouched task is
+					// persisted as pending rather than omitted, so the checkpoint
+					// distinguishes "never started" from "rolled back with
+					// evidence" instead of losing the record entirely.
+					assert.equal(final.checkpoint.execution?.tasks?.["Task-2"]?.status, "pending");
 				}
 			} finally {
 				session2.session.dispose();

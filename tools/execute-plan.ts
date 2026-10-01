@@ -2,7 +2,7 @@
  * `execute_plan` tool — the execution handoff (v0.6.1). On explicit user
  * approval (no Auto-complete) the extension enters task-tree execution mode:
  * progress flows through `plans_update_task`, the dashboard tracks every
- * task, and the completion auditor gates the final pass. Legacy I-### plans
+ * task, and the execution reviewer gates the final pass. Legacy I-### plans
  * parse through the fallback with an upgrade notice.
  */
 
@@ -130,7 +130,7 @@ export async function executeHandoff(
 			: "";
 		approved = await ctx.ui.confirm(
 			"Execute this plan now?",
-			`${planPath}\n${items.length} verification check(s) over ${planTasks.tasks.length} task(s):\n${preview}${legacyNote}\n\nExecution mode enables write access; task progress is reported with the plans_update_task tool and gated by the completion auditor.`,
+			`${planPath}\n${items.length} verification check(s) over ${planTasks.tasks.length} task(s):\n${preview}${legacyNote}\n\nExecution mode enables write access; task progress is reported with the plans_update_task tool and gated by the execution reviewer.`,
 		);
 	}
 	if (!approved) {
@@ -148,7 +148,7 @@ export async function executeHandoff(
 		status: "executing",
 		planPath,
 		itemCount: items.length,
-		message: `${autoNote}Execution approved. ${planTasks.tasks.length} task(s) queued in wave order; report progress with the plans_update_task tool (status + evidence); the completion auditor verifies every check before the run completes.${legacyNote}`,
+		message: `${autoNote}Execution approved. ${planTasks.tasks.length} task(s) queued in wave order; report progress with the plans_update_task tool (status + evidence); the execution reviewer verifies every check before the run completes.${legacyNote}`,
 	};
 }
 
@@ -158,11 +158,18 @@ export async function executeCommand(ctx: ExtensionContext, planPathArg?: string
 	const planPath = planPathArg ? path.resolve(ctx.cwd, planPathArg.replace(/^@/, "")) : activeExecution?.planPath;
 	if (activeExecution && planPath && path.resolve(activeExecution.planPath) === path.resolve(planPath)) {
 		const resumed = resumeActiveExecution(ctx);
+		// v0.8 phase-aware response: a verifying run continues its review loop
+		// (this tool is also the ONLY budget-granting surface at a cap pause).
+		const statusText = activeExecution.review?.inFlight
+			? "Execution review in progress (status verifying); the reviewer round runs in the overlay."
+			: (getExecution()?.stall.paused ?? false)
+				? "Execution review paused at the round cap — this confirmation granted a fresh five-round budget; the review resumes now."
+				: "Execution resumed; task progress preserved.";
 		return {
 			status: "executing",
 			planPath,
 			itemCount: activeExecution.items.length,
-			message: resumed ? "Execution resumed; task progress preserved." : "This plan is already executing.",
+			message: resumed ? statusText : "This plan is already executing.",
 		};
 	}
 	return executeHandoff(ctx, planPathArg);
@@ -173,7 +180,7 @@ export function registerExecutePlanTool(ext: ExtensionAPI): void {
 		name: "execute_plan",
 		label: "Execute Plan",
 		description:
-			"Execution handoff for an accepted plan. Asks the user for explicit approval (never auto-completed), then enters task-tree execution mode: every task's progress is reported via the plans_update_task tool (status + evidence), the task dashboard tracks the tree (Ctrl+Shift+T expands it), and an independent completion auditor verifies the verification checks before the run completes. Legacy I-### plans parse through the compatibility mapping with an upgrade notice. When several runs with plans exist, a run-picker form selects the target run first. Only call after the user chose 'Execute this plan now' at the handoff question.",
+			"Execution handoff for an accepted plan. Asks the user for explicit approval (never auto-completed), then enters task-tree execution mode: every task's progress is reported via the plans_update_task tool (status + evidence), the task dashboard tracks the tree (Ctrl+Shift+T expands it), and an independent execution reviewer verifies the verification checks before the run completes. Legacy I-### plans parse through the compatibility mapping with an upgrade notice. When several runs with plans exist, a run-picker form selects the target run first. Only call after the user chose 'Execute this plan now' at the handoff question.",
 		promptSnippet: "Hand an accepted plan off to the tracked execution loop",
 		parameters: ExecutePlanParams,
 
