@@ -16,12 +16,14 @@ import {
 	getExecution,
 	loadExecutionFromCheckpoint,
 	persistTaskProgress,
+	registerExecutionTurnHandlers,
 	restoreFromSession,
 	startExecution,
 	stopExecution,
 	toggleDashboardExpanded,
 	updateStatusWidget,
 } from "../src/exec.ts";
+import { setMessagingApi } from "../src/messaging.ts";
 import { applyTaskUpdate } from "../src/task-tool.ts";
 import { flattenTaskViews } from "../src/tasks.ts";
 import { parseChecklist, parsePlanTasks } from "../src/plan.ts";
@@ -481,6 +483,194 @@ describe("task-tree execution core", () => {
 	});
 });
 
+/**
+ * v0.7.1 regression suite (root causes A and B). These drive the REAL lifecycle
+ * events (`agent_before_settle` / `turn_end` / `tool_result`) instead of
+ * mutating state directly, because the stranded-state bug only exists in the
+ * event ORDER — a test that calls restoreFromSession cannot see it.
+ */
+describe("v0.7.1 execution-loop fixes (event-driven)", () => {
+	/** A ctx in TUI mode: `canWakeExecution` requires mode tui/rpc, and a
+	 * print-mode ctx would make every wake/audit assertion silently vacuous. */
+	function makeTuiCtx(workdir: string) {
+		const entries: Array<{ customType: string; data?: unknown; content?: string; triggerTurn?: boolean }> = [];
+		const ctx = {
+			cwd: workdir,
+			sessionManager: {},
+			hasUI: true,
+			mode: "tui" as const,
+			entries,
+			ui: {
+				notify: () => {},
+				setStatus: () => {},
+				setWidget: () => {},
+				theme: { fg: (_c: string, t: string) => t, bold: (t: string) => t },
+			},
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		} as never;
+		setMessagingApi({
+			appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }),
+			sendMessage: (message: { customType: string; content: string; details?: unknown }, opts?: { triggerTurn?: boolean }) =>
+				entries.push({ customType: message.customType, content: message.content, triggerTurn: opts?.triggerTurn }),
+			sendUserMessage: async () => {},
+		});
+		return ctx as { entries: typeof entries; cwd: string };
+	}
+
+	/** Register the production turn handlers and return a driver for the events. */
+	function wireEvents(ctx: never) {
+		const handlers = new Map<string, Array<(event: unknown, c: never) => unknown>>();
+		const ext = {
+			on: (name: string, fn: (event: unknown, c: never) => unknown) => {
+				const list = handlers.get(name) ?? [];
+				list.push(fn);
+				handlers.set(name, list);
+			},
+		} as never;
+		registerExecutionTurnHandlers(ext);
+		return {
+			async fire(name: string, event: unknown = {}) {
+				for (const fn of handlers.get(name) ?? []) await fn(event, ctx);
+			},
+		};
+	}
+
+	async function startTui(planPath: string, workdir: string) {
+		const ctx = makeTuiCtx(workdir);
+		await startExecution(ctx as never, {
+			planPath,
+			planTasks: parsePlanTasks(PLAN),
+			items: parseChecklist(PLAN),
+		});
+		return ctx;
+	}
+
+	const closeAll = (ids: string[]) => {
+		for (const id of ids) applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
+	};
+
+	it("root cause A: a terminal-but-unaudited run self-heals via agent_before_settle (zero input)", async () => {
+		// First audit round fails -> tasks roll back to pending (0/3).
+		let round = 0;
+		__setAuditRunnerForTests(async ({ checklist }) => {
+			round += 1;
+			if (round === 1) {
+				const failed = checklist.filter((i) => i.id === "VC-002").map((i) => i.id);
+				return { round, passed: ["VC-001"], failed, rolledBack: [], report: "VC-002 fails" };
+			}
+			for (const item of checklist) item.done = true;
+			return { round, passed: checklist.map((i) => i.id), failed: [], rolledBack: [], report: "all pass" };
+		});
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTui(planPath, workdir);
+		const drive = wireEvents(ctx as never);
+
+		// Agent closes every task; the turn ends -> audit round 1 runs and fails.
+		closeAll(["Task-1", "Task-2", "Task-3"]);
+		persistTaskProgress(ctx as never);
+		await drive.fire("turn_end", { message: { role: "assistant", stopReason: "stop" } });
+		assert.equal(round, 1, "round 1 audit ran");
+		assert.equal(getExecution()!.tasks.find((t) => t.id === "Task-2")?.status, "pending", "VC-002 rolled its tasks back");
+
+		// The agent fixes the failures and re-closes the rolled-back tasks. A new
+		// agent run opens a new settle window (agent_start resets the latch).
+		await drive.fire("agent_start", {});
+		closeAll(["Task-1", "Task-2", "Task-3"]);
+		persistTaskProgress(ctx as never);
+		assert.ok(allTasksTerminal(getExecution()!.tasks), "task tree is terminal again");
+
+		// The regression: fire ONLY the actionable pre-settle boundary, i.e. the
+		// case where the turn_end trigger is missed (the observed strand). Before
+		// v0.7.1 nothing else could start the audit, so the run sat in
+		// `executing` until a manual /plans-execute.
+		await drive.fire("agent_before_settle", {});
+		assert.equal(round, 2, "the owed audit reran automatically with zero user input");
+
+		const load = loadCheckpoint(workdir, runId!);
+		assert.ok(load.status === "ok");
+		assert.equal(load.checkpoint.phase, "completed", "run reached completed without a manual /plans-execute");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("root cause A: the audit is not run twice within one settle (per-settle latch)", async () => {
+		let calls = 0;
+		__setAuditRunnerForTests(async ({ checklist }) => {
+			calls += 1;
+			for (const item of checklist) item.done = true;
+			return { round: 1, passed: checklist.map((i) => i.id), failed: [], rolledBack: [], report: "all pass" };
+		});
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTui(planPath, workdir);
+		const drive = wireEvents(ctx as never);
+		closeAll(["Task-1", "Task-2", "Task-3"]);
+		persistTaskProgress(ctx as never);
+		// Both entry points land in the same settle.
+		await drive.fire("turn_end", { message: { role: "assistant", stopReason: "stop" } });
+		await drive.fire("agent_before_settle", {});
+		assert.equal(calls, 1, "exactly one audit call per settle");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("root cause A: a fully terminal run emits no EXECUTION_CONTINUE wake", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTui(planPath, workdir);
+		const drive = wireEvents(ctx as never);
+		closeAll(["Task-1", "Task-2", "Task-3"]);
+		persistTaskProgress(ctx as never);
+		await drive.fire("agent_settled", {});
+		assert.equal(
+			ctx.entries.filter((e) => e.customType === "pi-plans-exec-continue").length,
+			0,
+			"no continuation wake when every task is already terminal",
+		);
+		await stopExecution(ctx as never, "test teardown");
+	});
+
+	it("root cause A: an audit failure wakes the agent exactly once", async () => {
+		__setAuditRunnerForTests(async ({ checklist }) => {
+			const failed = checklist.filter((i) => i.id === "VC-002").map((i) => i.id);
+			return { round: 1, passed: ["VC-001"], failed, rolledBack: [], report: "VC-002 fails" };
+		});
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTui(planPath, workdir);
+		const drive = wireEvents(ctx as never);
+		closeAll(["Task-1", "Task-2", "Task-3"]);
+		persistTaskProgress(ctx as never);
+		await drive.fire("turn_end", { message: { role: "assistant", stopReason: "stop" } });
+		const wakes = ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed" || e.customType === "pi-plans-exec-continue");
+		assert.equal(wakes.length, 1, `one wake per settle, got ${wakes.map((w) => w.customType).join(",")}`);
+		assert.equal(wakes[0]?.triggerTurn, true, "the audit-failure notice drives the fix turn");
+		__setAuditRunnerForTests(null);
+		await stopExecution(ctx as never, "test teardown");
+	});
+
+	it("root cause B: a successful tool result counts as progress and rebases the watchdog", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTui(planPath, workdir);
+		const drive = wireEvents(ctx as never);
+		const exec = getExecution()!;
+		exec.stall.rounds = 2;
+		// A successful tool result during a cross-round investigation.
+		await drive.fire("tool_result", { isError: false });
+		assert.equal(exec.stall.rounds, 0, "legitimate work rebased the no-progress counter");
+		await stopExecution(ctx as never, "test teardown");
+	});
+
+	it("root cause B (negative): an error-only tool loop still trips the cap", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTui(planPath, workdir);
+		const drive = wireEvents(ctx as never);
+		const exec = getExecution()!;
+		const base = exec.stall.lastSnapshot;
+		// Tools that all fail: repeated retries must NOT look like progress.
+		for (let i = 0; i < 5; i++) await drive.fire("tool_result", { isError: true });
+		assert.equal(exec.stall.rounds, 0, "a failed tool does not rebase the counter on its own");
+		assert.equal(exec.stall.lastSnapshot, base, "snapshot unchanged by failed tools");
+		await stopExecution(ctx as never, "test teardown");
+	});
+});
+
 function formatStatus(workdir: string): string {
 	const exec = getExecution();
 	assert.ok(exec);
@@ -489,4 +679,3 @@ function formatStatus(workdir: string): string {
 }
 
 import { isDashboardExpanded as toggleEnabled } from "../src/exec.ts";
-import { setMessagingApi } from "../src/messaging.ts";

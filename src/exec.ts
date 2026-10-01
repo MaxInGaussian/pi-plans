@@ -119,6 +119,11 @@ export interface ExecState {
 	stall: { rounds: number; lastSnapshot: string | null; paused: boolean; pausedReason?: string };
 	/** Completion-audit bookkeeping. */
 	audit: { rounds: number; failed: string[]; running: boolean };
+	/** Per-settle audit latch (v0.7.1): a settled round fires the completion
+	 * audit at most once, so the turn_end / agent_before_settle / resume entry
+	 * points cannot double-consume a round when several land in one settle.
+	 * Created on demand by auditLatchOf(); every construction path may omit it. */
+	auditLatch?: { auditedThisSettle: boolean; activity: number };
 }
 
 /**
@@ -282,7 +287,9 @@ export function loadExecutionFromCheckpoint(
 			failed: [],
 			running: false,
 		},
+		auditLatch: { auditedThisSettle: false, activity: 0 },
 	};
+	execution.stall.lastSnapshot = stallSnapshot();
 	executionRunId = runId;
 	bindRun(ctx.sessionManager, ctx.cwd, runId);
 	resetContinuationRuntime(ctx);
@@ -597,9 +604,13 @@ export async function startExecution(
 		startedAt: utcNow(),
 		usage: { inToks: 0, outToks: 0 },
 		uiLanguage: resolveUiLanguage(ctx.cwd),
-		stall: { rounds: 0, lastSnapshot: stallSnapshot(), paused: false },
+		stall: { rounds: 0, lastSnapshot: null, paused: false },
 		audit: { rounds: 0, failed: [], running: false },
+		auditLatch: { auditedThisSettle: false, activity: 0 },
 	};
+	// Seed the watchdog baseline only after `execution` points at the new state
+	// (stallSnapshot reads the live execution).
+	execution.stall.lastSnapshot = stallSnapshot();
 	resetContinuationRuntime(ctx);
 	pendingExecutionFlush = false;
 	resetExecutionCompactionState(ctx);
@@ -706,6 +717,8 @@ export function registerExecutionTurnHandlers(
 		if (!runtime) return;
 		runtime.handled = false;
 		runtime.stopReason = undefined;
+		// v0.7.1: a new agent run opens a new settle window (per-settle latch).
+		if (execution) resetSettleLatch();
 	});
 	ext.on("before_agent_start", async (_event, ctx) => {
 		const runtime = currentContinuationRuntime(ctx);
@@ -717,6 +730,28 @@ export function registerExecutionTurnHandlers(
 	ext.on("agent_settled", async (_event, ctx) => {
 		drainExecutionFlush(ctx);
 		maybeContinuationFollowUp(ctx);
+	});
+	// v0.7.1: `agent_settled` is notification-only per pi's contract, so the
+	// audit fallback lives on `agent_before_settle` — the final ACTIONABLE
+	// boundary. It is what makes a terminal-but-unaudited run self-heal with
+	// zero user input, instead of stranding until a manual /plans-execute.
+	ext.on("agent_before_settle", async (_event, ctx) => {
+		if (!pendingAudit()) return;
+		const runtime = currentContinuationRuntime(ctx);
+		if (runtime?.handled) return;
+		// The continuation wake owns this settle: if the loop already woke the
+		// agent to fix rolled-back work, the audit waits for the next settle
+		// (Q-2 single-wake guarantee) rather than emitting a second wake.
+		if (runtime && !allTasksTerminal(runtime.owner.tasks)) {
+			maybeContinuationFollowUp(ctx);
+			return;
+		}
+		// Fully settled and still owed an audit: run it now. The audit's own
+		// pass/fail message drives the rest (pass completes the run; fail
+		// triggers a fix turn), so no extra continuation is requested here —
+		// pendingAudit() is false once paused, which bounds any loop.
+		latchAuditThisSettle();
+		await runAuditFlow(ctx);
 	});
 	ext.on("session_shutdown", async (_event, ctx) => {
 		drainExecutionFlush(ctx);
@@ -730,6 +765,19 @@ export function registerExecutionTurnHandlers(
 		if (message?.role === "assistant" && message.usage) {
 			lastAssistantUsage = { input: message.usage.input ?? 0, output: message.usage.output ?? 0 };
 		}
+	});
+	// v0.7.1 (root cause B): the stall watchdog counted only task-status changes,
+	// so a round where the agent legitimately investigated (read code, gathered
+	// evidence) without closing a task looked identical to a dead agent. A
+	// SUCCESSFUL tool result is real progress; a failed/blocked tool is not, so
+	// an agent looping on the same error still trips the cap (F-005, Q-3).
+	ext.on("tool_result", async (event, _ctx) => {
+		if (!execution) return;
+		const result = event as { isError?: boolean; error?: unknown };
+		if (result.isError === true || result.error !== undefined) return;
+		auditLatchOf(execution).activity += 1;		// Real progress: rebase the watchdog so this round counts as a change.
+		execution.stall.rounds = 0;
+		execution.stall.lastSnapshot = stallSnapshot();
 	});
 
 	ext.on("turn_end", async (event, ctx) => {
@@ -745,7 +793,8 @@ export function registerExecutionTurnHandlers(
 		lastAssistantUsage = null;
 		const usage = raw ? { input: raw.input ?? 0, output: raw.output ?? 0 } : undefined;
 		if (usage) recordExecutionTurn(ctx, usage);
-		if (getExecution() && allTasksTerminal(execution!.tasks) && !execution!.audit.running) {
+		if (getExecution() && pendingAudit() && !auditLatchOf(execution!).auditedThisSettle) {
+			latchAuditThisSettle();
 			await runAuditFlow(ctx);
 		}
 		await onTurnEnd?.(ctx);
@@ -845,14 +894,24 @@ async function runAuditFlow(ctx: ExtensionContext): Promise<void> {
 	persist(ctx);
 	updateStatusWidget(ctx);
 	const report = outcome?.report ?? "(audit subagent failed to run)";
+	// v0.7.1: the failure notification now wakes the agent so it can fix the
+	// rolled-back work without the user having to poke the run (root cause of
+	// the observed stall). The wake is the ONLY turn this settle emits — the
+	// rollback below also marks the runtime handled so the continuation path
+	// cannot add a second EXECUTION_CONTINUE wake for the same settle (Q-2).
+	const stranded = rolledBack.length === 0;
 	messaging().sendMessage(
 		{
 			customType: "pi-plans-audit-failed",
-			content: `**pi-plans: completion audit round ${ex.audit.rounds} failed** — checks: ${failed.join(", ")}. Rolled back tasks: ${rolledBack.join(", ") || "(none covered)"}. Fix the failures and re-close the rolled-back tasks with \`plans_update_task\`; the audit reruns automatically once all tasks are terminal again.${ex.audit.rounds >= AUDIT_MAX_ROUNDS ? ` This was round ${AUDIT_MAX_ROUNDS} of ${AUDIT_MAX_ROUNDS}: interactive sessions pause for review; the next terminal-task cycle stops or pauses the run.` : ""}\n\n---\n${report.slice(0, 4000)}`,
+			content: `**pi-plans: completion audit round ${ex.audit.rounds} failed** — checks: ${failed.join(", ")}. Rolled back tasks: ${rolledBack.join(", ") || "(none covered)"}. Fix the failures and re-close the rolled-back tasks with \`plans_update_task\`; the audit reruns automatically once all tasks are terminal again.${ex.audit.rounds >= AUDIT_MAX_ROUNDS ? ` This was round ${AUDIT_MAX_ROUNDS} of ${AUDIT_MAX_ROUNDS}: interactive sessions pause for review; the next terminal-task cycle stops or pauses the run.` : ""}${stranded ? ` No task covers the failed check(s), so the task tree stayed terminal — the next settle re-runs the audit automatically.` : ""}\n\n---\n${report.slice(0, 4000)}`,
 			display: true,
 		},
-		{ triggerTurn: false },
+		{ triggerTurn: true },
 	);
+	// Q-2 (single wake): this message owns the settle's only turn. Mark the
+	// runtime handled so maybeContinuationFollowUp stays silent.
+	const runtime = currentContinuationRuntime(ctx);
+	if (runtime) runtime.handled = true;
 }
 
 /** True when the session can surface a pause to a human (D-022): interactive
@@ -1360,9 +1419,54 @@ export async function stopExecution(ctx: ExtensionContext, reason: string): Prom
 	updateStatusWidget(ctx);
 }
 
+/** v0.7.1: the per-settle latch, created on demand so no execution-construction
+ * path can leave it undefined (a missing latch must degrade to "no latch",
+ * never throw inside a lifecycle handler). */
+function auditLatchOf(ex: ExecState): ExecState["auditLatch"] {
+	if (!ex.auditLatch) ex.auditLatch = { auditedThisSettle: false, activity: 0 };
+	return ex.auditLatch;
+}
+
 function stallSnapshot(): string {
 	if (!execution) return "";
-	return JSON.stringify(taskProgressMap(execution.tasks));
+	// v0.7.1: the snapshot carries the round's tool-activity counter, so a round
+	// in which the agent legitimately did work (read code, run commands) counts
+	// as progress even when no task changed status. Only a round with neither a
+	// status change NOR a successful tool result is "no progress".
+	return JSON.stringify({ tasks: taskProgressMap(execution.tasks), activity: auditLatchOf(execution).activity });
+}
+
+/**
+ * v0.7.1: shared "the completion audit is owed" predicate. Every entry point
+ * that can start the audit (turn_end, agent_before_settle, restoreFromSession,
+ * the resume path) goes through this so they can never disagree.
+ *
+ * Semantics (unchanged from restoreFromSession's guard, F-006): a check that
+ * covers no task never gates completion, so only auditable checks count.
+ */
+function pendingAudit(ex: ExecState | null = execution): ex is ExecState {
+	if (!ex) return false;
+	// A paused run is never self-driven: the stall / audit-cap pause is an
+	// explicit "hand control back" signal, and resuming it is the user's call.
+	// This also bounds the zero-input continue loop in agent_before_settle.
+	if (ex.stall.paused) return false;
+	if (ex.audit.running) return false;
+	return allTasksTerminal(ex.tasks) && auditableChecks(ex.items, ex.tasks).some((item) => !item.done);
+}
+
+/** v0.7.1: record that this settle already ran (or declined) its audit, so a
+ * second entry point in the same settle cannot re-consume a round. */
+function latchAuditThisSettle(): void {
+	if (execution) auditLatchOf(execution).auditedThisSettle = true;
+}
+
+/** v0.7.1: called on agent_start — a new agent run is a new settle window, so
+ * the latch and the activity counter both reset here. */
+function resetSettleLatch(): void {
+	if (!execution) return;
+	const latch = auditLatchOf(execution);
+	latch.auditedThisSettle = false;
+	latch.activity = 0;
 }
 
 function pauseForStall(ctx: ExtensionContext, reason: string): void {
@@ -1424,6 +1528,11 @@ function maybeContinuationFollowUp(ctx: ExtensionContext): void {
 		pauseForStall(ctx, runtime.stopReason === "error" ? "agent failed" : "agent interrupted");
 		return;
 	}
+	// v0.7.1: a fully-terminal run that still owes an audit is NOT a
+	// continuation case — the audit owns that state (agent_before_settle).
+	// Return without waking: emitting EXECUTION_CONTINUE here would send the
+	// agent back to redo work it has already finished (F-003).
+	if (execution && allTasksTerminal(execution.tasks) && pendingAudit(execution)) return;
 	if (runtime.stopReason !== "stop" || !canWakeExecution(ctx, runtime)) return;
 	runtime.handled = true;
 	const ex = runtime.owner;
@@ -1489,6 +1598,16 @@ export function resumeGoalWaitIfPaused(ctx: ExtensionContext): boolean {
 }
 
 export function resumeActiveExecution(ctx: ExtensionContext): boolean {
+	// v0.7.1 (root cause A): a terminal-but-unaudited run used to fall through
+	// to `return false` here, so `/plans-execute` answered "already executing"
+	// and the run stayed stranded until a full re-entry or a session restore.
+	// It is not paused, so the pause path below cannot see it — check it first
+	// and run the owed audit instead of reporting "nothing to resume".
+	if (!execution?.stall.paused && pendingAudit()) {
+		latchAuditThisSettle();
+		void runAuditFlow(ctx).catch(() => { /* surfaced via the audit message */ });
+		return true;
+	}
 	if (!resumeGoalWaitIfPaused(ctx)) return false;
 	const runtime = currentContinuationRuntime(ctx)!;
 	if (canWakeExecution(ctx, runtime)) {
@@ -1635,16 +1754,19 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 		startedAt: snapshot.startedAt,
 		usage: snapshot.usage ?? { inToks: 0, outToks: 0 },
 		uiLanguage: resolveUiLanguage(ctx.cwd),
-		stall: { ...snapshot.stall, lastSnapshot: stallSnapshot(), rounds: 0 },
+		stall: { ...snapshot.stall, lastSnapshot: null, rounds: 0 },
 		audit: { rounds: snapshot.audit?.rounds ?? 0, failed: snapshot.audit?.failed ?? [], running: false },
+		auditLatch: { auditedThisSettle: false, activity: 0 },
 	};
+	execution.stall.lastSnapshot = stallSnapshot();
 	resetContinuationRuntime(ctx);
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	executionRunId = active?.run_id ?? null;
 	if (active) bindRun(ctx.sessionManager, ctx.cwd, active.run_id);
 	persist(ctx);
-	if (allTasksTerminal(execution.tasks) && !execution.items.every((item) => item.done)) {
+	if (pendingAudit()) {
 		// Terminal tasks without a passing audit: rerun the audit flow.
+		latchAuditThisSettle();
 		await runAuditFlow(ctx);
 	}
 	updateStatusWidget(ctx);
