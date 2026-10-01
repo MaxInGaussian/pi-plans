@@ -18,6 +18,11 @@ const EXPECTED_SKILLS = new Set([
 ]);
 const REQUIRED_REFERENCES = ["pi-planning-workflow.md", "plan-artifact-template.md", "state-and-config.md"];
 const REQUIRED_AGENTS = ["reviewer.md"];
+// Root-level docs that must exist and must be entirely English (see AGENTS.md).
+const REQUIRED_ROOT_DOCS = ["AGENTS.md", "CHANGELOG.md"];
+// CJK ideographs plus full-width CJK punctuation. Ideographs alone are not
+// enough: a file can read untranslated while carrying full-width punctuation.
+const CJK_RE = /[　-〿一-鿿＀-￯]/;
 const REQUIRED_TOOL_FILES = [
 	"tools/plans.ts",
 	"tools/ask-choice.ts",
@@ -142,7 +147,7 @@ function validatePackageMetadata(): void {
 	if (!skills.has("./skills")) fail("package.json: pi.skills must include ./skills");
 
 	const files = new Set((pkg.files ?? []).map(normalizePackageEntry));
-	for (const required of ["README.md", "LICENSE", "CONTRIBUTING.md", "index.ts", "agents", "references", "scripts", "skills", "src", "tests", "tools"]) {
+	for (const required of ["README.md", "LICENSE", "CONTRIBUTING.md", "AGENTS.md", "index.ts", "agents", "references", "scripts", "skills", "src", "tests", "tools"]) {
 		if (!files.has(required)) fail(`package.json: files must include ${required}`);
 	}
 	for (const excluded of ["!scripts/bench/vendor", "!scripts/bench/results"]) {
@@ -165,6 +170,7 @@ const REQUIRED_PACK_ENTRIES = [
 	"README.md",
 	"LICENSE",
 	"CONTRIBUTING.md",
+	"AGENTS.md",
 	"index.ts",
 	"package.json",
 	"agents/reviewer.md",
@@ -263,13 +269,24 @@ function main(): void {
 		if (!fs.existsSync(path.join(ROOT, tool))) fail(`missing ${tool}`);
 	}
 
+	for (const doc of REQUIRED_ROOT_DOCS) {
+		const file = path.join(ROOT, doc);
+		if (!fs.existsSync(file)) {
+			fail(`missing root doc ${doc}`);
+			continue;
+		}
+		if (CJK_RE.test(fs.readFileSync(file, "utf8"))) {
+			fail(`${doc}: must be entirely English (no CJK ideographs or full-width CJK punctuation)`);
+		}
+	}
+
 	if (!fs.existsSync(path.join(ROOT, "index.ts"))) fail("missing index.ts");
 
 	validateDefaultConfig();
 	validatePlansTool();
 	validatePackageMetadata();
 	validatePackageArtifact();
-	console.log(`validated ${EXPECTED_SKILLS.size} skills, ${REQUIRED_REFERENCES.length} references, ${REQUIRED_AGENTS.length} agents, ${REQUIRED_TOOL_FILES.length} tools`);
+	console.log(`validated ${EXPECTED_SKILLS.size} skills, ${REQUIRED_REFERENCES.length} references, ${REQUIRED_AGENTS.length} agents, ${REQUIRED_TOOL_FILES.length} tools, ${REQUIRED_ROOT_DOCS.length} docs`);
 }
 
 main();

@@ -41,6 +41,7 @@
 		"README.md",
 		"LICENSE",
 		"CONTRIBUTING.md",
+	"AGENTS.md",
 		"index.ts",
 		"agents/",
 		"docs/assets",
