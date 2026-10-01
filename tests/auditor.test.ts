@@ -49,6 +49,27 @@ describe("auditor parsing", () => {
 		assert.deepEqual(failed, ["VC-002"]);
 	});
 
+	it("parses verdicts wrapped in markdown emphasis", () => {
+		// Regression: `verdict: **pass**` used to parse as nothing, and the
+		// caller's fail-closed rule then rolled the entire run back.
+		const report = [
+			"- `VC-001` — verdict: **pass**; evidence: src/a.ts",
+			"- `VC-002` — verdict: **fail**; evidence: src/c.ts",
+			"- `VC-003` — verdict: *pass*; evidence: src/d.ts",
+			"- `VC-004` — verdict: `pass`; evidence: src/e.ts",
+		].join("\n");
+		const { passed, failed } = parseAuditReport(report, checks());
+		assert.deepEqual(passed, ["VC-001", "VC-003", "VC-004"]);
+		assert.deepEqual(failed, ["VC-002"]);
+	});
+
+	it("does not read a verdict word prefix as a verdict", () => {
+		const report = ["- `VC-001` — verdict: passed; evidence: x", "- `VC-002` — verdict: failing; evidence: y"].join("\n");
+		const { passed, failed } = parseAuditReport(report, checks());
+		assert.deepEqual(passed, []);
+		assert.deepEqual(failed, []);
+	});
+
 	it("conflicting verdicts for one check resolve to fail", () => {
 		const report = "- `VC-001` — verdict: pass; note: a\n- `VC-001` — verdict: fail; note: b";
 		const { passed, failed } = parseAuditReport(report, checks());

@@ -53,7 +53,13 @@ export function parseAuditReport(report: string, checklist: CheckItem[]): { pass
 	const passed: string[] = [];
 	const failed: string[] = [];
 	const known = new Set(checklist.map((item) => item.id));
-	for (const match of report.matchAll(/`?(VC-\d+)`?[^\n]*?verdict:\s*(pass|fail)/gi)) {
+	// The reviewer agent writes Markdown, so a verdict may carry emphasis
+	// (`**pass**`, `*pass*`, `_pass_`, `` `pass` ``). Requiring a bare token
+	// silently discarded such verdicts, and the caller's fail-closed rule then
+	// marked every check failed and rolled the whole run back -- reporting
+	// correct work as failure. Tolerate the markers; \b keeps `passed` and
+	// `passing` from matching.
+	for (const match of report.matchAll(/`?(VC-\d+)`?[^\n]*?verdict:\s*[*_`~]*\s*(pass|fail)\b/gi)) {
 		const id = match[1].toUpperCase();
 		if (!known.has(id)) continue;
 		(match[2].toLowerCase() === "pass" ? passed : failed).push(id);
