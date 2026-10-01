@@ -124,6 +124,12 @@ describe("init", () => {
 	it("default artifact root lands in the state dir of a linked worktree", () => {
 		const main = mkWorkdir("wt-main");
 		git(main, "init", "-q");
+		// Older git (<=2.41, e.g. Apple Git 2.39.2) cannot `worktree add` from an
+		// unborn HEAD ("not a valid object name: 'HEAD'"); git >=2.42 DWIMs the
+		// add to --orphan. Seed one commit (inline identity keeps this hermetic;
+		// same commit-then-worktree-add pattern as tests/resume.test.ts) so both
+		// generations behave the same.
+		git(main, "-c", "user.name=MaxInGaussian", "-c", "user.email=maxingaussian@gmail.com", "commit", "--allow-empty", "-m", "init");
 		initState(main);
 		const linked = path.join(tmpRoot, "wt-linked");
 		git(main, "worktree", "add", linked, "-b", "wt-branch");
