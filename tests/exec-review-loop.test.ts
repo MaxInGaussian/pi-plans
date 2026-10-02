@@ -521,6 +521,79 @@ describe("findings-driven fix loop (v0.9)", () => {
 	});
 });
 
+describe("mixed and hygiene rounds (v0.9.1 F-004/F-006/F-007/F-012)", () => {
+	it("a round with a failed check AND a high finding rolls back the union once and wakes exactly once (F-007)", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		// VC-001 fails (covers Task-1) and F-001 also maps to Task-1: the union
+		// must dedupe to one reopen of Task-1 plus Task-2 (VC-002 stays passed).
+		ctl.resolveRound({ round: 1, passed: ["VC-002"], failed: ["VC-001"], undeterminable: [], report: "mixed", findings: [{ id: "F-001", severity: "high", taskIds: ["Task-1"], note: "n", evidence: "e", raw: "r" }] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.equal(ex.tasks.find((t) => t.id === "Task-1")?.status, "pending", "Task-1 reopened once by both channels");
+		assert.equal(ex.tasks.find((t) => t.id === "Task-2")?.status, "complete", "the passing check's task stays closed");
+		assert.equal(ex.items.find((i) => i.id === "VC-002")?.done, true, "unrelated pass kept");
+		const wakes = ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed");
+		assert.equal(wakes.length, 1, "one wake for the mixed round");
+		assert.match(String(wakes[0].content), /and failed checks: VC-001/);
+		assert.equal(loadCheckpoint(workdir, runId).checkpoint.phase, "executing");
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+	});
+
+	it("a pure VC-fail round keeps the v0.8 lead — never '0 high-severity findings' (F-004)", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001"], failed: ["VC-002"], undeterminable: [], report: "vc2 broken" });
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const wake = ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed");
+		assert.equal(wake.length, 1);
+		assert.doesNotMatch(String(wake[0].content), /0 high-severity finding/);
+		assert.doesNotMatch(String(wake[0].content), /High findings:\n\(none/);
+		assert.match(String(wake[0].content), /round 1 failed\*\* — checks: VC-002/);
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+	});
+
+	it("the appended bullet carries its wave tail and sanitizes reviewer text (F-006/F-012)", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [{ id: "F-009", severity: "high", taskIds: [], proposedTask: "harden — the retry; budget guard", note: "n", evidence: "e", raw: "r" }] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		const appended = ex.tasks.find((t) => t.id === "Task-3");
+		assert.ok(appended, "task appended");
+		const planText = fs.readFileSync(planPath, "utf8");
+		const bullet = planText.split("\n").find((l) => l.startsWith("- `Task-3`:"))!;
+		assert.match(bullet, /— wave: \d+$/, "the bullet carries the wave tail");
+		// Re-parse restores the same wave the live tree assigned (not wave 1).
+		const reparse = (await import("../src/plan.ts")).parsePlanTasks(planText);
+		const flat = reparse.tasks.flatMap(function walk(t: { children: unknown[] }) { return [t, ...t.children]; } as never) as never[];
+		const reparsed = flat.find((t: { id: string }) => t.id === "Task-3") as { wave: number; title: string; files: string[] };
+		assert.equal(reparsed.wave, appended.wave, "re-parse restores the live wave");
+		// Sanitized: em dash -> hyphen, ';' -> ',', no forged fields.
+		assert.ok(!/—|—/.test(reparsed.title.split("(appended")[0]), "em dashes sanitized out of the reviewer text");
+		assert.equal(reparsed.files.length, 0, "no fields forged from reviewer text");
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+	});
+});
+
 describe("no-report rounds preserve findings (v0.9.1 F-001)", () => {
 	const finding = (id: string) => ({ id, severity: "high" as const, taskIds: ["Task-2"], note: `${id} note`, evidence: "e", raw: "r" });
 
@@ -624,6 +697,7 @@ describe("plan amendment re-stamps the checkpoint identity (v0.9.1 F-002)", () =
 		const { loadExecutionFromCheckpoint } = await import("../src/exec.ts");
 		const result = loadExecutionFromCheckpoint(makeCtx(workdir), runId);
 		assert.equal(result.status, "loaded", `resume accepts the amended plan (${result.status})`);
+		assert.deepEqual(result.findings?.map((f) => f.id), ["F-009"], "the load result surfaces unresolved findings for the resume brief (F-005)");
 		await stopExecution(makeCtx(workdir), "post-check teardown");
 	});
 });

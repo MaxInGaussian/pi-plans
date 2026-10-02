@@ -286,7 +286,8 @@ export function renderDashboardTreeLines(model: DashboardModel, width: number, t
 		if (task.status === "pending" && task.evidence) line += `  ↺${clip(task.evidence, 40)}`;
 		lines.push(line);
 		for (const child of task.children) row(child, depth + 1);
-	};	for (const task of model.tasks) row(task, 0);
+	};
+	for (const task of model.tasks) row(task, 0);
 	lines.push("");
 	lines.push("Verification checks:");
 	for (const item of model.checklist) {

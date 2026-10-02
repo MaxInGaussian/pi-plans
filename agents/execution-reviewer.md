@@ -23,9 +23,15 @@ Output exactly two sections, in this order.
 
 ### 1. Verification verdicts
 
-Markdown with exactly one section per check, in the order given by the brief:
+One section per check, in the order given by the brief. The preferred shape
+puts the id and the verdict on one line (the runner reads this form first):
 
 - `VC-###` — verdict: pass | fail | undeterminable; evidence: <repo path/command or recorded output proving it>; note: <one line>.
+
+A heading-style section is also read: start it with the id (`### VC-###` or a
+bullet that names the check) and keep that check's `verdict:` line inside the
+section. Whichever form you choose, use ONE form for the whole report and
+never let one check's verdict drift into another's section.
 
 Emit **every** check the brief lists, in the brief's order. Never omit a check,
 never merge two checks into one section, never invent a check that is not listed.

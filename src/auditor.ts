@@ -182,7 +182,7 @@ Emit every listed check exactly once. \`undeterminable\` is a legitimate answer:
 }
 
 /** Parse the audit subagent's verdict lines. Exported for tests. */
-export function parseAuditReport(report: string, pendingVcIds: string[]): ParsedAudit {
+export function parseAuditReport(report: string, pendingVcIds: string[], knownTaskIds?: Set<string>): ParsedAudit {
 	const passed: string[] = [];
 	const failed: string[] = [];
 	const known = new Set(pendingVcIds.map((id) => id.toUpperCase()));
@@ -194,22 +194,41 @@ export function parseAuditReport(report: string, pendingVcIds: string[]): Parsed
 	// `passing` from matching.
 	// v0.9: finding bullets (F-###) are excluded from verdict scanning — a
 	// finding's note may cite a VC id, and that must never register a verdict.
-	const verdictLines = report
-		.split(/\n/)
-		.filter((line) => !/^\s*[-*]\s+`?F-\d+`?\b/i.test(line))
-		.join("\n");
-	for (const match of verdictLines.matchAll(/`?(VC-\d+)`?[^\n]*?verdict:\s*[*_`~]*\s*(pass|fail|undeterminable)\b/gi)) {
-		const id = match[1].toUpperCase();
-		if (!known.has(id)) continue;
-		const verdict = match[2].toLowerCase();
+	// v0.9.1 (F-011): the contract promises "one section per check" and an
+	// equally literal reading puts the id in a `### VC-###` heading with the
+	// verdict on a line of its own below it. The old same-line-only scan
+	// parsed such reports to ZERO verdicts and burned whole budgets as
+	// undeterminable. The scan is now section-aware: a line that NAMES a
+	// known check at a heading/bullet start opens that check's section, and a
+	// bare `verdict:` token attributes to the nearest open section; an
+	// id-and-verdict pair on one line stays direct.
+	const record = (id: string, verdict: string): void => {
 		if (verdict === "pass") passed.push(id);
 		else if (verdict === "fail") failed.push(id);
+	};
+	const verdictToken = /verdict:\s*[*_`~]*\s*(pass|fail|undeterminable)\b/i;
+	let current: string | null = null;
+	for (const line of report.split(/\n/)) {
+		if (/^\s*[-*]\s+`?F-\d+`?\b/i.test(line)) continue; // finding bullet
+		const sectionId = line.match(/^\s*(?:#{1,6}\s+|[-*]\s+)?`?(VC-\d+)`?\b/i);
+		if (sectionId) {
+			const id = sectionId[1].toUpperCase();
+			if (known.has(id)) current = id;
+		}
+		const direct = line.match(/`?(VC-\d+)`?[^\n]*?verdict:\s*[*_`~]*\s*(pass|fail|undeterminable)\b/i);
+		if (direct) {
+			const id = direct[1].toUpperCase();
+			if (known.has(id)) record(id, direct[2].toLowerCase());
+			continue;
+		}
+		const bare = line.match(verdictToken);
+		if (bare && current) record(current, bare[1].toLowerCase());
 	}
 	// A check with conflicting verdicts resolves to fail: the reader saw both.
 	for (const id of [...new Set(passed)]) if (failed.includes(id)) passed.splice(passed.indexOf(id), 1);
 	const undecided = new Set(known);
 	for (const id of [...passed, ...failed]) undecided.delete(id);
-	return { passed: [...new Set(passed)], failed: [...new Set(failed)], undeterminable: [...undecided], findings: parseFindings(report) };
+	return { passed: [...new Set(passed)], failed: [...new Set(failed)], undeterminable: [...undecided], findings: parseFindings(report, knownTaskIds) };
 }
 
 /** Pure decision core: classify a parsed report into the audit outcome. It
@@ -282,7 +301,7 @@ export async function runCompletionAudit(
 		if (result.cancelled === true) return { cancelled: true };
 		return null;
 	}
-	const parsed = parseAuditReport(result.output, pending.map((item) => item.id));
+	const parsed = parseAuditReport(result.output, pending.map((item) => item.id), new Set(flattenTaskViews(opts.tasks).map((t) => t.id)));
 	messaging().appendEntry("pi-plans-audit", {
 		planPath: opts.planPath,
 		round: opts.round,

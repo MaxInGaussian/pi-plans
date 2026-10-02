@@ -280,6 +280,59 @@ describe("findings parsing (v0.9)", () => {
 	});
 });
 
+describe("section-aware verdict parsing (v0.9.1 F-011)", () => {
+	it("parses heading-style sections: id heading + verdict on its own line below", () => {
+		const report = [
+			"## 1. Verification verdicts",
+			"",
+			"### VC-001",
+			"- verdict: pass; evidence: src/a.ts",
+			"",
+			"### VC-002",
+			"- verdict: **fail**; evidence: src/c.ts",
+			"",
+			"### VC-003",
+			"verdict: undeterminable",
+		].join("\n");
+		const { passed, failed, undeterminable } = parseAuditReport(report, ["VC-001", "VC-002", "VC-003"]);
+		assert.deepEqual(passed, ["VC-001"]);
+		assert.deepEqual(failed, ["VC-002"]);
+		assert.deepEqual(undeterminable, ["VC-003"]);
+	});
+
+	it("a bare verdict with no open section is ignored (never misattributed)", () => {
+		const report = "Some preamble mentioning verdict: pass with no section above\n### VC-001\n- verdict: fail";
+		const { passed, failed } = parseAuditReport(report, ["VC-001"]);
+		assert.deepEqual(passed, []);
+		assert.deepEqual(failed, ["VC-001"]);
+	});
+
+	it("an unknown section id does not capture later bare verdicts", () => {
+		const report = ["### VC-999", "- verdict: pass", "### VC-002", "- verdict: pass"].join("\n");
+		const { passed, undeterminable } = parseAuditReport(report, ["VC-002"]);
+		assert.deepEqual(passed, ["VC-002"]);
+		assert.deepEqual(undeterminable, []);
+	});
+
+	it("finding bullets never open a verdict section", () => {
+		const report = [
+			"### VC-001",
+			"- `F-005` — severity: high; tasks: Task-1; note: cites verdict: pass inside a note; evidence: e",
+			"- verdict: fail",
+		].join("\n");
+		const { passed, failed } = parseAuditReport(report, ["VC-001"]);
+		assert.deepEqual(passed, []);
+		assert.deepEqual(failed, ["VC-001"]);
+		assert.equal(parseAuditReport(report, ["VC-001"]).findings[0]?.severity, "high");
+	});
+
+	it("knownTaskIds filters finding mappings to plan tasks (F-003)", () => {
+		const report = "- `F-001` — severity: high; tasks: Task-1, VC-007, bogus; note: n; evidence: e";
+		const { findings } = parseAuditReport(report, [], new Set(["Task-1"]));
+		assert.deepEqual(findings[0]?.taskIds, ["Task-1"]);
+	});
+});
+
 describe("review brief dual-output contract (v0.9)", () => {
 	it("demands both sections: verdicts and findings grammar", () => {
 		const task = buildAuditTask("/tmp/PLAN_v1.md", checks(), view(), 1);

@@ -73,6 +73,7 @@ import { resolveGraphMode } from "./code-graph/mode.ts";
 import {
 	parseChecklist,
 	parsePlanTasks,
+	CHECKLIST_HEADERS,
 	flattenTasks,
 	type CheckItem,
 	type PlanTasks,
@@ -234,6 +235,10 @@ export interface CheckpointExecutionLoad {
 	/** v0.6.1 (D-020): true when an orphaned v0.6.0 delegated executor was
 	 * detected — resume requires a fresh handoff approval. */
 	legacyDelegate?: boolean;
+	/** v0.9.1 (F-005): unresolved findings from the newest committed round,
+	 * so the /resume-plans brief can surface outstanding highs before the
+	 * per-turn injection ever runs. */
+	findings?: ReviewFinding[];
 	error?: string;
 }
 
@@ -368,6 +373,7 @@ export function loadExecutionFromCheckpoint(
 		pausedReason: cp.execution.pausedReason,
 		legacyPlan: planTasks.legacy,
 		legacyDelegate,
+		findings: toReviewFindings(cp.execution.audit?.findings),
 	};
 }
 
@@ -1212,6 +1218,9 @@ async function handleReviewOutcome(
 				passed: [],
 				failed: [],
 				undeterminable: pendingIds,
+				// v0.9.1 (F-014): the discard report must not understate a
+				// round whose embedded report carries highs.
+				findings: owner.audit.findings,
 				discardedReason: "fingerprint changed between round start and resolve (worktree/plan moved under the reviewer)",
 				fingerprintCaptured: round.fingerprint,
 				fingerprintFound: fingerprintNow,
@@ -1257,26 +1266,44 @@ function appendFindingTasks(ex: ExecState, highs: ReviewFinding[]): string[] {
 		const planText = fs.readFileSync(ex.planPath, "utf8");
 		const lines = planText.split("\n");
 		// Insert inside the Tasks section: before the Execution Waves
-		// subsection when present, else before the Verification Checks
-		// header, else at EOF; walk back over blank separators so the bullet
-		// lands adjacent to its siblings.
+		// subsection when present, else before the FIRST checklist header the
+		// plan uses (v0.9.1 F-013: legacy plans say `## Verifier Checklist`,
+		// and an EOF fallback would land outside every parsed section), else
+		// at EOF; walk back over blank separators so the bullet lands
+		// adjacent to its siblings.
 		let insertAt = lines.length;
 		const wavesIdx = lines.findIndex((l) => /^###\s+Execution Waves/.test(l));
-		const vcIdx = lines.findIndex((l) => /^##\s+Verification Checks/.test(l));
+		const checklistIdx = lines.findIndex((l) => CHECKLIST_HEADERS.some((h) => new RegExp(`^##\\s+${h}`).test(l)));
 		if (wavesIdx !== -1) insertAt = wavesIdx;
-		else if (vcIdx !== -1) insertAt = vcIdx;
+		else if (checklistIdx !== -1) insertAt = checklistIdx;
 		while (insertAt > 0 && lines[insertAt - 1].trim() === "") insertAt--;
+		// v0.9.1 (F-012): reviewer text becomes task-title metadata at parse
+		// time — strip the microsyntax metacharacters (em/en dashes, `--`
+		// separators, the `;` field delimiter) so an embedded token can never
+		// split title from tail or forge fields.
+		const sanitize = (text: string): string => text.replace(/[—–]/g, "-").replace(/-{2,}/g, "-").replace(/;/g, ",");
+		const entries: Array<{ id: string; title: string }> = [];
 		const newLines: string[] = [];
 		for (const h of highs) {
 			next += 1;
 			const id = `Task-${next}`;
-			const title = `fix ${h.id}: ${h.proposedTask ?? h.note ?? "address the finding"} (appended by execution review round ${ex.audit.rounds})`;
-			newLines.push(`- \`${id}\`: ${title}`);
-			ex.tasks.push({ id, title, wave, deps: [], files: [], status: "pending", children: [] });
-			appended.push(id);
+			const title = `fix ${h.id}: ${sanitize(h.proposedTask ?? h.note ?? "address the finding")} (appended by execution review round ${ex.audit.rounds})`;
+			// v0.9.1 (F-006): carry the wave in the bullet tail so a re-parse
+			// restores the same wave the live tree assigned — without it the
+			// appended remediation task fell back to wave 1 on restore and
+			// hijacked the ▸ anchor.
+			newLines.push(`- \`${id}\`: ${title} — wave: ${wave}`);
+			entries.push({ id, title });
 		}
 		lines.splice(insertAt, 0, ...newLines);
 		fs.writeFileSync(ex.planPath, lines.join("\n"), "utf8");
+		// v0.9.1 (F-008): only a successful plan write mints the live tasks —
+		// pushing before the write left checkpoint entries the plan file does
+		// not contain whenever the write failed.
+		for (const entry of entries) {
+			ex.tasks.push({ id: entry.id, title: entry.title, wave, deps: [], files: [], status: "pending", children: [] });
+			appended.push(entry.id);
+		}
 	} catch {
 		/* best-effort: stranded highs surface via the cap pause */
 	}
@@ -1409,7 +1436,13 @@ async function commitReviewOutcome(
 			const reportRef = reportPath
 				? `Full round report: ${reportPath}`
 				: `Full round report (run dir unwritable — inline):\n\n---\n${reportText.slice(0, 4000)}`;
-			const content = `**pi-plans: execution review round ${ex.audit.rounds} found ${actionableHighs.length} high-severity finding(s)**${failed.length > 0 ? ` and failed checks: ${failed.join(", ")}` : ""}. Rolled back tasks: ${allRolledBack.join(", ") || "(none covered)"}${amended.length > 0 ? `. Tasks appended to the plan for unmapped findings: ${amended.join(", ")}` : ""}.\n\nHigh findings:\n${highLines || "(none — failed checks only)"}\n\nFix them and re-close the affected tasks with \`plans_update_task\`; the review reruns automatically once all tasks are terminal again.${ex.audit.rounds >= REVIEW_MAX_ROUNDS ? ` This was round ${REVIEW_MAX_ROUNDS} of ${REVIEW_MAX_ROUNDS}: the next terminal-task cycle pauses the run for review.` : ""}${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
+			// v0.9.1 (F-004): a pure VC-fail round keeps the v0.8 lead — never
+			// announce "0 high-severity findings" over an empty block.
+			const findingsLead = actionableHighs.length > 0
+				? `**pi-plans: execution review round ${ex.audit.rounds} found ${actionableHighs.length} high-severity finding(s)**${failed.length > 0 ? ` and failed checks: ${failed.join(", ")}` : ""}.`
+				: `**pi-plans: execution review round ${ex.audit.rounds} failed** — checks: ${failed.join(", ")}.`;
+			const findingsBlock = actionableHighs.length > 0 ? `\n\nHigh findings:\n${highLines}` : "";
+			const content = `${findingsLead} Rolled back tasks: ${allRolledBack.join(", ") || "(none covered)"}${amended.length > 0 ? `. Tasks appended to the plan for unmapped findings: ${amended.join(", ")}` : ""}.${findingsBlock}\n\nFix them and re-close the affected tasks with \`plans_update_task\`; the review reruns automatically once all tasks are terminal again.${ex.audit.rounds >= REVIEW_MAX_ROUNDS ? ` This was round ${REVIEW_MAX_ROUNDS} of ${REVIEW_MAX_ROUNDS}: the next terminal-task cycle pauses the run for review.` : ""}${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
 			messaging().sendMessage(
 				{
 					customType: "pi-plans-audit-failed",

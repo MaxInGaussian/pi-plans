@@ -309,12 +309,18 @@ async function buildBrief(
 					: `\nExecution had been paused: ${load.pausedReason} — the pause is cleared by this resume; continue from where it stopped.`
 				: "";
 			const legacy = load.legacyPlan ? "\nThis plan parses through the legacy I-### compatibility mapping; upgrade it to the ## Tasks format at the next revision." : "";
+			// v0.9.1 (F-005): outstanding highs surface in the brief itself, not
+			// only in the per-turn injection.
+			const highs = (load.findings ?? []).filter((f) => f.severity === "high");
+			const highLine = highs.length > 0
+				? `\nUnresolved high-severity findings from review round (stable ids): ${highs.map((f) => `${f.id}${f.taskIds.length ? ` (${f.taskIds.join(", ")})` : ""}: ${f.note}`).join("; ")} — fix them, then re-close the affected tasks.`
+				: "";
 			// v0.8: a verifying run keeps checkpoint phase "executing" but the run
 			// STATUS is verifying — surface which loop owns the run right now.
 			const verifying = run.status === "verifying";
 			return {
 				phaseLabel: verifying ? "verifying" : "executing",
-				text: `[PI-PLANS RESUME] ${verifying ? "Execution review of" : "Execution of"} run ${runId} continues in this session.\nPlan: ${load.planPath}${reverify}${paused}${legacy}\n${verifying ? "The task tree is terminal and the execution-review loop owns the run: when all tasks are terminal and checks are still owed, a read-only reviewer round runs automatically (status verifying → done when every check passes). If a check fails, its tasks roll back to pending — fix and re-close them with plans_update_task." : "Follow the execution-loop contract: work through tasks in wave order, report every task with the plans_update_task tool (status + evidence / skipReason), and let the execution reviewer verify the checks. The current wave and remaining tasks are injected each turn."}`,
+				text: `[PI-PLANS RESUME] ${verifying ? "Execution review of" : "Execution of"} run ${runId} continues in this session.\nPlan: ${load.planPath}${reverify}${paused}${legacy}${highLine}\n${verifying ? "The task tree is terminal and the execution-review loop owns the run: when all tasks are terminal and checks are still owed, a read-only reviewer round runs automatically (status verifying → done when every check passes). If a check fails, its tasks roll back to pending — fix and re-close them with plans_update_task." : "Follow the execution-loop contract: work through tasks in wave order, report every task with the plans_update_task tool (status + evidence / skipReason), and let the execution reviewer verify the checks. The current wave and remaining tasks are injected each turn."}`,
 			};
 		}
 		if (load.legacyDelegate) {
