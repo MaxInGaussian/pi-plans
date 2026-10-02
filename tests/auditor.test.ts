@@ -2,6 +2,9 @@
  * coverage, rollback boundaries, skipped-pass, and no-cover exclusion. */
 
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { CheckItem } from "../src/plan.ts";
 import { auditRollbackSet, buildTaskView } from "../src/tasks.ts";
@@ -206,5 +209,133 @@ describe("audit rollback boundaries", () => {
 		const presolved = presolvedCheckIds(checks(), tasks);
 		assert.ok(presolved.includes("VC-003"));
 		assert.ok(!presolved.includes("VC-002"), "mixed coverage needs the auditor");
+	});
+});
+describe("findings parsing (v0.9)", () => {
+	const GOOD = [
+		"- `VC-001` — verdict: pass; evidence: ok",
+		"",
+		"- `F-001` — severity: high; tasks: Task-3, task-4; note: union rollback missing; evidence: src/exec.ts:1290",
+		"- `F-002` — severity: medium; tasks: none; proposed-task: cap retry backoff at 60s; note: unbounded; evidence: src/client.ts:12",
+	].join("\n");
+
+	it("parses well-formed findings with id/task normalization", () => {
+		const { findings } = parseAuditReport(GOOD, ALL_IDS);
+		assert.equal(findings.length, 2);
+		const f1 = findings[0];
+		assert.equal(f1.id, "F-001");
+		assert.equal(f1.severity, "high");
+		assert.deepEqual(f1.taskIds, ["Task-3", "Task-4"]);
+		assert.equal(f1.note, "union rollback missing");
+		assert.equal(f1.evidence, "src/exec.ts:1290");
+		const f2 = findings[1];
+		assert.equal(f2.severity, "medium");
+		assert.deepEqual(f2.taskIds, []);
+		assert.equal(f2.proposedTask, "cap retry backoff at 60s");
+	});
+
+	it("tolerates emphasis markers on severity", () => {
+		const { findings } = parseAuditReport("- `F-001` — severity: **high**; tasks: Task-1; note: n; evidence: e", ALL_IDS);
+		assert.equal(findings[0]?.severity, "high");
+		const { findings: f2 } = parseAuditReport("- `F-002` — severity: `medium`; tasks: none; note: n", ALL_IDS);
+		assert.equal(f2[0]?.severity, "medium");
+	});
+
+	it("degrades unreadable severity to a recorded non-blocking entry (never a rollback driver)", () => {
+		const { findings } = parseAuditReport("- `F-003` — tasks: whatever; note: no severity field", ALL_IDS);
+		assert.equal(findings[0]?.severity, "malformed");
+		assert.deepEqual(findings[0]?.taskIds, []);
+	});
+
+	it("degrades a missing mandatory tasks field", () => {
+		const { findings } = parseAuditReport("- `F-004` — severity: high; note: tasks field absent", ALL_IDS);
+		assert.equal(findings[0]?.severity, "malformed");
+	});
+
+	it("resolves duplicate ids to the first bullet", () => {
+		const report = [
+			"- `F-001` — severity: high; tasks: Task-1; note: first",
+			"- `F-001` — severity: low; tasks: none; note: second",
+		].join("\n");
+		const { findings } = parseAuditReport(report, ALL_IDS);
+		assert.equal(findings.length, 1);
+		assert.equal(findings[0].note, "first");
+	});
+
+	it("a finding bullet citing a VC verdict never registers that verdict", () => {
+		const report = "- `F-005` — severity: high; tasks: Task-1; note: cites VC-004 verdict: pass; evidence: z";
+		const { passed, failed } = parseAuditReport(report, ALL_IDS);
+		assert.equal(passed.length + failed.length, 0);
+	});
+
+	it("prose mentioning F-### outside a bullet is ignored", () => {
+		const { findings } = parseAuditReport("also prose mentions F-009 not a bullet\n- `F-001` — severity: low; tasks: none; note: real", ALL_IDS);
+		assert.deepEqual(findings.map((f) => f.id), ["F-001"]);
+	});
+
+	it("applyAuditOutcome carries findings through to the outcome", () => {
+		const parsed = parseAuditReport(GOOD, ["VC-001"]);
+		const outcome = applyAuditOutcome(1, parsed, GOOD);
+		assert.equal(outcome.findings?.length, 2);
+	});
+});
+
+describe("review brief dual-output contract (v0.9)", () => {
+	it("demands both sections: verdicts and findings grammar", () => {
+		const task = buildAuditTask("/tmp/PLAN_v1.md", checks(), view(), 1);
+		assert.match(task, /1\. Verification verdicts/);
+		assert.match(task, /2\. Implementation findings/);
+		assert.match(task, /severity: high \| medium \| low/);
+		assert.match(task, /proposed-task:/);
+	});
+
+	it("lists plan tasks as the valid mapping domain", () => {
+		const task = buildAuditTask("/tmp/PLAN_v1.md", checks(), view(), 1);
+		assert.match(task, /Plan tasks \(the only ids valid in a finding's tasks field\):/);
+		assert.match(task, /`Task-3\.1`: injection/);
+	});
+
+	it("injects prior unresolved findings with the stable-id reuse instruction", () => {
+		const prior = [{
+			id: "F-001", severity: "high" as const, taskIds: ["Task-2"], note: "still broken",
+			evidence: "src/b.ts", raw: "- `F-001` — severity: high; tasks: Task-2; note: still broken",
+		}];
+		const task = buildAuditTask("/tmp/PLAN_v1.md", checks(), view(), 3, prior);
+		assert.match(task, /reuse these exact ids while the problem persists/);
+		assert.match(task, /`F-001` — severity: high; tasks: Task-2/);
+	});
+
+	it("marks the first findings round when no prior list exists", () => {
+		const task = buildAuditTask("/tmp/PLAN_v1.md", checks(), view(), 1);
+		assert.match(task, /first round with findings in scope/);
+	});
+});
+
+describe("review round report findings lines (v0.9)", () => {
+	it("emits the high-findings line and per-finding detail", async () => {
+		const { writeReviewRoundReport } = await import("../src/auditor.ts");
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-round-report-"));
+		try {
+			const file = writeReviewRoundReport(dir, {
+				budgetRound: 2,
+				attempt: 1,
+				outcome: "failed",
+				passed: ["VC-001"],
+				failed: [],
+				undeterminable: [],
+				findings: [
+					{ id: "F-001", severity: "high", taskIds: ["Task-2"], note: "broken", evidence: "e", raw: "raw" },
+					{ id: "F-002", severity: "medium", taskIds: [], proposedTask: "tidy up", note: "polish", evidence: "e", raw: "raw" },
+				],
+				coveredTaskIds: ["Task-1", "Task-2"],
+				report: "## Report\nbody",
+			});
+			assert.ok(file);
+			const text = fs.readFileSync(file, "utf8");
+			assert.match(text, /- high findings: F-001/);
+			assert.match(text, /F-002 \(medium; proposed: tidy up\)/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

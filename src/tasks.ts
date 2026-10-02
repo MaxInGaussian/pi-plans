@@ -165,6 +165,29 @@ export function auditRollbackSet(
 	return reopen;
 }
 
+/** Rollback set for high-severity findings (v0.9): reopen exactly the named
+ * tasks — parents cascade to their children, skipped tasks reopen too — with
+ * semantics identical to auditRollbackSet, but keyed by task id because
+ * findings carry task ids, not VC ids. Evidence is kept and skipReason
+ * cleared for the same reasons as the VC path. */
+export function findingsRollbackSet(tasks: TaskView[], taskIds: string[]): string[] {
+	const wanted = new Set(taskIds);
+	const flat = flattenTaskViews(tasks);
+	const reopen: string[] = [];
+	const reopenNode = (node: TaskView): void => {
+		if (node.status !== "pending") {
+			node.status = "pending";
+			node.skipReason = undefined;
+			reopen.push(node.id);
+		}
+		for (const child of node.children) reopenNode(child);
+	};
+	for (const node of flat) {
+		if (wanted.has(node.id)) reopenNode(node);
+	}
+	return reopen;
+}
+
 /** Checks that lose their satisfied state because a rollback reopened work
  * they were verifying. Returns the ids whose `done` flag was cleared.
  *

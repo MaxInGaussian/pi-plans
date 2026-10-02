@@ -12,8 +12,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { auditableChecks, skippedPassCheckIds, type TaskView } from "./tasks.ts";
-import type { CheckItem } from "./plan.ts";
+import { auditableChecks, flattenTaskViews, skippedPassCheckIds, type TaskView } from "./tasks.ts";
+import { normalizeTaskId, type CheckItem } from "./plan.ts";
 import { messaging } from "./messaging.ts";
 
 /** Budget cap: committed rounds per user-granted budget. Discarded (fingerprint-changed) attempts do not count. */
@@ -29,7 +29,34 @@ export interface AuditOutcome {
 	/** Checks whose report carried no readable verdict, or whose evidence was
 	 * inconclusive. Never treated as `failed`: see src/exec.ts. */
 	undeterminable: string[];
+	/** Severity-graded implementation findings from this round (v0.9). Absent
+	 * on legacy shapes means "no findings reported"; the parse boundary always
+	 * sets a concrete array so hand-written construction sites cannot silently
+	 * drop them. */
+	findings?: ReviewFinding[];
 	report: string;
+}
+
+/** Severity vocabulary for implementation findings; mirrors the plan
+ * priority words. `malformed` marks a bullet the grammar parser could not
+ * read — it is recorded and displayed but never drives a rollback. */
+export type FindingSeverity = "high" | "medium" | "low" | "malformed";
+
+export interface ReviewFinding {
+	/** Stable id, normalized uppercase (`F-001`). Reused verbatim across
+	 * rounds while the problem persists; absence from the newest round's
+	 * report is the resolution signal. */
+	id: string;
+	severity: FindingSeverity;
+	/** Task ids owning the defect (normalized), `[]` when unmapped. */
+	taskIds: string[];
+	/** Required for unmapped high findings: the runner appends this as a new
+	 * plan task mechanically, so it must be a self-contained imperative title. */
+	proposedTask?: string;
+	note: string;
+	evidence: string;
+	/** Original bullet, for degraded records and round reports. */
+	raw: string;
 }
 
 /** Parse the verdict lines of an audit report against the checks that are
@@ -40,6 +67,58 @@ export interface ParsedAudit {
 	passed: string[];
 	failed: string[];
 	undeterminable: string[];
+	findings: ReviewFinding[];
+}
+
+/** One finding bullet's field-capture helper: lazily up to the next
+ * `; <known-field>:` boundary or the end of the line, so free text in one
+ * field cannot swallow the next. */
+function captureField(line: string, field: string): string | undefined {
+	const m = line.match(new RegExp(`${field}:\\s*(.*?)(?=;\\s*(?:severity|tasks|proposed-task|note|evidence):|$)`, "i"));
+	return m ? m[1].trim().replace(/^[*_`~]+|[*_`~]+$/g, "") : undefined;
+}
+
+/** Parse the findings bullets of a review report. Degrade, never crash, never
+ * roll back: a bullet with an F-### id but unreadable fields is recorded with
+ * severity "malformed" (visible, non-blocking), exactly like the verdict
+ * parser's emphasis tolerance — a strict grammar once silently discarded
+ * verdicts and fail-closed rolled correct work back. */
+export function parseFindings(report: string, knownTaskIds?: Set<string>): ReviewFinding[] {
+	const findings: ReviewFinding[] = [];
+	const seen = new Set<string>();
+	for (const match of report.matchAll(/^\s*[-*]\s+`?(F-\d+)`?\b/gim)) {
+		const id = match[1].toUpperCase();
+		if (seen.has(id)) continue; // conflicting duplicates resolve to the first
+		seen.add(id);
+		// The bullet regex's leading \s* may swallow the preceding newline, so
+		// slice(index) can start mid-whitespace; strip it before taking the line.
+		const line = match.input!.slice(match.index!).replace(/^[\s]+/, "").split(/\n/)[0];
+		const severityRaw = captureField(line, "severity")?.toLowerCase();
+		const tasksRaw = captureField(line, "tasks");
+		const taskIds = (tasksRaw ?? "")
+			.split(/[,,，、]/)
+			.map((token) => normalizeTaskId(token.trim()))
+			.filter((t): t is string => t !== null)
+			.filter((t) => !knownTaskIds || knownTaskIds.has(t));
+		const severity: FindingSeverity =
+			severityRaw === "high" || severityRaw === "medium" || severityRaw === "low" ? severityRaw : "malformed";
+		if (severity === "malformed" || !tasksRaw) {
+			// Unreadable severity, or the grammar's mandatory tasks field missing:
+			// degrade to a recorded non-blocking entry.
+			findings.push({ id, severity: "malformed", taskIds: [], note: captureField(line, "note") ?? line.trim(), evidence: captureField(line, "evidence") ?? "", raw: line.trim() });
+			continue;
+		}
+		findings.push({
+			id,
+			severity,
+			taskIds,
+			proposedTask: captureField(line, "proposed-task") || undefined,
+			note: captureField(line, "note") ?? "",
+			evidence: captureField(line, "evidence") ?? "",
+			raw: line.trim(),
+		});
+	}
+	return findings;
 }
 
 /** Checks this round must judge: auditable (covering at least one task) and
@@ -51,13 +130,27 @@ export function auditablePendingChecks(checklist: CheckItem[], tasks: TaskView[]
 }
 
 /** Build the audit brief for the read-only subagent. Exported for tests. */
-export function buildAuditTask(planPath: string, checklist: CheckItem[], tasks: TaskView[], round: number): string {
+export function buildAuditTask(
+	planPath: string,
+	checklist: CheckItem[],
+	tasks: TaskView[],
+	round: number,
+	priorFindings: ReviewFinding[] = [],
+): string {
 	const checks = auditablePendingChecks(checklist, tasks)
 		.map((check) => `- \`${check.id}\`: ${check.text}`)
 		.join("\n");
-	return `Goal: verify that the implemented worktree satisfies the accepted plan's verification checks.
+	const taskList = flattenTaskViews(tasks)
+		.map((t) => `- \`${t.id}\`: ${t.title} (${t.status})`)
+		.join("\n");
+	const prior = priorFindings.length
+			? `Unresolved findings from earlier rounds (reuse these exact ids while the problem persists; a problem is resolved only by no longer reporting it):
 
-Target plan: ${planPath} (audit round ${round})
+${priorFindings.map((f) => `- \`${f.id}\` — severity: ${f.severity}; tasks: ${f.taskIds.join(", ") || "none"}; note: ${f.note}`).join("\n")}`
+			: "(none — this is the first round with findings in scope)";
+	return `Goal: verify that the implemented worktree satisfies the accepted plan's verification checks, and report implementation findings that drive the fix loop.
+
+Target plan: ${planPath} (review round ${round})
 
 Authority boundary: read-only analysis only. Do not edit, write, delete, commit, push, or spawn subagents.
 
@@ -67,11 +160,25 @@ Checks to verify (only these; checks covering no task and checks already satisfi
 
 ${checks}
 
-Output: Markdown with exactly one section per check, in the order above:
+Plan tasks (the only ids valid in a finding's tasks field):
+
+${taskList}
+
+${prior}
+
+Output: exactly two sections, in this order.
+
+1. Verification verdicts — one section per check, in the order above:
 
 - \`VC-###\` — verdict: pass | fail | undeterminable; evidence: <repo path/command proving it>; note: <one line>.
 
-Emit every listed check exactly once. \`undeterminable\` is a legitimate answer: use it whenever the evidence is missing, unreadable, ambiguous, or beyond your read-only reach. Report \`fail\` only when you can point at the specific thing that breaks the condition — never report \`fail\` for want of evidence.`;
+Emit every listed check exactly once. \`undeterminable\` is a legitimate answer: use it whenever the evidence is missing, unreadable, ambiguous, or beyond your read-only reach. Report \`fail\` only when you can point at the specific thing that breaks the condition — never report \`fail\` for want of evidence.
+
+2. Implementation findings — one bullet per defect anywhere in the implemented change (not only what the checks cover), exact line grammar:
+
+- \`F-###\` — severity: high | medium | low; tasks: Task-N, Task-M | none; proposed-task: <imperative one-line title>; note: <one line>; evidence: <repo path or quoted excerpt>
+
+\`high\` wakes the executor for a fix round; \`medium\`/\`low\` are recorded. When no existing task owns the defect use \`tasks: none\` and (required for high) a self-contained \`proposed-task:\` title. If nothing is worth reporting, emit exactly \`- none.\` under the findings heading.`;
 }
 
 /** Parse the audit subagent's verdict lines. Exported for tests. */
@@ -79,13 +186,19 @@ export function parseAuditReport(report: string, pendingVcIds: string[]): Parsed
 	const passed: string[] = [];
 	const failed: string[] = [];
 	const known = new Set(pendingVcIds.map((id) => id.toUpperCase()));
-	// The auditor writes Markdown, so a verdict may carry emphasis
+	// The reviewer writes Markdown, so a verdict may carry emphasis
 	// (`**pass**`, `*pass*`, `_pass_`, `` `pass` ``). Requiring a bare token
 	// silently discarded such verdicts, and the caller's fail-closed rule then
 	// marked every check failed and rolled the whole run back -- reporting
 	// correct work as failure. Tolerate the markers; \b keeps `passed` and
 	// `passing` from matching.
-	for (const match of report.matchAll(/`?(VC-\d+)`?[^\n]*?verdict:\s*[*_`~]*\s*(pass|fail|undeterminable)\b/gi)) {
+	// v0.9: finding bullets (F-###) are excluded from verdict scanning — a
+	// finding's note may cite a VC id, and that must never register a verdict.
+	const verdictLines = report
+		.split(/\n/)
+		.filter((line) => !/^\s*[-*]\s+`?F-\d+`?\b/i.test(line))
+		.join("\n");
+	for (const match of verdictLines.matchAll(/`?(VC-\d+)`?[^\n]*?verdict:\s*[*_`~]*\s*(pass|fail|undeterminable)\b/gi)) {
 		const id = match[1].toUpperCase();
 		if (!known.has(id)) continue;
 		const verdict = match[2].toLowerCase();
@@ -96,7 +209,7 @@ export function parseAuditReport(report: string, pendingVcIds: string[]): Parsed
 	for (const id of [...new Set(passed)]) if (failed.includes(id)) passed.splice(passed.indexOf(id), 1);
 	const undecided = new Set(known);
 	for (const id of [...passed, ...failed]) undecided.delete(id);
-	return { passed: [...new Set(passed)], failed: [...new Set(failed)], undeterminable: [...undecided] };
+	return { passed: [...new Set(passed)], failed: [...new Set(failed)], undeterminable: [...undecided], findings: parseFindings(report) };
 }
 
 /** Pure decision core: classify a parsed report into the audit outcome. It
@@ -109,6 +222,7 @@ export function applyAuditOutcome(round: number, parsed: ParsedAudit, report: st
 		passed: parsed.passed,
 		failed: parsed.failed,
 		undeterminable: parsed.undeterminable,
+		findings: parsed.findings,
 		report,
 	};
 }
@@ -132,6 +246,9 @@ export async function runCompletionAudit(
 		checklist: CheckItem[];
 		tasks: TaskView[];
 		round: number;
+		/** Unresolved findings from earlier committed rounds, injected into
+		 * the brief so the reviewer reuses stable ids (v0.9). */
+		priorFindings?: ReviewFinding[];
 		model?: string;
 		thinkingLevel?: string;
 		timeoutMs?: number;
@@ -141,7 +258,7 @@ export async function runCompletionAudit(
 ): Promise<AuditRoundResult> {
 	const { runPiSubagent } = await import("./subagent.ts");
 	const pending = auditablePendingChecks(opts.checklist, opts.tasks);
-	const task = buildAuditTask(opts.planPath, opts.checklist, opts.tasks, opts.round);
+	const task = buildAuditTask(opts.planPath, opts.checklist, opts.tasks, opts.round, opts.priorFindings ?? []);
 	// agents/auditor.md, not agents/reviewer.md: the reviewer prompt mandates a
 	// plan-review shape (`## Findings` / `## Questions`, F-###) and never says
 	// "verdict", so auditing under it produced reports this parser could not
@@ -172,6 +289,7 @@ export async function runCompletionAudit(
 		passed: parsed.passed,
 		failed: parsed.failed,
 		undeterminable: parsed.undeterminable,
+		highFindings: parsed.findings.filter((f) => f.severity === "high").map((f) => f.id),
 	});
 	return applyAuditOutcome(opts.round, parsed, result.output);
 }
@@ -191,6 +309,9 @@ export function writeReviewRoundReport(
 		passed: string[];
 		failed: string[];
 		undeterminable: string[];
+		/** v0.9 findings from this round; recorded in the round report so the
+		 * file stays the full evidence record. */
+		findings?: ReviewFinding[];
 		discardedReason?: string;
 		fingerprintCaptured?: string;
 		fingerprintFound?: string;
@@ -209,6 +330,8 @@ export function writeReviewRoundReport(
 			`- passed: ${entry.passed.join(", ") || "(none)"}`,
 			`- failed: ${entry.failed.join(", ") || "(none)"}`,
 			`- undeterminable: ${entry.undeterminable.join(", ") || "(none)"}`,
+			`- high findings: ${entry.findings?.filter((f) => f.severity === "high").map((f) => f.id).join(", ") || "(none)"}`,
+			...(entry.findings?.length ? [`- findings: ${entry.findings.map((f) => `${f.id} (${f.severity}${f.proposedTask ? "; proposed: " + f.proposedTask : ""})`).join(" | ")}`] : []),
 			...(entry.discardedReason ? [`- discarded: ${entry.discardedReason}`] : []),
 			`- fingerprint (captured): ${entry.fingerprintCaptured ?? "(n/a)"}`,
 			`- fingerprint (at resolve): ${entry.fingerprintFound ?? "(n/a)"}`,

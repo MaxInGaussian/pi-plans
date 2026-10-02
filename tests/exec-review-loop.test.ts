@@ -337,3 +337,207 @@ describe("execution-review loop (v0.8)", () => {
 		await stopExecution(makeCtx(workdir), "teardown");
 	});
 });
+
+describe("findings-driven fix loop (v0.9)", () => {
+	const finding = (id: string, severity: "high" | "medium" | "low", taskIds: string[], extra: Partial<{ note: string; proposedTask: string }> = {}) => ({
+		id, severity, taskIds, note: extra.note ?? `${id} note`, evidence: "src/lib", raw: `- \` ${id}\` raw`,
+		...(extra.proposedTask ? { proposedTask: extra.proposedTask } : {}),
+	});
+
+	it("all VCs pass but a mapped high finding blocks completion: rollback + exactly one wake + NOT done", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "ok but findings", findings: [finding("F-001", "high", ["Task-2"])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.ok(ex, "high findings never complete the run (liveness)");
+		assert.equal(loadCheckpoint(workdir, runId).checkpoint.phase, "executing");
+		assert.equal(getRun(workdir, runId)?.status, "executing", "back to executing for the fix round");
+		assert.equal(ex.tasks.find((t) => t.id === "Task-2")?.status, "pending", "the high finding's mapped task rolled back");
+		const wakes = ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed");
+		assert.equal(wakes.length, 1, "exactly one wake");
+		assert.match(String(wakes[0].content), /1 high-severity finding/);
+		assert.match(String(wakes[0].content), /F-001/);
+		assert.match(String(wakes[0].content), /Full round report: /, "the wake references the round report path");
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+	});
+
+	it("keep-done asymmetry: a pure-high rollback keeps earlier VC passes; a VC-fail rollback invalidates", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		// Round 1: VC-001 passes, VC-002 passes, but F-001 (high) maps to Task-1 —
+		// which VC-001 covers. The high rollback must NOT clear VC-001's done.
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-001", "high", ["Task-1"])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.equal(ex.items.find((i) => i.id === "VC-001")?.done, true, "pure-high rollback keeps the earlier pass");
+		assert.equal(ex.tasks.find((t) => t.id === "Task-1")?.status, "pending", "mapped task reopened");
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+
+		// Contrast: a VC-fail rollback invalidates checks covering the reopened task.
+		const second = freshWorkdir();
+		const ctx2 = await startTerminal(second.planPath, second.workdir);
+		const ctl2 = controlledRunner();
+		__setAuditRunnerForTests(ctl2.runner);
+		const restoring2 = restoreFromSession(ctx2, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl2.resolveRound({ round: 1, passed: ["VC-001"], failed: ["VC-002"], undeterminable: [], report: "r1" });
+		await restoring2;
+		await __awaitReviewRoundForTests();
+		const ex2 = getExecution()!;
+		assert.equal(ex2.items.find((i) => i.id === "VC-001")?.done, true, "unrelated pass kept");
+		assert.equal(ex2.tasks.find((t) => t.id === "Task-2")?.status, "pending", "failed check's task rolled back");
+		await stopExecution(ctx2, "teardown");
+		ctl2.drainAll();
+	});
+
+	it("undeterminable round carrying a high finding still wakes (high wins over self-schedule)", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: [], failed: [], undeterminable: ["VC-001", "VC-002"], report: "unreadable", findings: [finding("F-001", "high", ["Task-1"])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const wakes = ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed");
+		assert.equal(wakes.length, 1, "the high branch wakes despite all-undeterminable verdicts");
+		const ex = getExecution()!;
+		assert.equal(ex.tasks.find((t) => t.id === "Task-1")?.status, "pending", "mapped task reopened");
+		assert.deepEqual(ex.audit.undeterminable, ["VC-001", "VC-002"], "undeterminable set still recorded");
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+	});
+
+	it("an unmapped high appends a plan task (proposed-task applied mechanically) and wakes once", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-009", "high", [], { proposedTask: "harden the retry budget guard" })] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		const amended = ex.tasks.find((t) => t.id === "Task-3");
+		assert.ok(amended, "the unmapped high gained an appended task");
+		assert.equal(amended.status, "pending");
+		assert.match(amended.title, /fix F-009: harden the retry budget guard/);
+		assert.match(amended.title, /appended by execution review round 1/);
+		const planText = fs.readFileSync(planPath, "utf8");
+		assert.match(planText, /- `Task-3`: fix F-009: harden the retry budget guard/, "the plan file carries the appended bullet");
+		assert.match(planText, /## Verification Checks/, "the plan stays parseable (section intact)");
+		const cp = loadCheckpoint(workdir, runId).checkpoint;
+		assert.ok(cp.execution?.tasks?.["Task-3"], "checkpoint carries the appended task");
+		const wakes = ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed");
+		assert.equal(wakes.length, 1);
+		assert.match(String(wakes[0].content), /Tasks appended to the plan for unmapped findings: Task-3/);
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+	});
+
+	it("completion with residual medium/low findings summarizes them in the completion message", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "clean", findings: [finding("F-002", "medium", []), finding("F-003", "low", ["Task-1"])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		assert.equal(getExecution(), null, "no high findings: the run completes");
+		assert.equal(loadCheckpoint(workdir, runId).checkpoint.phase, "completed");
+		const done = ctx.entries.filter((e) => e.customType === "pi-plans-complete");
+		assert.equal(done.length, 1);
+		assert.match(String(done[0].content), /Recorded findings that did not block completion: F-002 \(medium\), F-003 \(low\)/);
+		ctl.drainAll();
+	});
+
+	it("findings persist across the session snapshot and survive the fresh-budget renewal", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001"], failed: [], undeterminable: ["VC-002"], report: "r1", findings: [finding("F-001", "high", ["Task-2"])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.equal(ex.audit.findings.length, 1, "findings in live state");
+		// The snapshot round-trip: a session restore rebuilds them.
+		const restored = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		await restored;
+		assert.deepEqual(getExecution()!.audit.findings.map((f: { id: string }) => f.id), ["F-001"], "findings survive the session restore");
+		// Renewal: /plans-execute grants a fresh budget and keeps the findings.
+		const { resumeActiveExecution } = await import("../src/exec.ts");
+		// Drive rounds 2-5 through the real path: fix, re-close, settle (restore
+		// is the settle entry in these tests) — the same high persists each time.
+		for (let r = 2; r <= 5; r++) {
+			for (const id of ["Task-1", "Task-2"]) {
+				applyTaskUpdate(getExecution()!.tasks, id, "complete", `fix round ${r}`);
+			}
+			persistTaskProgress(ctx);
+			const settle = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+			await tick();
+			ctl.resolveRound({ round: r, passed: [], failed: [], undeterminable: [], report: `r${r}`, findings: [finding("F-001", "high", ["Task-2"])] } as never);
+			await settle;
+			await __awaitReviewRoundForTests();
+		}
+		// Round 5 committed with the high: the next terminal cycle hits the cap.
+		for (const id of ["Task-1", "Task-2"]) {
+			applyTaskUpdate(getExecution()!.tasks, id, "complete", "post-cap close");
+		}
+		persistTaskProgress(ctx);
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		const paused = getExecution()!;
+		assert.equal(paused.stall.paused, true, "the cap pause fired");
+		assert.match(String(paused.stall.pausedReason), /high findings: F-001/, "the pause reason names the high findings");
+		assert.match(String(paused.stall.pausedReason), /execution review exhausted 5 rounds/, "the pause prefix phrase survives");
+		// Cancelled rounds burn no budget and loop nowhere — safe to leave the
+		// runner in this mode while checking the renewal semantics.
+		__setAuditRunnerForTests(async () => ({ cancelled: true }) as never);
+		assert.ok(resumeActiveExecution(ctx), "renewal lifts the pause");
+		assert.equal(getExecution()!.audit.rounds, 0, "fresh budget");
+		assert.deepEqual(getExecution()!.audit.findings.map((f: { id: string }) => f.id), ["F-001"], "stable ids carry into the fresh budget");
+		ctl.drainAll();
+		await stopExecution(ctx, "teardown");
+	});
+});
+
+describe("executor injection with findings (v0.9)", () => {
+	it("executionContextMessage lists unresolved high findings for the repairing agent", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [{ id: "F-001", severity: "high", taskIds: ["Task-2"], note: "loop misses union", evidence: "e", raw: "r" }] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const { executionContextMessage } = await import("../src/exec.ts");
+		const msg = executionContextMessage(ctx) ?? "";
+		assert.match(msg, /unresolved high-severity findings/);
+		assert.match(msg, /- F-001 \(Task-2\): loop misses union/);
+		assert.match(msg, /Fix them, then re-close the affected tasks/);
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+	});
+});

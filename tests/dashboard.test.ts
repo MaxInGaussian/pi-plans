@@ -14,7 +14,7 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { parsePlanTasks } from "../src/plan.ts";
-import { buildTaskView } from "../src/tasks.ts";
+import { buildTaskView, flattenTaskViews } from "../src/tasks.ts";
 import { visibleWidth as localVisibleWidth } from "../src/refine-ui-helpers.ts";
 import {
 	deriveDashboardModel,
@@ -398,5 +398,71 @@ describe("rolled-back task rendering", () => {
 		for (const row of rows) {
 			assert.ok(visibleWidth(row) <= 46, `row too wide: ${JSON.stringify(row)}`);
 		}
+	});
+});
+
+describe("findings visibility (v0.9)", () => {
+	const findings = [
+		{ id: "F-001", severity: "high", note: "union rollback missing", taskIds: ["Task-3"] },
+		{ id: "F-002", severity: "medium", note: "polish", taskIds: [] },
+	];
+
+	function withFindings(extra: { auditRounds?: number; reviewRunning?: boolean }) {
+		const tasks = buildTaskView(parsePlanTasks(PLAN), {});
+		const checklist = [
+			{ id: "VC-001", text: "`VC-001` covers `Task-1`; pass condition: x", done: false },
+			{ id: "VC-002", text: "`VC-002` covers `Task-3`; pass condition: y", done: false },
+		];
+		return deriveDashboardModel("demo-run", tasks, checklist, {
+			startedAt: new Date().toISOString(),
+			findings,
+			auditRounds: extra.auditRounds ?? null,
+			reviewRunning: extra.reviewRunning ?? false,
+		});
+	}
+
+	it("summary line shows review round/5 and the high count", () => {
+		const line = formatDashboardSummaryLine(withFindings({ auditRounds: 2 }));
+		assert.match(line, /review r2\/5/);
+		assert.match(line, /1 high/);
+	});
+
+	it("summary line omits the high token when only non-high findings remain", () => {
+		const tasks = buildTaskView(parsePlanTasks(PLAN), {});
+		const m = deriveDashboardModel("demo-run", tasks, [], {
+			startedAt: new Date().toISOString(),
+			findings: [{ id: "F-002", severity: "medium", note: "polish", taskIds: [] }],
+			auditRounds: 3,
+		});
+		const line = formatDashboardSummaryLine(m);
+		assert.match(line, /review r3\/5/);
+		assert.doesNotMatch(line, /high/);
+	});
+
+	it("compact panel renders the high-findings line in BOTH phases", () => {
+		// Non-terminal phase (the executor is repairing): the line must show.
+		const repairing = renderDashboardLines(withFindings({ auditRounds: 1 }), 80);
+		assert.ok(repairing.some((l) => /⚠.*high: F-001/.test(l)), "high findings visible while repairing");
+
+		// Terminal phase: still visible alongside the round counter.
+		const everyId = Object.fromEntries(
+			flattenTaskViews(buildTaskView(parsePlanTasks(PLAN), {})).map((t) => [t.id, { status: "complete" as const }]),
+		);
+		const allDone = buildTaskView(parsePlanTasks(PLAN), everyId);
+		const terminal = deriveDashboardModel("demo-run", allDone, [], {
+			startedAt: new Date().toISOString(),
+			findings,
+			auditRounds: 1,
+		});
+		const lines = renderDashboardLines(terminal, 80);
+		assert.ok(lines.some((l) => /⚠.*high: F-001/.test(l)));
+		assert.ok(lines.some((l) => /high finding\(s\) unresolved/.test(l)));
+	});
+
+	it("tree view lists findings with severity and mapping, and the verdict line names unresolved highs", () => {
+		const lines = renderDashboardTreeLines(withFindings({ auditRounds: 2 }), 100);
+		assert.ok(lines.some((l) => /⚠ F-001 \(high, Task-3\): union rollback missing/.test(l)));
+		assert.ok(lines.some((l) => /· F-002 \(medium\): polish/.test(l)));
+		assert.ok(lines.some((l) => /high findings unresolved: F-001/.test(l)));
 	});
 });

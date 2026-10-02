@@ -46,6 +46,9 @@ export interface DashboardModel {
 	 * never render `audit complete ✓` while this is set — the round-1 mis-cue
 	 * showed the tick for the whole duration of a running audit. */
 	reviewRunning: boolean;
+	/** v0.9: unresolved findings from the newest committed review round
+	 * (stable ids). High entries block completion; the rest are recorded. */
+	findings: Array<{ id: string; severity: string; note: string; taskIds: string[] }>;
 	startedAt: string;
 	usage: { inToks: number; outToks: number };
 }
@@ -172,21 +175,32 @@ export function renderDashboardLines(model: DashboardModel, width: number, theme
 		// instead — the panel must look alive, never finished-then-silent.
 		const owed = model.checklist.some((item) => !item.done);
 		const nextRound = (model.auditRounds ?? 0) + 1;
+		const highCount = model.findings.filter((f) => f.severity === "high").length;
 		const auditLine = model.reviewRunning
 			? `review: round ${nextRound}/${REVIEW_MAX_ROUNDS} running — read-only reviewer verifying`
 			: model.auditFailed.length > 0
 				? `audit: ${model.auditFailed.length} check(s) failed — rollback pending`
-				: model.auditUndeterminable.length > 0
-					? `audit: ${model.auditUndeterminable.length} check(s) undeterminable — verdict unreadable`
-					: owed
-						? `review: round ${nextRound}/${REVIEW_MAX_ROUNDS} — verdict pending`
-						: model.auditRounds !== null
-							? "audit complete ✓"
-							: "all tasks terminal — audit pending";
+				: highCount > 0
+					? `review: round ${nextRound}/${REVIEW_MAX_ROUNDS} — ${highCount} high finding(s) unresolved`
+					: model.auditUndeterminable.length > 0
+						? `audit: ${model.auditUndeterminable.length} check(s) undeterminable — verdict unreadable`
+						: owed
+							? `review: round ${nextRound}/${REVIEW_MAX_ROUNDS} — verdict pending`
+							: model.auditRounds !== null
+								? "audit complete ✓"
+								: "all tasks terminal — audit pending";
 		lines.push(boxRow("│", ` ${clip(auditLine, inner - 2)}`, " ", width));
 	}
 	if (!narrow && model.auditFailed.length > 0) {
 		lines.push(boxRow("│", ` ✗ ${clip(model.auditFailed.join(", "), inner - 3)}`, " ", width));
+	}
+	// v0.9: unresolved findings render in both phases — the fix loop's whole
+	// point is that the executor sees what it owes while repairing.
+	const highFindings = model.findings.filter((f) => f.severity === "high");
+	if (!narrow && highFindings.length > 0) {
+		lines.push(boxRow("│", ` ⚠ ${clip(`high: ${highFindings.map((f) => f.id).join(", ")}`, inner - 3)}`, " ", width));
+	} else if (!narrow && model.findings.length > 0) {
+		lines.push(boxRow("│", ` · ${clip(`findings: ${model.findings.map((f) => f.id).join(", ")}`, inner - 3)}`, " ", width));
 	}
 	if (!narrow && model.auditUndeterminable.length > 0) {
 		lines.push(boxRow("│", ` ? ${clip(model.auditUndeterminable.join(", "), inner - 3)}`, " ", width));
@@ -216,7 +230,7 @@ export function deriveDashboardModel(
 	topic: string,
 	tasks: TaskView[],
 	checklist: CheckItem[],
-	extra?: { paused?: boolean; pausedReason?: string; auditRounds?: number | null; auditFailed?: string[]; auditUndeterminable?: string[]; reviewRunning?: boolean; startedAt?: string; usage?: { inToks: number; outToks: number } },
+	extra?: { paused?: boolean; pausedReason?: string; auditRounds?: number | null; auditFailed?: string[]; auditUndeterminable?: string[]; reviewRunning?: boolean; findings?: Array<{ id: string; severity: string; note: string; taskIds: string[] }>; startedAt?: string; usage?: { inToks: number; outToks: number } },
 ): DashboardModel {
 	return {
 		topic,
@@ -228,6 +242,7 @@ export function deriveDashboardModel(
 		auditFailed: extra?.auditFailed ?? [],
 		auditUndeterminable: extra?.auditUndeterminable ?? [],
 		reviewRunning: extra?.reviewRunning ?? false,
+		findings: extra?.findings ?? [],
 		startedAt: extra?.startedAt ?? new Date().toISOString(),
 		usage: extra?.usage ?? { inToks: 0, outToks: 0 },
 	};
@@ -239,9 +254,14 @@ export function formatDashboardSummaryLine(model: DashboardModel): string {
 	const vcDone = model.checklist.filter((item) => item.done).length;
 	const cur = currentTask(model.tasks);
 	const wave = cur ? ` · wave ${cur.wave}` : "";
-	const audit = model.auditRounds !== null ? ` · audit r${model.auditRounds}` : "";
+	// v0.9: the review token carries the budget denominator and the unresolved
+	// high count — visible in BOTH phases (executing repair and verifying), so
+	// convergence is legible exactly while the executor is fixing.
+	const highs = model.findings.filter((f) => f.severity === "high").length;
+	const audit = model.auditRounds !== null ? ` · review r${model.auditRounds}/${REVIEW_MAX_ROUNDS}` : "";
+	const highToken = highs > 0 ? ` · ${highs} high` : "";
 	const pause = model.paused ? " · ⏸ paused" : "";
-	return `plans: ${model.topic} ▸ tasks ${p.done}/${p.total} · VC ${vcDone}/${model.checklist.length}${wave}${audit}${pause}`;
+	return `plans: ${model.topic} ▸ tasks ${p.done}/${p.total} · VC ${vcDone}/${model.checklist.length}${wave}${audit}${highToken}${pause}`;
 }
 
 /** Expanded tree view lines (Ctrl+Shift+T overlay). Wide layout from 96 cols. */
@@ -273,16 +293,27 @@ export function renderDashboardTreeLines(model: DashboardModel, width: number, t
 		const mark = model.auditFailed.includes(item.id) ? "✗" : item.done ? "☑" : "☐";
 		lines.push(`  ${mark} ${item.id}${wide ? ` ${clip(item.text.split(";")[1] ?? item.text, Math.min(80, width))}` : ""}`);
 	}
+	if (model.findings.length > 0) {
+		lines.push("");
+		lines.push("Findings (stable ids; absence from the newest round = resolved):");
+		for (const f of model.findings) {
+			const mark = f.severity === "high" ? "⚠" : f.severity === "malformed" ? "?" : "·";
+			lines.push(`  ${mark} ${f.id} (${f.severity}${f.taskIds.length ? `, ${f.taskIds.join(", ")}` : ""}): ${wide ? clip(f.note, 72) : clip(f.note, 40)}`);
+		}
+	}
 	if (model.reviewRunning) {
 		lines.push("");
 		lines.push(`Execution review: round ${(model.auditRounds ?? 0) + 1}/${REVIEW_MAX_ROUNDS} running`);
 	} else if (model.auditRounds !== null) {
 		lines.push("");
+		const highIds = model.findings.filter((f) => f.severity === "high").map((f) => f.id);
 		const verdict = model.auditFailed.length > 0
-			? ` — failed: ${model.auditFailed.join(", ")}`
-			: model.auditUndeterminable.length > 0
-				? ` — undeterminable: ${model.auditUndeterminable.join(", ")}`
-				: " — passed ✓";
+			? ` — failed: ${model.auditFailed.join(", ")}${highIds.length > 0 ? `; high: ${highIds.join(", ")}` : ""}`
+			: highIds.length > 0
+				? ` — high findings unresolved: ${highIds.join(", ")}`
+				: model.auditUndeterminable.length > 0
+					? ` — undeterminable: ${model.auditUndeterminable.join(", ")}`
+					: " — passed ✓";
 		lines.push(`Execution review: round ${model.auditRounds}${verdict}`);
 	}
 	const painted = theme ? lines.map((line) => theme.fg("muted", line)) : lines;

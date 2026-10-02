@@ -157,7 +157,29 @@ export interface ExecutionCheckpoint {
 	 * written before this field keep loading. */
 	stallRounds?: number;
 	/** v0.6.1: completion-audit bookkeeping (rounds, last failed set, pass). */
-	audit?: { rounds: number; lastResult?: string; passed?: boolean; undeterminable?: string[] };
+	audit?: {
+		rounds: number;
+		lastResult?: string;
+		passed?: boolean;
+		undeterminable?: string[];
+		/** v0.9: unresolved implementation findings from the newest committed
+		 * review round (stable F-### ids). Optional so pre-v0.9 checkpoints
+		 * keep loading as "no findings". */
+		findings?: ReviewFindingRecord[];
+	};
+}
+
+/** Serializable shape of one review finding (v0.9). Structurally identical to
+ * auditor.ts's ReviewFinding; declared here so the checkpoint layer does not
+ * import the auditor. */
+export interface ReviewFindingRecord {
+	id: string;
+	severity: string;
+	taskIds: string[];
+	proposedTask?: string;
+	note: string;
+	evidence: string;
+	raw: string;
 }
 
 export interface OwnerInfo {
@@ -514,14 +536,32 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	}
 	if (record.audit !== undefined && record.audit !== null) {
 		const audit = asRecord(record.audit, `${label}.audit`);
-		rejectExtraKeys(audit, new Set(["rounds", "lastResult", "passed", "undeterminable"]), `${label}.audit`);
-		const parsed: { rounds: number; lastResult?: string; passed?: boolean; undeterminable?: string[] } = {
+		rejectExtraKeys(audit, new Set(["rounds", "lastResult", "passed", "undeterminable", "findings"]), `${label}.audit`);
+		const parsed: { rounds: number; lastResult?: string; passed?: boolean; undeterminable?: string[]; findings?: ReviewFindingRecord[] } = {
 			rounds: asInt(audit.rounds, `${label}.audit.rounds`, 0),
 		};
 		if (audit.lastResult !== undefined) parsed.lastResult = asString(audit.lastResult, `${label}.audit.lastResult`);
 		if (audit.passed !== undefined) parsed.passed = asBool(audit.passed, `${label}.audit.passed`);
 		if (audit.undeterminable !== undefined) {
 			parsed.undeterminable = asStringArray(audit.undeterminable, `${label}.audit.undeterminable`);
+		}
+		if (audit.findings !== undefined && audit.findings !== null) {
+			const arr = Array.isArray(audit.findings) ? audit.findings : null;
+			if (!arr) throw new CheckpointValidationError(`${label}.audit.findings must be an array`);
+			parsed.findings = arr.map((entry, i) => {
+				const rec = asRecord(entry, `${label}.audit.findings.${i}`);
+				rejectExtraKeys(rec, new Set(["id", "severity", "taskIds", "proposedTask", "note", "evidence", "raw"]), `${label}.audit.findings.${i}`);
+				const out: ReviewFindingRecord = {
+					id: asString(rec.id, `${label}.audit.findings.${i}.id`),
+					severity: asString(rec.severity, `${label}.audit.findings.${i}.severity`),
+					taskIds: rec.taskIds === undefined ? [] : asStringArray(rec.taskIds, `${label}.audit.findings.${i}.taskIds`),
+					note: rec.note === undefined ? "" : asString(rec.note, `${label}.audit.findings.${i}.note`),
+					evidence: rec.evidence === undefined ? "" : asString(rec.evidence, `${label}.audit.findings.${i}.evidence`),
+					raw: rec.raw === undefined ? "" : asString(rec.raw, `${label}.audit.findings.${i}.raw`),
+				};
+				if (rec.proposedTask !== undefined) out.proposedTask = asString(rec.proposedTask, `${label}.audit.findings.${i}.proposedTask`);
+				return out;
+			});
 		}
 		execution.audit = parsed;
 	}
@@ -1080,8 +1120,10 @@ export interface ExecutionProgressInput {
 	delegate?: { modelSelector: string; startedAt: string } | null;
 	/** v0.6.1: task-tree progress snapshot (authoritative). */
 	tasks?: Record<string, { status: string; evidence?: string; skipReason?: string }>;
-	/** v0.6.1: completion-audit bookkeeping update. */
-	audit?: { rounds: number; lastResult?: string; passed?: boolean; undeterminable?: string[] };
+	/** v0.6.1: completion-audit bookkeeping update. v0.9: findings rides the
+	 * same replace-semantics slot — callers that must preserve findings (e.g.
+	 * budget renewal) pass them through explicitly. */
+	audit?: { rounds: number; lastResult?: string; passed?: boolean; undeterminable?: string[]; findings?: ReviewFindingRecord[] };
 	/** v0.7.1: watchdog budget counter, so a restart cannot refresh it. */
 	stallRounds?: number;
 }

@@ -482,4 +482,44 @@ describe("blocking budget persistence", () => {
 		const loaded = loadCheckpoint(workdir, runId);
 		assert.equal(loaded.status, "corrupt", "the closed schema is still enforced");
 	});
+	// v0.9: findings ride the same audit slot — same persistence rules.
+
+	it("round-trips findings through the checkpoint validator", () => {
+		const { workdir, runId } = setupRun("findings-roundtrip");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), {
+			audit: {
+				rounds: 2,
+				lastResult: "highs: F-001",
+				findings: [
+					{ id: "F-001", severity: "high", taskIds: ["Task-2"], note: "broken", evidence: "src/b.ts", raw: "raw line" },
+					{ id: "F-002", severity: "medium", taskIds: [], proposedTask: "tidy", note: "polish", evidence: "e", raw: "r" },
+				],
+			},
+		});
+		mutateCheckpoint(workdir, runId, () => cp);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		assert.deepEqual(loaded.checkpoint.execution?.audit?.findings, [
+			{ id: "F-001", severity: "high", taskIds: ["Task-2"], note: "broken", evidence: "src/b.ts", raw: "raw line" },
+			{ id: "F-002", severity: "medium", taskIds: [], proposedTask: "tidy", note: "polish", evidence: "e", raw: "r" },
+		]);
+	});
+
+	it("loads a checkpoint written before findings existed (absent, not corrupt)", () => {
+		const { workdir, runId } = setupRun("findings-legacy");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), { audit: { rounds: 1, lastResult: "VC-001" } });
+		mutateCheckpoint(workdir, runId, () => cp);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok", "legacy checkpoint still loads");
+		assert.equal(loaded.checkpoint.execution?.audit?.findings, undefined);
+	});
+
+	it("rejects unknown keys inside a findings record", () => {
+		const { workdir, runId } = setupRun("findings-bad-record");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), {
+			audit: { rounds: 1, findings: [{ id: "F-001", severity: "high", taskIds: [], note: "n", evidence: "e", raw: "r", bogus: true } as never] },
+		});
+		// Validation runs at write: a malformed findings record never lands.
+		assert.throws(() => mutateCheckpoint(workdir, runId, () => cp), /findings\.0: unexpected key/);
+	});
 });
