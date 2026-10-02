@@ -79,7 +79,7 @@ async function ensureRefAnalystModelReady(
 ): Promise<{ mode: string; model_selector: string | null; thinking_level: string | null; confirmed_at: string | null; name_prefix: string }> {
 	if (role.confirmed_at !== null && role.model_selector !== null) return role as never;
 	let outcome = await runFirstUseFlow(host, role.thinking_level);
-	if (outcome.status === "confirmed" && outcome.model_selector !== null && availableModels(host).length > 0 && findModel(host, outcome.model_selector) === null) {
+	if (outcome.status === "confirmed" && availableModels(host).length > 0 && findModel(host, outcome.modelSelector) === null) {
 		// F-008: a manually entered selector that the registry does not know —
 		// one re-pick, then let spawn-side errors surface precisely.
 		outcome = await runFirstUseFlow(host, outcome.role.thinking_level);

@@ -90,10 +90,15 @@ async function ensureReviewerReady(
 ): Promise<{ mode: string; model_selector: string | null; thinking_level: string | null; confirmed_at: string | null; name_prefix: string }> {
 	if (role.mode === "current-session" || reviewerReady(role as never)) return role as never;
 	let outcome: FirstUseOutcome = await runFirstUseFlow(host, role.thinking_level);
-	if (outcome.status === "confirmed" && outcome.model_selector !== null) {
+	if (outcome.status === "confirmed") {
 		// F-008: validate the freshly chosen selector against the registry when
 		// one is present, so a typo'd manual entry fails here, not at spawn.
-		if (availableModels(host).length > 0 && findModel(host, outcome.model_selector) === null) {
+		// (v0.8.1 field-drift fix: the outcome's top-level field is camelCase
+		// `modelSelector` — reading snake_case `model_selector` yielded
+		// undefined, passed the old `!== null` guard, and crashed findModel
+		// with "Cannot read properties of undefined (reading 'indexOf')"
+		// right after the first-use panel confirmed.)
+		if (availableModels(host).length > 0 && findModel(host, outcome.modelSelector) === null) {
 			outcome = await runFirstUseFlow(host, outcome.role.thinking_level);
 		}
 	}

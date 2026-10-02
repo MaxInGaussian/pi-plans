@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **First-use reviewer panel crash after model selection.** The F-008 selector re-validation in `refine` and `analyze_refs` read the first-use outcome's snake_case `model_selector`, but the outcome carries the camelCase `modelSelector` — the undefined value slipped past the `!== null` guard and crashed `findModel` with `Cannot read properties of undefined (reading 'indexOf')` immediately after the user confirmed a model in the native panel. Both call sites now read the typed field (latent since v0.7.0; it only fired on a first-use with an unconfirmed reviewer role).
+
 ### Changed
 
 - **analyze_refs no longer head-truncates the combined analysis.** The merged per-reference sections used to be cut to 2000 lines / 50 KB with a truncation note; they now flow into the tool result (and REF_ANALYSIS.md) verbatim, so the tail of large reference analyses is no longer silently dropped.
