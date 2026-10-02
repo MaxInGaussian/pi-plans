@@ -57,6 +57,7 @@ import {
 	applyExecutionProgress,
 	applyExecutionStopped,
 	createCheckpoint,
+	applyExecutionPlanAmended,
 	loadCheckpoint,
 	mutateCheckpoint,
 	planIdentityOf,
@@ -1300,9 +1301,18 @@ async function commitReviewOutcome(
 	const undeterminable = pendingIds.filter((id) => !passed.includes(id) && !failed.includes(id));
 	// v0.9: the newest round's reported findings ARE the unresolved set
 	// (stable ids — a problem is resolved only by no longer being reported).
-	const findings = outcome?.findings ?? [];
+	// v0.9.1 (F-001): only a REAL parsed report is authoritative. A round that
+	// produced no report at all — spawn failure (outcome === null) or the
+	// two-consecutive-discard synthesis — must PRESERVE the unresolved set:
+	// clearing it let the vacuous completion guard (empty pendingIds) mark a
+	// run done with its high finding silently dropped.
+	const reported = outcome !== null && outcome.findings !== undefined;
+	const findings = reported ? outcome.findings : ex.audit.findings;
 	ex.audit.findings = findings;
 	const highs = findings.filter((f) => f.severity === "high");
+	// Findings are actionable only when this round actually reported them;
+	// see the fix-loop branch below (v0.9.1, F-001).
+	const actionableHighs = reported ? highs : [];
 	const coveredTaskIds = flattenTaskViews(ex.tasks).map((task) => task.id);
 	const reportText = outcome?.report ?? "(review subagent failed to run)";
 	let reportPath: string | null = null;
@@ -1314,7 +1324,7 @@ async function commitReviewOutcome(
 				attempt: round.attempt,
 				outcome: outcome === null
 					? "spawn-failed"
-					: failed.length > 0 || highs.length > 0
+					: failed.length > 0 || actionableHighs.length > 0
 						? "failed"
 						: undeterminable.length > 0 ? "undeterminable" : "passed",
 				passed,
@@ -1338,8 +1348,12 @@ async function commitReviewOutcome(
 	// high finding can never complete the run (liveness). Failed checks and
 	// high findings drive ONE union rollback and exactly one executor wake;
 	// high wins over the undeterminable self-schedule (a finding is
-	// actionable independent of verdict evidence).
-	if (failed.length > 0 || highs.length > 0) {
+	// actionable independent of verdict evidence). v0.9.1 (F-001): verdicts
+	// are authoritative whenever a report exists, but the FINDINGS-driven
+	// half of the branch needs a findings-bearing report — a no-findings
+	// round (spawn failure, discard synthesis, legacy shape) preserves the
+	// unresolved set and self-schedules instead of rolling back on it.
+	if (failed.length > 0 || actionableHighs.length > 0) {
 		ex.audit.failed = failed;
 		ex.audit.undeterminable = undeterminable;
 		const rolledBack: string[] = [];
@@ -1352,18 +1366,25 @@ async function commitReviewOutcome(
 		// itself re-examines the repaired work next round (stable ids).
 		if (rolledBack.length > 0) invalidateChecksForRolledBackTasks(ex.items, ex.tasks, rolledBack);
 		const knownIds = new Set(coveredTaskIds);
-		const mappedHighIds = [...new Set(highs.flatMap((h) => h.taskIds).filter((id) => knownIds.has(id)))];
+		const mappedHighIds = [...new Set(actionableHighs.flatMap((h) => h.taskIds).filter((id) => knownIds.has(id)))];
 		const highRolledBack = findingsRollbackSet(ex.tasks, mappedHighIds);
-		const unmappedHighs = highs.filter((h) => !h.taskIds.some((id) => knownIds.has(id)));
+		const unmappedHighs = actionableHighs.filter((h) => !h.taskIds.some((id) => knownIds.has(id)));
 		const amended = unmappedHighs.length > 0 ? appendFindingTasks(ex, unmappedHighs) : [];
 		const allRolledBack = [...new Set([...rolledBack, ...highRolledBack])];
-		withExecutionCheckpoint(ctx, (cp) =>
-			applyExecutionProgress(cp, {
+		withExecutionCheckpoint(ctx, (cp) => {
+			// v0.9.1 (F-002): appending finding tasks rewrote the approved plan;
+			// re-stamp the checkpoint's plan identity in the same revision so a
+			// later /resume-plans accepts the amended plan instead of rejecting
+			// it as plan-mismatch (which would cost a full re-approval).
+			const amendedCp = amended.length > 0
+				? applyExecutionPlanAmended(cp, planIdentityOf(ex.planPath, cp.plan?.version ?? 1), ex.audit.rounds)
+				: cp;
+			return applyExecutionProgress(amendedCp, {
 				tasks: taskProgressMap(ex.tasks),
 				doneVcIds: ex.items.filter((item) => item.done).map((item) => item.id),
-				audit: { rounds: ex.audit.rounds, lastResult: failed.join(",") || `highs: ${highs.map((h) => h.id).join(",")}`, findings },
-			}),
-		);
+				audit: { rounds: ex.audit.rounds, lastResult: failed.join(",") || `highs: ${actionableHighs.map((h) => h.id).join(",")}`, findings },
+			});
+		});
 		if (allRolledBack.length > 0 || amended.length > 0) {
 			// Rolling back (or appending) is itself forward progress for the
 			// watchdog, but NOT for audit.rounds: that counter stays monotonic
@@ -1384,11 +1405,11 @@ async function commitReviewOutcome(
 				.filter((task) => !taskIsTerminal(task))
 				.map((task) => task.id);
 			const stranded = allRolledBack.length === 0 && amended.length === 0;
-			const highLines = highs.map((h) => `- ${h.id}${h.taskIds.length ? ` (${h.taskIds.join(", ")})` : ""}: ${h.note}`).join("\n");
+			const highLines = actionableHighs.map((h) => `- ${h.id}${h.taskIds.length ? ` (${h.taskIds.join(", ")})` : ""}: ${h.note}`).join("\n");
 			const reportRef = reportPath
 				? `Full round report: ${reportPath}`
 				: `Full round report (run dir unwritable — inline):\n\n---\n${reportText.slice(0, 4000)}`;
-			const content = `**pi-plans: execution review round ${ex.audit.rounds} found ${highs.length} high-severity finding(s)**${failed.length > 0 ? ` and failed checks: ${failed.join(", ")}` : ""}. Rolled back tasks: ${allRolledBack.join(", ") || "(none covered)"}${amended.length > 0 ? `. Tasks appended to the plan for unmapped findings: ${amended.join(", ")}` : ""}.\n\nHigh findings:\n${highLines || "(none — failed checks only)"}\n\nFix them and re-close the affected tasks with \`plans_update_task\`; the review reruns automatically once all tasks are terminal again.${ex.audit.rounds >= REVIEW_MAX_ROUNDS ? ` This was round ${REVIEW_MAX_ROUNDS} of ${REVIEW_MAX_ROUNDS}: the next terminal-task cycle pauses the run for review.` : ""}${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
+			const content = `**pi-plans: execution review round ${ex.audit.rounds} found ${actionableHighs.length} high-severity finding(s)**${failed.length > 0 ? ` and failed checks: ${failed.join(", ")}` : ""}. Rolled back tasks: ${allRolledBack.join(", ") || "(none covered)"}${amended.length > 0 ? `. Tasks appended to the plan for unmapped findings: ${amended.join(", ")}` : ""}.\n\nHigh findings:\n${highLines || "(none — failed checks only)"}\n\nFix them and re-close the affected tasks with \`plans_update_task\`; the review reruns automatically once all tasks are terminal again.${ex.audit.rounds >= REVIEW_MAX_ROUNDS ? ` This was round ${REVIEW_MAX_ROUNDS} of ${REVIEW_MAX_ROUNDS}: the next terminal-task cycle pauses the run for review.` : ""}${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
 			messaging().sendMessage(
 				{
 					customType: "pi-plans-audit-failed",
@@ -1402,10 +1423,13 @@ async function commitReviewOutcome(
 	}
 
 	// Fail-closed completion: every pending check affirmatively passed AND no
-	// high finding remains (the fix branch above already returned otherwise).
-	// An all-undeterminable round yields failed === [] — completing here would
-	// be fail-open, marking a run done with nothing verified.
-	if (passed.length === pendingIds.length) {
+	// high finding remains. The highs guard is explicit (v0.9.1, F-001): a
+	// no-report round skips the fix branch above, so this is the last line
+	// against vacuously completing an empty-pendingIds round with an
+	// unresolved high. An all-undeterminable round yields failed === [] —
+	// completing here would be fail-open, marking a run done with nothing
+	// verified.
+	if (passed.length === pendingIds.length && highs.length === 0) {
 		ex.audit.failed = [];
 		ex.audit.undeterminable = [];
 		withExecutionCheckpoint(ctx, (cp) =>
@@ -2359,7 +2383,12 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 		planTasks = parsePlanTasks(planText);
 		const snapshotProgress = taskProgressMap(snapshot.tasks ?? []);
 		tasks = buildTaskView(planTasks, snapshotProgress);
-		items = parseChecklist(planText);
+		// Fresh text wins, but the satisfied state survives the re-parse: a
+		// mid-loop session restore (v0.9.1, found via F-001's self-schedule
+		// path) must not hand the next round a brief that re-judges checks an
+		// earlier round already passed — that burned budget on every /reload.
+		const snapDone = new Set(snapshot.items.filter((c) => c.done).map((c) => c.id));
+		items = parseChecklist(planText).map((item) => (snapDone.has(item.id) ? { ...item, done: true } : item));
 	} catch {
 		tasks = snapshot.tasks;
 	}

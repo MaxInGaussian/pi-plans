@@ -156,6 +156,12 @@ export interface ExecutionCheckpoint {
 	 * silently hand a stalled run a fresh budget; optional so checkpoints
 	 * written before this field keep loading. */
 	stallRounds?: number;
+	/** v0.9.1 (F-002): set when the execution-review loop mechanically
+	 * appended finding tasks to the approved plan. The checkpoint's plan
+	 * identity is re-stamped at that moment so /resume-plans accepts the
+	 * amended plan; the approval record keeps the ORIGINAL digest as
+	 * evidence of what the user actually approved. */
+	planAmended?: { sha256: string; amendedAt: string; round: number };
 	/** v0.6.1: completion-audit bookkeeping (rounds, last failed set, pass). */
 	audit?: {
 		rounds: number;
@@ -487,7 +493,7 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	const record = asRecord(value, label);
 	rejectExtraKeys(
 		record,
-		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "stallRounds", "audit"]),
+		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "stallRounds", "planAmended", "audit"]),
 		label,
 	);
 	const execution: ExecutionCheckpoint = {
@@ -533,6 +539,15 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	}
 	if (record.stallRounds !== undefined && record.stallRounds !== null) {
 		execution.stallRounds = asInt(record.stallRounds, `${label}.stallRounds`, 0);
+	}
+	if (record.planAmended !== undefined && record.planAmended !== null) {
+		const rec = asRecord(record.planAmended, `${label}.planAmended`);
+		rejectExtraKeys(rec, new Set(["sha256", "amendedAt", "round"]), `${label}.planAmended`);
+		execution.planAmended = {
+			sha256: asString(rec.sha256, `${label}.planAmended.sha256`),
+			amendedAt: asString(rec.amendedAt, `${label}.planAmended.amendedAt`),
+			round: asInt(rec.round, `${label}.planAmended.round`, 0),
+		};
 	}
 	if (record.audit !== undefined && record.audit !== null) {
 		const audit = asRecord(record.audit, `${label}.audit`);
@@ -1148,6 +1163,23 @@ export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: Executi
 	if (progress.stallRounds !== undefined) execution.stallRounds = progress.stallRounds;
 	if (progress.audit !== undefined) execution.audit = progress.audit;
 	return { ...cp, execution };
+}
+
+/** v0.9.1 (F-002): the execution-review loop appended finding tasks to the
+ * approved plan file; re-stamp the checkpoint's plan identity to the amended
+ * digest so a later /resume-plans does not reject the run as plan-mismatch.
+ * The approval record is untouched — it keeps the digest the user actually
+ * approved, and planAmended records when and why the identity moved. */
+export function applyExecutionPlanAmended(cp: WorkflowCheckpoint, plan: PlanIdentity, round: number): WorkflowCheckpoint {
+	if (cp.phase !== "executing" || !cp.execution) throw new StateError("requires phase \"executing\"");
+	return {
+		...cp,
+		plan,
+		execution: {
+			...cp.execution,
+			planAmended: { sha256: plan.sha256, amendedAt: utcNow(), round },
+		},
+	};
 }
 
 /** D-011/F-001: code state changed under an unchanged plan — keep authorization, re-verify first. */

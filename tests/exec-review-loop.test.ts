@@ -521,6 +521,113 @@ describe("findings-driven fix loop (v0.9)", () => {
 	});
 });
 
+describe("no-report rounds preserve findings (v0.9.1 F-001)", () => {
+	const finding = (id: string) => ({ id, severity: "high" as const, taskIds: ["Task-2"], note: `${id} note`, evidence: "e", raw: "r" });
+
+	it("a spawn-failure round never vacuously completes a run with an unresolved high", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		// Round 1: both VCs pass, one mapped high -> rollback + wake.
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-001")] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const wakesAfterR1 = ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed").length;
+		// The executor fixes and re-closes; the settle starts round 2.
+		for (const id of ["Task-1", "Task-2"]) applyTaskUpdate(getExecution()!.tasks, id, "complete", "fixed");
+		persistTaskProgress(ctx);
+		const settle = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		// Round 2's subagent FAILS (null outcome): findings must be preserved,
+		// no completion, no second wake — the loop self-schedules. The inline
+		// settle chain stays pending through the self-scheduled round 3, so
+		// resolve round 3 BEFORE awaiting the settle.
+		ctl.resolveRound(null);
+		await tick();
+		const ex = getExecution()!;
+		assert.ok(ex, "a spawn-failure round never completes the run");
+		assert.deepEqual(ex.audit.findings.map((f: { id: string }) => f.id), ["F-001"], "unresolved findings survive the no-report round");
+		assert.equal(ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed").length, wakesAfterR1, "no extra wake on the no-report round");
+		// Round 3 spawned (self-schedule) and reports the fix — now it completes.
+		ctl.resolveRound({ round: 3, passed: [], failed: [], undeterminable: [], report: "fixed", findings: [] } as never);
+		await settle;
+		await __awaitReviewRoundForTests();
+		assert.equal(getExecution(), null, "a clean re-report completes");
+		ctl.drainAll();
+	});
+
+	it("the two-consecutive-discard synthesis preserves findings instead of clearing them", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-001")] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const engine = path.join(workdir, "lib", "engine.js");
+		const discard = () => {
+			fs.writeFileSync(engine, `export const engine = ${Math.random()};\n`, "utf8");
+			const later = new Date(Date.now() + 60_000);
+			fs.utimesSync(engine, later, later);
+		};
+		// Re-close, settle, then two fingerprint discards -> the synthesized
+		// commit must carry the previous findings forward, not wipe them.
+		for (const id of ["Task-1", "Task-2"]) applyTaskUpdate(getExecution()!.tasks, id, "complete", "fixed");
+		persistTaskProgress(ctx);
+		const settle = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		discard();
+		ctl.resolveRound({ round: 2, passed: [], failed: [], undeterminable: ["VC-001", "VC-002"], report: "stale", findings: [finding("F-001")] } as never);
+		await tick();
+		discard();
+		ctl.resolveRound({ round: 2, passed: [], failed: [], undeterminable: ["VC-001", "VC-002"], report: "stale", findings: [finding("F-001")] } as never);
+		await tick();
+		await tick();
+		const ex = getExecution()!;
+		assert.ok(ex, "the synthesis never completes the run");
+		assert.equal(ex.audit.rounds, 2, "the synthesis committed as round 2");
+		assert.deepEqual(ex.audit.findings.map((f: { id: string }) => f.id), ["F-001"], "findings preserved through the discard synthesis");
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+		await settle;
+		await __awaitReviewRoundForTests();
+	});
+});
+
+describe("plan amendment re-stamps the checkpoint identity (v0.9.1 F-002)", () => {
+	it("an amended plan passes /resume-plans instead of plan-mismatch", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [{ id: "F-009", severity: "high", taskIds: [], proposedTask: "harden the guard", note: "n", evidence: "e", raw: "r" }] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.ok(ex.tasks.find((t) => t.id === "Task-3"), "the amendment appended Task-3");
+		// The checkpoint identity now matches the AMENDED file, with provenance.
+		const cp = loadCheckpoint(workdir, runId).checkpoint;
+		const { sha256File } = await import("../src/workflow-state.ts");
+		assert.equal(cp.plan?.sha256, sha256File(planPath), "identity re-stamped to the amended digest");
+		assert.equal(cp.execution?.planAmended?.round, 1);
+		assert.equal(cp.execution?.planAmended?.sha256, sha256File(planPath));
+		// A later resume accepts the amended plan (no plan-mismatch re-approval).
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+		const { loadExecutionFromCheckpoint } = await import("../src/exec.ts");
+		const result = loadExecutionFromCheckpoint(makeCtx(workdir), runId);
+		assert.equal(result.status, "loaded", `resume accepts the amended plan (${result.status})`);
+		await stopExecution(makeCtx(workdir), "post-check teardown");
+	});
+});
+
 describe("executor injection with findings (v0.9)", () => {
 	it("executionContextMessage lists unresolved high findings for the repairing agent", async () => {
 		const { workdir, planPath } = freshWorkdir();
