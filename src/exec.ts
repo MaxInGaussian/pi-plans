@@ -106,6 +106,7 @@ import { RefineOverlayController, refineOverlayContext } from "./refine-ui.ts";
 import { applyRefineProgress, applyRefineResult, type RefineLaneState } from "./refine-ui-state.ts";
 import { resolveReviewerSpawn } from "./thinking-levels.ts";
 import { loadGlobalConfig, reviewerReady } from "./global-state.ts";
+import { matchesTerminalKey } from "./terminal-keys.ts";
 
 export interface ExecState {
 	planPath: string;
@@ -996,11 +997,21 @@ function freshReviewLane(attempt: number): RefineLaneState {
 
 /** Fresh controller per round (the controller is one-shot: closed latch,
  * overlayPromise bail, terminal-lane early return — reuse drops progress).
- * A UI failure must NEVER kill the round itself — best-effort only. */
+ * A UI failure must NEVER kill the round itself — best-effort only. The
+ * overlay forwards unhandled keys so Ctrl+Shift+T keeps working while the
+ * review overlay holds focus (pi-tui has no key bubbling). */
 function openReviewOverlay(ctx: ExtensionContext, lane: RefineLaneState, lang: "en" | "zh" | undefined, modelLabel: string): RefineOverlayController | null {
 	if (ctx.mode !== "tui" || ctx.hasUI !== true) return null;
 	try {
-		const controller = new RefineOverlayController("auditor", [{ id: lane.id, label: lane.label }], () => {}, lang ?? "en");
+		const controller = new RefineOverlayController(
+			"auditor",
+			[{ id: lane.id, label: lane.label }],
+			() => {},
+			lang ?? "en",
+			(data) => {
+				if (matchesTerminalKey(data, "ctrl+shift+t")) toggleDashboardExpanded(ctx);
+			},
+		);
 		controller.seedLane(lane);
 		controller.open(refineOverlayContext(ctx), modelLabel);
 		return controller;
@@ -1013,6 +1024,8 @@ function openReviewOverlay(ctx: ExtensionContext, lane: RefineLaneState, lang: "
  * state; inert when no round is in flight. */
 export function reopenReviewOverlay(ctx: ExtensionContext): void {
 	if (!execution?.review.inFlight || !reviewLane) return;
+	// Never stack a second overlay on a live one (Ctrl+Shift+R while open).
+	if (reviewOverlay && !reviewOverlay.isClosed()) return;
 	const controller = openReviewOverlay(ctx, reviewLane, execution.uiLanguage, reviewModelLabel ?? "session default");
 	if (controller) reviewOverlay = controller;
 }

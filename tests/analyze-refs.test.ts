@@ -303,7 +303,7 @@ describe("analyze_refs fanout", () => {
 
 	it("pins the per-batch overlay lifecycle (open before spawn, close in finally, cap 3)", () => {
 		const source = fs.readFileSync(path.join(ROOT, "tools", "analyze-refs.ts"), "utf8");
-		assert.equal((source.match(/new RefineOverlayController\("refs"/g) ?? []).length, 1, "controller must be constructed per batch inside the loop");
+		assert.equal((source.match(/new RefineOverlayController\(\s*"refs"/g) ?? []).length, 1, "controller must be constructed per batch inside the loop");
 		assert.match(source, /overlay\?\.open\(refineOverlayContext\(ctx\), modelLabel\)/);
 		assert.match(source, /await overlay\?\.close\(\);/);
 		assert.match(source, /const BATCH_SIZE = 3;/);

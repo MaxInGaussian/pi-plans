@@ -331,12 +331,12 @@ describe("refine overlay wiring", () => {
 	it("threads the chrome language through both overlay construction sites (issue #3, VC-007)", () => {
 		const refineSource = fs.readFileSync(path.join(process.cwd(), "tools", "refine.ts"), "utf8");
 		assert.match(refineSource, /const overlayLang = uiLanguageFromTag\(config\.language\.tag\)/);
-		assert.match(refineSource, /new RefineOverlayController\("reviewer", lanes, relayAbort, lang\)/);
+		assert.match(refineSource, /new RefineOverlayController\(\s*"reviewer",\s*lanes,\s*relayAbort,\s*lang,/);
 		assert.match(refineSource, /modelLabel,\s*\n\s*overlayLang,/);
 		const refsSource = fs.readFileSync(path.join(process.cwd(), "tools", "analyze-refs.ts"), "utf8");
 		assert.match(
 			refsSource,
-			/new RefineOverlayController\("refs", batch\.map\(\(job\) => \(\{ id: job\.laneId, label: job\.laneId \}\)\), relayAbort, resolveUiLanguage\(workdir\)\)/,
+			/new RefineOverlayController\(\s*"refs",\s*batch\.map\(\(job\) => \(\{ id: job\.laneId, label: job\.laneId \}\)\),\s*relayAbort,\s*resolveUiLanguage\(workdir\),/,
 		);
 	});
 });
@@ -532,5 +532,28 @@ describe("refine overlay kitty and fallback key handling (issue #2)", () => {
 		} finally {
 			__clearPiTuiForTests();
 		}
+	});
+
+	it("forwards unhandled keys instead of swallowing them (Ctrl+Shift+T while focused)", () => {
+		// pi-tui routes input ONLY to the focused component (no bubbling), so
+		// an open overlay used to swallow every global shortcut. Unhandled keys
+		// must reach the onUnhandledKey hook so callers can re-dispatch them.
+		const calls: string[] = [];
+		const component = new RefineOverlayComponent(
+			fakeTheme,
+			"auditor",
+			[readyLane("lane-1", "reviewer-1", "output")],
+			() => {},
+			undefined,
+			undefined,
+			"en",
+			(data) => calls.push(data),
+		);
+		// kitty CSI-u form of Ctrl+Shift+T — not an overlay key.
+		component.handleInput("\x1b[84;6u");
+		assert.deepEqual(calls, ["\x1b[84;6u"], "unhandled keys are forwarded");
+		// Handled keys (arrow down) are NOT forwarded.
+		component.handleInput("\x1b[B");
+		assert.deepEqual(calls, ["\x1b[84;6u"], "handled keys stay internal");
 	});
 });

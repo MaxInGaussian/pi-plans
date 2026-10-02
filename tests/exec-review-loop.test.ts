@@ -72,7 +72,7 @@ function freshWorkdir(): { workdir: string; planPath: string; runId: string } {
 	return { workdir, planPath, runId: run.run_id };
 }
 
-function makeCtx(workdir: string, mode: "print" | "tui" = "print", customOpens?: { count: number }) {
+function makeCtx(workdir: string, mode: "print" | "tui" = "print", customOpens?: { count: number }, components?: RefineOverlayComponent[]) {
 	const entries: Array<{ customType: string; data?: unknown; content?: string }> = [];
 	const ctx = {
 		cwd: workdir,
@@ -85,9 +85,12 @@ function makeCtx(workdir: string, mode: "print" | "tui" = "print", customOpens?:
 			setStatus: () => {},
 			setWidget: () => {},
 			theme: { fg: (_c: string, t: string) => t, bold: (t: string) => t },
-			// Minimal overlay host: counts ui.custom opens (one per controller).
-			custom: () => {
+			// Minimal overlay host: counts ui.custom opens (one per controller)
+			// and captures the rendered component so tests can drive its input.
+			custom: (render: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => { handleInput(data: string): void }) => {
 				if (customOpens) customOpens.count += 1;
+				const component = render({ requestRender() {}, terminal: undefined }, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, undefined, () => {});
+				if (components) components.push(component);
 				return Promise.resolve();
 			},
 		},
@@ -296,14 +299,19 @@ describe("execution-review loop (v0.8)", () => {
 		const ctl = controlledRunner();
 		__setAuditRunnerForTests(ctl.runner);
 		const opens = { count: 0 };
-		const ctx = makeCtx(workdir, "tui", opens);
+		const components: Array<{ handleInput(data: string): void }> = [];
+		const ctx = makeCtx(workdir, "tui", opens, components);
 		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
 		assert.equal(opens.count, 1, "the round opened its overlay before spawning");
-		// ESC closed the (one-shot) controller; the reopen shortcut rebuilds it
-		// from engine-held lane state while the round is still in flight.
+		// ESC closed the (one-shot) controller — only THEN may reopen rebuild it
+		// (the anti-stacking guard keeps a second overlay off a live one).
+		components[0]!.handleInput("\x1b");
 		const { reopenReviewOverlay } = await import("../src/exec.ts");
 		reopenReviewOverlay(ctx);
-		assert.equal(opens.count, 2, "reopen builds a fresh controller for the same round");
+		assert.equal(opens.count, 2, "reopen builds a fresh controller for the same round after ESC");
+		// A second reopen while the new controller is live must NOT stack.
+		reopenReviewOverlay(ctx);
+		assert.equal(opens.count, 2, "reopen never stacks a second live overlay");
 		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "done" });
 		await __awaitReviewRoundForTests();
 		// No round in flight → the shortcut is inert.

@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- **Ctrl+Shift+T dead while an overlay is open.** pi-tui routes key input only to the focused component (no bubbling), so any focused refine/refs/execution-review overlay swallowed every global shortcut — including the dashboard toggle, exactly when users watch the dashboard during the minutes-long review phase. The overlay component now forwards unhandled keys through an `onUnhandledKey` hook, and all three overlay call sites re-dispatch Ctrl+Shift+T to the dashboard toggle. `reopenReviewOverlay` also gained an anti-stacking guard so Ctrl+Shift+R can no longer open a second overlay on a live one.
+
 - **First-use reviewer panel crash after model selection.** The F-008 selector re-validation in `refine` and `analyze_refs` read the first-use outcome's snake_case `model_selector`, but the outcome carries the camelCase `modelSelector` — the undefined value slipped past the `!== null` guard and crashed `findModel` with `Cannot read properties of undefined (reading 'indexOf')` immediately after the user confirmed a model in the native panel. Both call sites now read the typed field (latent since v0.7.0; it only fired on a first-use with an unconfirmed reviewer role).
 
 ### Changed

@@ -183,10 +183,15 @@ export class RefineOverlayComponent implements Component {
 	private readonly modelLabel?: string;
 	/** Chrome language (issue #3); defaults to English for direct construction. */
 	private readonly lang: UiLanguage;
+	/** v0.8.1: pi-tui routes input ONLY to the focused component (no
+	 * bubbling), so an open overlay otherwise swallows every global shortcut
+	 * — including the Ctrl+Shift+T dashboard toggle users expect to work while
+	 * watching a review/refine overlay. Unhandled keys are forwarded here. */
+	private readonly onUnhandledKey?: (data: string) => void;
 	private selectedLane = 0;
 	private disposed = false;
 
-	constructor(theme: Theme, role: RefineOverlayRole, lanes: RefineLaneState[], onCancel: () => void, tui?: TUI, modelLabel?: string, lang: UiLanguage = "en") {
+	constructor(theme: Theme, role: RefineOverlayRole, lanes: RefineLaneState[], onCancel: () => void, tui?: TUI, modelLabel?: string, lang: UiLanguage = "en", onUnhandledKey?: (data: string) => void) {
 		this.theme = theme;
 		this.role = role;
 		this.lanes = lanes;
@@ -194,6 +199,7 @@ export class RefineOverlayComponent implements Component {
 		this.tui = tui;
 		this.modelLabel = modelLabel;
 		this.lang = lang;
+		this.onUnhandledKey = onUnhandledKey;
 		this.tui?.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
 	}
 
@@ -214,7 +220,10 @@ export class RefineOverlayComponent implements Component {
 			return;
 		}
 		const lane = this.lanes[this.selectedLane];
-		if (!lane) return;
+		if (!lane) {
+			this.onUnhandledKey?.(data);
+			return;
+		}
 		const viewport = Math.max(1, lane.viewportHeight ?? 1);
 		if (matchesTerminalKey(data, "up")) lane.scrollOffset -= 1;
 		else if (matchesTerminalKey(data, "down")) lane.scrollOffset += 1;
@@ -222,7 +231,11 @@ export class RefineOverlayComponent implements Component {
 		else if (matchesTerminalKey(data, "pageDown")) lane.scrollOffset += Math.max(1, viewport - 1);
 		else {
 			const mouse = data.match(/^\x1b\[<(\d+);\d+;\d+[Mm]$/);
-			if (!mouse || (Number(mouse[1]) & 64) !== 64) return;
+			if (!mouse || (Number(mouse[1]) & 64) !== 64) {
+				// Not ours: forward instead of swallowing (see onUnhandledKey note).
+				this.onUnhandledKey?.(data);
+				return;
+			}
 			lane.scrollOffset += (Number(mouse[1]) & 1) === 0 ? -3 : 3;
 		}
 		lane.followTranscript = false;
@@ -303,11 +316,14 @@ export class RefineOverlayController {
 	private tui: TUI | undefined;
 	private closed = false;
 	private readonly lang: UiLanguage;
+	/** Forwarded unhandled keys (see RefineOverlayComponent.onUnhandledKey). */
+	private readonly onUnhandledKey?: (data: string) => void;
 
-	constructor(role: RefineOverlayRole, laneIds: Array<{ id: string; label?: string }>, onCancel: () => void, lang: UiLanguage = "en") {
+	constructor(role: RefineOverlayRole, laneIds: Array<{ id: string; label?: string }>, onCancel: () => void, lang: UiLanguage = "en", onUnhandledKey?: (data: string) => void) {
 		this.role = role;
 		this.onCancel = onCancel;
 		this.lang = lang;
+		this.onUnhandledKey = onUnhandledKey;
 		this.lanes = laneIds.map((lane) => ({
 			id: lane.id,
 			label: lane.label ?? lane.id,
@@ -330,7 +346,7 @@ export class RefineOverlayController {
 				(_tui, theme, _keybindings, done) => {
 					this.tui = _tui;
 					this.done = done;
-					this.component = new RefineOverlayComponent(theme, this.role, this.lanes, () => this.cancel(), _tui, modelLabel, this.lang);
+					this.component = new RefineOverlayComponent(theme, this.role, this.lanes, () => this.cancel(), _tui, modelLabel, this.lang, this.onUnhandledKey);
 					if (this.closed) done(undefined);
 					return this.component;
 				},

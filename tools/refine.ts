@@ -44,6 +44,8 @@ import { buildReviewerTask, reviewerLanes } from "../src/refine-prompts.ts";
 import { graphBlockForRefiner } from "../src/code-graph/prompts.ts";
 import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
 import { RefineOverlayController, refineOverlayContext } from "../src/refine-ui.ts";
+import { matchesTerminalKey } from "../src/terminal-keys.ts";
+import { toggleDashboardExpanded } from "../src/exec.ts";
 
 
 const RefineParams = Type.Object({
@@ -122,7 +124,19 @@ function setupRefinementExecution(
 	if (parentSignal?.aborted) controller.abort();
 	else parentSignal?.addEventListener("abort", relayAbort, { once: true });
 
-	const overlay = ctx.mode === "tui" ? new RefineOverlayController("reviewer", lanes, relayAbort, lang) : undefined;
+	const overlay = ctx.mode === "tui"
+		? new RefineOverlayController(
+			"reviewer",
+			lanes,
+			relayAbort,
+			lang,
+			// pi-tui has no key bubbling: forward the dashboard toggle so
+			// Ctrl+Shift+T keeps working while the refine overlay holds focus.
+			(data) => {
+				if (matchesTerminalKey(data, "ctrl+shift+t")) toggleDashboardExpanded(ctx);
+			},
+		)
+		: undefined;
 	overlay?.open(refineOverlayContext(ctx), modelLabel);
 
 	return {
