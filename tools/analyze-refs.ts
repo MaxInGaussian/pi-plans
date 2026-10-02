@@ -15,7 +15,6 @@
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncateHead } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as fs from "node:fs";
@@ -264,9 +263,10 @@ export function registerAnalyzeRefsTool(ext: ExtensionAPI, baseDir: string): voi
 			}
 
 			const combined = sections.join("\n\n---\n\n");
-			const truncation = truncateHead(combined, { maxLines: 2000, maxBytes: 50 * 1024 });
-			let text = truncation.content;
-			if (truncation.truncated) text += `\n\n[Output truncated; full outputs remain in this tool result's details.]`;
+			// v0.8.1: no head-truncation — the full combined analysis flows into the
+		// tool result (and REF_ANALYSIS.md) verbatim; the previous 2000-line/
+		// 50KB cap silently dropped the tail of large reference analyses.
+			const text = combined;
 
 			return {
 				content: [

@@ -1,6 +1,11 @@
 # Changelog
 
-## [0.8.0] - 2026-10-02
+## [Unreleased]
+
+### Changed
+
+- **analyze_refs no longer head-truncates the combined analysis.** The merged per-reference sections used to be cut to 2000 lines / 50 KB with a truncation note; they now flow into the tool result (and REF_ANALYSIS.md) verbatim, so the tail of large reference analyses is no longer silently dropped.
+
 
 ### Changed
 
