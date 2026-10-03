@@ -337,9 +337,13 @@ describe("task-tree execution core", () => {
 				persistTaskProgress(ctx);
 			}
 			// Simulate an exhausted budget persisted from earlier attempts.
+			// v0.9.3: pin the (now non-default) 5-round budget so this test keeps
+			// exercising the same numeric-exhaustion path.
+			getExecution()!.reviewBudget = 5;
+			getExecution()!.reviewRoundsTotal = REVIEW_MAX_ROUNDS;
 			getExecution()!.audit.rounds = REVIEW_MAX_ROUNDS;
 			getExecution()!.audit.failed = ["VC-002"];
-			mutateCheckpoint(workdir, runId!, (cp) => applyExecutionProgress(cp, { audit: { rounds: REVIEW_MAX_ROUNDS, lastResult: "VC-002" } }));
+			mutateCheckpoint(workdir, runId!, (cp) => applyExecutionProgress(cp, { reviewBudget: 5, reviewRoundsTotal: REVIEW_MAX_ROUNDS, audit: { rounds: REVIEW_MAX_ROUNDS, lastResult: "VC-002" } }));
 			const snapshot = getExecution();
 			const ctxUi = { ...makeCtx(workdir), mode: "tui" as const };
 			await restoreFromSession(ctxUi, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
@@ -363,6 +367,8 @@ describe("task-tree execution core", () => {
 			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
 			persistTaskProgress(ctx3);
 		}
+		getExecution()!.reviewBudget = 5;
+		getExecution()!.reviewRoundsTotal = REVIEW_MAX_ROUNDS;
 		getExecution()!.audit.rounds = REVIEW_MAX_ROUNDS;
 		getExecution()!.audit.failed = ["VC-002"];
 		const headlessCtx = { ...makeCtx(wd2), hasUI: false } as never;
@@ -415,9 +421,20 @@ describe("task-tree execution core", () => {
 			persistTaskProgress(ctx);
 		}
 		// Exhaust the budget, then pause at the cap exactly like the loop does.
+		// v0.9.3: an explicit 5-round budget keeps the old numeric-cap shape.
+		getExecution()!.reviewBudget = 5;
+		getExecution()!.reviewRoundsTotal = REVIEW_MAX_ROUNDS;
 		getExecution()!.audit.rounds = REVIEW_MAX_ROUNDS;
 		getExecution()!.audit.failed = ["VC-001", "VC-002"];
-		const ctxTui = { ...makeCtx(workdir), mode: "tui" as const };
+		// The grant re-opens the picker (v0.9.3): this TUI host answers through
+		// its menu with the same 5-round budget; a bare panel resolution would
+		// mean "closed without a choice" and keep the run paused.
+		const baseCtx = makeCtx(workdir);
+		const ctxTui = {
+			...baseCtx,
+			mode: "tui" as const,
+			ui: { ...(baseCtx as { ui: Record<string, unknown> }).ui, select: async (_title: string, options: string[]) => options.find((o) => o.startsWith("5 round")) },
+		};
 		const snapshot = getExecution();
 		await restoreFromSession(ctxTui, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
 		await __awaitReviewRoundForTests();
@@ -433,14 +450,16 @@ describe("task-tree execution core", () => {
 		assert.equal(getExecution()!.audit.rounds, beforeRounds, "budget survives input");
 		// The explicit surface grants the fresh budget and completes the run.
 		const { resumeActiveExecution } = await import("../src/exec.ts");
-		const resumed = resumeActiveExecution(ctxTui);
-		assert.equal(resumed, true);
-		assert.equal(getExecution()!.audit.rounds, 0, "resume grants a fresh review budget");
+		const resumed = await resumeActiveExecution(ctxTui);
+		assert.equal(resumed.resumed, true);
+		assert.equal(resumed.grantedBudget, 5, "the grant reports the re-picked budget");
 		await __awaitReviewRoundForTests(); // detached grant chain completes the run
 		assert.equal(runnerCalls, 1, "review re-ran after the resume (fresh budget)");
 		const final = loadCheckpoint(workdir, runId!);
 		assert.ok(final.status === "ok");
 		assert.equal(final.checkpoint.phase, "completed");
+		// The granted round committed as budget round 1 — proof the counter reset.
+		assert.equal(final.checkpoint.execution?.audit?.rounds ?? 1, 1, "the granted budget restarted at round 1");
 		__setAuditRunnerForTests(null);
 	});
 
@@ -455,6 +474,9 @@ describe("task-tree execution core", () => {
 			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
 			persistTaskProgress(ctx);
 		}
+		// v0.9.3: pin the 5-round budget (the no-UI default is 3) so the retry
+		// chain still spends exactly REVIEW_MAX_ROUNDS rounds.
+		getExecution()!.reviewBudget = 5;
 		const snapshot = getExecution();
 		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
 		const ex = getExecution()!;
@@ -464,6 +486,7 @@ describe("task-tree execution core", () => {
 			assert.equal(ex.tasks.find((t) => t.id === id)?.status, "complete", `${id} not rolled back`);
 		}
 		assert.equal(ex.audit.rounds, REVIEW_MAX_ROUNDS, "the retry chain spent the whole budget");
+		assert.equal(ex.reviewRoundsTotal, REVIEW_MAX_ROUNDS, "the run-cumulative counter tracks every committed round");
 		assert.equal(ex.stall.paused, true, "the loop pauses at the cap");
 		assert.match(ex.stall.pausedReason ?? "", /execution review exhausted 5 rounds/);
 		assert.equal(
@@ -549,6 +572,8 @@ describe("task-tree execution core", () => {
 			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
 			persistTaskProgress(ctx);
 		}
+		// v0.9.3: pin the 5-round budget so the retry chain keeps its old length.
+		getExecution()!.reviewBudget = 5;
 		const snapshot = getExecution();
 		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
 		const ex = getExecution()!;
@@ -617,6 +642,8 @@ describe("task-tree execution core", () => {
 			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
 			persistTaskProgress(ctx);
 		}
+		getExecution()!.reviewBudget = 5;
+		getExecution()!.reviewRoundsTotal = REVIEW_MAX_ROUNDS;
 		getExecution()!.audit.rounds = REVIEW_MAX_ROUNDS;
 		getExecution()!.audit.failed = ["VC-002"];
 		const ctxUi = { ...makeCtx(workdir), mode: "tui" as const };

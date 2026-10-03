@@ -132,6 +132,59 @@ export function canTransition(task: TaskView, next: TaskStatus): boolean {
 	return false;
 }
 
+/** Authoritative provenance of the newest failed review round's rollback.
+ * Captured when the round commits: the reopen helpers mutate the tree (and
+ * report only the nodes that flipped), so a later "re-derivation" cannot
+ * distinguish an already-pending task from a reopened one and would re-apply
+ * the rollback to work that has since been re-closed. */
+export interface RollbackSource {
+	rolledBack: string[];
+	round: number;
+}
+
+/** Coverage of a set of failed checks (plus explicit finding task ids) with
+ * the same parent→child cascade the rollback applies, computed WITHOUT
+ * touching the tree. Used to reconstruct the blocker of a checkpoint written
+ * before `execution.blocked` existed: that round's reopen already happened,
+ * so only the provenance is missing. Never call it to APPLY a rollback —
+ * `auditRollbackSet`/`findingsRollbackSet` own that. */
+export function rollbackCoverageIds(
+	tasks: TaskView[],
+	checklist: CheckItem[],
+	vcIds: readonly string[],
+	extraTaskIds: readonly string[] = [],
+): string[] {
+	const wanted = new Set(vcIds);
+	const covered = new Set(extraTaskIds);
+	for (const item of checklist) {
+		if (!wanted.has(item.id)) continue;
+		for (const id of extractTaskCoverage(item.text)) covered.add(id);
+	}
+	if (covered.size === 0) return [];
+	const out: string[] = [];
+	const walk = (node: TaskView, inherited: boolean): void => {
+		const hit = inherited || covered.has(node.id);
+		if (hit) out.push(node.id);
+		for (const child of node.children) walk(child, hit);
+	};
+	for (const node of tasks) walk(node, false);
+	return out;
+}
+
+/** Blocking tasks of the newest rollback set: non-terminal tasks only, in
+ * tree order. Pure — it never touches `status`/`evidence`/`skipReason`, so it
+ * is safe to call on every wake, dashboard repaint, or checkpoint write. A
+ * task that was already pending when the round rolled back IS reported: the
+ * caller supplies the authoritative set, unlike `auditRollbackSet` which
+ * reports flips. */
+export function blockedReviewTasks(tasks: TaskView[], rolledBackIds: readonly string[]): string[] {
+	if (rolledBackIds.length === 0) return [];
+	const rolledBack = new Set(rolledBackIds);
+	return flattenTaskViews(tasks)
+		.filter((task) => rolledBack.has(task.id) && !taskIsTerminal(task))
+		.map((task) => task.id);
+}
+
 /** Rollback set for a failed verification check: every task in its covers
  * clause (parents cascade to their children, skipped tasks reopen too).
  * Returns the ids that actually reopen.

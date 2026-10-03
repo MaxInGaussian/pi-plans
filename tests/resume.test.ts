@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { listResumeCandidates, pickDefaultCandidate } from "../src/resume.ts";
 import { migrateRunIntoCurrentWorktree, resumePlansCommand } from "../src/resume-command.ts";
-import { createCheckpoint, loadCheckpoint, mutateCheckpoint, applyQuestionAsked, applyQuestionAnswered } from "../src/workflow-state.ts";
+import { createCheckpoint, loadCheckpoint, mutateCheckpoint, applyExecutionApproved, applyExecutionProgress, applyPlanWritten, applyQuestionAsked, applyQuestionAnswered, planIdentityOf, resolveHeadAt } from "../src/workflow-state.ts";
 import { acquireOwnership, processStartOf } from "../src/run-ownership.ts";
 import { resetRunBindingForTests } from "../src/run-context.ts";
 import { initState, setArtifactRoot, setRunStatus, startRun, StateError } from "../src/state.ts";
@@ -399,3 +399,47 @@ describe("impl-review crash-window recovery (removed in v0.6.1)", () => {
 	});
 });
 
+describe("execution resume brief with a blocked review (v0.9.2)", () => {
+	const BLOCKED_PLAN = `# PLAN_v1 - blocked brief
+
+## Tasks
+
+- Task-1: engine — files: lib/engine.js; wave: 1
+- Task-2: host — files: lib/host.js; wave: 1
+
+## Verification Checks
+
+- [ ] \`VC-001\` covers \`Task-1\`; pass condition: engine works; evidence: tests; metric: green.
+- [ ] \`VC-002\` covers \`Task-2\`; pass condition: host works; evidence: tests; metric: green.
+`;
+
+	it("names the open rolled-back task and how to unblock the review", async () => {
+		resetRunBindingForTests();
+		// A matching HEAD is required: an unverifiable head re-opens every task
+		// (reverifyAll) and legitimately drops the blocker with the progress.
+		const workdir = setupRepo("blocked-brief", { commit: true });
+		const run = startRun(workdir, { topic: "blockedbrief", skill: "plan-normal", requestText: "b" }).run;
+		const planPath = path.join(run.artifact_dir, "PLAN_v1.md");
+		fs.mkdirSync(run.artifact_dir, { recursive: true });
+		fs.writeFileSync(planPath, BLOCKED_PLAN, "utf8");
+		createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+		mutateCheckpoint(workdir, run.run_id, (cp) => {
+			const plan = planIdentityOf(planPath, 1);
+			let next = applyPlanWritten({ ...cp, nextAction: "accept-execute" }, plan);
+			next = applyExecutionApproved(next, { plan, worktree: workdir, headAtApproval: resolveHeadAt(workdir), approvedAt: next.updatedAt });
+			return applyExecutionProgress(next, {
+				tasks: { "Task-1": { status: "complete", evidence: "e" }, "Task-2": { status: "pending" } },
+				blocked: { rolledBack: ["Task-2"], tasks: ["Task-2"], round: 1, escalatedRounds: 2, since: next.updatedAt },
+			});
+		});
+		setRunStatus(workdir, run.run_id, "executing");
+		const mock = makeCtx(workdir);
+		await resumePlansCommand(ctxAdapter(mock) as never, BASE_DIR);
+		assert.equal(mock.userMessages.length, 1, "one resume brief");
+		const brief = mock.userMessages[0]!;
+		assert.match(brief, /PI-PLANS RESUME/);
+		assert.match(brief, /Review blocked: Task-2 was reopened by execution review round 1 and is still open/);
+		assert.match(brief, /close it with plans_update_task/);
+		assert.match(brief, /no review round is running while these are open\./i);
+	});
+});

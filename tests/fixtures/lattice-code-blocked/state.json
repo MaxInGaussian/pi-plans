@@ -1,0 +1,158 @@
+{
+	"_source": {
+		"run": "lattice-code 20261002T080333Z-v0-4-ts-host-python-daemon",
+		"checkpoint_slices": [
+			"execution.tasks (only the covered tasks)",
+			"execution.audit.rounds",
+			"execution.audit.lastResult",
+			"execution.audit.undeterminable"
+		],
+		"real_state": "round 1 rolled back the failed checks' coverage; the repair round re-closed everything except the parent Task-2, which is still pending here",
+		"note": "no `execution.blocked` key: the checkpoint predates the feature, which is exactly what the backfill must handle"
+	},
+	"tasks": {
+		"Task-2": {
+			"status": "pending",
+			"evidence": "提交 ce36d13（22 文件，+1101/−34）。make gate 全绿（frozen install + pytest 902 + bun test 11）；ruff 干净；门禁三查（更新版白名单）clean。VC-089/090/091/112 的种子用例就位（wave-2 形态：bun run 宿主）。"
+		},
+		"Task-2.1": {
+			"status": "complete",
+			"evidence": "修复轮补强（78ba6c1）：provider.ts overlay 层不变；隔离层经 F-001/F-014 相关修复复验（tests/isolation 对 bun-run 与新编译二进制各 8 用例全绿——含重跑的三条 manifest/env/共存证明）。VC-089~093 复验通过。"
+		},
+		"Task-2.2": {
+			"status": "complete",
+			"evidence": "隔离层原样复验：六变量 + sanitizedChildEnv + auth 0600 + XDG_CACHE_HOME 重定向；daemonPython 增 dev-venv 探测；bootstrap.ts 子进程沿用 sanitizedChildEnv。env.test 全绿。"
+		},
+		"Task-2.3": {
+			"status": "complete",
+			"evidence": "catalog/ 中立基座不变；statusContextFromCatalog（app.ts）新增：Ctx 段数据源接 catalog context_window（F-015 修复），VC-104 catalog-fed 用例（dual_marks.test）+ picker 全量 catalog 完备性用例（VC-122，见 Task-7 重开证据）。"
+		},
+		"Task-2.4": {
+			"status": "complete",
+			"evidence": "隔离套件对重建后的编译二进制复跑全绿（doctor 链路 + 预置 pi 共存 + 六变量）；manifest diff 证明不变。"
+		},
+		"Task-3": {
+			"status": "complete",
+			"evidence": "提交 5e18b99 + 修复轮 78ba6c1（挂载 + 数据源 + 差异化）。bun test 115/115、gate 全绿。"
+		},
+		"Task-3.1": {
+			"status": "complete",
+			"evidence": "四区装配现有生产挂载（F-002 修复）：mountTui/runTui 进 cli.ts 默认路径（TTY 时真跑 pi-tui 主屏 + Editor 焦点 + Ctrl+C 退出）；statusRegion 由 statusContextFromCatalog 供数（F-015）。app.test 4 用例 + dual_marks 全绿。"
+		},
+		"Task-3.2": {
+			"status": "complete",
+			"evidence": "banner 梯子不变；双 ⌗ 差异化修复（F-012）：input 前缀改 accent_dim 非加粗（与内核侧 prompt_glyph 奇偶校验一致），六相位逐一断言 rail token ≠ accent_dim、三档样式互异、ascii 档 [X] 码 ≠ [#]（dual_marks.test 6 用例）。"
+		},
+		"Task-3.3": {
+			"status": "complete",
+			"evidence": "rail 六态不变；statusbar 补 VC-104 断言：catalog-fed Ctx 真值渲染（Ctx 12.5%/200k）、模型组贴行尾 40–130 全扫、占位槽零抖动。"
+		},
+		"Task-3.4": {
+			"status": "complete",
+			"evidence": "卡片/输入线不变；宽度扫描 8–130 与样式逐行断言维持全绿。"
+		},
+		"Task-4": {
+			"status": "complete",
+			"evidence": "提交 2dbb046 + 修复轮 78ba6c1。pytest 218（含新 lease-less CONFLICT 帧、bootstrap 握手 2 例）、bun 115、gate 全绿。"
+		},
+		"Task-4.1": {
+			"status": "complete",
+			"evidence": "schema 增 read.peek/commit.abort/graph.reparse（F-007），双侧再生成（sha 25e658d1…）+ --check 双绿。"
+		},
+		"Task-4.2": {
+			"status": "complete",
+			"evidence": "daemon 修复：graph.test 改经 asyncio.to_thread 离环跑门（F-003——读循环/心跳不再被 120s 测试阻塞）；commit.finalize 校验 staged ticket、commit.abort 走 handle.abort_commit（F-006）；handle 增 abort_commit/reparse；EOF 排空竞态修复（in-flight 响应先写后关）；read.peek/graph.reparse 接线。VC-116/117 维持，VC-118 升级为 _dispatch 分支 + build_table 条目动态枚举映射（正则抽源 + 临时仓建 store）。"
+		},
+		"Task-4.3": {
+			"status": "complete",
+			"evidence": "F-001 修复：request id 每逻辑请求恰铸一次，重放复用同一 rid（send 显式收 rid；requestIds 日志）；专测：在飞 session.exec 被 kill → 重启重放 → requestIds 切片 ≥2 次发送且去重后恰 1 个 id。VC-095 主机半边成立（daemon 半边 tests/py 两用例原有）。"
+		},
+		"Task-5": {
+			"status": "complete",
+			"evidence": "提交 db1f0b8 + 修复轮 78ba6c1。VC-106（cassette 闭环 + 冷启动 + must_survive）与 VC-119（脱敏零命中）用例就位。"
+		},
+		"Task-5.1": {
+			"status": "complete",
+			"evidence": "F-011 修复：RoleLoop 重建于 pi-agent-core `Agent`（transcript 状态、工具执行、turn 生命周期皆库驱动；我们的 stream 适配器经 createAssistantMessageEventStream 供帧，LoopTools 以真 AgentTool 声明注入，错误经 stopReason=error 呈现为抛出）。headless 冒烟双态复绿。"
+		},
+		"Task-5.2": {
+			"status": "complete",
+			"evidence": "chain/envelope/冷启动规则不变；错误从适配器透传（errorMessage → throw）。"
+		},
+		"Task-5.3": {
+			"status": "complete",
+			"evidence": "F-009/F-010 修复：提交 cassette 产物 fixtures/cassettes/revision-loop.json（4 条目：拒绝→修订→批准）；扫描器增 org-/org_/acct_ 三类 org-id 模式并计入 redact；cassette 驱动全修订闭环用例（仅凭录制驱动 ChainDriver 到 approved、rev=2、双产物在盘）+ 提交产物零泄漏断言 + 脏样本捕获断言。"
+		},
+		"Task-5.4": {
+			"status": "complete",
+			"evidence": "cards 接线不变，维持全绿。"
+		},
+		"Task-6": {
+			"status": "complete",
+			"evidence": "提交 0a7dcaf + 修复轮 78ba6c1。schedule.test 14 用例全绿。"
+		},
+		"Task-6.1": {
+			"status": "complete",
+			"evidence": "F-008 修复：runWave 增运行时预检 assertDisjointWave（WaveOverlapError 携带碰撞对，./ 归一，executor 起跑前拒绝）+ 调度产物逐波过检用例；无租约写经真 daemon 拒绝用例（tests/py：graph.write 无 lease → ok:false CONFLICT \"holds no lease\"）。"
+		},
+		"Task-6.2": {
+			"status": "complete",
+			"evidence": "三轴预算与隔离语义不变，全绿维持。"
+		},
+		"Task-6.3": {
+			"status": "complete",
+			"evidence": "租约强制留 kernel 侧不变；CONFLICT 帧现由真 daemon 用例钉死（VC-107 第四项闭环）。"
+		},
+		"Task-7": {
+			"status": "complete",
+			"evidence": "提交 353edad + 修复轮 78ba6c1。picker.test 全绿。"
+		},
+		"Task-7.1": {
+			"status": "complete",
+			"evidence": "/login 两级与徽章语义不变（env 态维持刻意缺席）。"
+		},
+		"Task-7.2": {
+			"status": "complete",
+			"evidence": "选择器 FSM 不变；F-004 修复：catalog effort 的 null 值视为显式禁用（\"maps no native parameter\" 原因），缺失级维持 \"exposes no native parameter\"；VC-122 全量断言：catalog_v1.json 每模型 context_window≥1 且 effort≥1 级，禁用级模型 ≥1（picker.test 新增全量用例）。"
+		},
+		"Task-7.3": {
+			"status": "complete",
+			"evidence": "禁用级带原因 + 键位零冲突维持（含 null-effort 模型渲染 disabled 列表）。"
+		},
+		"Task-9": {
+			"status": "complete",
+			"evidence": "提交 c5b9def + 修复轮 78ba6c1。VC-111 两项闭环。"
+		},
+		"Task-9.1": {
+			"status": "complete",
+			"evidence": "F-005 修复：生产路径写会话（runHeadless 建 session、user/assistant/end 事件落 $LATTICE_HOME/sessions）；lattice resume 起真 DaemonClient（state.health 图恢复报告）后再回放 transcript；VC-111 强化：真 daemon 图等价往返用例（恢复前后 read.ls id 集恒等 + 篡改只显于回放）。"
+		},
+		"Task-9.2": {
+			"status": "complete",
+			"evidence": "resume 半边同上（daemon 恢复 + transcript 纯显示）；session.test 5 用例全绿。"
+		},
+		"Task-10": {
+			"status": "complete",
+			"evidence": "提交 4325370 + 修复轮 78ba6c1。VC-093/121/123 证据链补齐。"
+		},
+		"Task-10.1": {
+			"status": "complete",
+			"evidence": "五平台 + sidecar 不变（修复轮后 make dist 重建，二进制嵌入修复后 TS）。"
+		},
+		"Task-10.2": {
+			"status": "complete",
+			"evidence": "F-013 修复：tests/py/test_bootstrap_handshake.py —— 临时 venv 离线优先装 dist/kernel wheel（uv 缺席走 ensurepip+pip 回退），断言 wheel==installed==pyproject 0.4.0，且安装的 daemon 应答 ping（2 用例实跑通过；无 wheel 时 skip）。"
+		},
+		"Task-10.3": {
+			"status": "complete",
+			"evidence": "F-014 修复：README 全面改写（Quickstart 旧流程/ui.json/tmux/--glob 全清；新 Install/How-it-works/Development 与分发一致）；tests/py/test_readme_shape.py 三用例钉死（必含 $LATTICE_HOME/install.sh/-p，七类陈旧片段零命中，dev 命令在）。"
+		}
+	},
+	"audit": {
+		"rounds": 1,
+		"lastResult": "VC-095,VC-102,VC-104,VC-106,VC-107,VC-111,VC-118,VC-119,VC-121,VC-122,VC-123",
+		"undeterminable": [
+			"VC-109"
+		]
+	}
+}

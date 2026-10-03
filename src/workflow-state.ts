@@ -29,6 +29,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import * as path from "node:path";
 import { StateError, atomicWriteJson, resolveStateRootOrNull, runGit, runDirPath, utcNow } from "./state.ts";
 import { assertOwnership, heldOwnershipRecord } from "./run-ownership.ts";
+import type { NoProgressState, ReviewBudget } from "./review-budget.ts";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -133,6 +134,21 @@ export interface ExecutionApproval {
 	approvedAt: string;
 }
 
+/** v0.9.2: the newest failed execution-review round's rollback set plus the
+ * tasks among it that are still open. Captured when the round commits (the
+ * reopen helpers mutate the tree and report only flipped nodes, so a later
+ * re-derivation cannot rebuild this set) and persisted so wakes, the pause
+ * reason, the dashboard, and resume briefs can name the blocker after a
+ * restart. `escalatedRounds` counts consecutive blocked wakes — the escalation
+ * ladder must not ride `stallRounds`, which any successful tool call resets. */
+export interface ExecutionBlocked {
+	rolledBack: string[];
+	tasks: string[];
+	round: number;
+	escalatedRounds: number;
+	since: string;
+}
+
 export interface ExecutionCheckpoint {
 	approval: ExecutionApproval | null;
 	doneVcIds: string[];
@@ -156,6 +172,29 @@ export interface ExecutionCheckpoint {
 	 * silently hand a stalled run a fresh budget; optional so checkpoints
 	 * written before this field keep loading. */
 	stallRounds?: number;
+	/** v0.9.2: outstanding blocker from the newest failed review round (see
+	 * `ExecutionBlocked`); absent = nothing blocks the review. Optional on
+	 * read so checkpoints written before it keep loading. */
+	blocked?: ExecutionBlocked | null;
+	/** v0.9.3: the per-run execution-review budget (committed rounds, or
+	 * `"unlimited"`). Absent = not decided yet (the picker runs before round
+	 * 1) OR written by a pre-v0.9.3 build, in which case a checkpoint that
+	 * already spent rounds keeps the legacy 5-round bound
+	 * (`resolveStoredBudget` in ./review-budget.ts). */
+	reviewBudget?: ReviewBudget;
+	/** v0.9.3: the budget above was the no-UI fallback, not a user pick — the
+	 * dashboard/resume brief annotate it `(default)`. Optional on read. */
+	reviewBudgetDefaulted?: boolean;
+	/** v0.9.3: committed review rounds across the WHOLE run (never reset by a
+	 * grant) — bounds the unlimited budget together with `reviewCapExtension`. */
+	reviewRoundsTotal?: number;
+	/** v0.9.3: explicit `/plans-execute` grants lifted the unlimited hard cap
+	 * by this many rounds (each grant that lands on `unlimited` adds
+	 * `UNLIMITED_HARD_CAP`). */
+	reviewCapExtension?: number;
+	/** v0.9.3: no-progress valve state for the unlimited budget (signature of
+	 * the last committed round's outcome plus its consecutive streak). */
+	reviewNoProgress?: NoProgressState | null;
 	/** v0.9.1 (F-002): set when the execution-review loop mechanically
 	 * appended finding tasks to the approved plan. The checkpoint's plan
 	 * identity is re-stamped at that moment so /resume-plans accepts the
@@ -295,6 +334,13 @@ function asInt(value: unknown, label: string, min: number): number {
 		throw new CheckpointValidationError(`${label}: expected an integer >= ${min}`);
 	}
 	return value;
+}
+
+/** v0.9.3: a positive integer round count or the literal "unlimited". */
+function asReviewBudget(value: unknown, label: string): ReviewBudget {
+	if (value === "unlimited") return "unlimited";
+	if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
+	throw new CheckpointValidationError(`${label}: expected a positive integer or "unlimited"`);
 }
 
 function asEnum<T extends string>(value: unknown, allowed: Set<T>, label: string): T {
@@ -493,7 +539,7 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	const record = asRecord(value, label);
 	rejectExtraKeys(
 		record,
-		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "stallRounds", "planAmended", "audit"]),
+		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "stallRounds", "blocked", "planAmended", "audit", "reviewBudget", "reviewBudgetDefaulted", "reviewRoundsTotal", "reviewCapExtension", "reviewNoProgress"]),
 		label,
 	);
 	const execution: ExecutionCheckpoint = {
@@ -513,6 +559,17 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	};
 	if (record.currentI !== undefined) execution.currentI = asString(record.currentI, `${label}.currentI`);
 	if (record.pausedReason !== undefined) execution.pausedReason = asString(record.pausedReason, `${label}.pausedReason`);
+	if (record.blocked !== undefined && record.blocked !== null) {
+		const blocked = asRecord(record.blocked, `${label}.blocked`);
+		rejectExtraKeys(blocked, new Set(["rolledBack", "tasks", "round", "escalatedRounds", "since"]), `${label}.blocked`);
+		execution.blocked = {
+			rolledBack: asStringArray(blocked.rolledBack, `${label}.blocked.rolledBack`),
+			tasks: asStringArray(blocked.tasks, `${label}.blocked.tasks`),
+			round: asInt(blocked.round, `${label}.blocked.round`, 0),
+			escalatedRounds: asInt(blocked.escalatedRounds, `${label}.blocked.escalatedRounds`, 0),
+			since: asTimestamp(blocked.since, `${label}.blocked.since`),
+		};
+	}
 	if (record.reverifyAll !== undefined) execution.reverifyAll = asBool(record.reverifyAll, `${label}.reverifyAll`);
 	if (record.originWorktree !== undefined) execution.originWorktree = asString(record.originWorktree, `${label}.originWorktree`);
 	if (record.delegate !== undefined && record.delegate !== null) {
@@ -547,6 +604,30 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 			sha256: asString(rec.sha256, `${label}.planAmended.sha256`),
 			amendedAt: asString(rec.amendedAt, `${label}.planAmended.amendedAt`),
 			round: asInt(rec.round, `${label}.planAmended.round`, 0),
+		};
+	}
+	// v0.9.3 review budget. `reviewBudget` accepts a positive integer or the
+	// literal "unlimited"; the counters are non-negative integers; the
+	// no-progress record is a small fixed shape. All optional on read so
+	// pre-feature checkpoints keep loading.
+	if (record.reviewBudget !== undefined && record.reviewBudget !== null) {
+		execution.reviewBudget = asReviewBudget(record.reviewBudget, `${label}.reviewBudget`);
+	}
+	if (record.reviewBudgetDefaulted !== undefined) {
+		execution.reviewBudgetDefaulted = asBool(record.reviewBudgetDefaulted, `${label}.reviewBudgetDefaulted`);
+	}
+	if (record.reviewRoundsTotal !== undefined && record.reviewRoundsTotal !== null) {
+		execution.reviewRoundsTotal = asInt(record.reviewRoundsTotal, `${label}.reviewRoundsTotal`, 0);
+	}
+	if (record.reviewCapExtension !== undefined && record.reviewCapExtension !== null) {
+		execution.reviewCapExtension = asInt(record.reviewCapExtension, `${label}.reviewCapExtension`, 0);
+	}
+	if (record.reviewNoProgress !== undefined && record.reviewNoProgress !== null) {
+		const np = asRecord(record.reviewNoProgress, `${label}.reviewNoProgress`);
+		rejectExtraKeys(np, new Set(["key", "streak"]), `${label}.reviewNoProgress`);
+		execution.reviewNoProgress = {
+			key: asString(np.key, `${label}.reviewNoProgress.key`),
+			streak: asInt(np.streak, `${label}.reviewNoProgress.streak`, 0),
 		};
 	}
 	if (record.audit !== undefined && record.audit !== null) {
@@ -1141,6 +1222,20 @@ export interface ExecutionProgressInput {
 	audit?: { rounds: number; lastResult?: string; passed?: boolean; undeterminable?: string[]; findings?: ReviewFindingRecord[] };
 	/** v0.7.1: watchdog budget counter, so a restart cannot refresh it. */
 	stallRounds?: number;
+	/** v0.9.2: blocker record; null clears it (delete-on-null, like
+	 * `pausedReason`/`delegate`). */
+	blocked?: ExecutionBlocked | null;
+	/** v0.9.3: per-run execution-review budget; null clears it (delete-on-null,
+	 * used by the stop/complete cleanup paths). */
+	reviewBudget?: ReviewBudget | null;
+	/** v0.9.3: whether `reviewBudget` came from the no-UI fallback. */
+	reviewBudgetDefaulted?: boolean | null;
+	/** v0.9.3: committed rounds across the whole run (monotonic). */
+	reviewRoundsTotal?: number;
+	/** v0.9.3: explicit unlimited-cap extension accumulated by grants. */
+	reviewCapExtension?: number;
+	/** v0.9.3: no-progress valve state; null clears it (delete-on-null). */
+	reviewNoProgress?: NoProgressState | null;
 }
 
 export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: ExecutionProgressInput): WorkflowCheckpoint {
@@ -1161,6 +1256,16 @@ export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: Executi
 	else if (progress.delegate !== undefined) execution.delegate = progress.delegate;
 	if (progress.tasks !== undefined) execution.tasks = progress.tasks;
 	if (progress.stallRounds !== undefined) execution.stallRounds = progress.stallRounds;
+	if (progress.blocked === null) delete execution.blocked;
+	else if (progress.blocked !== undefined) execution.blocked = progress.blocked;
+	if (progress.reviewBudget === null) delete execution.reviewBudget;
+	else if (progress.reviewBudget !== undefined) execution.reviewBudget = progress.reviewBudget;
+	if (progress.reviewBudgetDefaulted === null) delete execution.reviewBudgetDefaulted;
+	else if (progress.reviewBudgetDefaulted !== undefined) execution.reviewBudgetDefaulted = progress.reviewBudgetDefaulted;
+	if (progress.reviewRoundsTotal !== undefined) execution.reviewRoundsTotal = progress.reviewRoundsTotal;
+	if (progress.reviewCapExtension !== undefined) execution.reviewCapExtension = progress.reviewCapExtension;
+	if (progress.reviewNoProgress === null) delete execution.reviewNoProgress;
+	else if (progress.reviewNoProgress !== undefined) execution.reviewNoProgress = progress.reviewNoProgress;
 	if (progress.audit !== undefined) execution.audit = progress.audit;
 	return { ...cp, execution };
 }
@@ -1192,14 +1297,25 @@ export function applyExecutionCompleted(cp: WorkflowCheckpoint): WorkflowCheckpo
 	if (cp.phase !== "executing" || !cp.execution) throw new StateError("requires phase \"executing\"");
 	// v0.6.1 (D-018): the post-execution amelioration loop is gone; a
 	// completed audit passes the run straight to the terminal phase.
+	// v0.9.3: the review budget (and its valve state) describes a review that
+	// no longer runs — completed runs do not carry it.
+	const {
+		reviewBudget: _reviewBudget,
+		reviewBudgetDefaulted: _reviewBudgetDefaulted,
+		reviewRoundsTotal: _reviewRoundsTotal,
+		reviewCapExtension: _reviewCapExtension,
+		reviewNoProgress: _reviewNoProgress,
+		...execution
+	} = cp.execution;
 	return {
 		...cp,
 		phase: "completed",
 		nextAction: "none",
 		execution: {
-			...cp.execution,
+			...execution,
 			pausedReason: undefined,
 			delegate: undefined,
+			blocked: undefined,
 			audit: { ...(cp.execution.audit ?? { rounds: 0 }), passed: true },
 		},
 	};
@@ -1230,6 +1346,14 @@ export function applyMigration(
 				// migration (same rule as VC validity).
 				tasks: {},
 				audit: { rounds: 0 },
+				// v0.9.3 (F-005): the review budget and its counters ARE carried
+				// across a migration — they describe the user's choice and the
+				// run's cumulative spend, not the (invalidated) code state.
+				reviewBudget: cp.execution.reviewBudget,
+				reviewBudgetDefaulted: cp.execution.reviewBudgetDefaulted,
+				reviewRoundsTotal: cp.execution.reviewRoundsTotal,
+				reviewCapExtension: cp.execution.reviewCapExtension,
+				reviewNoProgress: cp.execution.reviewNoProgress ?? undefined,
 			}
 			: undefined,
 		implementationReview: cp.implementationReview
@@ -1253,7 +1377,18 @@ function migrationNextAction(cp: WorkflowCheckpoint): NextAction {
 /** Mark a paused stop without erasing the last phase (D-008). */
 export function applyExecutionStopped(cp: WorkflowCheckpoint, reason: string): WorkflowCheckpoint {
 	if (cp.phase !== "executing" || !cp.execution) throw new StateError("requires phase \"executing\"");
-	const { delegate: _delegate, ...execution } = cp.execution;
+	// v0.9.3: a stop also drops the review budget and its valve state — the
+	// next execution of this plan picks its own budget.
+	const {
+		delegate: _delegate,
+		blocked: _blocked,
+		reviewBudget: _reviewBudget,
+		reviewBudgetDefaulted: _reviewBudgetDefaulted,
+		reviewRoundsTotal: _reviewRoundsTotal,
+		reviewCapExtension: _reviewCapExtension,
+		reviewNoProgress: _reviewNoProgress,
+		...execution
+	} = cp.execution;
 	// A stop also revokes any outstanding audit-rollback authorization.
 	const audit = execution.audit ? { ...execution.audit } : undefined;
 	return { ...cp, execution: { ...execution, audit, pausedReason: reason } };

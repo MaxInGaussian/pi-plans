@@ -7,7 +7,9 @@ import { describe, it } from "node:test";
 import type { CheckItem } from "../src/plan.ts";
 import {
 	auditRollbackSet,
+	blockedReviewTasks,
 	buildTaskView,
+	rollbackCoverageIds,
 	invalidateChecksForRolledBackTasks,
 	taskProgressMap,
 	type TaskProgressMap,
@@ -110,6 +112,49 @@ describe("progress persistence", () => {
 		const rebuilt = buildTaskView(parsePlanTasks(PLAN), taskProgressMap(tasks));
 		assert.equal(rebuilt[0]?.status, "pending");
 		assert.equal(rebuilt[0]?.evidence, "edited src/a.ts");
+	});
+});
+
+describe("blocked review tasks", () => {
+	it("reports every non-terminal member of the authoritative rollback set in tree order", () => {
+		// Task-3 is complete but its child is open, so the parent is not
+		// terminal either; both must surface as blockers.
+		const tasks = view({ "Task-1": { status: "complete" }, "Task-3": { status: "complete" } });
+		assert.deepEqual(
+			blockedReviewTasks(tasks, ["Task-1", "Task-2", "Task-3", "Task-3.1"]),
+			["Task-2", "Task-3", "Task-3.1"],
+		);
+	});
+
+	it("reports a task that was already pending, unlike the flip-reporting rollback helper", () => {
+		// The rollback helpers report only nodes they flipped; a task that was
+		// pending before the round must still count as blocking work.
+		const tasks = view({ "Task-1": { status: "pending" } });
+		assert.deepEqual(auditRollbackSet(tasks, checks(), "VC-001"), []);
+		assert.deepEqual(blockedReviewTasks(tasks, ["Task-1"]), ["Task-1"]);
+	});
+
+	it("ignores terminal tasks and ids outside the rollback set", () => {
+		const tasks = view(ALL_DONE);
+		assert.deepEqual(blockedReviewTasks(tasks, ["Task-1", "Task-3"]), []);
+		assert.deepEqual(blockedReviewTasks(tasks, []), []);
+	});
+
+	it("computes a failed round's coverage (pre-feature backfill) without mutating the tree", () => {
+		// VC-002 covers Task-2 and Task-3; the cascade pulls Task-3.1 in.
+		const tasks = view(ALL_DONE);
+		const before = JSON.stringify(tasks);
+		assert.deepEqual(rollbackCoverageIds(tasks, checks(), ["VC-002"]), ["Task-2", "Task-3", "Task-3.1"]);
+		assert.deepEqual(rollbackCoverageIds(tasks, checks(), ["VC-003"]), ["Task-3.1"]);
+		assert.deepEqual(rollbackCoverageIds(tasks, checks(), ["VC-999"]), []);
+		assert.equal(JSON.stringify(tasks), before, "coverage computation never reopens anything");
+	});
+
+	it("never mutates status, evidence, or skipReason", () => {
+		const tasks = view({ "Task-2": { status: "pending", evidence: "previous attempt" }, "Task-3": { status: "skipped", skipReason: "covered by Task-2" } });
+		const before = JSON.stringify(tasks);
+		blockedReviewTasks(tasks, ["Task-1", "Task-2", "Task-3", "Task-3.1"]);
+		assert.equal(JSON.stringify(tasks), before);
 	});
 });
 

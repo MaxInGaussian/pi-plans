@@ -12,17 +12,24 @@ import { after, before, describe, it } from "node:test";
 import {
 	__awaitReviewRoundForTests,
 	__setAuditRunnerForTests,
+	EXECUTION_BLOCKED_CUSTOM_TYPE,
+	EXECUTION_CONTINUE_CUSTOM_TYPE,
+	executionContextMessage,
 	getExecution,
 	persistTaskProgress,
+	registerExecutionTurnHandlers,
 	restoreFromSession,
 	startExecution,
 	stopExecution,
 } from "../src/exec.ts";
+import { parseChecklist, parsePlanTasks } from "../src/plan.ts";
 import { setMessagingApi } from "../src/messaging.ts";
 import { applyTaskUpdate } from "../src/task-tool.ts";
-import { REVIEW_MAX_ROUNDS } from "../src/auditor.ts";
-import { getRun, initState, startRun } from "../src/state.ts";
-import { createCheckpoint, loadCheckpoint, mutateCheckpoint, applyExecutionApproved, applyExecutionProgress, applyPlanWritten, planIdentityOf } from "../src/workflow-state.ts";
+import { spawnSync } from "node:child_process";
+import { getRun, initState, setRunStatus, startRun } from "../src/state.ts";
+import { createCheckpoint, loadCheckpoint, mutateCheckpoint, applyExecutionApproved, applyExecutionProgress, applyPlanWritten, planIdentityOf, resolveHeadAt } from "../src/workflow-state.ts";
+
+import { loadExecutionFromCheckpoint } from "../src/exec.ts";
 
 const PLAN = `# PLAN_v1 - review-loop fixture
 
@@ -147,6 +154,10 @@ describe("execution-review loop (v0.8)", () => {
 		__setAuditRunnerForTests(ctl.runner);
 		const ctxTui = makeCtx(workdir, "tui");
 		await restoreFromSession(ctxTui, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		// v0.9.3: a TUI host gets the budget panel before round 1; this minimal
+		// host resolves it without a choice, so one hop passes before the round
+		// spawns. The detach contract itself is unchanged.
+		await tick();
 		// The restore returned while the round is STILL running: in-flight marker
 		// present, run status moved to verifying, no outcome committed yet.
 		assert.ok(getExecution()!.review.inFlight, "the round is in flight after the settle returned");
@@ -278,7 +289,12 @@ describe("execution-review loop (v0.8)", () => {
 		__setAuditRunnerForTests(ctl.runner);
 		const ctx = makeCtx(workdir, "tui");
 		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		// v0.9.3: the first restore resolves the budget (one hop) before its
+		// round spawns; wait for it so the second restore really replaces a
+		// LIVE round.
+		await tick();
 		const firstAttempt = getExecution()!.review.attempts;
+		assert.equal(firstAttempt, 1, "the first round is in flight before the second restore");
 		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
 		const after = getExecution()!;
 		assert.ok(after.review.inFlight, "the second resume started its own round");
@@ -471,6 +487,9 @@ describe("findings-driven fix loop (v0.9)", () => {
 	it("findings persist across the session snapshot and survive the fresh-budget renewal", async () => {
 		const { workdir, planPath } = freshWorkdir();
 		const ctx = await startTerminal(planPath, workdir);
+		// v0.9.3: this test drives rounds 1..5 on purpose — pin the 5-round
+		// budget (the no-UI default is now 3).
+		getExecution()!.reviewBudget = 5;
 		const ctl = controlledRunner();
 		__setAuditRunnerForTests(ctl.runner);
 		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
@@ -513,7 +532,11 @@ describe("findings-driven fix loop (v0.9)", () => {
 		// Cancelled rounds burn no budget and loop nowhere — safe to leave the
 		// runner in this mode while checking the renewal semantics.
 		__setAuditRunnerForTests(async () => ({ cancelled: true }) as never);
-		assert.ok(resumeActiveExecution(ctx), "renewal lifts the pause");
+		// v0.9.3: the resume is async and reports the outcome; this ctx has no
+		// panel, so the headless path re-grants the same budget (5).
+		const renewed = await resumeActiveExecution(ctx);
+		assert.ok(renewed.resumed, "renewal lifts the pause");
+		assert.equal(renewed.grantedBudget, 5, "the headless grant keeps the current budget");
 		assert.equal(getExecution()!.audit.rounds, 0, "fresh budget");
 		assert.deepEqual(getExecution()!.audit.findings.map((f: { id: string }) => f.id), ["F-001"], "stable ids carry into the fresh budget");
 		ctl.drainAll();
@@ -720,5 +743,610 @@ describe("executor injection with findings (v0.9)", () => {
 		assert.match(msg, /Fix them, then re-close the affected tasks/);
 		await stopExecution(ctx, "teardown");
 		ctl.drainAll();
+	});
+});
+
+/**
+ * v0.9.2 blocked-point escalation (RCA: a missed parent re-close left the tree
+ * non-terminal, the review could not start, and three silent no-op wakes
+ * paused the run with a watchdog metric instead of the blocker).
+ */
+const PARENT_PLAN = `# PLAN_v1 - blocked fixture
+
+## Tasks
+
+- Task-1: engine — files: lib/engine.js; wave: 1
+- Task-2: host — files: lib/host.js; wave: 1
+  - Task-2.1: daemon wiring — files: lib/host.js
+
+## Verification Checks
+
+- [ ] \`VC-001\` covers \`Task-1\`; pass condition: engine works; evidence: tests; metric: green.
+- [ ] \`VC-002\` covers \`Task-2\`; pass condition: host works; evidence: tests; metric: green.
+`;
+
+describe("blocked-point escalation (v0.9.2)", () => {
+	let root = "";
+	let counter = 0;
+
+	before(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-blocked-"));
+	});
+
+	after(() => {
+		fs.rmSync(root, { recursive: true, force: true });
+		__setAuditRunnerForTests(null);
+	});
+
+	function freshParentWorkdir(): { workdir: string; planPath: string; runId: string } {
+		counter += 1;
+		const workdir = path.join(root, `blocked-${counter}`);
+		fs.mkdirSync(path.join(workdir, "lib"), { recursive: true });
+		fs.writeFileSync(path.join(workdir, "lib", "engine.js"), "export const engine = 1;\n", "utf8");
+		fs.writeFileSync(path.join(workdir, "lib", "host.js"), "export const host = 1;\n", "utf8");
+		initState(workdir);
+		const { run } = startRun(workdir, { topic: `blocked${counter}`, skill: "plan-small", requestText: "demo" });
+		createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+		const planPath = path.join(run.artifact_dir, "PLAN_v1.md");
+		fs.mkdirSync(run.artifact_dir, { recursive: true });
+		fs.writeFileSync(planPath, PARENT_PLAN, "utf8");
+		mutateCheckpoint(workdir, run.run_id, (cp) =>
+			applyExecutionApproved(
+				applyPlanWritten({ ...cp, nextAction: "accept-execute" }, planIdentityOf(planPath, 1)),
+				{ plan: planIdentityOf(planPath, 1), worktree: workdir, headAtApproval: null, approvedAt: cp.updatedAt },
+			),
+		);
+		return { workdir, planPath, runId: run.run_id };
+	}
+
+	/** ctx + event driver (pattern: tests/exec.test.ts wireEvents, 677-690). */
+	function makeHarness(workdir: string) {
+		const entries: Array<{ customType: string; data?: unknown; content?: string; display?: boolean }> = [];
+		const ctx = {
+			cwd: workdir,
+			sessionManager: {},
+			hasUI: true,
+			mode: "tui",
+			entries,
+			ui: {
+				notify: () => {},
+				setStatus: () => {},
+				setWidget: () => {},
+				theme: { fg: (_c: string, t: string) => t, bold: (t: string) => t },
+			},
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		} as never;
+		setMessagingApi({
+			appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }),
+			sendMessage: (message: { customType: string; content: string; display?: boolean }) => entries.push({ customType: message.customType, content: message.content, display: message.display }),
+		} as never);
+		const handlers = new Map<string, Array<(event: unknown, c: never) => unknown>>();
+		const ext = {
+			on: (name: string, fn: (event: unknown, c: never) => unknown) => {
+				const list = handlers.get(name) ?? [];
+				list.push(fn);
+				handlers.set(name, list);
+			},
+		} as never;
+		registerExecutionTurnHandlers(ext);
+		return {
+			ctx,
+			entries,
+			async fire(name: string, event: unknown = {}) {
+				for (const fn of handlers.get(name) ?? []) await fn(event, ctx);
+			},
+			/** One idle executor round that never touched a task or tool. */
+			async idleRound() {
+				await this.fire("agent_start");
+				await this.fire("turn_end", { message: { role: "assistant", stopReason: "stop", usage: { input: 1, output: 1 } } });
+				await this.fire("agent_settled");
+			},
+		};
+	}
+
+	it("names the missed parent, escalates before pausing, and clears on the parent re-close", async () => {
+		const { workdir, planPath, runId } = freshParentWorkdir();
+		const harness = makeHarness(workdir);
+		const ctx = harness.ctx;
+		await startExecution(ctx, { planPath, planTasks: parsePlanTasks(PARENT_PLAN), items: parseChecklist(PARENT_PLAN) });
+		// First pass: everything closed (children before the parent).
+		for (const id of ["Task-2.1", "Task-2", "Task-1"]) {
+			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
+			persistTaskProgress(ctx);
+		}
+		// Round 1 fails VC-002 -> Task-2 + Task-2.1 roll back.
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001"], failed: ["VC-002"], undeterminable: [], report: "VC-002 fails" });
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.equal(ex.audit.rounds, 1);
+		assert.deepEqual(ex.blocked?.rolledBack.sort(), ["Task-2", "Task-2.1"], "the authoritative rollback set is captured at commit time");
+		assert.deepEqual(ex.blocked?.tasks.sort(), ["Task-2", "Task-2.1"]);
+		assert.deepEqual(loadCheckpoint(workdir, runId).checkpoint.execution?.blocked?.tasks.sort(), ["Task-2", "Task-2.1"], "the blocker is persisted");
+		// The executor re-closes the CHILD only — the lattice-code shape.
+		applyTaskUpdate(ex.tasks, "Task-2.1", "complete", "wiring fixed");
+		persistTaskProgress(ctx);
+		assert.deepEqual(getExecution()!.blocked?.tasks, ["Task-2"], "closing the child does not close the parent");
+		assert.deepEqual(loadCheckpoint(workdir, runId).checkpoint.execution?.blocked?.tasks, ["Task-2"]);
+
+		// Blocked wake 1: escalated wording + one visible system line.
+		await harness.idleRound();
+		assert.equal(getExecution()!.blocked?.escalatedRounds, 1);
+		const wake1 = harness.entries.filter((e) => e.customType === EXECUTION_CONTINUE_CUSTOM_TYPE).at(-1)?.content ?? "";
+		assert.match(wake1, /Review: NO round is running — the task tree is not terminal, so the review cannot start/);
+		assert.match(wake1, /BLOCKED — 1 task\(s\) reopened by round 1 are still open:/);
+		assert.match(wake1, /- Task-2 \(reopened by round 1\)/);
+		assert.match(wake1, /Closing a child does NOT close its parent/);
+		assert.match(wake1, /blocked wake 1\/3/);
+		const visible1 = harness.entries.filter((e) => e.customType === EXECUTION_BLOCKED_CUSTOM_TYPE);
+		assert.equal(visible1.length, 1, "one visible escalation line");
+		assert.equal(visible1[0]!.display, true);
+		assert.match(visible1[0]!.content ?? "", /execution blocked \(wake 1\/3\)/);
+
+		// Blocked wake 2: still no change -> escalate, still no pause.
+		await harness.idleRound();
+		assert.equal(getExecution()!.blocked?.escalatedRounds, 2);
+		assert.equal(getExecution()!.stall.paused, false, "escalation precedes the pause");
+		assert.equal(harness.entries.filter((e) => e.customType === EXECUTION_BLOCKED_CUSTOM_TYPE).length, 2);
+		const wake2 = harness.entries.filter((e) => e.customType === EXECUTION_CONTINUE_CUSTOM_TYPE).at(-1)?.content ?? "";
+		assert.match(wake2, /blocked wake 2\/3/);
+
+		// Blocked wake 3: the watchdog pauses with the BLOCKER as the reason.
+		await harness.idleRound();
+		assert.equal(getExecution()!.stall.paused, true, "the third blocked wake pauses");
+		const reason = getExecution()!.stall.pausedReason ?? "";
+		assert.match(reason, /^blocked: review round 2 cannot start/);
+		assert.match(reason, /Task-2/);
+		assert.match(reason, /reopened by round 1/);
+		assert.equal(loadCheckpoint(workdir, runId).checkpoint.execution?.pausedReason, reason, "the pause reason is persisted");
+		// Levels 1 and 2 emit the visible line; the cap levels pauses instead of
+		// waking, and the pause carries the blocker in the pause row/notify.
+		assert.equal(harness.entries.filter((e) => e.customType === EXECUTION_BLOCKED_CUSTOM_TYPE).length, 2);
+		// The cap-pause prefix matching must not see a review-cap pause here.
+		await harness.fire("input", { source: "interactive" });
+		assert.equal(getExecution()!.stall.paused, false, "ordinary input resumes a blocked pause");
+		assert.equal(getExecution()!.blocked?.escalatedRounds, 0, "a resume grants a fresh ladder");
+
+		// Re-closing the parent clears the blocker and the review starts by itself.
+		applyTaskUpdate(getExecution()!.tasks, "Task-2", "complete", "host fixed");
+		persistTaskProgress(ctx);
+		assert.equal(getExecution()!.blocked, null);
+		assert.equal(loadCheckpoint(workdir, runId).checkpoint.execution?.blocked, undefined, "the record is dropped, not left stale");
+		// The very next settled round launches round 2 by itself (turn_end owns
+		// the terminal-but-unaudited state — no wake, no user input).
+		const settled = harness.fire("turn_end", { message: { role: "assistant", stopReason: "stop", usage: { input: 1, output: 1 } } });
+		await tick();
+		assert.equal(ctl.calls(), 2, "round 2 spawned from the settle, not from a wake");
+		ctl.resolveRound({ round: 2, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" });
+		await settled;
+		await __awaitReviewRoundForTests();
+		assert.equal(loadCheckpoint(workdir, runId).checkpoint.phase, "completed", "the review ran once the tree became terminal");
+		__setAuditRunnerForTests(null);
+		ctl.drainAll();
+	});
+	it("real progress resets the ladder instead of hardening the wording (round-1 F-001)", async () => {
+		const { workdir, planPath, runId } = freshParentWorkdir();
+		const harness = makeHarness(workdir);
+		const ctx = harness.ctx;
+		await startExecution(ctx, { planPath, planTasks: parsePlanTasks(PARENT_PLAN), items: parseChecklist(PARENT_PLAN) });
+		for (const id of ["Task-2.1", "Task-2", "Task-1"]) {
+			applyTaskUpdate(getExecution()!.tasks, id, "complete", `${id} evidence`);
+			persistTaskProgress(ctx);
+		}
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001"], failed: ["VC-002"], undeterminable: [], report: "VC-002 fails" });
+		await restoring;
+		await __awaitReviewRoundForTests();
+		// Both reopened tasks stay open: one no-progress blocked wake.
+		await harness.idleRound();
+		assert.equal(getExecution()!.blocked?.escalatedRounds, 1, "the first blocked wake counts as no progress");
+		assert.deepEqual(getExecution()!.blocked?.tasks.sort(), ["Task-2", "Task-2.1"]);
+		// The executor closes ONE of the two blockers -> real progress.
+		applyTaskUpdate(getExecution()!.tasks, "Task-2.1", "complete", "child fixed");
+		persistTaskProgress(ctx);
+		assert.deepEqual(getExecution()!.blocked?.tasks, ["Task-2"], "persistTaskProgress re-syncs the STORED list (the reason it cannot be the ladder baseline)");
+		await harness.idleRound();
+		assert.equal(getExecution()!.blocked?.escalatedRounds, 0, "a shrunken blocker set resets the ladder");
+		const wake = harness.entries.filter((e) => e.customType === EXECUTION_CONTINUE_CUSTOM_TYPE).at(-1)?.content ?? "";
+		assert.doesNotMatch(wake, /blocked wake/, "the reset wake carries no escalation sentence");
+		assert.equal(harness.entries.filter((e) => e.customType === EXECUTION_BLOCKED_CUSTOM_TYPE).length, 1, "no new visible line for a reset");
+		// The fresh ladder then counts again: 1, 2, pause at 3.
+		await harness.idleRound();
+		assert.equal(getExecution()!.blocked?.escalatedRounds, 1);
+		await harness.idleRound();
+		assert.equal(getExecution()!.blocked?.escalatedRounds, 2);
+		await harness.idleRound();
+		assert.equal(getExecution()!.stall.paused, true, "three consecutive no-progress wakes still pause");
+		assert.match(getExecution()!.stall.pausedReason ?? "", /blocked: review round 2 cannot start/);
+		assert.match(loadCheckpoint(workdir, runId).checkpoint.execution?.pausedReason ?? "", /Task-2/);
+		await stopExecution(ctx, "teardown");
+		ctl.drainAll();
+	});
+
+	it("the executor rules forbid waiting and require re-closing parents", async () => {
+		const { workdir, planPath } = freshParentWorkdir();
+		const harness = makeHarness(workdir);
+		await startExecution(harness.ctx, { planPath, planTasks: parsePlanTasks(PARENT_PLAN), items: parseChecklist(PARENT_PLAN) });
+		const msg = executionContextMessage(harness.ctx) ?? "";
+		assert.match(msg, /PARENTS INCLUDED/);
+		assert.match(msg, /Closing a task's children does NOT close the task/);
+		assert.match(msg, /NEVER wait for the review/);
+		await stopExecution(harness.ctx, "teardown");
+	});
+});
+
+/**
+ * Pre-feature checkpoint backfill (v0.9.2): the lattice-code run was paused by
+ * the old build, so its checkpoint has no `execution.blocked` record. The
+ * blocker is reconstructed from round 1's `audit.lastResult` + the plan's
+ * coverage — without re-applying the rollback (that would revert work the
+ * executor has since re-closed).
+ */
+describe("pre-feature checkpoint backfill (v0.9.2)", () => {
+	it("reconstructs the real lattice-code blocker (Task-2, round 1) and persists it", async () => {
+		const fixtureDir = path.join(import.meta.dirname, "fixtures", "lattice-code-blocked");
+		const planText = fs.readFileSync(path.join(fixtureDir, "plan-v2-trimmed.md"), "utf8");
+		const state = JSON.parse(fs.readFileSync(path.join(fixtureDir, "state.json"), "utf8")) as {
+			tasks: Record<string, { status: string; evidence?: string; skipReason?: string }>;
+			audit: { rounds: number; lastResult: string; undeterminable: string[] };
+		};
+		const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-backfill-"));
+		spawnSync("git", ["init"], { cwd: workdir });
+		spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: workdir });
+		spawnSync("git", ["config", "user.name", "T"], { cwd: workdir });
+		fs.writeFileSync(path.join(workdir, "seed.txt"), "seed", "utf8");
+		spawnSync("git", ["add", "-A"], { cwd: workdir });
+		spawnSync("git", ["commit", "-m", "seed"], { cwd: workdir });
+		initState(workdir);
+		const { run } = startRun(workdir, { topic: "lattice-backfill", skill: "plan-small", requestText: "demo" });
+		createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+		const planPath = path.join(run.artifact_dir, "PLAN_v2.md");
+		fs.mkdirSync(run.artifact_dir, { recursive: true });
+		fs.writeFileSync(planPath, planText, "utf8");
+		mutateCheckpoint(workdir, run.run_id, (cp) => {
+			const plan = planIdentityOf(planPath, 2);
+			let next = applyPlanWritten({ ...cp, nextAction: "accept-execute" }, plan);
+			next = applyExecutionApproved(next, {
+				plan,
+				worktree: workdir,
+				headAtApproval: resolveHeadAt(workdir),
+				approvedAt: next.updatedAt,
+			});
+			// The REAL slices; deliberately no `blocked` key (pre-feature checkpoint).
+			return applyExecutionProgress(next, {
+				tasks: state.tasks,
+				audit: { rounds: state.audit.rounds, lastResult: state.audit.lastResult, undeterminable: state.audit.undeterminable },
+			});
+		});
+		setRunStatus(workdir, run.run_id, "executing");
+		const ctx = makeCtx(workdir, "tui");
+		const load = loadExecutionFromCheckpoint(ctx, run.run_id);
+		assert.equal(load.status, "loaded");
+		assert.deepEqual(load.blocked?.tasks, ["Task-2"], "the real blocker is reconstructed");
+		assert.equal(load.blocked?.round, 1);
+		assert.ok(load.blocked?.rolledBack.includes("Task-7"), "coverage cascade covers the other tasks of the failed checks");
+		assert.ok(load.blocked?.rolledBack.includes("Task-2.1"), "children cascade");
+		const persisted = loadCheckpoint(workdir, run.run_id).checkpoint.execution?.blocked;
+		assert.deepEqual(persisted?.tasks, ["Task-2"], "the reconstructed blocker is persisted");
+		// The tree was NOT re-mutated: the reopened-then-re-closed tasks stay closed.
+		const after = loadCheckpoint(workdir, run.run_id).checkpoint.execution?.tasks ?? {};
+		assert.equal(after["Task-2"]?.status, "pending");
+		assert.equal(after["Task-2.1"]?.status, "complete");
+		assert.equal(after["Task-7"]?.status, "complete");
+		assert.equal(getExecution()!.blocked?.tasks[0], "Task-2");
+		// The /reload recovery path: a session snapshot written by a pre-feature
+		// build carries the LIVE failed set (`audit.failed`) and no blocker
+		// record — exactly the shape the stuck lattice-code session has.
+		const live = getExecution()!;
+		const snapshot = { ...live, audit: { ...live.audit, failed: state.audit.lastResult.split(",") } } as Record<string, unknown>;
+		delete snapshot.blocked;
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: snapshot }]);
+		assert.deepEqual(getExecution()!.blocked?.tasks, ["Task-2"], "a pre-feature session snapshot is backfilled too");
+		assert.equal(getExecution()!.blocked?.round, 1);
+		await stopExecution(makeCtx(workdir), "teardown");
+	});
+});
+
+describe("execution-review budget (v0.9.3)", () => {
+	const highFinding = (id: string, taskIds: string[] = ["Task-1"]) => ({
+		id,
+		severity: "high" as const,
+		taskIds,
+		note: `${id} note`,
+		evidence: "lib/engine.js",
+		raw: `- \` ${id}\``,
+	});
+
+	/** A ctx whose budget menu answers with `choice` (a label prefix), or a
+	 * cancelled menu when null. UI.custom is either absent (menu path) or a
+	 * no-choice overlay (falls through to the menu). */
+	function ctxWithBudgetMenu(workdir: string, choice: string | null, mode: "print" | "tui" = "tui", onAsk?: () => void) {
+		const base = makeCtx(workdir, mode);
+		const ui = (base as { ui: Record<string, unknown> }).ui;
+		return {
+			...base,
+			ui: {
+				...ui,
+				select: async (_title: string, options: string[]): Promise<string | undefined> => {
+					onAsk?.();
+					if (choice === null) return undefined;
+					return options.find((option) => option.startsWith(choice)) ?? options[0];
+				},
+			},
+		} as typeof base;
+	}
+
+	it("asks for the budget once, right before round 1, and persists the pick", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		let asks = 0;
+		const ctx = ctxWithBudgetMenu(workdir, "1 round", "tui", () => {
+			asks += 1;
+		});
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		const ex = getExecution()!;
+		assert.equal(ex.reviewBudget, 1, "the picked budget is live");
+		assert.equal(ex.reviewBudgetDefaulted, false, "a user pick is not marked default");
+		assert.ok(ex.review.inFlight, "the round spawns right after the pick");
+		assert.equal(asks, 1, "the panel was asked exactly once");
+		const cp = loadCheckpoint(workdir, runId);
+		assert.ok(cp.status === "ok");
+		assert.equal(cp.checkpoint.execution?.reviewBudget, 1, "the budget is persisted");
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" });
+		await restoring;
+		await __awaitReviewRoundForTests();
+		assert.equal(asks, 1, "no second ask for the same run");
+		assert.equal(getExecution(), null, "the passing round completed the run");
+		ctl.drainAll();
+		__setAuditRunnerForTests(null);
+	});
+
+	it("falls back to the default 3 with a visible note when no panel exists", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		const ex = getExecution()!;
+		assert.equal(ex.reviewBudget, 3, "the no-UI default applies");
+		assert.equal(ex.reviewBudgetDefaulted, true, "and it is marked as the fallback");
+		const notes = ctx.entries.filter((e) => e.customType === "pi-plans-review-budget-default");
+		assert.equal(notes.length, 1, "one visible note, never silent");
+		assert.match(String(notes[0].content), /default/);
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" });
+		await restoring;
+		await __awaitReviewRoundForTests();
+		ctl.drainAll();
+		__setAuditRunnerForTests(null);
+	});
+
+	it("completes at an exhausted budget with an unresolved high — no rollback, no append, no wake", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		// One round, then the budget is spent.
+		getExecution()!.reviewBudget = 1;
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "pass with a high", findings: [highFinding("F-001")] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		assert.equal(getExecution(), null, "the run completes at the exhausted budget");
+		const cp = loadCheckpoint(workdir, runId);
+		assert.ok(cp.status === "ok");
+		assert.equal(cp.checkpoint.phase, "completed");
+		assert.equal(ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed").length, 0, "no fix wake on the tolerated round");
+		assert.equal(/Task-4/.test(fs.readFileSync(planPath, "utf8")), false, "no plan task was appended");
+		const done = ctx.entries.filter((e) => e.customType === "pi-plans-complete");
+		assert.equal(done.length, 1);
+		assert.match(String(done[0].content), /review budget exhausted/, "the completion discloses the exhausted budget");
+		assert.match(String(done[0].content), /F-001/, "and names the tolerated high finding");
+		ctl.drainAll();
+		__setAuditRunnerForTests(null);
+	});
+
+	it("still wakes and repairs a high finding when the budget is NOT exhausted", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		getExecution()!.reviewBudget = 3;
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "pass with a high", findings: [highFinding("F-001")] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution();
+		assert.notEqual(ex, null, "the run does not complete with a live high inside the budget");
+		assert.equal(ex!.tasks.find((t) => t.id === "Task-1")?.status, "pending", "the mapped task rolled back");
+		const wakes = ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed");
+		assert.equal(wakes.length, 1, "exactly one repair wake");
+		ctl.drainAll();
+		await stopExecution(ctx, "teardown");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("unlimited: three identical no-report rounds trip the no-progress valve", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		getExecution()!.reviewBudget = "unlimited";
+		// A spawn failure carries no report: the signature must still advance
+		// (round-1 F-002) — otherwise the valve could never catch a dead runner.
+		__setAuditRunnerForTests(async () => null);
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		const ex = getExecution()!;
+		assert.equal(ex.audit.rounds, 3, "three rounds committed before the valve");
+		assert.equal(ex.reviewRoundsTotal, 3, "the cumulative counter agrees");
+		assert.equal(ex.stall.paused, true, "the valve pauses the run");
+		assert.match(ex.stall.pausedReason ?? "", /^execution review stalled/);
+		assert.match(ex.stall.pausedReason ?? "", /3 consecutive rounds/);
+		assert.equal(ex.reviewNoProgress?.streak, 3);
+		assert.ok(ctx.entries.some((e) => e.customType === "pi-plans-review-paused"), "the pause is in-band");
+		await stopExecution(ctx, "teardown");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("unlimited: the run-cumulative hard cap pauses at 50 rounds", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		getExecution()!.reviewBudget = "unlimited";
+		getExecution()!.reviewRoundsTotal = 49;
+		__setAuditRunnerForTests(async () => null);
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		const ex = getExecution()!;
+		assert.equal(ex.reviewRoundsTotal, 50, "the cap counts the whole run");
+		assert.equal(ex.stall.paused, true);
+		assert.match(ex.stall.pausedReason ?? "", /execution review exhausted 50 rounds/);
+		assert.match(ex.stall.pausedReason ?? "", /unlimited budget safety cap/);
+		await stopExecution(ctx, "teardown");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("the at-pause grant re-asks the budget; Esc keeps the pause, an unlimited pick adds 50", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		getExecution()!.reviewBudget = "unlimited";
+		getExecution()!.reviewRoundsTotal = 49;
+		__setAuditRunnerForTests(async () => null);
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		assert.equal(getExecution()!.stall.paused, true, "paused at the hard cap");
+		const { resumeActiveExecution } = await import("../src/exec.ts");
+		// Esc (cancelled menu) keeps the pause — never a silent grant.
+		const declined = await resumeActiveExecution(ctxWithBudgetMenu(workdir, null));
+		assert.equal(declined.resumed, false);
+		assert.equal(declined.budgetDeclined, true);
+		assert.equal(getExecution()!.stall.paused, true, "the pause stands after Esc");
+		// Picking unlimited lifts the cap by exactly one window and resets the
+		// per-grant counters — the cumulative total never resets.
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const grantingCtx = ctxWithBudgetMenu(workdir, "unlimited");
+		const granted = await resumeActiveExecution(grantingCtx);
+		assert.equal(granted.resumed, true);
+		assert.equal(granted.grantedBudget, "unlimited");
+		const ex = getExecution()!;
+		assert.equal(ex.reviewCapExtension, 50, "the unlimited grant extends the hard cap");
+		assert.equal(ex.audit.rounds, 0, "the per-grant round counter resets");
+		assert.equal(ex.reviewRoundsTotal, 50, "the run-cumulative counter does not");
+		assert.equal(ex.reviewNoProgress, undefined, "the valve window restarts");
+		assert.equal(ex.stall.paused, false, "the run resumed");
+		assert.ok(
+			grantingCtx.entries.some((e) => e.customType === "pi-plans-review-budget-granted" && /hard cap now 100 rounds/.test(String(e.content))),
+			"the grant names the lifted cap",
+		);
+		ctl.drainAll();
+		await stopExecution(ctx, "teardown");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("a headless session keeps the default budget and can still be granted at a pause (round-1 F-001)", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		// The SDK's ui.select is REQUIRED, so a real headless context carries a
+		// function that cannot ask. This host throws if the code ever calls it.
+		const headlessCtx = {
+			...ctx,
+			hasUI: false,
+			ui: {
+				...(ctx as { ui: Record<string, unknown> }).ui,
+				select: async (): Promise<string | undefined> => {
+					throw new Error("headless select must never be called");
+				},
+			},
+		} as typeof ctx;
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(headlessCtx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		const ex = getExecution()!;
+		assert.equal(ex.reviewBudget, 3, "a headless session gets the default budget");
+		assert.equal(ex.reviewBudgetDefaulted, true, "and it is marked as the fallback");
+		assert.ok(ex.review.inFlight, "the round spawned without asking");
+		const cp = loadCheckpoint(workdir, runId);
+		assert.ok(cp.status === "ok");
+		assert.equal(cp.checkpoint.execution?.reviewBudget, 3, "the default is persisted");
+		// A cancelled round ends the chain without burning budget or
+		// self-scheduling; the next restore then sees an exhausted budget.
+		ctl.resolveRound({ cancelled: true } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const live = getExecution()!;
+		live.audit.rounds = 3;
+		live.reviewRoundsTotal = 3;
+		live.audit.failed = ["VC-001"];
+		await restoreFromSession(headlessCtx, [{ type: "custom", customType: "pi-plans-exec", data: live }]);
+		assert.equal(getExecution()!.stall.paused, true, "an owed review at an exhausted budget pauses");
+		const { resumeActiveExecution } = await import("../src/exec.ts");
+		const granted = await resumeActiveExecution(headlessCtx);
+		assert.equal(granted.resumed, true, "a headless grant is not declined");
+		assert.equal(granted.budgetDeclined, undefined, "no panel decline path in a headless session");
+		assert.equal(granted.grantedBudget, 3, "the headless grant keeps the current budget");
+		assert.equal(getExecution()!.stall.paused, false, "the run resumes instead of staying paused forever");
+		assert.equal(getExecution()!.audit.rounds, 0, "and the per-grant counter reset");
+		ctl.resolveRound({ cancelled: true } as never);
+		await __awaitReviewRoundForTests();
+		await stopExecution(headlessCtx, "teardown");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("an auto-approve session never asks for the budget (recorded plan decision)", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		// A TUI-capable host: without the auto-approve gate this would ask.
+		const answering = ctxWithBudgetMenu(workdir, "1 round", "tui", () => {
+			throw new Error("auto-approve must not ask for the budget");
+		});
+		const previous = process.env.PI_PLANS_AUTO_APPROVE;
+		process.env.PI_PLANS_AUTO_APPROVE = "1";
+		try {
+			const ctl = controlledRunner();
+			__setAuditRunnerForTests(ctl.runner);
+			const restoring = restoreFromSession(answering, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+			await tick();
+			assert.equal(getExecution()!.reviewBudget, 3, "auto-approve takes the default budget");
+			assert.equal(getExecution()!.reviewBudgetDefaulted, true);
+			ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" });
+			await restoring;
+			await __awaitReviewRoundForTests();
+			ctl.drainAll();
+		} finally {
+			if (previous === undefined) delete process.env.PI_PLANS_AUTO_APPROVE;
+			else process.env.PI_PLANS_AUTO_APPROVE = previous;
+		}
+		__setAuditRunnerForTests(null);
+		await stopExecution(ctx, "teardown");
+	});
+
+	it("the budget counters and the valve state survive a session restore", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const live = getExecution()!;
+		live.reviewBudget = "unlimited";
+		live.reviewRoundsTotal = 7;
+		live.reviewCapExtension = 50;
+		live.reviewNoProgress = { key: "VC-002|VC-001|", streak: 2 };
+		// A cancelled round neither burns the budget nor mutates the counters.
+		__setAuditRunnerForTests(async () => ({ cancelled: true }) as never);
+		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: live }]);
+		const ex = getExecution()!;
+		assert.equal(ex.reviewBudget, "unlimited", "the budget survives");
+		assert.equal(ex.reviewRoundsTotal, 7, "the cumulative counter survives (no free window)");
+		assert.equal(ex.reviewCapExtension, 50, "the granted extension survives");
+		assert.deepEqual(ex.reviewNoProgress, { key: "VC-002|VC-001|", streak: 2 }, "the valve streak survives");
+		await stopExecution(ctx, "teardown");
+		__setAuditRunnerForTests(null);
 	});
 });

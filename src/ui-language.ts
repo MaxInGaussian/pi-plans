@@ -128,4 +128,42 @@ export function refineChrome(lang: UiLanguage): RefineChrome {
 	return REFINE_CHROME[lang];
 }
 
+// --------------------------------------------------------------------------
+// Execution-review budget picker chrome (src/review-budget.ts)
+// --------------------------------------------------------------------------
+
+export interface ReviewBudgetChrome {
+	/** Panel title (TUI) / select title prefix (menus). */
+	panelTitle: string;
+	/** Suffix appended to the menu title when re-picking at a pause. */
+	currentSuffix(current: string): string;
+	/** Row label for a numeric budget. */
+	roundsOption(rounds: number): string;
+	/** Row label for the unlimited budget. */
+	unlimitedOption: string;
+	/** Footer hint under the TUI panel. */
+	panelHint: string;
+}
+
+const REVIEW_BUDGET_CHROME: Record<UiLanguage, ReviewBudgetChrome> = {
+	zh: {
+		panelTitle: "执行评审轮数预算 — 评议会逐轮验证计划里的每条 VC",
+		currentSuffix: (current) => `（当前 ${current}）`,
+		roundsOption: (rounds) => `${rounds} 轮`,
+		unlimitedOption: "无上限（直到没有 high findings；3 轮无进展或累计 50 轮时暂停）",
+		panelHint: "[↑/↓] 选择  [Enter] 选定  [Esc] 取消（改用默认值）",
+	},
+	en: {
+		panelTitle: "Execution review budget — the reviewer verifies every VC round by round",
+		currentSuffix: (current) => `(current: ${current})`,
+		roundsOption: (rounds) => `${rounds} round${rounds === 1 ? "" : "s"}`,
+		unlimitedOption: "unlimited (until no high findings; pauses after 3 no-progress rounds or 50 committed rounds)",
+		panelHint: "[↑/↓] Select  [Enter] Choose  [Esc] Cancel (use the default)",
+	},
+};
+
+export function reviewBudgetChrome(lang: UiLanguage): ReviewBudgetChrome {
+	return REVIEW_BUDGET_CHROME[lang];
+}
+
 

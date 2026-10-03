@@ -523,3 +523,190 @@ describe("blocking budget persistence", () => {
 		assert.throws(() => mutateCheckpoint(workdir, runId, () => cp), /findings\.0: unexpected key/);
 	});
 });
+
+describe("blocked-point persistence (v0.9.2)", () => {
+	function executingCheckpoint(workdir: string, runId: string) {
+		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
+		const planPath = path.join(workdir, "PLAN_v1.md");
+		fs.writeFileSync(planPath, "# PLAN_v1 - blocked demo\n", "utf8");
+		const plan = planIdentityOf(planPath, 1);
+		let cp = applyPlanWritten(baseCheckpoint(workdir, runId), plan);
+		cp = { ...cp, nextAction: "accept-execute" };
+		cp = applyExecutionApproved(cp, { plan, worktree: cp.worktreeRoot, headAtApproval: null, approvedAt: cp.updatedAt });
+		return cp;
+	}
+
+	const BLOCKED = {
+		rolledBack: ["Task-2", "Task-2.1", "Task-7"],
+		tasks: ["Task-2"],
+		round: 1,
+		escalatedRounds: 0,
+		since: "2026-10-02T10:32:00Z",
+	};
+
+	it("round-trips the blocker and its escalation counter", () => {
+		const { workdir, runId } = setupRun("blocked-roundtrip");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), { blocked: BLOCKED });
+		mutateCheckpoint(workdir, runId, () => cp);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		assert.deepEqual(loaded.checkpoint.execution?.blocked, BLOCKED);
+	});
+
+	it("null clears the blocker (delete-on-null, like pausedReason)", () => {
+		const { workdir, runId } = setupRun("blocked-null");
+		let cp = applyExecutionProgress(executingCheckpoint(workdir, runId), { blocked: BLOCKED });
+		cp = applyExecutionProgress(cp, { blocked: null });
+		assert.equal(cp.execution?.blocked, undefined);
+		mutateCheckpoint(workdir, runId, () => cp);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		assert.equal(loaded.checkpoint.execution?.blocked, undefined);
+	});
+
+	it("loads a checkpoint written before the field existed", () => {
+		const { workdir, runId } = setupRun("blocked-legacy");
+		const cp = executingCheckpoint(workdir, runId);
+		mutateCheckpoint(workdir, runId, () => cp);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok", "legacy checkpoint still loads");
+		assert.equal(loaded.checkpoint.execution?.blocked, undefined);
+	});
+
+	it("rejects unknown keys inside the blocker record", () => {
+		const { workdir, runId } = setupRun("blocked-bad-record");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), {
+			blocked: { ...BLOCKED, bogus: true } as never,
+		});
+		assert.throws(() => mutateCheckpoint(workdir, runId, () => cp), /blocked: unexpected key/);
+	});
+
+	it("a stop revokes the blocker (stale rollback authorization)", () => {
+		const { workdir, runId } = setupRun("blocked-stopped");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), { blocked: BLOCKED });
+		const stopped = applyExecutionStopped(cp, "user stop");
+		assert.equal(stopped.execution?.blocked, undefined);
+		assert.equal(stopped.execution?.pausedReason, "user stop");
+	});
+
+	it("completion clears the blocker", () => {
+		const { workdir, runId } = setupRun("blocked-completed");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), { blocked: BLOCKED });
+		assert.equal(applyExecutionCompleted(cp).execution?.blocked, undefined);
+	});
+});
+
+describe("review-budget persistence (v0.9.3)", () => {
+	function executingCheckpoint(workdir: string, runId: string) {
+		createCheckpoint(workdir, { runId, originWorkdir: workdir, workdir });
+		const planPath = path.join(workdir, "PLAN_v1.md");
+		fs.writeFileSync(planPath, "# PLAN_v1 - budget demo\n", "utf8");
+		const plan = planIdentityOf(planPath, 1);
+		let cp = applyPlanWritten(baseCheckpoint(workdir, runId), plan);
+		cp = { ...cp, nextAction: "accept-execute" };
+		cp = applyExecutionApproved(cp, { plan, worktree: cp.worktreeRoot, headAtApproval: null, approvedAt: cp.updatedAt });
+		return cp;
+	}
+
+	const BUDGET = {
+		reviewBudget: "unlimited" as const,
+		reviewBudgetDefaulted: true,
+		reviewRoundsTotal: 7,
+		reviewCapExtension: 50,
+		reviewNoProgress: { key: "VC-002|VC-001|F-001", streak: 2 },
+	};
+
+	it("round-trips the budget, its counters, and the no-progress state", () => {
+		const { workdir, runId } = setupRun("budget-roundtrip");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), BUDGET);
+		mutateCheckpoint(workdir, runId, () => cp);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		assert.equal(loaded.checkpoint.execution?.reviewBudget, "unlimited");
+		assert.equal(loaded.checkpoint.execution?.reviewBudgetDefaulted, true);
+		assert.equal(loaded.checkpoint.execution?.reviewRoundsTotal, 7);
+		assert.equal(loaded.checkpoint.execution?.reviewCapExtension, 50);
+		assert.deepEqual(loaded.checkpoint.execution?.reviewNoProgress, { key: "VC-002|VC-001|F-001", streak: 2 });
+	});
+
+	it("accepts a numeric budget and rejects malformed values with the key name", () => {
+		const { workdir, runId } = setupRun("budget-validation");
+		const base = executingCheckpoint(workdir, runId);
+		assert.equal(applyExecutionProgress(base, { reviewBudget: 1 }).execution?.reviewBudget, 1);
+		// The write path stores what it is given (like every other progress
+		// field); the READ path validates and names the offending key.
+		for (const bad of [0, -1, 2.5, true, { rounds: 3 }]) {
+			const cp = applyExecutionProgress(base, { reviewBudget: bad as never });
+			assert.throws(
+				() => mutateCheckpoint(workdir, runId, () => cp),
+				/reviewBudget/,
+				`reviewBudget ${JSON.stringify(bad)} rejected`,
+			);
+		}
+		assert.throws(() => mutateCheckpoint(workdir, runId, () => applyExecutionProgress(base, { reviewBudget: "infinite" as never })), /reviewBudget/);
+		assert.throws(() => mutateCheckpoint(workdir, runId, () => applyExecutionProgress(base, { reviewRoundsTotal: -1 })), /reviewRoundsTotal/);
+		assert.throws(() => mutateCheckpoint(workdir, runId, () => applyExecutionProgress(base, { reviewCapExtension: -3 })), /reviewCapExtension/);
+		assert.throws(
+			() => mutateCheckpoint(workdir, runId, () => applyExecutionProgress(base, { reviewNoProgress: { key: "x" } as never })),
+			/reviewNoProgress/,
+		);
+		assert.throws(
+			() => mutateCheckpoint(workdir, runId, () => applyExecutionProgress(base, { reviewNoProgress: { key: "x", streak: -1 } })),
+			/reviewNoProgress.streak/,
+		);
+	});
+
+	it("null clears the budget and the valve state (delete-on-null)", () => {
+		const { workdir, runId } = setupRun("budget-null");
+		let cp = applyExecutionProgress(executingCheckpoint(workdir, runId), BUDGET);
+		cp = applyExecutionProgress(cp, { reviewBudget: null, reviewBudgetDefaulted: null, reviewNoProgress: null });
+		assert.equal(cp.execution?.reviewBudget, undefined);
+		assert.equal(cp.execution?.reviewBudgetDefaulted, undefined);
+		assert.equal(cp.execution?.reviewNoProgress, undefined);
+		mutateCheckpoint(workdir, runId, () => cp);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		assert.equal(loaded.checkpoint.execution?.reviewBudget, undefined);
+		assert.equal(loaded.checkpoint.execution?.reviewNoProgress, undefined);
+	});
+
+	it("loads a checkpoint written before the fields existed (absent, not corrupt)", () => {
+		const { workdir, runId } = setupRun("budget-legacy");
+		const cp = applyExecutionProgress(executingCheckpoint(workdir, runId), { reviewBudget: null });
+		mutateCheckpoint(workdir, runId, () => cp);
+		const raw = JSON.parse(fs.readFileSync(checkpointFilePath(workdir, runId), "utf8"));
+		assert.equal(raw.execution.reviewBudget, undefined);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		assert.equal(loaded.checkpoint.execution?.reviewBudget, undefined);
+		// The live state resolves a legacy shape to the 5-round bound; that
+		// resolution is exercised in tests/review-budget.test.ts.
+	});
+
+	it("a stop and a completion both drop the budget and its valve state", () => {
+		const { workdir, runId } = setupRun("budget-cleanup");
+		const withBudget = applyExecutionProgress(executingCheckpoint(workdir, runId), BUDGET);
+		const stopped = applyExecutionStopped(withBudget, "user stop");
+		assert.equal(stopped.execution?.reviewBudget, undefined);
+		assert.equal(stopped.execution?.reviewRoundsTotal, undefined);
+		assert.equal(stopped.execution?.reviewCapExtension, undefined);
+		assert.equal(stopped.execution?.reviewNoProgress, undefined);
+		const completed = applyExecutionCompleted(withBudget);
+		assert.equal(completed.execution?.reviewBudget, undefined);
+		assert.equal(completed.execution?.reviewRoundsTotal, undefined);
+		assert.equal(completed.execution?.reviewNoProgress, undefined);
+	});
+
+	it("a migration preserves the budget but resets the invalidated execution state", () => {
+		const { workdir, runId } = setupRun("budget-migration");
+		const migrated = applyMigration(applyExecutionProgress(executingCheckpoint(workdir, runId), BUDGET), {
+			workdir,
+			worktreeRoot: workdir,
+			commonDir: path.join(workdir, ".git"),
+		});
+		assert.equal(migrated.execution?.reviewBudget, "unlimited");
+		assert.equal(migrated.execution?.reviewRoundsTotal, 7);
+		assert.deepEqual(migrated.execution?.tasks, {}, "task progress still does not migrate");
+		assert.equal(migrated.execution?.audit?.rounds, 0, "audit rounds still restart at 0");
+	});
+});

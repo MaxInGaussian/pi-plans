@@ -3,10 +3,11 @@
  * reaches a terminal state, an independent read-only subagent verifies the
  * plan's verification checks against the worktree. Failed checks roll their
  * covered tasks back to pending (exclusively inside the review flow). The
- * loop is bounded at REVIEW_MAX_ROUNDS committed rounds; exhaustion pauses
- * the run for the user in every mode (fail-closed, never a hang and never a
- * silent stop) — only an explicit /plans-execute confirmation grants a fresh
- * budget.
+ * loop is bounded by the per-run review budget (v0.9.3: `ReviewBudget` in
+ * ./review-budget.ts, chosen right before round 1 and stored in the run
+ * checkpoint); exhaustion pauses the run for the user in every mode
+ * (fail-closed, never a hang and never a silent stop) — only an explicit
+ * /plans-execute confirmation grants a fresh budget.
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -16,7 +17,13 @@ import { auditableChecks, flattenTaskViews, skippedPassCheckIds, type TaskView }
 import { normalizeTaskId, type CheckItem } from "./plan.ts";
 import { messaging } from "./messaging.ts";
 
-/** Budget cap: committed rounds per user-granted budget. Discarded (fingerprint-changed) attempts do not count. */
+/** Legacy fixed cap (v0.8–v0.9.2): the review-round budget is now a per-run
+ * choice (`ReviewBudget` in ./review-budget.ts, default 3, pickable 1/2/3/5/
+ * unlimited). This constant survives ONLY for checkpoints and tests written
+ * against the old fixed budget — a pre-feature checkpoint that already spent
+ * rounds keeps the 5-round bound (`LEGACY_REVIEW_MAX_ROUNDS`). It no longer
+ * gates any round.
+ * @deprecated use `resolveStoredBudget` / `budgetExhausted` from ./review-budget.ts */
 export const REVIEW_MAX_ROUNDS = 5;
 
 /** Legacy alias for one release: checkpoints and old builds still know this name. */

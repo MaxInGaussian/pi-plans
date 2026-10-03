@@ -16,7 +16,7 @@
  */
 
 import type { CheckItem } from "./plan.ts";
-import { REVIEW_MAX_ROUNDS } from "./auditor.ts";
+import { LEGACY_REVIEW_MAX_ROUNDS, formatReviewBudget, unlimitedHardCapCeiling, type ReviewBudget } from "./review-budget.ts";
 import { truncateToWidth, visibleWidth } from "./refine-ui-helpers.ts";
 import {
 	allTasksTerminal,
@@ -49,6 +49,21 @@ export interface DashboardModel {
 	/** v0.9: unresolved findings from the newest committed review round
 	 * (stable ids). High entries block completion; the rest are recorded. */
 	findings: Array<{ id: string; severity: string; note: string; taskIds: string[] }>;
+	/** v0.9.2: tasks that keep the review from starting — the newest failed
+	 * round's rollback set intersected with the still-open tasks. Empty = the
+	 * review is not blocked by open work. */
+	blockedTasks: string[];
+	/** Round that reopened those tasks (shown as `reopened by round N`). */
+	blockedRound: number | null;
+	/** v0.9.3: the per-run execution-review budget (rounds or `unlimited`).
+	 * Null/absent = not chosen yet; `reviewBudgetDefaulted` marks the no-UI
+	 * fallback so the expanded view can annotate it `(default)`. */
+	reviewBudget?: ReviewBudget | null;
+	/** v0.9.3: committed rounds across the whole run + granted extension —
+	 * the unlimited budget's `n/50` progress. */
+	reviewRoundsTotal?: number;
+	reviewCapExtension?: number;
+	reviewBudgetDefaulted?: boolean;
 	startedAt: string;
 	usage: { inToks: number; outToks: number };
 }
@@ -177,19 +192,31 @@ export function renderDashboardLines(model: DashboardModel, width: number, theme
 		const nextRound = (model.auditRounds ?? 0) + 1;
 		const highCount = model.findings.filter((f) => f.severity === "high").length;
 		const auditLine = model.reviewRunning
-			? `review: round ${nextRound}/${REVIEW_MAX_ROUNDS} running — read-only reviewer verifying`
+			? `review: round ${nextRound}/${budgetLabelOf(model)} running — read-only reviewer verifying`
 			: model.auditFailed.length > 0
 				? `audit: ${model.auditFailed.length} check(s) failed — rollback pending`
 				: highCount > 0
-					? `review: round ${nextRound}/${REVIEW_MAX_ROUNDS} — ${highCount} high finding(s) unresolved`
+					? `review: round ${nextRound}/${budgetLabelOf(model)} — ${highCount} high finding(s) unresolved`
 					: model.auditUndeterminable.length > 0
 						? `audit: ${model.auditUndeterminable.length} check(s) undeterminable — verdict unreadable`
 						: owed
-							? `review: round ${nextRound}/${REVIEW_MAX_ROUNDS} — verdict pending`
+							? `review: round ${nextRound}/${budgetLabelOf(model)} — verdict pending`
 							: model.auditRounds !== null
 								? "audit complete ✓"
 								: "all tasks terminal — audit pending";
 		lines.push(boxRow("│", ` ${clip(auditLine, inner - 2)}`, " ", width));
+	}
+	// v0.9.2: the blocker row renders in BOTH phases — a paused run sees it
+	// below the pause summary (which may be clipped at narrow widths), and a
+	// live run sees exactly what keeps the review from starting.
+	if (model.blockedTasks.length > 0) {
+		const provenance = model.blockedRound !== null ? ` (reopened by round ${model.blockedRound})` : "";
+		// Provenance once per row keeps the id list readable and short enough to
+		// survive a 100-column panel without dropping the instruction.
+		const rowText = narrow
+			? `⊘ blocked: ${model.blockedTasks.join(", ")}${provenance}`
+			: `⊘ blocked: ${model.blockedTasks.join(", ")}${provenance} — close with plans_update_task`;
+		lines.push(boxRow("│", ` ${clip(rowText, inner - 2)}`, " ", width));
 	}
 	if (!narrow && model.auditFailed.length > 0) {
 		lines.push(boxRow("│", ` ✗ ${clip(model.auditFailed.join(", "), inner - 3)}`, " ", width));
@@ -220,6 +247,22 @@ export function renderDashboardLines(model: DashboardModel, width: number, theme
 	return clampLines(painted, width);
 }
 
+/** v0.9.3: the budget denominator as shown in every review line (`3`, `∞`).
+ * A model without the field (legacy fixtures) reads as the legacy 5. */
+function budgetLabelOf(model: DashboardModel): string {
+	return formatReviewBudget(model.reviewBudget ?? LEGACY_REVIEW_MAX_ROUNDS);
+}
+
+/** v0.9.3: unlimited budgets render their run-cumulative hard-cap progress. */
+function hardCapOf(model: DashboardModel): string | null {
+	if ((model.reviewBudget ?? null) !== "unlimited") return null;
+	const ceiling = unlimitedHardCapCeiling({
+		reviewRoundsTotal: model.reviewRoundsTotal ?? 0,
+		reviewCapExtension: model.reviewCapExtension ?? 0,
+	});
+	return `${model.reviewRoundsTotal ?? 0}/${ceiling}`;
+}
+
 function progressBar(done: number, total: number, width = 12): string {
 	if (total <= 0) return "";
 	const filled = Math.round((done / total) * width);
@@ -230,7 +273,7 @@ export function deriveDashboardModel(
 	topic: string,
 	tasks: TaskView[],
 	checklist: CheckItem[],
-	extra?: { paused?: boolean; pausedReason?: string; auditRounds?: number | null; auditFailed?: string[]; auditUndeterminable?: string[]; reviewRunning?: boolean; findings?: Array<{ id: string; severity: string; note: string; taskIds: string[] }>; startedAt?: string; usage?: { inToks: number; outToks: number } },
+	extra?: { paused?: boolean; pausedReason?: string; auditRounds?: number | null; auditFailed?: string[]; auditUndeterminable?: string[]; reviewRunning?: boolean; findings?: Array<{ id: string; severity: string; note: string; taskIds: string[] }>; blockedTasks?: string[]; blockedRound?: number | null; reviewBudget?: ReviewBudget | null; reviewRoundsTotal?: number; reviewCapExtension?: number; reviewBudgetDefaulted?: boolean; startedAt?: string; usage?: { inToks: number; outToks: number } },
 ): DashboardModel {
 	return {
 		topic,
@@ -243,6 +286,12 @@ export function deriveDashboardModel(
 		auditUndeterminable: extra?.auditUndeterminable ?? [],
 		reviewRunning: extra?.reviewRunning ?? false,
 		findings: extra?.findings ?? [],
+		blockedTasks: extra?.blockedTasks ?? [],
+		blockedRound: extra?.blockedRound ?? null,
+		reviewBudget: extra?.reviewBudget ?? null,
+		reviewRoundsTotal: extra?.reviewRoundsTotal ?? 0,
+		reviewCapExtension: extra?.reviewCapExtension ?? 0,
+		reviewBudgetDefaulted: extra?.reviewBudgetDefaulted ?? false,
 		startedAt: extra?.startedAt ?? new Date().toISOString(),
 		usage: extra?.usage ?? { inToks: 0, outToks: 0 },
 	};
@@ -258,10 +307,11 @@ export function formatDashboardSummaryLine(model: DashboardModel): string {
 	// high count — visible in BOTH phases (executing repair and verifying), so
 	// convergence is legible exactly while the executor is fixing.
 	const highs = model.findings.filter((f) => f.severity === "high").length;
-	const audit = model.auditRounds !== null ? ` · review r${model.auditRounds}/${REVIEW_MAX_ROUNDS}` : "";
+	const audit = model.auditRounds !== null ? ` · review r${model.auditRounds}/${budgetLabelOf(model)}` : "";
 	const highToken = highs > 0 ? ` · ${highs} high` : "";
 	const pause = model.paused ? " · ⏸ paused" : "";
-	return `plans: ${model.topic} ▸ tasks ${p.done}/${p.total} · VC ${vcDone}/${model.checklist.length}${wave}${audit}${highToken}${pause}`;
+	const blocked = model.blockedTasks.length > 0 ? " · ⊘ blocked" : "";
+	return `plans: ${model.topic} ▸ tasks ${p.done}/${p.total} · VC ${vcDone}/${model.checklist.length}${wave}${audit}${highToken}${pause}${blocked}`;
 }
 
 /** Expanded tree view lines (Ctrl+Shift+T overlay). Wide layout from 96 cols. */
@@ -302,9 +352,10 @@ export function renderDashboardTreeLines(model: DashboardModel, width: number, t
 			lines.push(`  ${mark} ${f.id} (${f.severity}${f.taskIds.length ? `, ${f.taskIds.join(", ")}` : ""}): ${wide ? clip(f.note, 72) : clip(f.note, 40)}`);
 		}
 	}
+	const budgetNote = `${budgetLabelOf(model)}${model.reviewBudgetDefaulted ? " (default)" : ""}${hardCapOf(model) ? ` · cap ${hardCapOf(model)}` : ""}`;
 	if (model.reviewRunning) {
 		lines.push("");
-		lines.push(`Execution review: round ${(model.auditRounds ?? 0) + 1}/${REVIEW_MAX_ROUNDS} running`);
+		lines.push(`Execution review: round ${(model.auditRounds ?? 0) + 1}/${budgetNote} running`);
 	} else if (model.auditRounds !== null) {
 		lines.push("");
 		const highIds = model.findings.filter((f) => f.severity === "high").map((f) => f.id);
@@ -315,7 +366,7 @@ export function renderDashboardTreeLines(model: DashboardModel, width: number, t
 				: model.auditUndeterminable.length > 0
 					? ` — undeterminable: ${model.auditUndeterminable.join(", ")}`
 					: " — passed ✓";
-		lines.push(`Execution review: round ${model.auditRounds}${verdict}`);
+		lines.push(`Execution review: round ${model.auditRounds}/${budgetNote}${verdict}`);
 	}
 	const painted = theme ? lines.map((line) => theme.fg("muted", line)) : lines;
 	return clampLines(painted, width);

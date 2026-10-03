@@ -157,19 +157,26 @@ export async function executeCommand(ctx: ExtensionContext, planPathArg?: string
 	const activeExecution = getExecution();
 	const planPath = planPathArg ? path.resolve(ctx.cwd, planPathArg.replace(/^@/, "")) : activeExecution?.planPath;
 	if (activeExecution && planPath && path.resolve(activeExecution.planPath) === path.resolve(planPath)) {
-		const resumed = resumeActiveExecution(ctx);
+		// v0.9.3: the resume is async because a review-pause grant re-opens the
+		// budget picker; the message below is produced AFTER that panel resolves.
+		const resumed = await resumeActiveExecution(ctx);
 		// v0.8 phase-aware response: a verifying run continues its review loop
-		// (this tool is also the ONLY budget-granting surface at a cap pause).
+		// (this tool is also the ONLY budget-granting surface at a review pause).
 		const statusText = activeExecution.review?.inFlight
 			? "Execution review in progress (status verifying); the reviewer round runs in the overlay."
 			: (getExecution()?.stall.paused ?? false)
-				? "Execution review paused at the round cap — this confirmation granted a fresh five-round budget; the review resumes now."
-				: "Execution resumed; task progress preserved.";
+				? "Execution review paused — run /plans-execute and pick a round budget to continue."
+				: resumed.grantedBudget !== undefined
+					? `Review budget granted (${resumed.grantedBudget === "unlimited" ? "unlimited" : `${resumed.grantedBudget} rounds`}); the review resumes now.`
+					: "Execution resumed; task progress preserved.";
+		const declined = resumed.budgetDeclined === true;
 		return {
 			status: "executing",
 			planPath,
 			itemCount: activeExecution.items.length,
-			message: resumed ? statusText : "This plan is already executing.",
+			message: declined
+				? "Review budget unchanged — the run stays paused. Call /plans-execute again and pick a round count to continue."
+				: resumed.resumed ? statusText : "This plan is already executing.",
 		};
 	}
 	return executeHandoff(ctx, planPathArg);

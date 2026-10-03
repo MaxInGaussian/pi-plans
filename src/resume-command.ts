@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { loadExecutionFromCheckpoint } from "./exec.ts";
+import { formatReviewBudget, isReviewPauseReason, unlimitedHardCapCeiling } from "./review-budget.ts";
 import { bindRun, boundRunId } from "./run-context.ts";
 import { acquireOwnership, OwnershipError, releaseOwnership } from "./run-ownership.ts";
 import { loadConfig, resolveArtifactRoot, resolveStateRootOrNull, setRunStatus, updateRunWorkdir } from "./state.ts";
@@ -300,13 +301,23 @@ async function buildBrief(
 			const reverify = load.reverifyAll
 				? `\nThe code state (HEAD) changed since approval: the authorization is KEPT, but every previously closed task was re-opened and must be re-done. Historically verified checks (evidence only): ${doneList}.`
 				: `\nPreviously verified and still valid: ${doneList}.`;
-			// v0.8: a review-cap pause is NOT cleared by this resume — only
-			// /plans-execute (an explicit user confirmation) grants a fresh
-			// five-round budget; ordinary resumes and input keep it paused.
+			// v0.9.3: one shared predicate for every review pause (numeric
+			// exhaustion, the unlimited hard cap, the no-progress valve) — the
+			// three prefixes live in src/review-budget.ts so this surface can
+			// never drift from the pause writer (round-1 F-007).
 			const paused = load.pausedReason
-				? load.pausedReason.startsWith("execution review exhausted") || load.pausedReason.startsWith("completion audit exhausted")
-					? `\nExecution had been paused: ${load.pausedReason} — this pause survives the resume; run /plans-execute to grant a fresh five-round review budget.`
+				? isReviewPauseReason(load.pausedReason)
+					? `\nExecution had been paused: ${load.pausedReason} — this pause survives the resume; run /plans-execute to grant a fresh review budget (it re-opens the round-count picker).`
 					: `\nExecution had been paused: ${load.pausedReason} — the pause is cleared by this resume; continue from where it stopped.`
+				: "";
+			// v0.9.3 (Q-5): the brief repeats the budget and marks the no-UI
+			// fallback, so a resumed run never hides which bound is in force.
+			const budgetLine = load.reviewBudget !== undefined
+				? `\nExecution review budget: ${formatReviewBudget(load.reviewBudget)}${load.reviewBudgetDefaulted ? " (default)" : ""}${
+						load.reviewBudget === "unlimited"
+							? ` · hard cap ${unlimitedHardCapCeiling({ reviewRoundsTotal: load.reviewRoundsTotal ?? 0, reviewCapExtension: load.reviewCapExtension ?? 0 })} rounds (spent ${load.reviewRoundsTotal ?? 0})`
+							: ""
+					}.`
 				: "";
 			const legacy = load.legacyPlan ? "\nThis plan parses through the legacy I-### compatibility mapping; upgrade it to the ## Tasks format at the next revision." : "";
 			// v0.9.1 (F-005): outstanding highs surface in the brief itself, not
@@ -315,12 +326,15 @@ async function buildBrief(
 			const highLine = highs.length > 0
 				? `\nUnresolved high-severity findings from review round (stable ids): ${highs.map((f) => `${f.id}${f.taskIds.length ? ` (${f.taskIds.join(", ")})` : ""}: ${f.note}`).join("; ")} — fix them, then re-close the affected tasks.`
 				: "";
+			const blockedLine = (load.blocked?.tasks.length ?? 0) > 0
+				? `\nReview blocked: ${load.blocked!.tasks.join(", ")} ${load.blocked!.tasks.length === 1 ? "was" : "were"} reopened by execution review round ${load.blocked!.round} and ${load.blocked!.tasks.length === 1 ? "is" : "are"} still open — close ${load.blocked!.tasks.length === 1 ? "it" : "them"} with plans_update_task (complete + evidence, or skipped + skipReason); the review starts by itself once every task is terminal. No review round is running while these are open.`
+				: "";
 			// v0.8: a verifying run keeps checkpoint phase "executing" but the run
 			// STATUS is verifying — surface which loop owns the run right now.
 			const verifying = run.status === "verifying";
 			return {
 				phaseLabel: verifying ? "verifying" : "executing",
-				text: `[PI-PLANS RESUME] ${verifying ? "Execution review of" : "Execution of"} run ${runId} continues in this session.\nPlan: ${load.planPath}${reverify}${paused}${legacy}${highLine}\n${verifying ? "The task tree is terminal and the execution-review loop owns the run: when all tasks are terminal and checks are still owed, a read-only reviewer round runs automatically (status verifying → done when every check passes). If a check fails, its tasks roll back to pending — fix and re-close them with plans_update_task." : "Follow the execution-loop contract: work through tasks in wave order, report every task with the plans_update_task tool (status + evidence / skipReason), and let the execution reviewer verify the checks. The current wave and remaining tasks are injected each turn."}`,
+				text: `[PI-PLANS RESUME] ${verifying ? "Execution review of" : "Execution of"} run ${runId} continues in this session.\nPlan: ${load.planPath}${reverify}${budgetLine}${paused}${legacy}${highLine}${blockedLine}\n${verifying ? "The task tree is terminal and the execution-review loop owns the run: when all tasks are terminal and checks are still owed, a read-only reviewer round runs automatically (status verifying → done when every check passes). If a check fails, its tasks roll back to pending — fix and re-close them with plans_update_task." : "Follow the execution-loop contract: work through tasks in wave order, report every task with the plans_update_task tool (status + evidence / skipReason), and let the execution reviewer verify the checks. The current wave and remaining tasks are injected each turn."}`,
 			};
 		}
 		if (load.legacyDelegate) {

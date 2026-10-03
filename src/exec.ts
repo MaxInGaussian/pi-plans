@@ -66,6 +66,8 @@ import {
 	sha256File,
 	StaleCheckpointError,
 	type ExecutionApproval,
+	type ExecutionBlocked,
+	type ExecutionCheckpoint,
 	type WorkflowCheckpoint,
 } from "./workflow-state.ts";
 import { graphBlockForExecutor } from "./code-graph/prompts.ts";
@@ -82,12 +84,14 @@ import {
 	allTasksTerminal,
 	auditRollbackSet,
 	auditableChecks,
+	blockedReviewTasks,
 	buildTaskView,
 	currentTask,
 	findingsRollbackSet,
 	flattenTaskViews,
 	invalidateChecksForRolledBackTasks,
 	maxWave,
+	rollbackCoverageIds,
 	taskIsTerminal,
 	taskProgress,
 	taskProgressMap,
@@ -103,7 +107,27 @@ import {
 	renderDashboardLines,
 	renderDashboardTreeLines,
 } from "./dashboard.ts";
-import { REVIEW_MAX_ROUNDS, presolvedCheckIds, runCompletionAudit, writeReviewRoundReport, type AuditOutcome, type AuditRoundResult, type ReviewFinding } from "./auditor.ts";
+import { presolvedCheckIds, runCompletionAudit, writeReviewRoundReport, type AuditOutcome, type AuditRoundResult, type ReviewFinding } from "./auditor.ts";
+import {
+	DEFAULT_REVIEW_BUDGET,
+	LEGACY_REVIEW_MAX_ROUNDS,
+	NO_PROGRESS_MAX_STREAK,
+	REVIEW_CAP_PAUSE_PREFIX,
+	REVIEW_NO_PROGRESS_PAUSE_PREFIX,
+	UNLIMITED_HARD_CAP,
+	askReviewBudget,
+	budgetExhausted,
+	bumpNoProgress,
+	formatReviewBudget,
+	isReviewPauseReason,
+	noProgressSignature,
+	noProgressTripped,
+	resolveStoredBudget,
+	reviewBudgetPanelAvailable,
+	unlimitedHardCapCeiling,
+	type NoProgressState,
+	type ReviewBudget,
+} from "./review-budget.ts";
 import type { ReviewFindingRecord } from "./workflow-state.ts";
 import { staleReloadHint as probeStaleReload } from "./staleness.ts";
 import { messaging } from "./messaging.ts";
@@ -137,13 +161,48 @@ export interface ExecState {
 	/** Execution-review loop (v0.8), memory-only: the attempt index names the
 	 * per-round report files; consecutiveDiscards bounds the fingerprint
 	 * re-run loop; inFlight owns the round's abort lifecycle. */
-	review: { attempts: number; consecutiveDiscards: number; inFlight: InFlightReview | null };
+	review: { attempts: number; consecutiveDiscards: number; inFlight: InFlightReview | null; budgetAsking?: boolean };
 	/** Per-settle audit latch (v0.7.1): a settled round fires the completion
 	 * audit at most once, so the turn_end / agent_before_settle / resume entry
 	 * points cannot double-consume a round when several land in one settle.
 	 * Created on demand by auditLatchOf(); every construction path may omit it. */
 	auditLatch?: { auditedThisSettle: boolean; activity: number };
+	/** v0.9.2: outstanding blocker from the newest failed review round — the
+	 * authoritative rollback set captured at commit time plus the still-open
+	 * tasks among it. Memory mirror of `execution.blocked`; null = nothing
+	 * blocks the review. */
+	blocked: ExecBlocked | null;
+	/** v0.9.2: blocker ids as observed at the PREVIOUS blocked wake — the
+	 * ladder's progress baseline. Memory-only: `blocked.tasks` is re-synced by
+	 * `persistTaskProgress` on every task close (so it stays fresh for the
+	 * resume brief), which would make a comparison against it meaningless.
+	 * Absent after a restore/resume → the next blocked wake restarts the count. */
+	blockedWakeTasks?: string[];
+	/** v0.9.2: highest escalation level already surfaced as a visible system
+	 * line. Memory-only (never persisted/snapshotted) so a restored session
+	 * re-notifies once. */
+	blockedNotifiedLevel?: number;
+	/** v0.9.3: the per-run execution-review budget. Resolved exactly once —
+	 * right before round 1 — from the picker or the no-UI default, then
+	 * persisted. `undefined` = not decided yet (never conflated with a legacy
+	 * checkpoint, which `loadExecutionFromCheckpoint` resolves to 5). */
+	reviewBudget?: ReviewBudget;
+	/** v0.9.3: the budget came from the fallback (no UI/headless/auto-approve),
+	 * not from a user pick — the expanded dashboard row marks it `(default)`
+	 * and the resume brief repeats the note. Persisted so a later session can
+	 * still tell the difference. */
+	reviewBudgetDefaulted?: boolean;
+	/** v0.9.3: committed review rounds across the whole run (never reset by a
+	 * grant) — the unlimited budget's cumulative hard-cap counter. */
+	reviewRoundsTotal: number;
+	/** v0.9.3: rounds added to the unlimited hard cap by explicit grants. */
+	reviewCapExtension: number;
+	/** v0.9.3: no-progress valve state (unlimited budget only). */
+	reviewNoProgress?: NoProgressState;
 }
+
+/** Live blocker record (see `ExecutionBlocked` in workflow-state.ts). */
+type ExecBlocked = ExecutionBlocked;
 
 /** One in-flight review round: owns its abort lifecycle, its fingerprint of
  * the audited subject, and the per-round one-shot wake token (v0.8). */
@@ -173,6 +232,8 @@ const STALL_MAX_ROUNDS = 3;
 let execution: ExecState | null = null;
 
 export const EXECUTION_CONTINUE_CUSTOM_TYPE = "pi-plans-exec-continue";
+/** v0.9.2: visible escalation line — never replays after a restart. */
+export const EXECUTION_BLOCKED_CUSTOM_TYPE = "pi-plans-exec-blocked";
 /** Legacy v0.6.0 continuation message type — filtered on restore. */
 const LEGACY_GOAL_WAIT_CUSTOM_TYPE = "pi-plans-goal-wait";
 
@@ -239,7 +300,49 @@ export interface CheckpointExecutionLoad {
 	 * so the /resume-plans brief can surface outstanding highs before the
 	 * per-turn injection ever runs. */
 	findings?: ReviewFinding[];
+	/** v0.9.2: persisted blocker of the newest failed round, so the resume
+	 * brief can name the open tasks that keep the review from starting. */
+	blocked?: ExecutionBlocked | null;
+	/** v0.9.3: the persisted per-run review budget (or undefined when the run
+	 * never picked one — a legacy checkpoint resolves to 5 in the live state,
+	 * see `reviewBudgetDefaulted`). */
+	reviewBudget?: ReviewBudget;
+	reviewBudgetDefaulted?: boolean;
+	reviewRoundsTotal?: number;
+	reviewCapExtension?: number;
 	error?: string;
+}
+
+/** v0.9.2: a checkpoint written before `execution.blocked` existed still names
+ * its blocker — `audit.lastResult` records the newest failed round's ids and
+ * the coverage cascade is pure, so the rollback set can be reconstructed
+ * WITHOUT re-applying anything (the tree already carries the reopen's outcome;
+ * re-applying it would revert tasks the executor has since re-closed).
+ * Finding-driven rounds (`highs: F-…`) carry no coverage and stay without a
+ * record — the wake still states that no round can start while tasks are open. */
+function blockedFromFailedIds(
+	failedIds: readonly string[],
+	round: number,
+	tasks: TaskView[],
+	checklist: CheckItem[],
+): ExecBlocked | null {
+	if (failedIds.length === 0) return null;
+	const rolledBack = rollbackCoverageIds(tasks, checklist, failedIds, []);
+	if (rolledBack.length === 0) return null;
+	const open = blockedReviewTasks(tasks, rolledBack);
+	if (open.length === 0) return null;
+	return { rolledBack, tasks: open, round, escalatedRounds: 0, since: utcNow() };
+}
+
+function backfillBlocked(
+	checkpoint: ExecutionCheckpoint,
+	tasks: TaskView[],
+	checklist: CheckItem[],
+): ExecBlocked | null {
+	const last = checkpoint.audit?.lastResult?.trim() ?? "";
+	if (last.length === 0 || last.startsWith("highs:")) return null;
+	const failed = last.split(",").map((id) => id.trim()).filter((id) => id.length > 0);
+	return blockedFromFailedIds(failed, checkpoint.audit?.rounds ?? 0, tasks, checklist);
 }
 
 /**
@@ -309,6 +412,11 @@ export function loadExecutionFromCheckpoint(
 		startedAt: utcNow(),
 		usage: { inToks: cp.execution.usage.inToks, outToks: cp.execution.usage.outToks },
 		uiLanguage: resolveUiLanguage(ctx.cwd),
+		// v0.9.2: the persisted blocker survives a restore so the resume brief
+		// and the dashboard can name it; a reverifyAll restore drops it together
+		// with the task progress it described. Pre-feature checkpoints are
+		// backfilled from the newest failed round's ids.
+		blocked: reverifyAll ? null : (cp.execution.blocked ?? backfillBlocked(cp.execution, tasks, items)),
 		// D-020: a paused legacy (or stopped) execution rebuilds unpaused — the
 		// resume itself is the user's intent; the reason is surfaced in the
 		// resume brief instead. EXCEPT a review-cap pause (v0.8): it must
@@ -327,8 +435,16 @@ export function loadExecutionFromCheckpoint(
 			findings: toReviewFindings(cp.execution.audit?.findings),
 			running: false,
 		},
-		review: { attempts: 0, consecutiveDiscards: 0, inFlight: null },
+		review: { attempts: 0, consecutiveDiscards: 0, inFlight: null, budgetAsking: false },
 		auditLatch: { auditedThisSettle: false, activity: 0 },
+		// v0.9.3: the review budget survives a restore; a checkpoint written
+		// before the feature that already spent rounds keeps the legacy 5-round
+		// bound instead of being cut to the new default mid-flight.
+		reviewBudget: resolveStoredBudget(cp.execution.reviewBudget, cp.execution.audit?.rounds ?? 0),
+		reviewBudgetDefaulted: cp.execution.reviewBudgetDefaulted === true,
+		reviewRoundsTotal: cp.execution.reviewRoundsTotal ?? 0,
+		reviewCapExtension: cp.execution.reviewCapExtension ?? 0,
+		reviewNoProgress: cp.execution.reviewNoProgress ?? undefined,
 	};
 	execution.stall.lastSnapshot = stallSnapshot();
 	executionRunId = runId;
@@ -363,6 +479,11 @@ export function loadExecutionFromCheckpoint(
 	if (headChanged) {
 		withExecutionCheckpoint(ctx, (current) => applyExecutionHeadChanged(current));
 	}
+	// A backfilled blocker is authoritative from here on: persist it once so a
+	// later restart reads the record instead of re-deriving it.
+	if (!reverifyAll && (cp.execution.blocked ?? null) === null && execution!.blocked !== null) {
+		withExecutionCheckpoint(ctx, (current) => applyExecutionProgress(current, { blocked: execution!.blocked }));
+	}
 	persist(ctx);
 	updateStatusWidget(ctx);
 	return {
@@ -374,6 +495,13 @@ export function loadExecutionFromCheckpoint(
 		legacyPlan: planTasks.legacy,
 		legacyDelegate,
 		findings: toReviewFindings(cp.execution.audit?.findings),
+		// The LIVE record: a pre-feature checkpoint is backfilled (and persisted)
+		// above, so the resume brief sees the reconstructed blocker.
+		blocked: execution?.blocked ?? null,
+		reviewBudget: execution?.reviewBudget,
+		reviewBudgetDefaulted: execution?.reviewBudgetDefaulted === true,
+		reviewRoundsTotal: execution?.reviewRoundsTotal ?? 0,
+		reviewCapExtension: execution?.reviewCapExtension ?? 0,
 	};
 }
 
@@ -515,6 +643,8 @@ function updatePanelWidget(ctx: ExtensionContext): void {
 					auditUndeterminable: current.audit.undeterminable,
 					findings: current.audit.findings,
 					reviewRunning: current.audit.running === true || current.review.inFlight !== null,
+					blockedTasks: blockedTaskIds(current),
+					blockedRound: current.blocked?.round ?? null,
 					startedAt: current.startedAt,
 					usage: current.usage,
 				});
@@ -540,6 +670,12 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 			auditUndeterminable: execution.audit.undeterminable,
 			findings: execution.audit.findings,
 			reviewRunning: execution.audit.running === true || execution.review.inFlight !== null,
+			blockedTasks: blockedTaskIds(execution),
+			blockedRound: execution.blocked?.round ?? null,
+			reviewBudget: execution.reviewBudget ?? null,
+			reviewRoundsTotal: execution.reviewRoundsTotal,
+			reviewCapExtension: execution.reviewCapExtension,
+			reviewBudgetDefaulted: execution.reviewBudgetDefaulted === true,
 		});
 		ctx.ui.setStatus("pi-plans", ctx.ui.theme.fg("accent", formatDashboardSummaryLine(model)));
 		return;
@@ -611,6 +747,15 @@ function persist(ctx: ExtensionContext): void {
 		startedAt: execution.startedAt,
 		usage: execution.usage,
 		stall: execution.stall,
+		blocked: execution.blocked,
+		// v0.9.3 (round-1 F-005): the review budget rides the session snapshot
+		// too — a /reload restore rebuilds the live state from it, and a
+		// restored counter must NOT hand the run a free unlimited window.
+		reviewBudget: execution.reviewBudget,
+		reviewBudgetDefaulted: execution.reviewBudgetDefaulted,
+		reviewRoundsTotal: execution.reviewRoundsTotal,
+		reviewCapExtension: execution.reviewCapExtension,
+		reviewNoProgress: execution.reviewNoProgress,
 		audit: { rounds: execution.audit.rounds, failed: execution.audit.failed, findings: execution.audit.findings },
 	});
 }
@@ -654,9 +799,15 @@ export async function startExecution(
 		usage: { inToks: 0, outToks: 0 },
 		uiLanguage: resolveUiLanguage(ctx.cwd),
 		stall: { rounds: 0, lastSnapshot: null, paused: false },
+		blocked: null,
 		audit: { rounds: 0, failed: [], undeterminable: [], findings: [], running: false },
-		review: { attempts: 0, consecutiveDiscards: 0, inFlight: null },
+		review: { attempts: 0, consecutiveDiscards: 0, inFlight: null, budgetAsking: false },
 		auditLatch: { auditedThisSettle: false, activity: 0 },
+		// v0.9.3: a fresh handoff starts with NO budget — the picker resolves it
+		// (or the no-UI default applies) right before round 1.
+		reviewBudget: undefined,
+		reviewRoundsTotal: 0,
+		reviewCapExtension: 0,
 	};
 	// Seed the watchdog baseline only after `execution` points at the new state
 	// (stallSnapshot reads the live execution).
@@ -716,11 +867,21 @@ export function persistTaskProgress(ctx: ExtensionContext): void {
 	// Any task-state change resets the stall watchdog baseline.
 	execution.stall.rounds = 0;
 	execution.stall.lastSnapshot = stallSnapshot();
+	// v0.9.2: closing a reopened task shrinks the blocker; when the last one
+	// closes the record is dropped so no stale blocker outlives the repair.
+	if (execution.blocked) {
+		execution.blocked.tasks = blockedReviewTasks(execution.tasks, execution.blocked.rolledBack);
+		if (execution.blocked.tasks.length === 0) {
+			execution.blocked = null;
+			execution.blockedWakeTasks = undefined;
+		}
+	}
 	withExecutionCheckpoint(ctx, (cp) =>
 		applyExecutionProgress(cp, {
 			tasks: taskProgressMap(execution!.tasks),
 			doneVcIds: execution!.items.filter((item) => item.done).map((item) => item.id),
 			stallRounds: execution!.stall.rounds,
+			blocked: execution!.blocked,
 			audit: {
 				rounds: execution!.audit.rounds,
 				lastResult: execution!.audit.failed.length > 0 ? execution!.audit.failed.join(",") : undefined,
@@ -884,14 +1045,102 @@ export function registerExecutionTurnHandlers(
  *
  *  Completion stays fail-closed AND never fail-open: a run completes only
  *  when every pending check was affirmatively passed. */
-const REVIEW_CAP_PAUSE_PREFIX = "execution review exhausted";
-/** v0.7 protocol value — dual-matched for one release so checkpoints written
- * by older builds keep their cap pause recognized on restore. */
-const LEGACY_AUDIT_CAP_PAUSE_PREFIX = "completion audit exhausted";
-
 function isReviewCapPause(reason: string | undefined | null): boolean {
-	if (!reason) return false;
-	return reason.startsWith(REVIEW_CAP_PAUSE_PREFIX) || reason.startsWith(LEGACY_AUDIT_CAP_PAUSE_PREFIX);
+	return isReviewPauseReason(reason);
+}
+
+/** v0.9.3: the counters that bound an unlimited budget. */
+function budgetCounters(ex: ExecState): { reviewRoundsTotal: number; reviewCapExtension: number } {
+	return { reviewRoundsTotal: ex.reviewRoundsTotal, reviewCapExtension: ex.reviewCapExtension };
+}
+
+/** The budget in force for this run; a legacy checkpoint resolves to 5 during
+ * load, so this is only a guard for hand-built test states. */
+function activeBudget(ex: ExecState): ReviewBudget {
+	return ex.reviewBudget ?? LEGACY_REVIEW_MAX_ROUNDS;
+}
+
+function budgetSpent(ex: ExecState): boolean {
+	return budgetExhausted(activeBudget(ex), ex.audit.rounds, budgetCounters(ex));
+}
+
+/** `3` / `∞` — the budget as shown in status lines and messages. */
+function budgetLabel(ex: ExecState): string {
+	return formatReviewBudget(activeBudget(ex));
+}
+
+/**
+ * v0.9.3: whether the budget panel may be shown in THIS session. Beyond the
+ * native-surface check, auto-approve sessions never ask — the recorded plan
+ * decision routes headless/auto-approve runs to the default budget
+ * (`PI_PLANS_AUTO_APPROVE=1` exists for unattended harnesses, where a panel
+ * would either hang or answer meaninglessly).
+ */
+function reviewBudgetPanelUsable(ctx: ExtensionContext): boolean {
+	return !isAutoApproveEnabledLocal() && reviewBudgetPanelAvailable(ctx);
+}
+
+/** Persist a freshly resolved budget (and the counters) in one revision. */
+function persistResolvedBudget(ctx: ExtensionContext, ex: ExecState): void {
+	withExecutionCheckpoint(ctx, (cp) =>
+		applyExecutionProgress(cp, {
+			reviewBudget: ex.reviewBudget ?? null,
+			reviewBudgetDefaulted: ex.reviewBudgetDefaulted === true,
+			reviewRoundsTotal: ex.reviewRoundsTotal,
+			reviewCapExtension: ex.reviewCapExtension,
+		}),
+	);
+	persist(ctx);
+	updateStatusWidget(ctx);
+}
+
+/** One visible note whenever the fallback (rather than a user pick) decided
+ * the budget — never a silent bound (v0.9.3, Q-3). */
+function notifyDefaultBudget(ex: ExecState, why: "no-panel" | "cancelled"): void {
+	const budget = formatReviewBudget(ex.reviewBudget ?? DEFAULT_REVIEW_BUDGET);
+	messaging().sendMessage(
+		{
+			customType: "pi-plans-review-budget-default",
+			content:
+				why === "no-panel"
+					? `**pi-plans: execution review budget: ${budget} (default)** — no budget panel is available in this session, so the default budget applies. The review runs up to ${budget} round(s) before pausing for /plans-execute.`
+					: `**pi-plans: execution review budget: ${budget} (default)** — the budget panel was closed without a choice, so the default budget applies. The review runs up to ${budget} round(s) before pausing for /plans-execute.`,
+			display: true,
+		},
+		{ triggerTurn: false },
+	);
+}
+
+/** Synchronous fallback: apply (and persist) the default budget. Used when no
+ * panel exists at all — the headless/print/json and auto-approve paths — so
+ * the first round needs no extra async hop. */
+function applyDefaultReviewBudget(ctx: ExtensionContext, ex: ExecState): void {
+	if (ex.reviewBudget !== undefined) return;
+	ex.reviewBudget = DEFAULT_REVIEW_BUDGET;
+	ex.reviewBudgetDefaulted = true;
+	notifyDefaultBudget(ex, "no-panel");
+	persistResolvedBudget(ctx, ex);
+}
+
+/**
+ * Resolve the per-run review budget exactly once, immediately before the first
+ * round. The panel path is async; every other case is handled up front by
+ * `applyDefaultReviewBudget`. `budgetAsking` keeps a second settle (or a
+ * restore while the panel is open) from opening a second panel.
+ */
+async function askReviewBudgetForRun(ctx: ExtensionContext, ex: ExecState): Promise<void> {
+	if (ex.reviewBudget !== undefined || ex.review.budgetAsking) return;
+	ex.review.budgetAsking = true;
+	try {
+		const picked = await askReviewBudget(ctx, ex.uiLanguage, undefined);
+		if (execution !== ex || ex.reviewBudget !== undefined) return;
+		ex.reviewBudget = picked ?? DEFAULT_REVIEW_BUDGET;
+		ex.reviewBudgetDefaulted = picked === null;
+		if (picked === null) notifyDefaultBudget(ex, "cancelled");
+		persistResolvedBudget(ctx, ex);
+	} finally {
+		ex.review.budgetAsking = false;
+	}
 }
 
 /** The currently-running (or self-scheduling) review chain; the sanctioned
@@ -933,8 +1182,56 @@ function toReviewFindings(records?: ReviewFindingRecord[]): ReviewFinding[] {
  * the review owed even when every check is done (the stranded-high path),
  * mirroring how a failed check keeps it owed today. */
 function reviewOwed(ex: ExecState): boolean {
-	return allTasksTerminal(ex.tasks)
-		&& (auditableChecks(ex.items, ex.tasks).some((item) => !item.done) || unresolvedHighFindings(ex).length > 0);
+	return allTasksTerminal(ex.tasks) && reviewOutstanding(ex);
+}
+
+/** v0.9.2: the review is outstanding wherever the tree stands — checks still
+ * owed or an unresolved high finding. `reviewOwed` ANDs this with
+ * allTasksTerminal; the blocked wake needs exactly the half that stays true
+ * while tasks are open, because that is the state in which the review cannot
+ * start (and in which `pendingAudit` is false by construction). */
+function reviewOutstanding(ex: ExecState): boolean {
+	return auditableChecks(ex.items, ex.tasks).some((item) => !item.done) || unresolvedHighFindings(ex).length > 0;
+}
+
+/** v0.9.2: live blocker ids — the newest failed round's rollback set
+ * intersected with the still-open tasks. Always recomputed from the tree: the
+ * stored `tasks` list may predate the last status change. */
+function blockedTaskIds(ex: ExecState): string[] {
+	return ex.blocked ? blockedReviewTasks(ex.tasks, ex.blocked.rolledBack) : [];
+}
+
+/** v0.9.2: one visible system line per escalation level, so the user sees the
+ * loop escalating before the watchdog pauses it. Memory-only latch (the
+ * restored state re-notifies once, which is the useful behavior). */
+function notifyBlockedEscalation(ctx: ExtensionContext, ex: ExecState): void {
+	const level = ex.blocked?.escalatedRounds ?? 0;
+	if (!ex.blocked || level === 0 || ex.blockedNotifiedLevel === level) return;
+	ex.blockedNotifiedLevel = level;
+	const ids = blockedTaskIds(ex);
+	try {
+		messaging().sendMessage(
+			{
+				customType: EXECUTION_BLOCKED_CUSTOM_TYPE,
+				content: `**pi-plans: execution blocked (wake ${level}/${STALL_MAX_ROUNDS})** — review round ${ex.blocked.round + 1} cannot start: ${ids.join(", ")} ${ids.length === 1 ? "was" : "were"} reopened by round ${ex.blocked.round} and ${ids.length === 1 ? "is" : "are"} still open. Close them with \`plans_update_task\` (the review starts by itself once every task is terminal).`,
+				display: true,
+			},
+			{ triggerTurn: false },
+		);
+	} catch {
+		/* best-effort: the wake below still carries the same blocker */
+	}
+}
+
+/** v0.9.2: the pause reason names the real blocker instead of the watchdog's
+ * own metric. Single line, never a review-cap prefix (`isReviewCapPause`
+ * matches "execution review exhausted" / "completion audit exhausted"). */
+function blockedPauseReason(ex: ExecState): string {
+	const ids = blockedTaskIds(ex);
+	const round = ex.blocked?.round ?? ex.audit.rounds;
+	const head = ids.slice(0, 3).join(", ");
+	const more = ids.length > 3 ? `, +${ids.length - 3} more` : "";
+	return `blocked: review round ${round + 1} cannot start — ${ids.length} task(s) reopened by round ${round} still open (${head}${more})`;
 }
 
 function runDirOf(ctx: ExtensionContext): string | null {
@@ -1076,7 +1373,13 @@ function pauseReviewCap(ctx: ExtensionContext, ex: ExecState): void {
 			: highs.length > 0
 				? `high findings: ${highs.map((f) => f.id).join(", ")}`
 				: `unreadable verdicts: ${ex.audit.undeterminable.join(", ") || "unknown"}`;
-	const reason = `${REVIEW_CAP_PAUSE_PREFIX} ${REVIEW_MAX_ROUNDS} rounds (${detail}). Only /plans-execute — an explicit user confirmation — grants a fresh five-round budget; ordinary messages and session restores do not. (Or close the failed checks' tasks as skipped to pass them as skipped-pass.)`;
+	// v0.9.3: the reason names the budget actually in force — the numeric round
+	// count, or the unlimited hard cap that stopped the loop.
+	const scope =
+		activeBudget(ex) === "unlimited"
+			? `${unlimitedHardCapCeiling(budgetCounters(ex))} rounds (unlimited budget safety cap)`
+			: `${activeBudget(ex)} round${activeBudget(ex) === 1 ? "" : "s"}`;
+	const reason = `${REVIEW_CAP_PAUSE_PREFIX} ${scope} (${detail}). Only /plans-execute — an explicit user confirmation — grants a fresh budget (and re-opens the ${formatReviewBudget(activeBudget(ex))} picker; ordinary messages and session restores do not). (Or close the failed checks' tasks as skipped to pass them as skipped-pass.)`;
 	pauseForStall(ctx, reason);
 	// In-band, headless-visible pause signal (the pi-plans-exec-stop pattern):
 	// pauseForStall's ui.notify is optional and absent headless, so the pause
@@ -1085,6 +1388,41 @@ function pauseReviewCap(ctx: ExtensionContext, ex: ExecState): void {
 		{ customType: "pi-plans-review-paused", content: `**pi-plans: ${reason}**`, display: true },
 		{ triggerTurn: false },
 	);
+}
+
+/** v0.9.3: the unlimited budget's no-progress valve — three consecutive
+ * committed rounds with an identical outcome signature cannot converge, so
+ * the run pauses fail-closed instead of burning rounds silently. */
+function pauseReviewNoProgress(ctx: ExtensionContext, ex: ExecState): void {
+	const streak = ex.reviewNoProgress?.streak ?? NO_PROGRESS_MAX_STREAK;
+	const highs = unresolvedHighFindings(ex);
+	const detail =
+		ex.audit.failed.length > 0
+			? `failed: ${ex.audit.failed.join(", ")}${highs.length > 0 ? `; high findings: ${highs.map((f) => f.id).join(", ")}` : ""}`
+			: highs.length > 0
+				? `high findings: ${highs.map((f) => f.id).join(", ")}`
+				: `unreadable verdicts: ${ex.audit.undeterminable.join(", ") || "unknown"}`;
+	const reason = `${REVIEW_NO_PROGRESS_PAUSE_PREFIX} — ${streak} consecutive rounds reported the same outcome (${detail}). Only /plans-execute — an explicit user confirmation — grants a fresh budget (and re-opens the budget picker; ordinary messages and session restores do not).`;
+	pauseForStall(ctx, reason);
+	messaging().sendMessage(
+		{ customType: "pi-plans-review-paused", content: `**pi-plans: ${reason}**`, display: true },
+		{ triggerTurn: false },
+	);
+}
+
+/** v0.9.3: the single gate every round spawn passes through. Returns false
+ * when the run was paused (no round may start). The unlimited valve order is
+ * deliberate: no-progress is checked first so its reason wins when both hold. */
+function reviewBudgetGate(ctx: ExtensionContext, ex: ExecState): boolean {
+	if (activeBudget(ex) === "unlimited" && noProgressTripped(ex.reviewNoProgress)) {
+		pauseReviewNoProgress(ctx, ex);
+		return false;
+	}
+	if (budgetSpent(ex)) {
+		pauseReviewCap(ctx, ex);
+		return false;
+	}
+	return true;
 }
 
 async function startReviewRound(ctx: ExtensionContext): Promise<void> {
@@ -1105,11 +1443,27 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 		await completeExecution(ctx);
 		return;
 	}
-	if (ex.stall.paused || ex.review.inFlight) return;
-	if (ex.audit.rounds >= REVIEW_MAX_ROUNDS) {
-		pauseReviewCap(ctx, ex);
-		return;
+	if (ex.stall.paused || ex.review.inFlight || ex.review.budgetAsking) return;
+	// v0.9.3: the budget is resolved right here — every task is terminal, the
+	// review is genuinely owed, and this is the last moment before round 1.
+	// No panel → the default applies synchronously (no extra tick, so a
+	// detached settle still shows the round in flight immediately); a panel →
+	// one await, guarded against a second settle by `budgetAsking`.
+	if (ex.reviewBudget === undefined && !reviewBudgetPanelUsable(ctx)) applyDefaultReviewBudget(ctx, ex);
+	if (ex.reviewBudget === undefined) {
+		await askReviewBudgetForRun(ctx, ex);
+		if (execution !== ex || ex.reviewBudget === undefined) return;
 	}
+	if (pendingChecks.length === 0) {
+		// Every verification check is satisfied; only unresolved highs keep the
+		// review owed. With the budget spent there is no round left to buy, so
+		// the run completes and DISCLOSES the highs (v0.9.3, Q-2).
+		if (budgetSpent(ex)) {
+			await completeExecution(ctx);
+			return;
+		}
+	}
+	if (!reviewBudgetGate(ctx, ex)) return;
 	// Phase transition: the executor is done with its tasks; the review loop
 	// owns the run until it converges (or pauses at the cap).
 	setRunStatusForReview(ctx, "verifying");
@@ -1320,6 +1674,9 @@ async function commitReviewOutcome(
 	// The budget is charged only when an outcome commits — never on discard
 	// or cancellation (CF2-003).
 	ex.audit.rounds = round.budgetRound;
+	// v0.9.3: the run-cumulative counter never resets — it is what bounds an
+	// unlimited budget across grants (Q-4).
+	ex.reviewRoundsTotal += 1;
 	const passed = pendingIds.filter((id) => (outcome?.passed ?? []).includes(id));
 	const failed = pendingIds.filter((id) => (outcome?.failed ?? []).includes(id));
 	// Anything the round neither passed nor failed is undeterminable: the
@@ -1337,6 +1694,12 @@ async function commitReviewOutcome(
 	const findings = reported ? outcome.findings : ex.audit.findings;
 	ex.audit.findings = findings;
 	const highs = findings.filter((f) => f.severity === "high");
+	// v0.9.3: the no-progress valve's signature is computed HERE, from the
+	// post-classification triple — a spawn-failure round (`outcome === null`)
+	// and a discard synthesis have no findings array of their own, but the
+	// preserved unresolved set plus the derived verdicts still describe a
+	// concrete, comparable outcome (round-1 F-002).
+	ex.reviewNoProgress = bumpNoProgress(ex.reviewNoProgress, noProgressSignature(failed, undeterminable, highs.map((f) => f.id)));
 	// Findings are actionable only when this round actually reported them;
 	// see the fix-loop branch below (v0.9.1, F-001).
 	const actionableHighs = reported ? highs : [];
@@ -1371,6 +1734,40 @@ async function commitReviewOutcome(
 		if (item) item.done = true;
 	}
 
+	// v0.9.3 (Q-2/F-003): the exhausted-budget completion. EVERY check this
+	// round still owed affirmed, only unresolved highs remain, and the budget
+	// cannot buy another round — the run completes, tolerating the highs (they
+	// stay in the round report and the checkpoint; `completeExecution`
+	// discloses them). Evaluated BEFORE the fix branch on purpose: the
+	// tolerated round must not roll back tasks, append plan tasks, rewrite the
+	// approved plan, or wake the executor for a run that is about to be done.
+	if (budgetSpent(ex) && passed.length === pendingIds.length && highs.length > 0) {
+		ex.audit.failed = [];
+		ex.audit.undeterminable = [];
+		ex.blocked = null;
+		withExecutionCheckpoint(ctx, (cp) =>
+			applyExecutionProgress(cp, {
+				tasks: taskProgressMap(ex.tasks),
+				doneVcIds: ex.items.filter((item) => item.done).map((item) => item.id),
+				blocked: null,
+				reviewRoundsTotal: ex.reviewRoundsTotal,
+				reviewNoProgress: ex.reviewNoProgress ?? null,
+				audit: { rounds: ex.audit.rounds, passed: true, findings },
+			}),
+		);
+		persist(ctx);
+		messaging().sendMessage(
+			{
+				customType: "pi-plans-review-tolerated",
+				content: `**pi-plans: review budget exhausted (${budgetLabel(ex)}) — completing with ${highs.length} unresolved high finding(s): ${highs.map((f) => f.id).join(", ")}** — every verification check passed; the finding(s) remain in the round reports.`,
+				display: true,
+			},
+			{ triggerTurn: false },
+		);
+		await completeExecution(ctx);
+		return;
+	}
+
 	// v0.9 fix loop — evaluated BEFORE the completion branch so an unresolved
 	// high finding can never complete the run (liveness). Failed checks and
 	// high findings drive ONE union rollback and exactly one executor wake;
@@ -1398,6 +1795,20 @@ async function commitReviewOutcome(
 		const unmappedHighs = actionableHighs.filter((h) => !h.taskIds.some((id) => knownIds.has(id)));
 		const amended = unmappedHighs.length > 0 ? appendFindingTasks(ex, unmappedHighs) : [];
 		const allRolledBack = [...new Set([...rolledBack, ...highRolledBack])];
+		// v0.9.2: capture the round's rollback set HERE. The reopen helpers above
+		// mutate the tree and report only flipped nodes, so this is the only
+		// moment the authoritative provenance exists; the still-open subset is
+		// what blocks the next round and what wakes/pauses name explicitly.
+		ex.blocked = allRolledBack.length > 0
+			? {
+				rolledBack: [...allRolledBack],
+				tasks: blockedReviewTasks(ex.tasks, allRolledBack),
+				round: ex.audit.rounds,
+				escalatedRounds: 0,
+				since: utcNow(),
+			}
+			: null;
+		ex.blockedWakeTasks = undefined;
 		withExecutionCheckpoint(ctx, (cp) => {
 			// v0.9.1 (F-002): appending finding tasks rewrote the approved plan;
 			// re-stamp the checkpoint's plan identity in the same revision so a
@@ -1409,6 +1820,9 @@ async function commitReviewOutcome(
 			return applyExecutionProgress(amendedCp, {
 				tasks: taskProgressMap(ex.tasks),
 				doneVcIds: ex.items.filter((item) => item.done).map((item) => item.id),
+				blocked: ex.blocked,
+				reviewRoundsTotal: ex.reviewRoundsTotal,
+				reviewNoProgress: ex.reviewNoProgress ?? null,
 				audit: { rounds: ex.audit.rounds, lastResult: failed.join(",") || `highs: ${actionableHighs.map((h) => h.id).join(",")}`, findings },
 			});
 		});
@@ -1442,7 +1856,7 @@ async function commitReviewOutcome(
 				? `**pi-plans: execution review round ${ex.audit.rounds} found ${actionableHighs.length} high-severity finding(s)**${failed.length > 0 ? ` and failed checks: ${failed.join(", ")}` : ""}.`
 				: `**pi-plans: execution review round ${ex.audit.rounds} failed** — checks: ${failed.join(", ")}.`;
 			const findingsBlock = actionableHighs.length > 0 ? `\n\nHigh findings:\n${highLines}` : "";
-			const content = `${findingsLead} Rolled back tasks: ${allRolledBack.join(", ") || "(none covered)"}${amended.length > 0 ? `. Tasks appended to the plan for unmapped findings: ${amended.join(", ")}` : ""}.${findingsBlock}\n\nFix them and re-close the affected tasks with \`plans_update_task\`; the review reruns automatically once all tasks are terminal again.${ex.audit.rounds >= REVIEW_MAX_ROUNDS ? ` This was round ${REVIEW_MAX_ROUNDS} of ${REVIEW_MAX_ROUNDS}: the next terminal-task cycle pauses the run for review.` : ""}${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
+			const content = `${findingsLead} Rolled back tasks: ${allRolledBack.join(", ") || "(none covered)"}${amended.length > 0 ? `. Tasks appended to the plan for unmapped findings: ${amended.join(", ")}` : ""}.${findingsBlock}\n\nFix them and re-close the affected tasks with \`plans_update_task\`; the review reruns automatically once all tasks are terminal again.${budgetSpent(ex) ? (activeBudget(ex) === "unlimited" ? ` This was round ${ex.reviewRoundsTotal} against the unlimited budget's ${unlimitedHardCapCeiling(budgetCounters(ex))}-round safety cap: the next terminal-task cycle pauses the run for review.` : ` This was round ${ex.audit.rounds} of ${budgetLabel(ex)}: the next terminal-task cycle pauses the run for review (or completes if every check passed).`) : ""}${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
 			messaging().sendMessage(
 				{
 					customType: "pi-plans-audit-failed",
@@ -1465,10 +1879,15 @@ async function commitReviewOutcome(
 	if (passed.length === pendingIds.length && highs.length === 0) {
 		ex.audit.failed = [];
 		ex.audit.undeterminable = [];
+		// v0.9.2: a passing audit ends the blocker — the review consumed it.
+		ex.blocked = null;
 		withExecutionCheckpoint(ctx, (cp) =>
 			applyExecutionProgress(cp, {
 				tasks: taskProgressMap(ex.tasks),
 				doneVcIds: ex.items.filter((item) => item.done).map((item) => item.id),
+				blocked: null,
+				reviewRoundsTotal: ex.reviewRoundsTotal,
+				reviewNoProgress: ex.reviewNoProgress ?? null,
 				audit: { rounds: ex.audit.rounds, passed: true, findings },
 			}),
 		);
@@ -1484,6 +1903,8 @@ async function commitReviewOutcome(
 		applyExecutionProgress(cp, {
 			tasks: taskProgressMap(ex.tasks),
 			doneVcIds: ex.items.filter((item) => item.done).map((item) => item.id),
+			reviewRoundsTotal: ex.reviewRoundsTotal,
+			reviewNoProgress: ex.reviewNoProgress ?? null,
 			audit: { rounds: ex.audit.rounds, lastResult: failed.join(",") || undefined, findings },
 		}),
 	);
@@ -1496,10 +1917,11 @@ async function maybeContinueReview(ctx: ExtensionContext, ex: ExecState): Promis
 	if (execution !== ex) return;
 	if (!reviewOwed(ex)) return;
 	if (ex.stall.paused) return;
-	if (ex.audit.rounds >= REVIEW_MAX_ROUNDS) {
-		pauseReviewCap(ctx, ex);
-		return;
-	}
+	// The budget gate owns every pause (numeric exhaustion, the unlimited hard
+	// cap, and the unlimited no-progress valve). An exhausted budget with every
+	// check satisfied has already completed inside commitReviewOutcome; here
+	// the review is still owed, so a spent budget pauses.
+	if (!reviewBudgetGate(ctx, ex)) return;
 	await startReviewRound(ctx);
 }
 
@@ -2085,6 +2507,8 @@ function pendingAudit(ex: ExecState | null = execution): ex is ExecState {
 	// This also bounds the zero-input continue loop in agent_before_settle.
 	if (ex.stall.paused) return false;
 	if (ex.review.inFlight) return false;
+	// The budget panel is open: the review is being resolved, not owed anew.
+	if (ex.review.budgetAsking) return false;
 	return allTasksTerminal(ex.tasks)
 		&& (auditableChecks(ex.items, ex.tasks).some((item) => !item.done) || unresolvedHighFindings(ex).length > 0);
 }
@@ -2171,6 +2595,33 @@ function maybeContinuationFollowUp(ctx: ExtensionContext): void {
 	if (runtime.stopReason !== "stop" || !canWakeExecution(ctx, runtime)) return;
 	runtime.handled = true;
 	const ex = runtime.owner;
+	// v0.9.2: while a failed round's tasks are still open, the next round
+	// cannot start — and this ladder must NOT ride `stall.rounds`, which any
+	// successful tool call resets: an executor that investigates but never
+	// closes the reopened tasks has to escalate (and eventually pause) anyway.
+	const blockedIds = blockedTaskIds(ex);
+	if (ex.blocked && blockedIds.length > 0) {
+		// Progress = fewer blockers than at the PREVIOUS blocked wake. The
+		// stored `blocked.tasks` cannot serve as that baseline: every task
+		// close re-syncs it, so it always equals the live set and the ladder
+		// would only ever increment (review round 1, F-001). A same-size but
+		// different set counts as no progress; a new member counts as none.
+		const baseline = ex.blockedWakeTasks;
+		const progressed = baseline !== undefined && blockedIds.length < baseline.length;
+		ex.blockedWakeTasks = [...blockedIds];
+		ex.blocked.escalatedRounds = progressed ? 0 : ex.blocked.escalatedRounds + 1;
+		ex.blocked.tasks = blockedIds;
+		withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { blocked: ex.blocked }));
+		if (ex.blocked.escalatedRounds >= STALL_MAX_ROUNDS) {
+			pauseForStall(ctx, blockedPauseReason(ex));
+			return;
+		}
+		notifyBlockedEscalation(ctx, ex);
+		persist(ctx);
+		updateStatusWidget(ctx);
+		sendContinuationWake(ctx, runtime);
+		return;
+	}
 	const snapshot = stallSnapshot();
 	const changed = ex.stall.lastSnapshot !== null && snapshot !== ex.stall.lastSnapshot;
 	ex.stall.lastSnapshot = snapshot;
@@ -2190,8 +2641,10 @@ function maybeContinuationFollowUp(ctx: ExtensionContext): void {
 
 export function filterGoalWaitMessages<T extends { customType?: string; details?: unknown }>(messages: T[]): T[] {
 	// v0.6.1: continuation wakes are one-shot; stale ones (including the
-	// legacy v0.6.0 goal-wait type) never replay after a restart.
+	// legacy v0.6.0 goal-wait type) never replay after a restart. v0.9.2: the
+	// visible escalated-blocked line is one-shot for the same reason.
 	return messages.filter((message) => message.customType !== EXECUTION_CONTINUE_CUSTOM_TYPE
+		&& message.customType !== EXECUTION_BLOCKED_CUSTOM_TYPE
 		&& message.customType !== LEGACY_GOAL_WAIT_CUSTOM_TYPE);
 }
 
@@ -2200,18 +2653,20 @@ export function filterContinuationMessages<T extends { customType?: string; deta
 }
 
 /** Called for genuine user input or an explicit same-execution resume.
- * v0.8: a REVIEW-CAP pause is never lifted here — ordinary input must not
- * refill the five-round budget (CF2-004); only /plans-execute
+ * v0.8: a REVIEW pause is never lifted here — ordinary input must not
+ * refill the review budget (CF2-004); only /plans-execute
  * (resumeActiveExecution) is the explicit confirmation surface. Genuine
  * stall pauses still clear on input as before. */
 export function resumeGoalWaitIfPaused(ctx: ExtensionContext): boolean {
 	const ex = getExecution();
 	if (!ex?.stall.paused || !currentContinuationRuntime(ctx)) return false;
-	if (isReviewCapPause(ex.stall.pausedReason)) {
+	if (isReviewPauseReason(ex.stall.pausedReason)) {
 		// Surfaced once per input so the user is not left guessing why the run
 		// stays paused; the pause itself and the budget survive untouched.
+		// v0.9.3: the note names the budget actually in force and the fact that
+		// the confirmation re-opens the picker.
 		ctx.ui.notify?.(
-			"pi-plans: the review-round budget is exhausted — run /plans-execute to grant a fresh five-round budget (that confirmation is the only surface that does).",
+			`pi-plans: the review budget is exhausted (${budgetLabel(ex)}) — run /plans-execute to grant a fresh budget (it re-opens the round-count picker; that confirmation is the only surface that does).`,
 			"warning",
 		);
 		return false;
@@ -2220,18 +2675,61 @@ export function resumeGoalWaitIfPaused(ctx: ExtensionContext): boolean {
 	ex.stall.pausedReason = undefined;
 	ex.stall.rounds = 0;
 	ex.stall.lastSnapshot = stallSnapshot();
-	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { pausedReason: null }));
+	// v0.9.2: a resume grants a fresh escalation ladder (the blocker itself is
+	// still recorded, so the next wake names it) and never a fresh review
+	// budget — that stays `/plans-execute`-only.
+	if (ex.blocked) {
+		ex.blocked.escalatedRounds = 0;
+		ex.blockedWakeTasks = undefined;
+	}
+	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { pausedReason: null, blocked: ex.blocked }));
 	persist(ctx);
 	updateStatusWidget(ctx);
 	return true;
 }
 
-export function resumeActiveExecution(ctx: ExtensionContext): boolean {
-	// v0.8: /plans-execute is THE explicit confirmation surface for a
-	// review-cap pause — the only place a fresh five-round budget is granted
-	// (Q-confirm-surface). Ordinary input and session restores never refill.
+/** Outcome of an explicit `/plans-execute` resume, so the calling tool can
+ * report what actually happened (v0.9.3: the grant may re-open the picker). */
+export interface ResumeOutcome {
+	resumed: boolean;
+	/** Set when the pause was lifted by a budget grant. */
+	grantedBudget?: ReviewBudget;
+	/** True when the user closed the budget panel — the pause stands. */
+	budgetDeclined?: boolean;
+}
+
+export async function resumeActiveExecution(ctx: ExtensionContext): Promise<ResumeOutcome> {
+	// v0.8: /plans-execute is THE explicit confirmation surface for a review
+	// pause — the only place a fresh budget is granted (Q-confirm-surface).
+	// Ordinary input and session restores never refill.
+	// v0.9.3: the grant re-opens the budget picker with the current value
+	// preselected; Esc keeps the run paused (an explicit confirmation is the
+	// only way forward). Headless sessions, which have no panel to show, keep
+	// the current budget instead of stranding the run.
 	const pausedEx = getExecution();
-	if (pausedEx?.stall.paused && isReviewCapPause(pausedEx.stall.pausedReason)) {
+	if (pausedEx?.stall.paused && isReviewPauseReason(pausedEx.stall.pausedReason)) {
+		const previous = activeBudget(pausedEx);
+		let granted = previous;
+		if (reviewBudgetPanelUsable(ctx)) {
+			const picked = await askReviewBudget(ctx, pausedEx.uiLanguage, previous);
+			if (picked === null) {
+				messaging().sendMessage(
+					{
+						customType: "pi-plans-review-budget-declined",
+						content: `**pi-plans: review budget unchanged (${formatReviewBudget(previous)})** — the run stays paused. Run /plans-execute and pick a round count to continue.`,
+						display: true,
+					},
+					{ triggerTurn: false },
+				);
+				return { resumed: false, budgetDeclined: true };
+			}
+			granted = picked;
+			// Q-4: only a grant that lands on `unlimited` lifts the hard cap —
+			// the cumulative counter itself never resets.
+			if (granted === "unlimited") {
+				pausedEx.reviewCapExtension += UNLIMITED_HARD_CAP;
+			}
+		}
 		pausedEx.stall.paused = false;
 		pausedEx.stall.pausedReason = undefined;
 		pausedEx.stall.rounds = 0;
@@ -2239,28 +2737,45 @@ export function resumeActiveExecution(ctx: ExtensionContext): boolean {
 		pausedEx.audit.rounds = 0;
 		pausedEx.audit.failed = [];
 		pausedEx.audit.undeterminable = [];
+		// v0.9.3: a fresh budget window also resets the no-progress valve.
+		pausedEx.reviewNoProgress = undefined;
+		// v0.9.2: the explicit confirmation also refreshes the blocked ladder
+		// (the blocker set itself survives — it still names what stays open).
+		if (pausedEx.blocked) {
+			pausedEx.blocked.escalatedRounds = 0;
+			pausedEx.blockedWakeTasks = undefined;
+		}
 		// v0.9: the fresh budget inherits unresolved findings (stable ids keep
 		// counting) — only the round counter resets.
 		withExecutionCheckpoint(ctx, (cp) =>
 			applyExecutionProgress(cp, {
 				tasks: taskProgressMap(pausedEx.tasks),
 				audit: { rounds: 0, lastResult: undefined, findings: pausedEx.audit.findings },
+				blocked: pausedEx.blocked,
+				reviewBudget: granted,
+				reviewBudgetDefaulted: pausedEx.reviewBudgetDefaulted === true,
+				reviewRoundsTotal: pausedEx.reviewRoundsTotal,
+				reviewCapExtension: pausedEx.reviewCapExtension,
+				reviewNoProgress: null,
 				pausedReason: null,
 			}),
 		);
 		persist(ctx);
 		updateStatusWidget(ctx);
+		const grantedNote = granted === "unlimited"
+			? `unlimited review budget granted (hard cap now ${unlimitedHardCapCeiling(budgetCounters(pausedEx))} rounds; the run has spent ${pausedEx.reviewRoundsTotal})`
+			: `fresh ${formatReviewBudget(granted)}-round review budget granted`;
 		messaging().sendMessage(
 			{
 				customType: "pi-plans-review-budget-granted",
-				content: "**pi-plans: fresh five-round review budget granted** — the execution review resumes now.",
+				content: `**pi-plans: ${grantedNote}** — the execution review resumes now.`,
 				display: true,
 			},
 			{ triggerTurn: false },
 		);
 		const grantChain = launchReviewRound(ctx);
 		if (grantChain) void grantChain.catch(() => { /* surfaced via the review messages */ });
-		return true;
+		return { resumed: true, grantedBudget: granted };
 	}
 	// v0.7.1 (root cause A): a terminal-but-unaudited run used to fall through
 	// to `return false` here, so `/plans-execute` answered "already executing"
@@ -2271,15 +2786,15 @@ export function resumeActiveExecution(ctx: ExtensionContext): boolean {
 		latchAuditThisSettle();
 		const chain = launchReviewRound(ctx);
 		if (chain) void chain.catch(() => { /* surfaced via the review messages */ });
-		return true;
+		return { resumed: true };
 	}
-	if (!resumeGoalWaitIfPaused(ctx)) return false;
+	if (!resumeGoalWaitIfPaused(ctx)) return { resumed: false };
 	const runtime = currentContinuationRuntime(ctx)!;
 	if (canWakeExecution(ctx, runtime)) {
 		runtime.handled = true;
 		sendContinuationWake(ctx, runtime);
 	}
-	return true;
+	return { resumed: true };
 }
 
 export async function completeExecution(ctx: ExtensionContext): Promise<void> {
@@ -2297,6 +2812,13 @@ export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 	const residualNote = residualFindings.length > 0
 		? `\n\nRecorded findings that did not block completion: ${residualFindings.map((f) => `${f.id} (${f.severity})`).join(", ")} — see the execution-review round reports under the run directory.`
 		: "";
+	// v0.9.3 (Q-2, round-1 F-004): an exhausted budget may complete WITH
+	// unresolved high findings — the completion surface must say so instead of
+	// claiming "execution review passed".
+	const toleratedHighs = execution.audit.findings.filter((f) => f.severity === "high");
+	const toleratedNote = toleratedHighs.length > 0
+		? `\n\n⚠️ The review budget was exhausted (${budgetLabel(execution)}) before these high-severity finding(s) could be resolved: ${toleratedHighs.map((f) => f.id).join(", ")} — every verification check passed; the finding(s) remain in the round reports under the run directory.`
+		: "";
 	const planPath = execution.planPath;
 	withExecutionCheckpoint(ctx, (cp) => applyExecutionCompleted(cp));
 	execution = null;
@@ -2306,7 +2828,9 @@ export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 	messaging().sendMessage(
 		{
 			customType: "pi-plans-complete",
-			content: `**Plan complete!** ✅ \`${planPath}\` — execution review passed.\n\n${summary}${residualNote}`,
+			content: toleratedHighs.length > 0
+				? `**Plan complete (review budget exhausted).** ⚠️ \`${planPath}\` — all verification checks passed; ${toleratedHighs.length} high-severity finding(s) stayed unresolved.\n\n${summary}${residualNote}${toleratedNote}`
+				: `**Plan complete!** ✅ \`${planPath}\` — execution review passed.\n\n${summary}${residualNote}`,
 			display: true,
 		},
 		{ triggerTurn: false },
@@ -2345,13 +2869,28 @@ export function executionContextMessage(ctx: ExtensionContext): string | null {
 	const highFindingsNote = unresolvedHighs.length > 0
 		? `\nExecution review round ${execution.audit.rounds} unresolved high-severity findings:\n${unresolvedHighs.map((f) => `- ${f.id}${f.taskIds.length ? ` (${f.taskIds.join(", ")})` : ""}: ${f.note}`).join("\n")}\nFix them, then re-close the affected tasks with evidence.`
 		: "";
+	// v0.9.2: the wake must answer "is the review running?" explicitly. The
+	// previous text left the executor waiting for a round that cannot start
+	// while the tree is open (the exact stall this feature fixes).
+	const blockedIds = blockedTaskIds(execution);
+	const blockedRound = execution.blocked?.round ?? execution.audit.rounds;
+	const outstanding = reviewOutstanding(execution);
+	const reviewLine = execution.review.inFlight
+		? `\nReview: round ${execution.audit.rounds + 1}/${budgetLabel(execution)} IS RUNNING (read-only reviewer verifying) — do not wait on it and do not re-close tasks for it.`
+		: blockedIds.length > 0 && outstanding
+			? `\nReview: NO round is running — the task tree is not terminal, so the review cannot start. It starts by itself the moment every task is terminal (round ${execution.audit.rounds + 1}/${budgetLabel(execution)}).`
+			: "";
+	const escalated = (execution.blocked?.escalatedRounds ?? 0) > 0;
+	const blockedLine = blockedIds.length > 0 && outstanding
+		? `\nBLOCKED — ${blockedIds.length} task(s) reopened by round ${blockedRound} are still open:\n${blockedIds.map((id) => `- ${id} (reopened by round ${blockedRound}) — close with \`plans_update_task\`: status "complete" with evidence, or "skipped" with a skipReason. Closing a child does NOT close its parent; a parent with an open child is not terminal.`).join("\n")}${escalated ? `\nThis is blocked wake ${execution.blocked?.escalatedRounds}/${STALL_MAX_ROUNDS}: if these tasks stay open, the watchdog pauses the run and a human has to resume it.` : ""}`
+		: "";
 	return `[PI-PLANS EXECUTION — write access enabled]
 Implement the accepted plan at ${execution.planPath} (tasks ${progress.done}/${progress.total}${execution.legacyPlan ? " · legacy I-### mapping" : ""} · VC ${vcDone}/${execution.items.length}).
 
 Current wave ${currentWave} open tasks:
 ${waveList}
 
-Remaining open tasks (all waves): ${open.map((task) => task.id).join(", ") || "(none)"}.${rollbackNote}${highFindingsNote}
+Remaining open tasks (all waves): ${open.map((task) => task.id).join(", ") || "(none)"}.${rollbackNote}${highFindingsNote}${reviewLine}${blockedLine}
 
 ${graphLine}
 
@@ -2359,6 +2898,8 @@ Execution rules:
 - Work through tasks in wave order (earlier waves first); within a wave, follow the listed dependency order. Wave grouping encodes which tasks could run in parallel — keep their file sets disjoint.
 - Report progress ONLY through the \`plans_update_task\` tool: status "complete" with evidence (test command output / file paths), or "skipped" with a skipReason. One call per task; statuses are immutable once set.
 - Close subtasks before their parent; a parent is auditable only when every child is terminal.
+- After a FAILED review round, every reopened task must be re-closed with fresh evidence — PARENTS INCLUDED. Closing a task's children does NOT close the task: a parent that still has an open child is not terminal, and the review cannot start until the whole tree is terminal.
+- NEVER wait for the review. While any task is open, the review is not running and nothing will re-close tasks for you: an open task is your work queue — close it with evidence or skip it with a skipReason.
 - When every task is terminal, the independent execution reviewer verifies the plan's verification checks (${execution.items.map((item) => item.id).join(", ")}); failed checks roll their covered tasks back automatically.
 - Simplest implementation that fully meets the task: no speculative abstractions, configuration, or indirection; keep components modular with clearly separated concerns.
 - Architectural decisions are for the long term: no stopgaps. Remove the obsolete paths this change obsoletes.
@@ -2438,6 +2979,10 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 		usage: snapshot.usage ?? { inToks: 0, outToks: 0 },
 		uiLanguage: resolveUiLanguage(ctx.cwd),
 		stall: { ...snapshot.stall, lastSnapshot: null },
+		// v0.9.2: a snapshot taken by a pre-feature build carries the live failed
+		// set but no blocker record; reconstruct it so the very first wake after
+		// a /reload (the recovery path for an already-stuck run) names the tasks.
+		blocked: snapshot.blocked ?? blockedFromFailedIds(snapshot.audit?.failed ?? [], snapshot.audit?.rounds ?? 0, tasks, items),
 		audit: {
 			rounds: snapshot.audit?.rounds ?? 0,
 			failed: snapshot.audit?.failed ?? [],
@@ -2445,8 +2990,16 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 			findings: toReviewFindings(snapshot.audit?.findings),
 			running: false,
 		},
-		review: { attempts: 0, consecutiveDiscards: 0, inFlight: null },
+		review: { attempts: 0, consecutiveDiscards: 0, inFlight: null, budgetAsking: false },
 		auditLatch: { auditedThisSettle: false, activity: 0 },
+		// v0.9.3 (round-1 F-005): the snapshot's budget/counters survive a
+		// /reload — an unset budget stays unset (the picker runs before round 1),
+		// a legacy snapshot resolves to the 5-round bound via the audit counter.
+		reviewBudget: resolveStoredBudget(snapshot.reviewBudget, snapshot.audit?.rounds ?? 0),
+		reviewBudgetDefaulted: snapshot.reviewBudgetDefaulted === true,
+		reviewRoundsTotal: snapshot.reviewRoundsTotal ?? 0,
+		reviewCapExtension: snapshot.reviewCapExtension ?? 0,
+		reviewNoProgress: snapshot.reviewNoProgress ?? undefined,
 	};
 	execution.stall.lastSnapshot = stallSnapshot();
 	resetContinuationRuntime(ctx);

@@ -186,6 +186,9 @@ describe("width invariant (TUI crash regression)", () => {
 			["paused", { ...base, paused: true, pausedReason: base.pausedReason as string }],
 			["all-terminal", { ...base, tasks: base.tasks.map((t) => ({ ...t, status: "complete" as const })) }],
 			["audit-failed", { ...base, auditRounds: 3, auditFailed: ["VC-1", "VC-2"] }],
+			// v0.9.2: the blocker row must keep the exact-width invariant too.
+			["blocked", { ...base, blockedTasks: ["Task-1", "Task-3", "Task-3.1"], blockedRound: 1 }],
+			["blocked-paused", { ...base, paused: true, pausedReason: "blocked: review round 2 cannot start — 1 task(s) reopened by round 1 still open (Task-3)", blockedTasks: ["Task-3"], blockedRound: 1 }],
 		];
 	};
 
@@ -464,5 +467,100 @@ describe("findings visibility (v0.9)", () => {
 		assert.ok(lines.some((l) => /⚠ F-001 \(high, Task-3\): union rollback missing/.test(l)));
 		assert.ok(lines.some((l) => /· F-002 \(medium\): polish/.test(l)));
 		assert.ok(lines.some((l) => /high findings unresolved: F-001/.test(l)));
+	});
+});
+
+describe("blocked-review visibility (v0.9.2)", () => {
+	function withBlocker(extra: { paused?: boolean; pausedReason?: string } = {}) {
+		const tasks = buildTaskView(parsePlanTasks(PLAN), {});
+		const checklist = [{ id: "VC-001", text: "`VC-001` covers `Task-1`; pass condition: x", done: false }];
+		return deriveDashboardModel("demo-run", tasks, checklist, {
+			startedAt: new Date().toISOString(),
+			auditRounds: 1,
+			auditFailed: ["VC-002"],
+			blockedTasks: ["Task-3", "Task-3.1"],
+			blockedRound: 1,
+			...extra,
+		});
+	}
+
+	it("compact panel names the blocker and what to do about it", () => {
+		const lines = renderDashboardLines(withBlocker(), 100);
+		assert.ok(lines.some((l) => /⊘ blocked: Task-3, Task-3\.1 \(reopened by round 1\) — close with plans_update_task/.test(l)));
+		// Narrow widths keep the ids and drop the instruction.
+		const narrow = renderDashboardLines(withBlocker(), 40);
+		assert.ok(narrow.some((l) => /⊘ blocked: Task-3, Task-3\.1/.test(l)));
+	});
+
+	it("the blocker row survives a paused run (the pause summary may be clipped)", () => {
+		const lines = renderDashboardLines(withBlocker({ paused: true, pausedReason: "blocked: review round 2 cannot start — 2 task(s) reopened by round 1 still open" }), 100);
+		assert.ok(lines.some((l) => /⏸ blocked: review round 2 cannot start/.test(l)));
+		assert.ok(lines.some((l) => /⊘ blocked: Task-3/.test(l)), "blocker row still lists the tasks");
+	});
+
+	it("the summary line carries the blocked token only when blockers exist", () => {
+		assert.match(formatDashboardSummaryLine(withBlocker()), / · ⊘ blocked$/);
+		const tasks = buildTaskView(parsePlanTasks(PLAN), {});
+		const clean = deriveDashboardModel("demo-run", tasks, [], { startedAt: new Date().toISOString(), auditRounds: 1 });
+		assert.doesNotMatch(formatDashboardSummaryLine(clean), /blocked/);
+	});
+});
+
+describe("review-budget visibility (v0.9.3)", () => {
+	function withBudget(extra: Record<string, unknown> = {}) {
+		const tasks = buildTaskView(parsePlanTasks(PLAN), {});
+		const checklist = [{ id: "VC-001", text: "`VC-001` covers `Task-1`; pass condition: x", done: false }];
+		return deriveDashboardModel("demo-run", tasks, checklist, {
+			startedAt: new Date().toISOString(),
+			auditRounds: 2,
+			...extra,
+		});
+	}
+
+	it("the summary line renders the chosen budget denominator", () => {
+		assert.match(formatDashboardSummaryLine(withBudget({ reviewBudget: 3 })), / · review r2\/3/);
+		assert.match(formatDashboardSummaryLine(withBudget({ reviewBudget: "unlimited" })), / · review r2\/∞/);
+		// A model without the field (legacy fixtures/checkpoints) reads as 5.
+		assert.match(formatDashboardSummaryLine(withBudget()), / · review r2\/5/);
+	});
+
+	it("the compact panel renders the budget denominator too", () => {
+		// The review row only renders once every task is terminal.
+		const terminal = (extra: Record<string, unknown>) => {
+			const tasks = buildTaskView(parsePlanTasks(PLAN), {
+				"Task-1": { status: "complete" },
+				"Task-2": { status: "complete" },
+				"Task-3": { status: "complete" },
+				"Task-3.1": { status: "complete" },
+				"Task-3.2": { status: "complete" },
+			});
+			const checklist = [{ id: "VC-001", text: "`VC-001` covers `Task-1`; pass condition: x", done: false }];
+			return deriveDashboardModel("demo-run", tasks, checklist, { startedAt: new Date().toISOString(), auditRounds: 2, ...extra });
+		};
+		const lines = renderDashboardLines(terminal({ reviewBudget: 3 }), 100);
+		assert.ok(lines.some((l) => /review: round 3\/3/.test(l)), "the numeric budget renders");
+		const unlimited = renderDashboardLines(terminal({ reviewBudget: "unlimited" }), 100);
+		assert.ok(unlimited.some((l) => /review: round 3\/∞/.test(l)), "the unlimited budget renders");
+	});
+
+	it("the expanded view carries the default annotation and the unlimited hard-cap progress", () => {
+		const defaulted = renderDashboardTreeLines(withBudget({ reviewBudget: 3, reviewBudgetDefaulted: true }), 120);
+		assert.ok(defaulted.some((l) => /Execution review: round 2\/3 \(default\)/.test(l)));
+		const userPicked = renderDashboardTreeLines(withBudget({ reviewBudget: 3 }), 120);
+		assert.ok(userPicked.some((l) => /Execution review: round 2\/3/.test(l)));
+		assert.equal(userPicked.some((l) => /\(default\)/.test(l)), false, "a user pick carries no annotation");
+		const unlimited = renderDashboardTreeLines(
+			withBudget({ reviewBudget: "unlimited", reviewRoundsTotal: 12, reviewCapExtension: 50 }),
+			120,
+		);
+		assert.ok(unlimited.some((l) => /Execution review: round 2\/∞ · cap 12\/100/.test(l)), "the run-cumulative cap progress renders");
+	});
+
+	it("keeps the width invariant with the budget row present", () => {
+		const lines = renderDashboardLines(withBudget({ reviewBudget: "unlimited", reviewBudgetDefaulted: true }), 60);
+		for (const line of lines) {
+			assert.equal(localVisibleWidth(line), localVisibleWidth(line));
+			assert.ok(visibleWidth(line) <= 60, `line exceeds 60 columns: ${line}`);
+		}
 	});
 });
