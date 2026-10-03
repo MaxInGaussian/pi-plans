@@ -154,7 +154,7 @@ describe("execution-review loop (v0.8)", () => {
 		__setAuditRunnerForTests(ctl.runner);
 		const ctxTui = makeCtx(workdir, "tui");
 		await restoreFromSession(ctxTui, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
-		// v0.9.3: a TUI host gets the budget panel before round 1; this minimal
+		// v0.9.3: a TUI host gets the budget select menu before round 1; this minimal
 		// host resolves it without a choice, so one hop passes before the round
 		// spawns. The detach contract itself is unchanged.
 		await tick();
@@ -533,7 +533,7 @@ describe("findings-driven fix loop (v0.9)", () => {
 		// runner in this mode while checking the renewal semantics.
 		__setAuditRunnerForTests(async () => ({ cancelled: true }) as never);
 		// v0.9.3: the resume is async and reports the outcome; this ctx has no
-		// panel, so the headless path re-grants the same budget (5).
+		// menu, so the headless path re-grants the same budget (5).
 		const renewed = await resumeActiveExecution(ctx);
 		assert.ok(renewed.resumed, "renewal lifts the pause");
 		assert.equal(renewed.grantedBudget, 5, "the headless grant keeps the current budget");
@@ -1099,7 +1099,7 @@ describe("execution-review budget (v0.9.3)", () => {
 		assert.equal(ex.reviewBudget, 1, "the picked budget is live");
 		assert.equal(ex.reviewBudgetDefaulted, false, "a user pick is not marked default");
 		assert.ok(ex.review.inFlight, "the round spawns right after the pick");
-		assert.equal(asks, 1, "the panel was asked exactly once");
+		assert.equal(asks, 1, "the budget menu was asked exactly once");
 		const cp = loadCheckpoint(workdir, runId);
 		assert.ok(cp.status === "ok");
 		assert.equal(cp.checkpoint.execution?.reviewBudget, 1, "the budget is persisted");
@@ -1112,7 +1112,7 @@ describe("execution-review budget (v0.9.3)", () => {
 		__setAuditRunnerForTests(null);
 	});
 
-	it("falls back to the default 3 with a visible note when no panel exists", async () => {
+	it("falls back to the default 3 with a visible note when no budget menu exists", async () => {
 		const { workdir, planPath } = freshWorkdir();
 		const ctx = await startTerminal(planPath, workdir);
 		const ctl = controlledRunner();
@@ -1125,6 +1125,11 @@ describe("execution-review budget (v0.9.3)", () => {
 		const notes = ctx.entries.filter((e) => e.customType === "pi-plans-review-budget-default");
 		assert.equal(notes.length, 1, "one visible note, never silent");
 		assert.match(String(notes[0].content), /default/);
+		assert.match(
+			String(notes[0].content),
+			/no budget menu is available in this session/,
+			"the note names the missing menu surface",
+		);
 		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" });
 		await restoring;
 		await __awaitReviewRoundForTests();
@@ -1292,7 +1297,7 @@ describe("execution-review budget (v0.9.3)", () => {
 		const { resumeActiveExecution } = await import("../src/exec.ts");
 		const granted = await resumeActiveExecution(headlessCtx);
 		assert.equal(granted.resumed, true, "a headless grant is not declined");
-		assert.equal(granted.budgetDeclined, undefined, "no panel decline path in a headless session");
+		assert.equal(granted.budgetDeclined, undefined, "no menu decline path in a headless session");
 		assert.equal(granted.grantedBudget, 3, "the headless grant keeps the current budget");
 		assert.equal(getExecution()!.stall.paused, false, "the run resumes instead of staying paused forever");
 		assert.equal(getExecution()!.audit.rounds, 0, "and the per-grant counter reset");

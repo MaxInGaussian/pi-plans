@@ -7,6 +7,7 @@
 
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { visibleWidth } from "../src/refine-ui-helpers.ts";
 import {
 	askReviewBudget,
 	budgetExhausted,
@@ -106,18 +107,14 @@ describe("no-progress valve (v0.9.3)", () => {
 });
 
 describe("budget picker (v0.9.3)", () => {
-	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-
 	it("falls back to null without a native surface (the default-budget path)", async () => {
 		assert.equal(reviewBudgetPanelAvailable({ mode: "print", hasUI: false }), false);
 		assert.equal(reviewBudgetPanelAvailable({ mode: "tui", hasUI: true, ui: {} }), false);
 		assert.equal(await askReviewBudget({ mode: "print", hasUI: false }, "en"), null);
 		assert.equal(await askReviewBudget({ mode: "tui", hasUI: true, ui: {} }, "en"), null);
-		// RPC: ui.custom exists but resolves undefined (no overlay support).
-		assert.equal(await askReviewBudget({ mode: "rpc", hasUI: true, ui: { custom: async () => undefined } }, "en"), null);
 	});
 
-	it("treats a headless session as panel-less even though ui.select exists (round-1 F-001)", async () => {
+	it("treats a headless session as menu-less even though ui.select exists (round-1 F-001)", async () => {
 		// The SDK's ExtensionUIContext.select is REQUIRED, so json/print
 		// sessions still carry a function; hasUI is the availability signal.
 		const headless = {
@@ -127,69 +124,111 @@ describe("budget picker (v0.9.3)", () => {
 				select: async () => {
 					throw new Error("a headless select must never be asked");
 				},
-				custom: async () => {
-					throw new Error("a headless custom must never be asked");
-				},
 			},
 		};
-		assert.equal(reviewBudgetPanelAvailable(headless), false, "hasUI false means no panel");
+		assert.equal(reviewBudgetPanelAvailable(headless), false, "hasUI false means no menu");
 		assert.equal(await askReviewBudget(headless, "en"), null, "and the picker answers null without calling the UI");
-		// A TUI/RPC host with hasUI true keeps the native surfaces.
-		assert.equal(reviewBudgetPanelAvailable({ mode: "rpc", hasUI: true, ui: { select: async () => undefined } }), true);
-		assert.equal(reviewBudgetPanelAvailable({ mode: "tui", hasUI: true, ui: { custom: async () => null } }), true);
 	});
 
-	it("returns the menu selection and maps the label back to a budget", async () => {
+	it("(a) opens the session's select menu and maps the pick back to a budget", async () => {
 		const titles: string[] = [];
-		const pick = {
-			mode: "rpc",
+		const rows: string[][] = [];
+		const tuiHost = {
+			mode: "tui" as const,
 			hasUI: true,
 			ui: {
 				select: async (title: string, options: string[]): Promise<string | undefined> => {
 					titles.push(title);
+					rows.push(options);
 					return options[3];
 				},
 			},
 		};
-		// options[3] = "5 rounds" (en); the title carries the current value.
-		assert.equal(await askReviewBudget(pick, "en", 3), 5);
-		assert.match(titles[0] ?? "", /current: 3/);
-		// Cancelled select → null (the caller decides: default at first ask,
-		// keep-paused at a grant).
-		assert.equal(await askReviewBudget({ mode: "rpc", hasUI: true, ui: { select: async () => undefined } }, "en"), null);
+		assert.equal(reviewBudgetPanelAvailable(tuiHost), true, "a TUI host is served by the same select menu");
+		assert.equal(await askReviewBudget(tuiHost, "en", 3), 5, "options[3] is the 5-round row");
+		assert.match(titles[0] ?? "", /current: 3/, "the title names the current budget (no preselection parameter)");
+		assert.equal(rows[0]?.length, REVIEW_BUDGET_CHOICES.length, "one row per pickable budget");
+		assert.match(rows[0]?.[3] ?? "", /^5 rounds$/);
 	});
 
-	it("builds the TUI panel, returns its pick, and treats Esc as no answer", async () => {
-		const panelHost = {
+	it("(b) treats a cancelled select (Esc) as no answer", async () => {
+		const cancelling = { mode: "rpc" as const, hasUI: true, ui: { select: async () => undefined } };
+		assert.equal(await askReviewBudget(cancelling, "en"), null, "first ask: the caller applies the default");
+		assert.equal(await askReviewBudget(cancelling, "zh", 3), null, "at a pause: the caller keeps the run paused");
+	});
+
+	it("(c) never calls a legacy ui.custom, even when the host provides one", async () => {
+		let customCalls = 0;
+		const legacyHost: {
+			mode: string;
+			hasUI: boolean;
+			ui: { custom: () => Promise<unknown>; select: (title: string, options: string[]) => Promise<string | undefined> };
+		} = {
 			mode: "tui",
 			hasUI: true,
 			ui: {
-				// Construction must succeed with the host's minimal tui/theme —
-				// exactly what the real overlay passes in tests.
-				custom: (render: (tui: unknown, theme: unknown, kb: unknown, done: (value: unknown) => void) => unknown) => {
-					render({ requestRender() {} }, theme, undefined, () => {});
-					return Promise.resolve(2);
+				custom: () => {
+					customCalls += 1;
+					throw new Error("ui.custom must never be asked — the overlay surface is gone");
 				},
+				select: async (_title, options) => options[0],
 			},
 		};
-		assert.equal(reviewBudgetPanelAvailable(panelHost), true);
-		assert.equal(await askReviewBudget(panelHost, "zh", 1), 2);
-		const escHost = {
-			mode: "tui",
-			hasUI: true,
-			ui: {
-				custom: (render: (tui: unknown, theme: unknown, kb: unknown, done: (value: unknown) => void) => unknown) => {
-					render({ requestRender() {} }, theme, undefined, () => {});
-					return Promise.resolve(null);
-				},
-			},
-		};
-		assert.equal(await askReviewBudget(escHost as never, "zh", 3), null);
+		assert.equal(reviewBudgetPanelAvailable(legacyHost), true, "availability no longer depends on ui.custom");
+		assert.equal(await askReviewBudget(legacyHost, "en"), 1, "the select menu answers");
+		assert.equal(customCalls, 0, "the removed overlay branch is never consulted");
 	});
 
-	it("ships zh and en chrome for the panel and its rows", () => {
+	it("(d) answers null for a UI host without a select menu", async () => {
+		const noMenu = { mode: "tui" as const, hasUI: true, ui: {} };
+		assert.equal(reviewBudgetPanelAvailable(noMenu), false, "the menu is the only surface");
+		assert.equal(await askReviewBudget(noMenu, "en"), null, "the caller falls back to the default budget");
+	});
+
+	it("(e) survives a selector that throws (catch → null, never a stranded run)", async () => {
+		const throwing = {
+			mode: "tui" as const,
+			hasUI: true,
+			ui: {
+				select: async () => {
+					throw new Error("host selector exploded");
+				},
+			},
+		};
+		assert.equal(reviewBudgetPanelAvailable(throwing), true);
+		assert.equal(await askReviewBudget(throwing, "en"), null, "the catch lands on the default-budget path");
+	});
+
+	it("(f) keeps the menu title and every row within 74 display columns (zh and en)", async () => {
+		for (const lang of ["zh", "en"] as const) {
+			let title = "";
+			let labels: string[] = [];
+			const host = {
+				mode: "rpc" as const,
+				hasUI: true,
+				ui: {
+					select: async (t: string, options: string[]): Promise<string | undefined> => {
+						title = t;
+						labels = options;
+						return undefined;
+					},
+				},
+			};
+			// `unlimited` is the longest suffix ("(current: unlimited)").
+			await askReviewBudget(host, lang, "unlimited");
+			assert.ok(visibleWidth(title) <= 74, `${lang} title fits one line (${visibleWidth(title)} cols): ${title}`);
+			assert.equal(labels.length, REVIEW_BUDGET_CHOICES.length);
+			for (const label of labels) {
+				assert.ok(visibleWidth(label) <= 74, `${lang} row fits one line (${visibleWidth(label)} cols): ${label}`);
+			}
+		}
+	});
+
+	it("ships zh and en chrome for the menu and its rows", () => {
 		const zh = reviewBudgetChrome("zh");
 		const en = reviewBudgetChrome("en");
+		assert.equal("panelHint" in zh, false, "the overlay-only footer hint is gone");
+		assert.equal("panelHint" in en, false, "the overlay-only footer hint is gone");
 		assert.match(zh.unlimitedOption, /无上限/);
 		assert.match(zh.roundsOption(3), /3 轮/);
 		assert.match(zh.currentSuffix("3"), /当前 3/);

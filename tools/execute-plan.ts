@@ -158,7 +158,7 @@ export async function executeCommand(ctx: ExtensionContext, planPathArg?: string
 	const planPath = planPathArg ? path.resolve(ctx.cwd, planPathArg.replace(/^@/, "")) : activeExecution?.planPath;
 	if (activeExecution && planPath && path.resolve(activeExecution.planPath) === path.resolve(planPath)) {
 		// v0.9.3: the resume is async because a review-pause grant re-opens the
-		// budget picker; the message below is produced AFTER that panel resolves.
+		// budget picker; the message below is produced AFTER that menu resolves.
 		const resumed = await resumeActiveExecution(ctx);
 		// v0.8 phase-aware response: a verifying run continues its review loop
 		// (this tool is also the ONLY budget-granting surface at a review pause).

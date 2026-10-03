@@ -149,7 +149,7 @@ export interface ExecState {
 	legacyPlan: boolean;
 	startedAt: string;
 	usage: { inToks: number; outToks: number };
-	/** Chrome language for panel/status strings; undefined → "en". */
+	/** Chrome language for dashboard/status strings; undefined → "en". */
 	uiLanguage?: UiLanguage;
 	/** Stall watchdog (v0.6.1): consecutive settled rounds without a task
 	 * status change; auto-pause at the cap. */
@@ -1070,11 +1070,14 @@ function budgetLabel(ex: ExecState): string {
 }
 
 /**
- * v0.9.3: whether the budget panel may be shown in THIS session. Beyond the
+ * v0.9.3: whether the budget menu may be opened in THIS session. Beyond the
  * native-surface check, auto-approve sessions never ask — the recorded plan
  * decision routes headless/auto-approve runs to the default budget
- * (`PI_PLANS_AUTO_APPROVE=1` exists for unattended harnesses, where a panel
- * would either hang or answer meaninglessly).
+ * (`PI_PLANS_AUTO_APPROVE=1` exists for unattended harnesses, where a native
+ * selector would either hang or answer meaninglessly).
+ * The identifier keeps its historical name (`reviewBudgetPanelUsable` /
+ * `reviewBudgetPanelAvailable`), but the surface it guards is the native select
+ * menu — see src/review-budget.ts.
  */
 function reviewBudgetPanelUsable(ctx: ExtensionContext): boolean {
 	return !isAutoApproveEnabledLocal() && reviewBudgetPanelAvailable(ctx);
@@ -1095,16 +1098,18 @@ function persistResolvedBudget(ctx: ExtensionContext, ex: ExecState): void {
 }
 
 /** One visible note whenever the fallback (rather than a user pick) decided
- * the budget — never a silent bound (v0.9.3, Q-3). */
-function notifyDefaultBudget(ex: ExecState, why: "no-panel" | "cancelled"): void {
+ * the budget — never a silent bound (v0.9.3, Q-3). `"unavailable"` covers both
+ * a session with no menu at all and a selector that threw (the catch in
+ * `askReviewBudget` must never strand the run). */
+function notifyDefaultBudget(ex: ExecState, why: "unavailable" | "cancelled"): void {
 	const budget = formatReviewBudget(ex.reviewBudget ?? DEFAULT_REVIEW_BUDGET);
 	messaging().sendMessage(
 		{
 			customType: "pi-plans-review-budget-default",
 			content:
-				why === "no-panel"
-					? `**pi-plans: execution review budget: ${budget} (default)** — no budget panel is available in this session, so the default budget applies. The review runs up to ${budget} round(s) before pausing for /plans-execute.`
-					: `**pi-plans: execution review budget: ${budget} (default)** — the budget panel was closed without a choice, so the default budget applies. The review runs up to ${budget} round(s) before pausing for /plans-execute.`,
+				why === "unavailable"
+					? `**pi-plans: execution review budget: ${budget} (default)** — no budget menu is available in this session, so the default budget applies. The review runs up to ${budget} round(s) before pausing for /plans-execute.`
+					: `**pi-plans: execution review budget: ${budget} (default)** — the budget menu was closed without a choice, so the default budget applies. The review runs up to ${budget} round(s) before pausing for /plans-execute.`,
 			display: true,
 		},
 		{ triggerTurn: false },
@@ -1112,21 +1117,21 @@ function notifyDefaultBudget(ex: ExecState, why: "no-panel" | "cancelled"): void
 }
 
 /** Synchronous fallback: apply (and persist) the default budget. Used when no
- * panel exists at all — the headless/print/json and auto-approve paths — so
- * the first round needs no extra async hop. */
+ * native menu exists at all — the headless/print/json and auto-approve paths —
+ * so the first round needs no extra async hop. */
 function applyDefaultReviewBudget(ctx: ExtensionContext, ex: ExecState): void {
 	if (ex.reviewBudget !== undefined) return;
 	ex.reviewBudget = DEFAULT_REVIEW_BUDGET;
 	ex.reviewBudgetDefaulted = true;
-	notifyDefaultBudget(ex, "no-panel");
+	notifyDefaultBudget(ex, "unavailable");
 	persistResolvedBudget(ctx, ex);
 }
 
 /**
  * Resolve the per-run review budget exactly once, immediately before the first
- * round. The panel path is async; every other case is handled up front by
+ * round. The menu ask is async; every other case is handled up front by
  * `applyDefaultReviewBudget`. `budgetAsking` keeps a second settle (or a
- * restore while the panel is open) from opening a second panel.
+ * restore while the menu is open) from opening a second ask.
  */
 async function askReviewBudgetForRun(ctx: ExtensionContext, ex: ExecState): Promise<void> {
 	if (ex.reviewBudget !== undefined || ex.review.budgetAsking) return;
@@ -1446,8 +1451,8 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 	if (ex.stall.paused || ex.review.inFlight || ex.review.budgetAsking) return;
 	// v0.9.3: the budget is resolved right here — every task is terminal, the
 	// review is genuinely owed, and this is the last moment before round 1.
-	// No panel → the default applies synchronously (no extra tick, so a
-	// detached settle still shows the round in flight immediately); a panel →
+	// No menu → the default applies synchronously (no extra tick, so a
+	// detached settle still shows the round in flight immediately); a menu ask →
 	// one await, guarded against a second settle by `budgetAsking`.
 	if (ex.reviewBudget === undefined && !reviewBudgetPanelUsable(ctx)) applyDefaultReviewBudget(ctx, ex);
 	if (ex.reviewBudget === undefined) {
@@ -2507,7 +2512,7 @@ function pendingAudit(ex: ExecState | null = execution): ex is ExecState {
 	// This also bounds the zero-input continue loop in agent_before_settle.
 	if (ex.stall.paused) return false;
 	if (ex.review.inFlight) return false;
-	// The budget panel is open: the review is being resolved, not owed anew.
+	// The budget menu is open: the review is being resolved, not owed anew.
 	if (ex.review.budgetAsking) return false;
 	return allTasksTerminal(ex.tasks)
 		&& (auditableChecks(ex.items, ex.tasks).some((item) => !item.done) || unresolvedHighFindings(ex).length > 0);
@@ -2694,7 +2699,7 @@ export interface ResumeOutcome {
 	resumed: boolean;
 	/** Set when the pause was lifted by a budget grant. */
 	grantedBudget?: ReviewBudget;
-	/** True when the user closed the budget panel — the pause stands. */
+	/** True when the user closed the budget menu — the pause stands. */
 	budgetDeclined?: boolean;
 }
 
@@ -2702,9 +2707,10 @@ export async function resumeActiveExecution(ctx: ExtensionContext): Promise<Resu
 	// v0.8: /plans-execute is THE explicit confirmation surface for a review
 	// pause — the only place a fresh budget is granted (Q-confirm-surface).
 	// Ordinary input and session restores never refill.
-	// v0.9.3: the grant re-opens the budget picker with the current value
-	// preselected; Esc keeps the run paused (an explicit confirmation is the
-	// only way forward). Headless sessions, which have no panel to show, keep
+	// v0.9.3: the grant re-opens the budget picker with the current value named
+	// in the menu title (the native selector has no preselection parameter); Esc
+	// keeps the run paused (an explicit confirmation is the
+	// only way forward). Headless sessions, which have no menu to show, keep
 	// the current budget instead of stranding the run.
 	const pausedEx = getExecution();
 	if (pausedEx?.stall.paused && isReviewPauseReason(pausedEx.stall.pausedReason)) {

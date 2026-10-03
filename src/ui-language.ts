@@ -133,7 +133,7 @@ export function refineChrome(lang: UiLanguage): RefineChrome {
 // --------------------------------------------------------------------------
 
 export interface ReviewBudgetChrome {
-	/** Panel title (TUI) / select title prefix (menus). */
+	/** Select-menu title prefix (the menu the review-budget question opens). */
 	panelTitle: string;
 	/** Suffix appended to the menu title when re-picking at a pause. */
 	currentSuffix(current: string): string;
@@ -141,8 +141,6 @@ export interface ReviewBudgetChrome {
 	roundsOption(rounds: number): string;
 	/** Row label for the unlimited budget. */
 	unlimitedOption: string;
-	/** Footer hint under the TUI panel. */
-	panelHint: string;
 }
 
 const REVIEW_BUDGET_CHROME: Record<UiLanguage, ReviewBudgetChrome> = {
@@ -151,14 +149,12 @@ const REVIEW_BUDGET_CHROME: Record<UiLanguage, ReviewBudgetChrome> = {
 		currentSuffix: (current) => `（当前 ${current}）`,
 		roundsOption: (rounds) => `${rounds} 轮`,
 		unlimitedOption: "无上限（直到没有 high findings；3 轮无进展或累计 50 轮时暂停）",
-		panelHint: "[↑/↓] 选择  [Enter] 选定  [Esc] 取消（改用默认值）",
 	},
 	en: {
-		panelTitle: "Execution review budget — the reviewer verifies every VC round by round",
+		panelTitle: "Execution review budget — rounds the reviewer runs",
 		currentSuffix: (current) => `(current: ${current})`,
 		roundsOption: (rounds) => `${rounds} round${rounds === 1 ? "" : "s"}`,
-		unlimitedOption: "unlimited (until no high findings; pauses after 3 no-progress rounds or 50 committed rounds)",
-		panelHint: "[↑/↓] Select  [Enter] Choose  [Esc] Cancel (use the default)",
+		unlimitedOption: "unlimited (valve after 3 stalled rounds; 50-round cap)",
 	},
 };
 

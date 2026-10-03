@@ -18,11 +18,10 @@
  *   already satisfied, in which case the run completes even with unresolved
  *   high findings (they are recorded and disclosed);
  * - only `/plans-execute` lifts a review pause; it re-opens the picker with the
- *   current value preselected.
+ *   current value named in the menu title (the native selector has no
+ *   preselection parameter).
  */
 
-import { Container, SelectList, Spacer, Text, getKeybindings } from "@earendil-works/pi-tui";
-import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { REVIEW_MAX_ROUNDS } from "./auditor.ts";
 import { reviewBudgetChrome, type ReviewBudgetChrome, type UiLanguage } from "./ui-language.ts";
 
@@ -153,16 +152,19 @@ export function noProgressTripped(state: NoProgressState | undefined): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Picker panel
+// Picker (one native select menu — the surface ask_choice uses for a single
+// question: `ctx.ui.select(question, labels)`)
 // ---------------------------------------------------------------------------
 
 /** Narrow structural view of ExtensionContext the picker needs. */
 export interface ReviewBudgetPanelHost {
 	mode?: string | undefined;
 	hasUI?: boolean;
+	/** The native menu surface. `select` is required whenever `ui` is present —
+	 *  the SDK declares it as a required method; hosts that expose no menus at
+	 *  all simply omit `ui` (or `hasUI`). */
 	ui?: {
-		custom?: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => unknown, options?: Record<string, unknown>) => Promise<unknown>;
-		select?: (title: string, options: string[], opts?: unknown) => Promise<string | undefined>;
+		select: (title: string, options: string[], opts?: unknown) => Promise<string | undefined>;
 	};
 }
 
@@ -172,80 +174,24 @@ export interface ReviewBudgetPanelHost {
  * `ExtensionUIContext.select` is a REQUIRED SDK method and therefore present on
  * every context — including `json`/`print` sessions where it cannot ask
  * anything. `hasUI` ("true in TUI and RPC modes") is the availability signal:
- * without it a headless session takes the panel path, and every at-pause grant
- * would be "declined" forever, leaving the run permanently paused
+ * without it a headless session would ask into the void, and every at-pause
+ * grant would be "declined" forever, leaving the run permanently paused
  * (round-1 F-001). UI-less sessions fall back to the default budget instead.
  */
 export function reviewBudgetPanelAvailable(host: ReviewBudgetPanelHost): boolean {
 	if (host.hasUI !== true) return false;
 	const ui = host.ui;
-	if (!ui) return false;
-	if (typeof ui.select === "function") return true;
-	return host.mode === "tui" && typeof ui.custom === "function";
-}
-
-interface BudgetItem {
-	label: string;
-	value: ReviewBudget;
-}
-
-const BUDGET_LAYOUT = { minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 32 };
-
-const BUDGET_OVERLAY_OPTIONS = {
-	overlay: true,
-	overlayOptions: {
-		width: "78%",
-		minWidth: 60,
-		maxHeight: "78%",
-		anchor: "top-center",
-		margin: { top: 1, left: 2, right: 2 },
-	},
-};
-
-/** TUI panel: one selectable row per budget value. */
-class BudgetPanelComponent extends Container {
-	private readonly selectList: SelectList;
-
-	constructor(
-		items: BudgetItem[],
-		preselect: ReviewBudget | undefined,
-		chrome: ReviewBudgetChrome,
-		onSelect: (budget: ReviewBudget) => void,
-		onCancel: () => void,
-	) {
-		super();
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(chrome.panelTitle, 0, 0));
-		this.addChild(new Spacer(1));
-		this.selectList = new SelectList(items, Math.max(1, items.length), getSelectListTheme(), BUDGET_LAYOUT);
-		const index = items.findIndex((item) => item.value === preselect);
-		if (index !== -1) this.selectList.setSelectedIndex(index);
-		this.selectList.onSelect = (item) => onSelect((item as BudgetItem).value);
-		this.selectList.onCancel = () => onCancel();
-		this.addChild(this.selectList);
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(chrome.panelHint, 0, 0));
-	}
-
-	handleInput(keyData: string): void {
-		const kb = getKeybindings();
-		const isNav =
-			kb.matches(keyData, "tui.select.up") ||
-			kb.matches(keyData, "tui.select.down") ||
-			kb.matches(keyData, "tui.select.confirm") ||
-			kb.matches(keyData, "tui.select.cancel");
-		if (!isNav) return; // unknown keys are ignored, never a silent cancel
-		this.selectList.handleInput(keyData);
-	}
+	return !!ui && typeof ui.select === "function";
 }
 
 /**
- * Ask for the execution-review budget. Returns the picked value, or `null`
- * when the question could not be answered — panel Esc/cancel, `ui.custom`
- * unavailable (RPC), a select menu cancelled, or no UI at all. Callers decide
- * what `null` means: the FIRST resolution falls back to
- * `DEFAULT_REVIEW_BUDGET` with a visible note; the at-pause grant keeps the
- * run paused (Esc never silently grants rounds).
+ * Ask for the execution-review budget through the session's native selector
+ * (`ctx.ui.select` — the same surface `ask_choice` uses for a single question).
+ * Returns the picked value, or `null` when the question could not be answered —
+ * menu Esc/cancel, no UI at all, or a selector that threw. Callers decide what
+ * `null` means: the FIRST resolution falls back to `DEFAULT_REVIEW_BUDGET` with
+ * a visible note; the at-pause grant keeps the run paused (Esc never silently
+ * grants rounds).
  */
 export async function askReviewBudget(
 	host: ReviewBudgetPanelHost,
@@ -253,34 +199,19 @@ export async function askReviewBudget(
 	current?: ReviewBudget,
 ): Promise<ReviewBudget | null> {
 	const chrome = reviewBudgetChrome(lang ?? "en");
-	if (!reviewBudgetPanelAvailable(host)) return null;
-	const items: BudgetItem[] = REVIEW_BUDGET_CHOICES.map((value) => ({ label: budgetItemLabel(value, chrome), value }));
-	if (host.mode === "tui" && typeof host.ui?.custom === "function") {
-		try {
-			const picked = await host.ui.custom<ReviewBudget | null>((_tui, _theme, _kb, done) => {
-				let settled = false;
-				const finish = (value: ReviewBudget | null): void => {
-					if (settled) return;
-					settled = true;
-					done(value);
-				};
-				return new BudgetPanelComponent(items, current, chrome, (budget) => finish(budget), () => finish(null));
-			}, BUDGET_OVERLAY_OPTIONS as never);
-			if (picked === "unlimited" || typeof picked === "number") return picked;
-			if (picked === null) return null; // Esc on the panel
-			// undefined: no TUI surface (RPC custom()) — fall through to menus.
-		} catch {
-			/* construction failure: fall through to menus */
-		}
-	}
-	if (typeof host.ui?.select === "function") {
-		const labels = items.map((item) => item.label);
-		const title = current === undefined ? chrome.panelTitle : `${chrome.panelTitle} ${chrome.currentSuffix(formatReviewBudget(current))}`;
+	if (!reviewBudgetPanelAvailable(host) || !host.ui) return null;
+	const labels = REVIEW_BUDGET_CHOICES.map((value) => budgetItemLabel(value, chrome));
+	const title = current === undefined ? chrome.panelTitle : `${chrome.panelTitle} ${chrome.currentSuffix(formatReviewBudget(current))}`;
+	try {
 		const picked = await host.ui.select(title, labels);
 		if (typeof picked === "string") {
 			const index = labels.indexOf(picked);
-			if (index >= 0) return items[index]!.value;
+			if (index >= 0) return REVIEW_BUDGET_CHOICES[index]!;
 		}
+	} catch {
+		/* a host selector that throws must never strand the run: fall through to
+		   `null`, which means the default budget (first ask) or "the menu was
+		   closed without a choice" (at-pause grant). */
 	}
 	return null;
 }
