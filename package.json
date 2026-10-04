@@ -1,6 +1,6 @@
 {
 	"name": "pi-plans",
-	"version": "0.8.4",
+	"version": "0.8.5",
 	"description": "Human-in-the-loop planning extension for the Pi coding agent: researched, refined Markdown plans before any code changes.",
 	"license": "MIT",
 	"type": "module",
@@ -34,7 +34,8 @@
 			"./skills/plan-small",
 			"./skills/plan-normal",
 			"./skills/plan-big",
-			"./skills/plan-with-refs"
+			"./skills/plan-with-refs",
+			"./skills/plan-huge"
 		]
 	},
 	"files": [
