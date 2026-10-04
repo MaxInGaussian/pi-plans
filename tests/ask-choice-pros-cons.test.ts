@@ -51,7 +51,7 @@ function propertyDescription(schema: unknown, property: string): string {
 	return found!;
 }
 
-const SKILL_DIRS = ["planning", "debug-and-plan", "plan-small", "plan-normal", "plan-big", "plan-with-refs"];
+const SKILL_DIRS = ["planning", "debug-and-plan", "plan-small", "plan-normal", "plan-big", "plan-huge", "plan-with-refs"];
 
 describe("ask_choice pros/cons contract (v0.6.0 feature 5)", () => {
 	it("Option.description requires both halves via the ✓ / ✗ markers", () => {

@@ -19,15 +19,20 @@ import {
 import { disableAutoComplete } from "../src/autocomplete.ts";
 import { isAutoApproveEnabled } from "../src/auto-approve.ts";
 import { checklistHeaderName, latestPlanVersion, lintPlanTasks, parseChecklist, parsePlanTasks } from "../src/plan.ts";
-import { normalizeWorkdir, type RunSummary } from "../src/state.ts";
-import { bindRun } from "../src/run-context.ts";
+import { latestHugePlan, hugePlanFileName, parseHugePlanPath, type HugePlanFile } from "../src/huge-plan.ts";
+import { loadCheckpoint } from "../src/workflow-state.ts";
+import { getRun, normalizeWorkdir, type RunSummary } from "../src/state.ts";
+import { bindRun, boundRunId, resolveActiveRun } from "../src/run-context.ts";
 import { executionCandidates, resolveCommandRun } from "../src/run-picker.ts";
 import { resolveUiLanguage } from "../src/ui-language.ts";
 
 
 const ExecutePlanParams = Type.Object({
 	planPath: Type.Optional(
-		Type.String({ description: "Path to the accepted PLAN_vN.md. Default: highest version in the active run's artifact directory." }),
+		Type.String({
+			description:
+				"Path to the accepted plan. Default: the current version stream's latest round for a huge run, else the active run's highest PLAN_vN.md.",
+		}),
 	),
 	workdir: Type.Optional(Type.String({ description: "Target workspace; default current working directory" })),
 });
@@ -37,6 +42,69 @@ export interface HandoffOutcome {
 	planPath?: string;
 	itemCount?: number;
 	message: string;
+}
+
+/** plan-huge: the run the session is bound to (or the active run) when it
+ * carries a huge checkpoint. */
+function hugeRunOf(
+	workdir: string,
+	sessionManager: unknown,
+): { runId: string; artifactDir: string; run: RunSummary; huge: NonNullable<ReturnType<typeof loadCheckpoint>["checkpoint"]>["huge"] } | null {
+	const runId = boundRunId(sessionManager, workdir) ?? resolveActiveRun(sessionManager, workdir)?.run_id ?? null;
+	if (!runId) return null;
+	const info = getRun(workdir, runId);
+	if (!info) return null;
+	const load = loadCheckpoint(workdir, runId);
+	if (load.status !== "ok" || !load.checkpoint.huge) return null;
+	const run: RunSummary = {
+		run_id: info.run_id,
+		topic: info.topic,
+		skill: info.skill,
+		status: info.status,
+		created_at: info.created_at,
+		updated_at: info.updated_at,
+		artifact_dir: info.artifact_dir,
+	};
+	return { runId, artifactDir: info.artifact_dir, run, huge: load.checkpoint.huge };
+}
+
+/** plan-huge: latest plan of the checkpoint's current version stream. */
+export function currentHugeVersionPlan(artifactDir: string, huge: { versions: Array<{ label: string; status: string }>; currentIndex: number }): HugePlanFile | null {
+	const current = huge.versions[huge.currentIndex];
+	if (!current) return null;
+	return latestHugePlan(artifactDir, current.label);
+}
+
+/** plan-huge: refuse overall plans, stale rounds and completed versions —
+ * before any approval or state change. Returns an error message or null. */
+function hugeExecutionGate(
+	workdir: string,
+	sessionManager: unknown,
+	planPath: string,
+): string | null {
+	const parsed = parseHugePlanPath(planPath);
+	if (!parsed) return null;
+	const huge = hugeRunOf(workdir, sessionManager);
+	if (parsed.kind === "overall") {
+		const current = huge ? currentHugeVersionPlan(huge.artifactDir, huge.huge) : null;
+		return `\`PLAN_overall_vN.md\` is a planning artifact and is never executable — execute the current version plan (当前版本计划) instead${current ? `: \`${current.path}\`` : "; plan the first version first"}.`;
+	}
+	if (!huge) {
+		return `${planPath} is a huge version plan, but the resolved run has no \`huge\` checkpoint state. Start or resume the run that owns this plan.`;
+	}
+	const current = huge.huge.versions[huge.huge.currentIndex];
+	if (!current) return `the run has no current version to execute`;
+	if (parsed.stream !== current.label) {
+		return `\`${parsed.stream}\` is not the current version of this run (current: ${current.label}); plan the current version instead.`;
+	}
+	if (current.status === "done") {
+		return `version ${current.label} is already complete; plan the next version instead.`;
+	}
+	const latest = latestHugePlan(huge.artifactDir, current.label);
+	if (latest && parsed.round < latest.round) {
+		return `\`${planPath}\` is a stale round of ${current.label} (latest: v${latest.round}); execute the latest round.`;
+	}
+	return null;
 }
 
 /** Shared handoff logic for the execute_plan tool and /plans-execute command. */
@@ -53,26 +121,50 @@ export async function executeHandoff(
 	if (planPathArg) {
 		planPath = path.resolve(workdir, planPathArg.replace(/^@/, ""));
 	} else {
-		// v0.6.0 (R-3): pick the run explicitly when several execution
-		// candidates coexist; binding-first, single candidate stays direct.
-		chosenRun = await resolveCommandRun(
-			{ cwd: workdir, sessionManager: ctx.sessionManager, ui: ctx.ui },
-			{ candidates: executionCandidates(workdir), title: "Execute which run?" },
-		);
-		if (!chosenRun) {
-			return {
-				status: "error",
-				message: "No plan path given and no executable planning run found. Pass planPath or start a run first.",
-			};
+		// plan-huge: a bound/active huge run resolves its CURRENT version's
+		// latest round directly — the overall plan is never a candidate.
+		const huge = hugeRunOf(workdir, ctx.sessionManager);
+		if (huge) {
+			const hugePlan = currentHugeVersionPlan(huge.artifactDir, huge.huge);
+			if (!hugePlan) {
+				const current = huge.huge.versions[huge.huge.currentIndex];
+				const expected = hugePlanFileName(current?.label ?? "v0.1.0", (current?.round ?? 0) + 1);
+				return {
+					status: "error",
+					message: `No version plan found for the current version${current ? ` ${current.label}` : ""} in ${huge.artifactDir}; write ${expected} first (the overall plan is never executable).`,
+				};
+			}
+			chosenRun = huge.run;
+			planPath = hugePlan.path;
+		} else {
+			// v0.6.0 (R-3): pick the run explicitly when several execution
+			// candidates coexist; binding-first, single candidate stays direct.
+			chosenRun = await resolveCommandRun(
+				{ cwd: workdir, sessionManager: ctx.sessionManager, ui: ctx.ui },
+				{ candidates: executionCandidates(workdir), title: "Execute which run?" },
+			);
+			if (!chosenRun) {
+				return {
+					status: "error",
+					message: "No plan path given and no executable planning run found. Pass planPath or start a run first.",
+				};
+			}
+			const latest = latestPlanVersion(chosenRun.artifact_dir);
+			if (!latest) {
+				return { status: "error", message: `No PLAN_vN.md found in ${chosenRun.artifact_dir}` };
+			}
+			planPath = latest.path;
 		}
-		const latest = latestPlanVersion(chosenRun.artifact_dir);
-		if (!latest) {
-			return { status: "error", message: `No PLAN_vN.md found in ${chosenRun.artifact_dir}` };
-		}
-		planPath = latest.path;
 	}
 	if (!fs.existsSync(planPath)) {
 		return { status: "error", message: `Plan file not found: ${planPath}` };
+	}
+
+	// plan-huge gate: refuse the overall plan and out-of-stream/stale rounds
+	// before any parsing, approval prompt or state change.
+	const hugeGate = hugeExecutionGate(workdir, ctx.sessionManager, planPath);
+	if (hugeGate) {
+		return { status: "error", message: hugeGate };
 	}
 
 	const planText = fs.readFileSync(planPath, "utf8");

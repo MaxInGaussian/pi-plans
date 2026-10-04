@@ -517,6 +517,33 @@ export function showConfig(workdir: string): PlansConfig {
 	return loadConfig(stateRoot);
 }
 
+/** plan-huge (v0.9.5): one version row of the run's version tree. */
+export interface StateViewHugeVersion {
+	label: string;
+	mission: string;
+	done: string;
+	status: string;
+	/** Latest revision round of this version's plan stream (0 = not planned). */
+	round: number;
+	/** Task progress: from the archived completion (done versions) or the live
+	 * execution record (the current version). */
+	tasksDone: number;
+	tasksTotal: number;
+	/** Archived review report paths (completed versions). */
+	reviewReports: string[];
+	completedAt: string | null;
+}
+
+export interface StateViewHuge {
+	currentVersion: string | null;
+	position: string;
+	overallRound: number;
+	deferred: { absorbed: number; dropped: number };
+	/** Reference-gap notices (version plans with too few GitHub references). */
+	refGaps: string[];
+	versions: StateViewHugeVersion[];
+}
+
 export interface StateView {
 	config: PlansConfig;
 	stateRoot: string | null;
@@ -526,11 +553,87 @@ export interface StateView {
 	globalRoot: string;
 	globalConfigPath: string;
 	notices: string[];
+	/** plan-huge: the active run's version tree (absent for ordinary runs). */
+	huge?: StateViewHuge | null;
 }
 
 /** Composite read-only view for the `plans show` action: workspace config +
  * effective global reviewer + diagnostics. Never writes (F-001: read paths
  * resolve the effective reviewer in memory only). */
+
+/** plan-huge: read the checkpoint's huge section into the state view. Read
+ * directly from the run directory (state.ts must not import workflow-state.ts
+ * — that module imports this one) and tolerate any missing/corrupt shape: the
+ * state view is diagnostics, never a gate. */
+function readHugeStateView(workdir: string, runId: string): StateViewHuge | null {
+	const runDir = runDirPath(workdir, runId);
+	if (runDir === null) return null;
+	let raw: {
+		huge?: {
+			versions?: Array<Record<string, unknown>>;
+			currentIndex?: number;
+			overallRound?: number;
+			deferred?: Array<Record<string, unknown>>;
+		};
+		execution?: { tasks?: Record<string, { status?: string }> };
+	};
+	try {
+		raw = JSON.parse(readFileSync(path.join(runDir, "checkpoint.json"), "utf8")) as typeof raw;
+	} catch {
+		return null;
+	}
+	const huge = raw.huge;
+	if (!huge || !Array.isArray(huge.versions) || huge.versions.length === 0) return null;
+	const completed = (tasks: unknown): { done: number; total: number } => {
+		if (tasks === null || typeof tasks !== "object") return { done: 0, total: 0 };
+		const values = Object.values(tasks as Record<string, unknown>);
+		// Archived completions store `id → status` strings; the live execution
+		// record stores `id → { status, evidence }` objects.
+		const done = values.filter((entry) => {
+			if (typeof entry === "string") return entry === "complete" || entry === "skipped";
+			const status = (entry as { status?: string } | null)?.status;
+			return status === "complete" || status === "skipped";
+		}).length;
+		return { done, total: values.length };
+	};
+	const versions: StateViewHugeVersion[] = huge.versions.map((entry) => {
+		const completion = (entry.completion ?? null) as Record<string, unknown> | null;
+		const archived = completion ? completed(completion.tasks) : { done: 0, total: 0 };
+		const live = completed(raw.execution?.tasks);
+		const progress = completion ? archived : live;
+		const reports = Array.isArray(completion?.reviewReports)
+			? (completion!.reviewReports as unknown[]).filter((value): value is string => typeof value === "string")
+			: [];
+		return {
+			label: String(entry.label ?? ""),
+			mission: String(entry.mission ?? ""),
+			done: String(entry.done ?? ""),
+			status: String(entry.status ?? "pending"),
+			round: typeof entry.round === "number" ? entry.round : 0,
+			tasksDone: progress.done,
+			tasksTotal: progress.total,
+			reviewReports: reports,
+			completedAt: typeof completion?.completedAt === "string" ? completion.completedAt : null,
+		};
+	});
+	const index = typeof huge.currentIndex === "number" ? huge.currentIndex : 0;
+	const deferred = Array.isArray(huge.deferred) ? huge.deferred : [];
+	const refGaps = (getRun(workdir, runId)?.notices ?? [])
+		.filter((notice) => notice.kind === "huge-refs")
+		.map((notice) => notice.text);
+	return {
+		currentVersion: versions[index]?.label ?? null,
+		position: `${index + 1}/${versions.length}`,
+		overallRound: typeof huge.overallRound === "number" ? huge.overallRound : 1,
+		deferred: {
+			absorbed: deferred.filter((entry) => entry.disposition === "absorbed").length,
+			dropped: deferred.filter((entry) => entry.disposition === "dropped").length,
+		},
+		refGaps,
+		versions,
+	};
+}
+
 export function showStateView(workdir: string): StateView {
 	const stateRoot = resolveStateRootOrNull(workdir);
 	const config =
@@ -548,6 +651,8 @@ export function showStateView(workdir: string): StateView {
 			`reviewer not yet migrated to the global config; showing the workspace block (${resolveGlobalConfigPath()}) — the next mutating pi-plans call migrates it`,
 		);
 	}
+	const active = readActive(workdir);
+	const huge = active ? readHugeStateView(workdir, active.run_id) : null;
 	return {
 		config: config ?? structuredClone(DEFAULT_CONFIG),
 		stateRoot,
@@ -555,6 +660,7 @@ export function showStateView(workdir: string): StateView {
 		globalRoot: resolveGlobalDir(),
 		globalConfigPath: resolveGlobalConfigPath(),
 		notices,
+		...(huge ? { huge } : {}),
 	};
 }
 

@@ -8,13 +8,20 @@ import { lintPlanIntoNotices } from "../src/state.ts";
 import { getExecution, markPrePlanCompactPending, refreshUiLanguage } from "../src/exec.ts";
 import { loadVccSettings, scaffoldVccSettings } from "../src/compaction.ts";
 import {
+	applyHugeDeferredDispositions,
+	applyHugeOverallAccepted,
+	applyHugeOverallPlanWritten,
+	applyHugeVersionCompleted,
+	applyHugeVersionPlanWritten,
 	applyPlanWritten,
 	applyReviewConsolidated,
 	createCheckpoint,
+	loadCheckpoint,
 	mutateCheckpoint,
 	planIdentityOf,
 	type WorkflowCheckpoint,
 } from "../src/workflow-state.ts";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -27,6 +34,8 @@ import { loadGraphRuntime } from "../src/code-graph/runtime.ts";
 import { resolveCanonicalWorktree } from "../src/code-graph/paths.ts";
 import { Store } from "../src/code-graph/store.ts";
 import {
+	appendRunNotice,
+	getRun,
 	initState,
 	loadConfig,
 	normalizeWorkdir,
@@ -46,6 +55,15 @@ import {
 	VALID_RUN_STATUSES,
 } from "../src/state.ts";
 import { messaging } from "../src/messaging.ts";
+import {
+	deferredEntryIds,
+	githubEvidenceLint,
+	hugePlanFileName,
+	lintDeferredSection,
+	lintVersionsTable,
+	parseHugePlanPath,
+	parseVersionsTable,
+} from "../src/huge-plan.ts";
 
 const PlansParams = Type.Object({
 	action: StringEnum(
@@ -134,12 +152,36 @@ const PlansParams = Type.Object({
 	checkpoint: Type.Optional(
 		Type.Object({
 			/** Whitelisted semantic transition (I-003). State-machine validated; approval cannot be forged here. */
-			transition: StringEnum(["plan-written", "review-consolidated"] as const),
-			/** plan-written: absolute or workdir-relative PLAN_vN.md path. */
+			transition: StringEnum([
+				"plan-written",
+				"review-consolidated",
+				"overall-plan-written",
+				"overall-accepted",
+				"overall-review-consolidated",
+				"version-plan-written",
+				"version-review-consolidated",
+				"version-completed",
+			] as const),
+			/** plan-written / overall-plan-written / version-plan-written: plan path. */
 			planPath: Type.Optional(Type.String()),
 			/** review-consolidated: round id + optional disposition artifact (run-dir relative). */
 			roundId: Type.Optional(Type.String()),
 			dispositionArtifact: Type.Optional(Type.String()),
+			/** overall-plan-written (controlled revision): why, and which not-started versions change. */
+			reason: Type.Optional(Type.String()),
+			affectedVersions: Type.Optional(Type.Array(Type.String())),
+			/** version-plan-written: how the previous version's deferred items were processed. */
+			deferred: Type.Optional(
+				Type.Array(
+					Type.Object({
+						itemId: Type.String(),
+						disposition: StringEnum(["absorbed", "dropped"] as const),
+						confirmationId: Type.Optional(Type.String()),
+					}),
+				),
+			),
+			/** version-completed: version-scoped review report paths (run-dir relative). */
+			reviewReports: Type.Optional(Type.Array(Type.String())),
 		}),
 	),
 });
@@ -211,16 +253,77 @@ export async function finalCommit(
 	}
 }
 
+/** plan-huge: deferred items the previous version left for this one, read
+ * from the previous version's latest plan file. */
+export function hugePreviousDeferredItems(
+	workdir: string,
+	runId: string,
+): Array<{ itemId: string; fromVersion: string }> {
+	const load = loadCheckpoint(workdir, runId);
+	if (load.status !== "ok" || !load.checkpoint.huge) return [];
+	const huge = load.checkpoint.huge;
+	const previous = huge.versions[huge.currentIndex - 1];
+	if (!previous || previous.round < 1) return [];
+	const run = getRun(workdir, runId);
+	if (!run) return [];
+	const file = path.join(run.artifact_dir, hugePlanFileName(previous.label, previous.round));
+	if (!fs.existsSync(file)) return [];
+	return deferredEntryIds(fs.readFileSync(file, "utf8")).map((itemId) => ({ itemId, fromVersion: previous.label }));
+}
+
+/** plan-huge: compact progress summary for `plans show` and dashboards. */
+export function hugeRunSummary(workdir: string, runId: string | null): Record<string, unknown> | null {
+	if (!runId) return null;
+	const load = loadCheckpoint(workdir, runId);
+	if (load.status !== "ok" || !load.checkpoint.huge) return null;
+	const huge = load.checkpoint.huge;
+	const current = huge.versions[huge.currentIndex] ?? null;
+	const run = getRun(workdir, runId);
+	const refNotices = (run?.notices ?? []).filter((notice) => notice.kind === "huge-refs");
+	return {
+		currentVersion: current?.label ?? null,
+		currentStatus: current?.status ?? null,
+		currentRound: current?.round ?? 0,
+		overallRound: huge.overallRound,
+		position: `${huge.currentIndex + 1}/${huge.versions.length}`,
+		versions: huge.versions.map((version) => ({
+			label: version.label,
+			mission: version.mission,
+			done: version.done,
+			status: version.status,
+			round: version.round,
+			completedAt: version.completion?.completedAt ?? null,
+		})),
+		deferred: {
+			absorbed: huge.deferred.filter((entry) => entry.disposition === "absorbed").length,
+			dropped: huge.deferred.filter((entry) => entry.disposition === "dropped").length,
+		},
+		refNotices: refNotices.map((notice) => notice.text),
+	};
+}
+
 /** Whitelisted, state-machine-validated checkpoint transitions (I-003). */
 export function recordCheckpointTransition(
 	ctx: { sessionManager: unknown },
 	workdir: string,
 	runIdArg: string | undefined,
 	checkpoint: {
-		transition: "plan-written" | "review-consolidated";
+		transition:
+			| "plan-written"
+			| "review-consolidated"
+			| "overall-plan-written"
+			| "overall-accepted"
+			| "overall-review-consolidated"
+			| "version-plan-written"
+			| "version-review-consolidated"
+			| "version-completed";
 		planPath?: string;
 		roundId?: string;
 		dispositionArtifact?: string;
+		reason?: string;
+		affectedVersions?: string[];
+		deferred?: Array<{ itemId: string; disposition: "absorbed" | "dropped"; confirmationId?: string }>;
+		reviewReports?: string[];
 	},
 ): WorkflowCheckpoint {
 	const runId =
@@ -244,6 +347,99 @@ export function recordCheckpointTransition(
 			if (!checkpoint.roundId) throw new StateError("review-consolidated requires roundId");
 			return mutateCheckpoint(workdir, runId, (cp) =>
 				applyReviewConsolidated(cp, checkpoint.roundId!, checkpoint.dispositionArtifact),
+			);
+		}
+		case "overall-plan-written": {
+			if (!checkpoint.planPath) throw new StateError("overall-plan-written requires planPath");
+			const planPath = path.isAbsolute(checkpoint.planPath)
+				? checkpoint.planPath
+				: path.resolve(workdir, checkpoint.planPath.replace(/^@/, ""));
+			const parsed = parseHugePlanPath(planPath);
+			if (!parsed || parsed.kind !== "overall") {
+				throw new StateError("overall-plan-written requires a PLAN_overall_vN.md path");
+			}
+			const text = fs.readFileSync(planPath, "utf8");
+			const tableLint = lintVersionsTable(text);
+			if (tableLint) throw new StateError(`overall plan rejected: ${tableLint}`);
+			const rows = parseVersionsTable(text);
+			const cp = mutateCheckpoint(workdir, runId, (inner) => {
+				const withPlan = applyPlanWritten(inner, planIdentityOf(planPath, parsed.round));
+				return applyHugeOverallPlanWritten(withPlan, {
+					round: parsed.round,
+					versions: rows.map((row) => ({ label: row.label, mission: row.mission, done: row.done })),
+					reason: checkpoint.reason,
+					affectedVersions: checkpoint.affectedVersions,
+				});
+			});
+			lintPlanIntoNotices(workdir, runId, planPath);
+			return cp;
+		}
+		case "overall-accepted": {
+			return mutateCheckpoint(workdir, runId, (cp) => applyHugeOverallAccepted(cp));
+		}
+		case "overall-review-consolidated": {
+			if (!checkpoint.roundId) throw new StateError("overall-review-consolidated requires roundId");
+			return mutateCheckpoint(workdir, runId, (cp) => {
+				if (!cp.huge) throw new StateError("overall-review-consolidated requires a huge run");
+				const consolidated = applyReviewConsolidated(cp, checkpoint.roundId!, checkpoint.dispositionArtifact);
+				return { ...consolidated, nextAction: "accept-overall" };
+			});
+		}
+		case "version-plan-written": {
+			if (!checkpoint.planPath) throw new StateError("version-plan-written requires planPath");
+			const planPath = path.isAbsolute(checkpoint.planPath)
+				? checkpoint.planPath
+				: path.resolve(workdir, checkpoint.planPath.replace(/^@/, ""));
+			const parsed = parseHugePlanPath(planPath);
+			if (!parsed || parsed.kind !== "version") {
+				throw new StateError("version-plan-written requires a PLAN_vX.Y.Z_vN.md path");
+			}
+			const text = fs.readFileSync(planPath, "utf8");
+			const deferredLint = lintDeferredSection(text);
+			if (deferredLint) throw new StateError(`version plan rejected: ${deferredLint}`);
+			// Every deferred item of the previous version must be processed: absorbed
+			// items have to be referenced by this plan, drops need a user confirmation
+			// (enforced by the reducer against answeredQuestions).
+			const required = hugePreviousDeferredItems(workdir, runId);
+			const provided = new Map((checkpoint.deferred ?? []).map((entry) => [entry.itemId, entry]));
+			for (const item of required) {
+				const entry = provided.get(item.itemId);
+				if (!entry) {
+					throw new StateError(
+						`deferred item ${item.itemId} of ${item.fromVersion} is unprocessed; absorb it or ask for a confirmed drop`,
+					);
+				}
+				if (entry.disposition === "absorbed" && !text.includes(item.itemId)) {
+					throw new StateError(`absorbed deferred item ${item.itemId} must be referenced by this version plan`);
+				}
+			}
+			const cp = mutateCheckpoint(workdir, runId, (inner) => {
+				const withPlan = applyPlanWritten(inner, planIdentityOf(planPath, parsed.round));
+				const previous = inner.huge?.versions[inner.huge.currentIndex - 1];
+				const withDeferred =
+					checkpoint.deferred && checkpoint.deferred.length > 0 && previous
+						? applyHugeDeferredDispositions(withPlan, previous.label, checkpoint.deferred)
+						: withPlan;
+				return applyHugeVersionPlanWritten(withDeferred, { stream: parsed.stream, round: parsed.round });
+			});
+			const refsLint = githubEvidenceLint(text);
+			if (refsLint) {
+				appendRunNotice(workdir, runId, { kind: "huge-refs", source: "version-plan-written", text: refsLint });
+			}
+			lintPlanIntoNotices(workdir, runId, planPath);
+			return cp;
+		}
+		case "version-review-consolidated": {
+			if (!checkpoint.roundId) throw new StateError("version-review-consolidated requires roundId");
+			return mutateCheckpoint(workdir, runId, (cp) => {
+				if (!cp.huge) throw new StateError("version-review-consolidated requires a huge run");
+				const consolidated = applyReviewConsolidated(cp, checkpoint.roundId!, checkpoint.dispositionArtifact);
+				return { ...consolidated, nextAction: "accept-execute" };
+			});
+		}
+		case "version-completed": {
+			return mutateCheckpoint(workdir, runId, (cp) =>
+				applyHugeVersionCompleted(cp, { reviewReports: checkpoint.reviewReports }),
 			);
 		}
 	}
@@ -276,12 +472,16 @@ export function registerPlansTool(ext: ExtensionAPI): void {
 					}
 					case "show": {
 						const view = showStateView(workdir);
+						const activeRunId =
+							boundRunId(ctx.sessionManager, workdir) ?? resolveActiveRun(ctx.sessionManager, workdir)?.run_id ?? null;
+						const huge = hugeRunSummary(workdir, activeRunId);
 						result = {
 							config: view.config,
 							stateRoot: view.stateRoot,
 							reviewer: view.reviewer,
 							globalConfigPath: view.globalConfigPath,
 							notices: view.notices,
+							...(huge ? { huge } : {}),
 						};
 						if (view.config.graph_enabled === null) {
 							result = {

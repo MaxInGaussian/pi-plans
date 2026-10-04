@@ -259,4 +259,50 @@ export function terminationChrome(lang: UiLanguage): TerminationChrome {
 	return TERMINATION_CHROME[lang];
 }
 
+// --------------------------------------------------------------------------
+// plan-huge chrome (dashboard progress line, /plans version tree)
+// --------------------------------------------------------------------------
+
+export interface HugeChrome {
+	/** Dashboard progress line for the current version. */
+	progress(version: string, index: number, total: number, status: string): string;
+	/** One line of the `/plans` version tree. */
+	versionLine(version: string, status: string, round: number): string;
+	/** Localized label of one version status. */
+	statusLabel(status: string): string;
+}
+
+const HUGE_CHROME: Record<UiLanguage, HugeChrome> = {
+	zh: {
+		progress: (version, index, total, status) => `huge ${version} ${index}/${total} · ${status}`,
+		versionLine: (version, status, round) => `- ${version}: ${status} · 第 ${round} 轮`,
+		statusLabel: (status) =>
+			({
+				pending: "未开始",
+				planning: "规划中",
+				reviewing: "评审中",
+				executing: "执行中",
+				verifying: "校验中",
+				done: "已完成",
+			})[status] ?? status,
+	},
+	en: {
+		progress: (version, index, total, status) => `huge ${version} ${index}/${total} · ${status}`,
+		versionLine: (version, status, round) => `- ${version}: ${status} · round ${round}`,
+		statusLabel: (status) =>
+			({
+				pending: "pending",
+				planning: "planning",
+				reviewing: "reviewing",
+				executing: "executing",
+				verifying: "verifying",
+				done: "done",
+			})[status] ?? status,
+	},
+};
+
+export function hugeChrome(lang: UiLanguage): HugeChrome {
+	return HUGE_CHROME[lang];
+}
+
 

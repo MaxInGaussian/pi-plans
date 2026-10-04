@@ -82,7 +82,11 @@ async function run(ctx: ExtensionContext, baseDir: string): Promise<void> {
 	if (candidate === null) {
 		const labels = candidates.map((entry, index) => {
 			const cross = entry.crossWorktree ? " · cross-worktree" : "";
-			const plan = entry.planVersion !== null ? `PLAN v${entry.planVersion}` : "no plan";
+			const plan = entry.planStream
+				? `PLAN ${entry.planStream} round ${entry.planVersion ?? 0}`
+				: entry.planVersion !== null
+					? `PLAN v${entry.planVersion}`
+					: "no plan";
 			const corruptMark = entry.checkpointStatus === "corrupt" ? " · ⚠ corrupt checkpoint" : "";
 			return `${index + 1}. ${entry.runId} · ${entry.phaseLabel} · ${plan}${cross} · ${entry.updatedAt}${corruptMark}`;
 		});
@@ -384,7 +388,8 @@ async function buildBrief(
 		`Artifact directory: ${run.artifact_dir}`,
 	];
 	if (cp.plan) {
-		lines.push(`Current plan: ${cp.plan.path} (v${cp.plan.version}, digest ${cp.plan.sha256.slice(0, 12)}…). Higher versions in the directory are NOT approved for execution without a new handoff.`);
+		const streamLabel = cp.plan.stream ? `${cp.plan.stream} round ${cp.plan.version}` : `v${cp.plan.version}`;
+		lines.push(`Current plan: ${cp.plan.path} (${streamLabel}, digest ${cp.plan.sha256.slice(0, 12)}…). Higher versions in the directory are NOT approved for execution without a new handoff.`);
 	} else {
 		lines.push("No plan version recorded yet — continue the interview.");
 	}

@@ -32,6 +32,31 @@ One paragraph summarizing the user's request.
 
 Ordering, files to avoid, verification commands, and anything the executor must know. The handoff still requires explicit user approval (`ask_choice` with `autoComplete: false`, then the `execute_plan` tool) and is never auto-completed. Once approved, execution mode tracks every task through the `plans_update_task` tool (status + evidence); when all tasks are terminal, the independent execution reviewer verifies each check above before the run completes.
 
+### Huge (plan-huge) version streams
+
+A `plan-huge` version plan (`PLAN_vX.Y.Z_vN.md`) keeps the exact same body:
+`## Original Request`, `## Tasks` (+ `### Execution Waves`), and
+`## Verification Checks`. On top of that it may carry two huge-only auxiliary
+sections, both parsed by `src/huge-plan.ts`:
+
+- `## Deferred to vX.Y.Z` — the work intentionally left for the next version.
+  One row per item: ``- `D-vX.Y.Z-n`: <summary> — reason: <why>``. Ids are
+  version-scoped (`D-<this version>-<n>`), never reused, and the last version
+  may write `## Deferred to none`. Collecting an item into the next version plan
+  is `absorbed`; dropping it needs a recorded user confirmation whose
+  `questionId` is `huge-deferred-<version>--<itemId>` (double dash — the
+  checkpoint question-id grammar forbids `:`) with `source === "user"` in the
+  run checkpoint (an `auto-complete` answer does not count).
+- `## Evidence` — 1–3 GitHub project URLs that informed the version plan
+  (at least one). A version plan with zero GitHub references gets a run notice
+  (visible in `/plans`); the lint is advisory, never a hard block.
+
+Huge streams also never reuse `PLAN_vN.md` for their revisions: the trailing
+`vN` of `PLAN_vX.Y.Z_vN.md` is the round of that version stream, and the run
+keeps them in the same flat artifact directory (`.git/pi-plans/plans/<date-topic>/`)
+as `PLAN_overall_vN.md` plus one `PLAN_vX.Y.Z_vN.md` family per version.
+See `references/huge-plan-artifact-template.md` for the overall-plan template.
+
 ## Revision Ledger
 
 - `PLAN_v1`: <one line per revision: what changed and why>.

@@ -13,10 +13,16 @@ const EXPECTED_SKILLS = new Set([
 	"plan-small",
 	"plan-normal",
 	"plan-big",
+	"plan-huge",
 	"plan-with-refs",
 	"debug-and-plan",
 ]);
-const REQUIRED_REFERENCES = ["pi-planning-workflow.md", "plan-artifact-template.md", "state-and-config.md"];
+const REQUIRED_REFERENCES = [
+	"pi-planning-workflow.md",
+	"plan-artifact-template.md",
+	"huge-plan-artifact-template.md",
+	"state-and-config.md",
+];
 const REQUIRED_AGENTS = ["reviewer.md", "execution-reviewer.md"];
 // Root-level docs that must exist and must be entirely English (see AGENTS.md).
 const REQUIRED_ROOT_DOCS = ["AGENTS.md", "CHANGELOG.md"];
@@ -176,6 +182,7 @@ const REQUIRED_PACK_ENTRIES = [
 	"agents/reviewer.md",
 	"references/pi-planning-workflow.md",
 	"skills/planning/SKILL.md",
+	"skills/plan-huge/SKILL.md",
 	"tools/plans.ts",
 	"src/state.ts",
 	"scripts/validate.ts",

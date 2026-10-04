@@ -24,6 +24,9 @@ export interface ResumeCandidate {
 	/** True when the run's recorded workdir/worktree differs from `workdir`. */
 	crossWorktree: boolean;
 	planVersion: number | null;
+	/** plan-huge: current version stream label (`v0.1.0`) or the overall
+	 * stream — null for ordinary runs. */
+	planStream?: string | null;
 	updatedAt: string;
 }
 
@@ -61,7 +64,21 @@ function phaseLabelOf(run: RunInfo, checkpoint: WorkflowCheckpoint | null): stri
 	return run.status;
 }
 
+/** plan-huge: the stream the resume UI should name (current version, else the
+ * recorded plan's stream). */
+function planStreamOf(checkpoint: WorkflowCheckpoint | null): string | null {
+	const huge = checkpoint?.huge;
+	if (huge) return huge.versions[huge.currentIndex]?.label ?? null;
+	return checkpoint?.plan?.stream ?? null;
+}
+
 function planVersionOf(checkpoint: WorkflowCheckpoint | null, run: RunInfo): number | null {
+	// plan-huge: the display version is the CURRENT version stream's round.
+	const huge = checkpoint?.huge;
+	if (huge) {
+		const current = huge.versions[huge.currentIndex];
+		if (current && current.round > 0) return current.round;
+	}
 	if (checkpoint?.plan) return checkpoint.plan.version;
 	// Legacy: highest PLAN_vN in the artifact dir (R-008 fallback).
 	if (run.artifact_dir && existsSync(run.artifact_dir)) {
@@ -126,6 +143,7 @@ export function listResumeCandidates(workdir: string): ResumeCandidate[] {
 			phaseLabel: phaseLabelOf(run, checkpoint),
 			crossWorktree,
 			planVersion: planVersionOf(checkpoint, run),
+			planStream: planStreamOf(checkpoint),
 			updatedAt: checkpoint?.updatedAt ?? run.updated_at,
 		});
 	}

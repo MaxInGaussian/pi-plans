@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
 	formChrome,
+	hugeChrome,
 	refineChrome,
 	resolveUiLanguage,
 	uiLanguageFromTag,
@@ -115,6 +116,24 @@ describe("chrome tables", () => {
 		assert.equal(refine.switchLane, "Tab & Shift + Tab 切换 lane");
 	});
 
+	it("keeps the huge chrome tables paired and localized", () => {
+		const zh = hugeChrome("zh");
+		const en = hugeChrome("en");
+		assert.equal(zh.progress("v0.1.0", 2, 3, "规划中"), "huge v0.1.0 2/3 · 规划中");
+		assert.equal(en.progress("v0.1.0", 2, 3, "planning"), "huge v0.1.0 2/3 · planning");
+		assert.equal(zh.statusLabel("executing"), "执行中");
+		assert.equal(en.statusLabel("executing"), "executing");
+		assert.equal(zh.statusLabel("done"), "已完成");
+		assert.equal(en.statusLabel("done"), "done");
+		assert.match(zh.versionLine("v0.1.0", "已完成", 2), /第 2 轮/);
+		assert.match(en.versionLine("v0.1.0", "done", 2), /round 2/);
+		for (const status of ["pending", "planning", "reviewing", "executing", "verifying", "done"]) {
+			assert.notEqual(zh.statusLabel(status), status, `zh label missing for ${status}`);
+			assert.equal(en.statusLabel(status).includes(status), true);
+		}
+		assert.equal(en.statusLabel("unknown-status"), "unknown-status");
+	});
+
 	it("keeps every en string free of CJK", () => {
 		const groups: string[][] = [];
 		const f = formChrome("en");
@@ -132,6 +151,12 @@ describe("chrome tables", () => {
 		]);
 		const r = refineChrome("en");
 		groups.push([r.close, r.scroll, r.page, r.switchLane]);
+		const h = hugeChrome("en");
+		groups.push([
+			h.progress("v0.1.0", 2, 3, h.statusLabel("executing")),
+			h.versionLine("v0.1.0", h.statusLabel("done"), 2),
+			...["pending", "planning", "reviewing", "executing", "verifying", "done"].map((status) => h.statusLabel(status)),
+		]);
 		for (const group of groups) {
 			for (const text of group) {
 				assert.ok(!CJK.test(text), `CJK leaked in en chrome: ${text}`);

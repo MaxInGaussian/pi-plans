@@ -29,6 +29,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import * as path from "node:path";
 import { StateError, atomicWriteJson, resolveStateRootOrNull, runGit, runDirPath, utcNow } from "./state.ts";
 import { assertOwnership, heldOwnershipRecord } from "./run-ownership.ts";
+import { HUGE_MAX_VERSIONS, HUGE_MIN_VERSIONS, parseHugePlanName } from "./huge-plan.ts";
 import type { NoProgressState, ReviewBudget } from "./review-budget.ts";
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,10 @@ export type NextAction =
 	| "run-review"
 	| "consolidate-review"
 	| "revise-plan"
+	| "accept-overall"
+	| "start-version-planning"
+	| "plan-next-version"
+	| "complete-huge"
 	| "accept-execute"
 	| "execute-items"
 	| "apply-review-fixes"
@@ -79,10 +84,14 @@ export interface AnsweredQuestionRef {
 export interface PlanIdentity {
 	/** Absolute path of the exact PLAN_vN.md this state refers to. */
 	path: string;
-	/** N parsed from the file name. */
+	/** Revision round parsed from the trailing `vN` (for `PLAN_vN.md` the
+	 * legacy version number; for `PLAN_vX.Y.Z_vN.md` the stream round). */
 	version: number;
 	/** SHA-256 of the full file bytes. */
 	sha256: string;
+	/** plan-huge (v0.9.5): stream id of the plan — `overall` or a version
+	 * label like `v0.1.0`. Absent on legacy `PLAN_vN.md` identities. */
+	stream?: string;
 }
 
 export type LaneStatus = "pending" | "running" | "complete" | "failed";
@@ -227,6 +236,78 @@ export interface ReviewFindingRecord {
 	raw: string;
 }
 
+/** plan-huge (v0.9.5): one version of a huge run's version table. */
+export type HugeVersionStatus = "pending" | "planning" | "reviewing" | "executing" | "verifying" | "done";
+
+/** Archived evidence of a completed version, written when the version's
+ * execution review passes and the run loops back to planning. The review
+ * budget and the cumulative counters are carried here so the next version
+ * inherits them instead of re-asking. */
+export interface HugeVersionCompletion {
+	completedAt: string;
+	/** VC ids the completion audit passed for this version. */
+	doneVcIds?: string[];
+	/** Task-status snapshot (task id → status) at completion. */
+	tasks?: Record<string, string>;
+	auditPassed?: boolean;
+	/** Version-scoped review report paths inside the run directory. */
+	reviewReports?: string[];
+	/** Plan identity + approval evidence of the completed version. */
+	planPath?: string;
+	planSha256?: string;
+	approvedAt?: string;
+	headAtApproval?: string | null;
+	usage?: { inToks: number; outToks: number };
+	reviewBudget?: ReviewBudget;
+	reviewBudgetDefaulted?: boolean;
+	reviewRoundsTotal?: number;
+	reviewCapExtension?: number;
+	/** v0.9.5: the no-progress valve streak is inherited across versions so a
+	 * stalled review keeps its escalation history. */
+	reviewNoProgress?: NoProgressState;
+}
+
+export interface HugeVersionState {
+	label: string;
+	mission: string;
+	done: string;
+	status: HugeVersionStatus;
+	/** Latest revision round recorded for this version's plan stream. */
+	round: number;
+	/** Overall-plan round this version was planned against. */
+	overallRound?: number;
+	completion?: HugeVersionCompletion;
+}
+
+/** One processed item of the previous version's `## Deferred to vX.Y.Z`
+ * ledger. Drops must reference the recorded user confirmation. */
+export interface HugeDeferredDisposition {
+	itemId: string;
+	fromVersion: string;
+	disposition: "absorbed" | "dropped";
+	/** `questionId` of the recorded user confirmation (drops only). */
+	confirmationId?: string;
+	at: string;
+}
+
+export interface HugeState {
+	/** Version table snapshot; array order is the version sequence. */
+	versions: HugeVersionState[];
+	/** Index of the current version in `versions`. */
+	currentIndex: number;
+	/** Latest recorded overall-plan round. */
+	overallRound: number;
+	/** Deferred-item ledger across versions. */
+	deferred: HugeDeferredDisposition[];
+}
+
+/** Question id of the batch ask that confirms dropping one deferred item.
+ * The `--` separator keeps the id inside the checkpoint id grammar (which
+ * forbids `:`), while staying 1:1 with `(version, itemId)`. */
+export function deferredQuestionId(version: string, itemId: string): string {
+	return `huge-deferred-${version}--${itemId}`;
+}
+
 export interface OwnerInfo {
 	host: string;
 	pid: number;
@@ -265,6 +346,8 @@ export interface WorkflowCheckpoint {
 	reviewRounds: ReviewRoundState[];
 	implementationReview?: ImplementationReviewState;
 	execution?: ExecutionCheckpoint;
+	/** v0.9.5: plan-huge multi-version streams (absent = an ordinary run). */
+	huge?: HugeState;
 	autoComplete?: boolean;
 	owner?: OwnerInfo | null;
 	migration?: MigrationInfo | null;
@@ -284,6 +367,10 @@ const NEXT_ACTIONS = new Set<NextAction>([
 	"run-review",
 	"consolidate-review",
 	"revise-plan",
+	"accept-overall",
+	"start-version-planning",
+	"plan-next-version",
+	"complete-huge",
 	"accept-execute",
 	"execute-items",
 	"apply-review-fixes",
@@ -299,6 +386,20 @@ const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const RUN_ID_RE = /^\d{8}T\d{6}Z-[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+
+const HUGE_STREAM_RE = /^(overall|v0\.\d+\.\d+)$/;
+const HUGE_VERSION_LABEL_RE = /^v0\.\d+\.\d+$/;
+const HUGE_DEFERRED_ITEM_RE = /^D-v0\.\d+\.\d+-\d+$/;
+
+const HUGE_VERSION_STATUSES = new Set<HugeVersionStatus>([
+	"pending",
+	"planning",
+	"reviewing",
+	"executing",
+	"verifying",
+	"done",
+]);
+const HUGE_DEFERRED_DISPOSITIONS = new Set<HugeDeferredDisposition["disposition"]>(["absorbed", "dropped"]);
 
 // ---------------------------------------------------------------------------
 // Validation helpers (explicit, no blind casts)
@@ -393,7 +494,7 @@ function asOptionalId(value: unknown, label: string): string | undefined {
 
 function asPlanIdentity(value: unknown, label: string): PlanIdentity {
 	const record = asRecord(value, label);
-	rejectExtraKeys(record, new Set(["path", "version", "sha256"]), label);
+	rejectExtraKeys(record, new Set(["path", "version", "sha256", "stream"]), label);
 	const plan: PlanIdentity = {
 		path: asString(record.path, `${label}.path`),
 		version: asInt(record.version, `${label}.version`, 1),
@@ -401,6 +502,13 @@ function asPlanIdentity(value: unknown, label: string): PlanIdentity {
 	};
 	if (!path.isAbsolute(plan.path)) throw new CheckpointValidationError(`${label}.path: must be absolute`);
 	if (!SHA256_RE.test(plan.sha256)) throw new CheckpointValidationError(`${label}.sha256: malformed digest`);
+	if (record.stream !== undefined) {
+		const stream = asString(record.stream, `${label}.stream`);
+		if (!HUGE_STREAM_RE.test(stream)) {
+			throw new CheckpointValidationError(`${label}.stream: expected "overall" or a vX.Y.Z label`);
+		}
+		plan.stream = stream;
+	}
 	return plan;
 }
 
@@ -664,6 +772,149 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	return execution;
 }
 
+function asHugeVersionCompletion(value: unknown, label: string): HugeVersionCompletion {
+	const record = asRecord(value, label);
+	rejectExtraKeys(
+		record,
+		new Set([
+			"completedAt", "doneVcIds", "tasks", "auditPassed", "reviewReports", "planPath",
+			"planSha256", "approvedAt", "headAtApproval", "usage", "reviewBudget",
+			"reviewBudgetDefaulted", "reviewRoundsTotal", "reviewCapExtension", "reviewNoProgress",
+		]),
+		label,
+	);
+	const completion: HugeVersionCompletion = { completedAt: asTimestamp(record.completedAt, `${label}.completedAt`) };
+	if (record.doneVcIds !== undefined) completion.doneVcIds = asStringArray(record.doneVcIds, `${label}.doneVcIds`);
+	if (record.tasks !== undefined) completion.tasks = asRecordMap(record.tasks, `${label}.tasks`);
+	if (record.auditPassed !== undefined) completion.auditPassed = asBool(record.auditPassed, `${label}.auditPassed`);
+	if (record.reviewReports !== undefined) {
+		completion.reviewReports = asStringArray(record.reviewReports, `${label}.reviewReports`).map((entry) =>
+			safeRelativePath(entry, `${label}.reviewReports`),
+		);
+	}
+	if (record.planPath !== undefined) completion.planPath = asString(record.planPath, `${label}.planPath`);
+	if (record.planSha256 !== undefined) {
+		const sha = asString(record.planSha256, `${label}.planSha256`);
+		if (!SHA256_RE.test(sha)) throw new CheckpointValidationError(`${label}.planSha256: malformed digest`);
+		completion.planSha256 = sha;
+	}
+	if (record.approvedAt !== undefined) completion.approvedAt = asTimestamp(record.approvedAt, `${label}.approvedAt`);
+	if (record.headAtApproval !== undefined) {
+		completion.headAtApproval =
+			record.headAtApproval === null ? null : asString(record.headAtApproval, `${label}.headAtApproval`);
+	}
+	if (record.usage !== undefined && record.usage !== null) {
+		const usage = asRecord(record.usage, `${label}.usage`);
+		rejectExtraKeys(usage, new Set(["inToks", "outToks"]), `${label}.usage`);
+		completion.usage = {
+			inToks: asInt(usage.inToks, `${label}.usage.inToks`, 0),
+			outToks: asInt(usage.outToks, `${label}.usage.outToks`, 0),
+		};
+	}
+	if (record.reviewBudget !== undefined && record.reviewBudget !== null) {
+		completion.reviewBudget = asReviewBudget(record.reviewBudget, `${label}.reviewBudget`);
+	}
+	if (record.reviewBudgetDefaulted !== undefined) {
+		completion.reviewBudgetDefaulted = asBool(record.reviewBudgetDefaulted, `${label}.reviewBudgetDefaulted`);
+	}
+	if (record.reviewRoundsTotal !== undefined && record.reviewRoundsTotal !== null) {
+		completion.reviewRoundsTotal = asInt(record.reviewRoundsTotal, `${label}.reviewRoundsTotal`, 0);
+	}
+	if (record.reviewCapExtension !== undefined && record.reviewCapExtension !== null) {
+		completion.reviewCapExtension = asInt(record.reviewCapExtension, `${label}.reviewCapExtension`, 0);
+	}
+	if (record.reviewNoProgress !== undefined && record.reviewNoProgress !== null) {
+		const noProgress = asRecord(record.reviewNoProgress, `${label}.reviewNoProgress`);
+		rejectExtraKeys(noProgress, new Set(["key", "streak"]), `${label}.reviewNoProgress`);
+		completion.reviewNoProgress = {
+			key: asString(noProgress.key, `${label}.reviewNoProgress.key`),
+			streak: asInt(noProgress.streak, `${label}.reviewNoProgress.streak`, 0),
+		};
+	}
+	return completion;
+}
+
+function asHugeVersion(value: unknown, label: string): HugeVersionState {
+	const record = asRecord(value, label);
+	rejectExtraKeys(
+		record,
+		new Set(["label", "mission", "done", "status", "round", "overallRound", "completion"]),
+		label,
+	);
+	const labelText = asString(record.label, `${label}.label`);
+	if (!HUGE_VERSION_LABEL_RE.test(labelText)) {
+		throw new CheckpointValidationError(`${label}.label: expected a vX.Y.Z version label`);
+	}
+	const version: HugeVersionState = {
+		label: labelText,
+		mission: asString(record.mission, `${label}.mission`),
+		done: asString(record.done, `${label}.done`),
+		status: asEnum(record.status, HUGE_VERSION_STATUSES, `${label}.status`),
+		round: asInt(record.round, `${label}.round`, 0),
+	};
+	if (record.overallRound !== undefined) version.overallRound = asInt(record.overallRound, `${label}.overallRound`, 1);
+	if (record.completion !== undefined && record.completion !== null) {
+		version.completion = asHugeVersionCompletion(record.completion, `${label}.completion`);
+	}
+	return version;
+}
+
+function asHugeDeferredDisposition(value: unknown, label: string): HugeDeferredDisposition {
+	const record = asRecord(value, label);
+	rejectExtraKeys(record, new Set(["itemId", "fromVersion", "disposition", "confirmationId", "at"]), label);
+	const itemId = asString(record.itemId, `${label}.itemId`);
+	if (!HUGE_DEFERRED_ITEM_RE.test(itemId)) {
+		throw new CheckpointValidationError(`${label}.itemId: expected a D-vX.Y.Z-n id`);
+	}
+	const disposition = asEnum(record.disposition, HUGE_DEFERRED_DISPOSITIONS, `${label}.disposition`);
+	const entry: HugeDeferredDisposition = {
+		itemId,
+		fromVersion: asString(record.fromVersion, `${label}.fromVersion`),
+		disposition,
+		at: asTimestamp(record.at, `${label}.at`),
+	};
+	if (record.confirmationId !== undefined) entry.confirmationId = asId(record.confirmationId, `${label}.confirmationId`);
+	if (disposition === "dropped" && entry.confirmationId === undefined) {
+		throw new CheckpointValidationError(`${label}.confirmationId: a dropped deferred item needs a recorded user confirmation`);
+	}
+	return entry;
+}
+
+function asHugeState(value: unknown, label: string): HugeState {
+	const record = asRecord(value, label);
+	rejectExtraKeys(record, new Set(["versions", "currentIndex", "overallRound", "deferred"]), label);
+	const versions = Array.isArray(record.versions)
+		? record.versions.map((entry, i) => asHugeVersion(entry, `${label}.versions[${i}]`))
+		: [];
+	if (versions.length === 0) throw new CheckpointValidationError(`${label}.versions: at least one version is required`);
+	const seenLabels = new Set<string>();
+	for (const version of versions) {
+		if (seenLabels.has(version.label)) {
+			throw new CheckpointValidationError(`${label}.versions: duplicate label ${version.label}`);
+		}
+		seenLabels.add(version.label);
+	}
+	const currentIndex = asInt(record.currentIndex, `${label}.currentIndex`, 0);
+	if (currentIndex >= versions.length) {
+		throw new CheckpointValidationError(`${label}.currentIndex: out of range (${currentIndex})`);
+	}
+	const deferred = Array.isArray(record.deferred)
+		? record.deferred.map((entry, i) => asHugeDeferredDisposition(entry, `${label}.deferred[${i}]`))
+		: [];
+	const seenItems = new Set<string>();
+	for (const entry of deferred) {
+		const key = `${entry.fromVersion}::${entry.itemId}`;
+		if (seenItems.has(key)) throw new CheckpointValidationError(`${label}.deferred: duplicate disposition ${key}`);
+		seenItems.add(key);
+	}
+	return {
+		versions,
+		currentIndex,
+		overallRound: asInt(record.overallRound, `${label}.overallRound`, 1),
+		deferred,
+	};
+}
+
 function asOwner(value: unknown, label: string): OwnerInfo {
 	const record = asRecord(value, label);
 	rejectExtraKeys(record, new Set(["host", "pid", "sessionId", "processToken", "generation", "acquiredAt"]), label);
@@ -690,7 +941,7 @@ export function validateCheckpoint(data: unknown): WorkflowCheckpoint {
 	const allowed = new Set([
 		"schema", "runId", "revision", "generation", "updatedAt", "phase", "nextAction",
 		"originWorkdir", "workdir", "worktreeRoot", "commonDir", "plan", "pendingQuestion",
-		"pendingQuestions", "answeredQuestions", "reviewRounds", "implementationReview", "execution",
+		"pendingQuestions", "answeredQuestions", "reviewRounds", "implementationReview", "execution", "huge",
 		"autoComplete", "owner", "migration",
 	]);
 	rejectExtraKeys(record, allowed, "checkpoint");
@@ -732,6 +983,9 @@ export function validateCheckpoint(data: unknown): WorkflowCheckpoint {
 	}
 	if (record.execution !== undefined) {
 		checkpoint.execution = asExecution(record.execution, "checkpoint.execution");
+	}
+	if (record.huge !== undefined) {
+		checkpoint.huge = asHugeState(record.huge, "checkpoint.huge");
 	}
 	if (record.autoComplete !== undefined) checkpoint.autoComplete = asBool(record.autoComplete, "checkpoint.autoComplete");
 	if (record.owner !== undefined && record.owner !== null) {
@@ -813,12 +1067,22 @@ export function resolveWorktreeRoot(workdir: string): string | null {
 	return top === "" ? null : path.resolve(workdir, top);
 }
 
-/** Build a plan identity from an absolute PLAN_vN.md path. */
+/** Build a plan identity from an absolute PLAN_vN.md path. plan-huge
+ * revisions (`PLAN_overall_vN.md`, `PLAN_vX.Y.Z_vN.md`) resolve to their
+ * stream round and record the stream id; legacy names keep their old
+ * meaning (the caller's `version` fallback). */
 export function planIdentityOf(planPath: string, version: number): PlanIdentity {
 	if (!path.isAbsolute(planPath)) throw new StateError(`plan path must be absolute: ${planPath}`);
-	const match = /PLAN_v(\d+)\.md$/.exec(path.basename(planPath));
+	const name = path.basename(planPath);
+	const match = /PLAN_v(\d+)\.md$/.exec(name);
 	const resolvedVersion = match ? Number.parseInt(match[1]!, 10) : version;
-	return { path: planPath, version: resolvedVersion, sha256: sha256File(planPath) };
+	const identity: PlanIdentity = { path: planPath, version: resolvedVersion, sha256: sha256File(planPath) };
+	const huge = parseHugePlanName(name);
+	if (huge) {
+		identity.version = huge.round;
+		identity.stream = huge.stream;
+	}
+	return identity;
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,6 +1441,14 @@ export function applyReviewConsolidated(cp: WorkflowCheckpoint, roundId: string,
 	return { ...cp, reviewRounds: cp.reviewRounds.map((entry) => (entry.roundId === roundId ? nextRound : entry)) };
 }
 
+/** plan-huge: seed the next version's review budget from the most recently
+ * completed version, so the budget question is asked once per run. */
+function inheritedHugeBudget(cp: WorkflowCheckpoint): HugeVersionCompletion | undefined {
+	const completed = (cp.huge?.versions ?? []).filter((version) => version.completion?.reviewBudget !== undefined);
+	const last = completed[completed.length - 1];
+	return last?.completion;
+}
+
 export function applyExecutionApproved(cp: WorkflowCheckpoint, approval: ExecutionApproval): WorkflowCheckpoint {
 	// F-007 (implementation review): terminal and review phases cannot approve
 	// execution; a re-approval (stop/migration reset approval to null) is legal
@@ -1190,7 +1462,10 @@ export function applyExecutionApproved(cp: WorkflowCheckpoint, approval: Executi
 	if (cp.plan !== null && cp.plan.sha256 !== approval.plan.sha256) {
 		throw new StateError("approved plan does not match the checkpoint's recorded plan");
 	}
-	return {
+	// v0.9.5: a version after the first inherits the archived review budget
+	// and cumulative counters instead of re-asking the user.
+	const inherited = cp.huge ? inheritedHugeBudget(cp) : undefined;
+	const next: WorkflowCheckpoint = {
 		...cp,
 		phase: "executing",
 		nextAction: "execute-items",
@@ -1202,8 +1477,21 @@ export function applyExecutionApproved(cp: WorkflowCheckpoint, approval: Executi
 			usage: { inToks: 0, outToks: 0 },
 			tasks: {},
 			audit: { rounds: 0 },
+			reviewBudget: inherited?.reviewBudget,
+			reviewBudgetDefaulted: inherited?.reviewBudgetDefaulted,
+			reviewRoundsTotal: inherited?.reviewRoundsTotal,
+			reviewCapExtension: inherited?.reviewCapExtension,
+			reviewNoProgress: inherited?.reviewNoProgress,
 		},
 	};
+	if (cp.huge) {
+		const index = cp.huge.currentIndex;
+		const versions = cp.huge.versions.map((version, i) =>
+			i === index ? { ...version, status: "executing" as HugeVersionStatus } : version,
+		);
+		next.huge = { ...cp.huge, versions };
+	}
+	return next;
 }
 
 export interface ExecutionProgressInput {
@@ -1321,6 +1609,250 @@ export function applyExecutionCompleted(cp: WorkflowCheckpoint): WorkflowCheckpo
 	};
 }
 
+// ---------------------------------------------------------------------------
+// plan-huge (v0.9.5): multi-version stream reducers
+// ---------------------------------------------------------------------------
+
+export interface HugeVersionTableRow {
+	label: string;
+	mission: string;
+	done: string;
+}
+
+export interface HugeOverallWrittenInput {
+	round: number;
+	versions: HugeVersionTableRow[];
+	/** Controlled revision (round > 1): why the architecture changed. */
+	reason?: string;
+	/** Controlled revision: labels of the not-started versions that change. */
+	affectedVersions?: string[];
+}
+
+/** Record the overall plan (stream `overall`). Round 1 installs the version
+ * table; a later round is a controlled revision that may only touch versions
+ * that have not started, and must state its reason and affected versions. */
+export function applyHugeOverallPlanWritten(cp: WorkflowCheckpoint, input: HugeOverallWrittenInput): WorkflowCheckpoint {
+	if (cp.phase !== "planning" && cp.phase !== "reviewing") {
+		throw new StateError(`cannot record an overall plan in phase "${cp.phase}"`);
+	}
+	if (input.versions.length < HUGE_MIN_VERSIONS || input.versions.length > HUGE_MAX_VERSIONS) {
+		throw new StateError(
+			`the version table must hold ${HUGE_MIN_VERSIONS}-${HUGE_MAX_VERSIONS} versions (got ${input.versions.length})`,
+		);
+	}
+	const affected = input.affectedVersions === undefined ? undefined : new Set(input.affectedVersions);
+	if (input.round > 1) {
+		if (!input.reason || input.reason.trim() === "") {
+			throw new StateError("a controlled overall revision requires a reason");
+		}
+		if (!affected || affected.size === 0) {
+			throw new StateError("a controlled overall revision requires affectedVersions");
+		}
+	}
+	const previous = new Map((cp.huge?.versions ?? []).map((version) => [version.label, version]));
+	const versions: HugeVersionState[] = input.versions.map((row) => {
+		if (!HUGE_VERSION_LABEL_RE.test(row.label)) {
+			throw new StateError(`version labels must be vX.Y.Z: ${row.label}`);
+		}
+		if (input.round === 1) {
+			return { label: row.label, mission: row.mission, done: row.done, status: "pending", round: 0, overallRound: input.round };
+		}
+		const existing = previous.get(row.label);
+		if (existing && existing.status !== "pending") {
+			if (affected?.has(row.label)) {
+				throw new StateError(`version ${row.label} has already started; a revision can only affect not-started versions`);
+			}
+			return existing;
+		}
+		if (affected && !affected.has(row.label)) {
+			const changed = !existing || existing.mission !== row.mission || existing.done !== row.done;
+			if (changed) {
+				throw new StateError(`version ${row.label} changed but is not listed in affectedVersions`);
+			}
+		}
+		if (existing) return { ...existing, mission: row.mission, done: row.done, overallRound: input.round };
+		return { label: row.label, mission: row.mission, done: row.done, status: "pending", round: 0, overallRound: input.round };
+	});
+	const currentIndex = Math.min(cp.huge?.currentIndex ?? 0, versions.length - 1);
+	// A revision must keep every version that already started or completed:
+	// dropping one would silently re-point the run (or orphan its archive).
+	if (input.round > 1) {
+		for (const previousVersion of cp.huge?.versions ?? []) {
+			if (previousVersion.status === "pending") continue;
+			if (!versions.some((version) => version.label === previousVersion.label)) {
+				throw new StateError(
+					`a controlled overall revision must keep every started or completed version (missing ${previousVersion.label})`,
+				);
+			}
+		}
+	}
+	return {
+		...cp,
+		huge: { versions, currentIndex, overallRound: input.round, deferred: cp.huge?.deferred ?? [] },
+		nextAction: "accept-overall",
+	};
+}
+
+/** Mark the overall plan accepted: the current version's planning begins. */
+export function applyHugeOverallAccepted(cp: WorkflowCheckpoint): WorkflowCheckpoint {
+	if (!cp.huge) throw new StateError("no huge state recorded");
+	if (cp.nextAction !== "accept-overall") {
+		throw new StateError(`overall acceptance requires nextAction "accept-overall" (found "${cp.nextAction}")`);
+	}
+	const index = cp.huge.currentIndex;
+	const current = cp.huge.versions[index];
+	if (!current) throw new StateError("no current version to plan");
+	const versions = cp.huge.versions.map((version, i) =>
+		i === index ? { ...version, status: "planning" as HugeVersionStatus } : version,
+	);
+	return { ...cp, huge: { ...cp.huge, versions }, nextAction: "start-version-planning" };
+}
+
+/** Record a version plan revision (`PLAN_vX.Y.Z_vN.md`) for the current
+ * version. A plan for another stream is refused. */
+export function applyHugeVersionPlanWritten(
+	cp: WorkflowCheckpoint,
+	input: { stream: string; round: number },
+): WorkflowCheckpoint {
+	if (cp.phase !== "planning" && cp.phase !== "reviewing") {
+		throw new StateError(`cannot record a version plan in phase "${cp.phase}"`);
+	}
+	if (!cp.huge) throw new StateError("no huge state recorded");
+	if (input.round < 1) throw new StateError("version plan round must be >= 1");
+	const index = cp.huge.currentIndex;
+	const current = cp.huge.versions[index];
+	if (!current) throw new StateError("no current version to plan");
+	if (input.stream !== current.label) {
+		throw new StateError(`version plan stream ${input.stream} is not the current version ${current.label}`);
+	}
+	const versions = cp.huge.versions.map((version, i) =>
+		i === index
+			? { ...version, round: Math.max(version.round, input.round), status: "planning" as HugeVersionStatus }
+			: version,
+	);
+	return { ...cp, huge: { ...cp.huge, versions }, nextAction: "continue-planning" };
+}
+
+/** Record how the previous version's deferred items were processed. A drop
+ * needs a recorded user confirmation for the exact item
+ * (`deferredQuestionId(version, itemId)`, `source === "user"`); an
+ * `auto-complete` answer never counts. */
+export function applyHugeDeferredDispositions(
+	cp: WorkflowCheckpoint,
+	fromVersion: string,
+	entries: Array<{ itemId: string; disposition: HugeDeferredDisposition["disposition"]; confirmationId?: string }>,
+): WorkflowCheckpoint {
+	if (!cp.huge) throw new StateError("no huge state recorded");
+	const recorded: HugeDeferredDisposition[] = [];
+	for (const entry of entries) {
+		if (!HUGE_DEFERRED_ITEM_RE.test(entry.itemId)) {
+			throw new StateError(`deferred item ids must be D-vX.Y.Z-n: ${entry.itemId}`);
+		}
+		const expected = deferredQuestionId(fromVersion, entry.itemId);
+		const confirmationId = entry.disposition === "dropped" ? (entry.confirmationId ?? expected) : undefined;
+		if (entry.disposition === "dropped") {
+			const confirmed = cp.answeredQuestions.some(
+				(question) => question.questionId === confirmationId && question.source === "user",
+			);
+			if (!confirmed) {
+				throw new StateError(
+					`dropping ${entry.itemId} needs a recorded user confirmation (${confirmationId}); an auto-complete answer does not count`,
+				);
+			}
+		}
+		const next: HugeDeferredDisposition = {
+			itemId: entry.itemId,
+			fromVersion,
+			disposition: entry.disposition,
+			at: utcNow(),
+		};
+		if (confirmationId !== undefined) next.confirmationId = confirmationId;
+		recorded.push(next);
+	}
+	const deferred = [...cp.huge.deferred];
+	for (const entry of recorded) {
+		const index = deferred.findIndex(
+			(existing) => existing.fromVersion === entry.fromVersion && existing.itemId === entry.itemId,
+		);
+		if (index >= 0) deferred[index] = entry;
+		else deferred.push(entry);
+	}
+	return { ...cp, huge: { ...cp.huge, deferred } };
+}
+
+/**
+ * Complete the current version: archive its evidence (VCs, tasks, plan
+ * identity, review reports, review budget) and either loop back to planning
+ * for the next version or finish the run when it was the last one. The run
+ * stays non-terminal between versions; only the last version completes it.
+ */
+export function applyHugeVersionCompleted(
+	cp: WorkflowCheckpoint,
+	extra?: { reviewReports?: string[] },
+): WorkflowCheckpoint {
+	if (cp.phase !== "executing" || !cp.execution) throw new StateError("requires phase \"executing\"");
+	if (!cp.huge) throw new StateError("no huge state recorded");
+	const index = cp.huge.currentIndex;
+	const current = cp.huge.versions[index];
+	if (!current) throw new StateError("no current version to complete");
+	const execution = cp.execution;
+	const completion: HugeVersionCompletion = {
+		completedAt: utcNow(),
+		doneVcIds: [...execution.doneVcIds],
+		tasks: execution.tasks
+			? Object.fromEntries(Object.entries(execution.tasks).map(([id, task]) => [id, task.status]))
+			: {},
+		auditPassed: execution.audit?.passed === true,
+		usage: execution.usage,
+		reviewBudget: execution.reviewBudget,
+		reviewBudgetDefaulted: execution.reviewBudgetDefaulted,
+		reviewRoundsTotal: execution.reviewRoundsTotal,
+		reviewCapExtension: execution.reviewCapExtension,
+		reviewNoProgress: execution.reviewNoProgress,
+	};
+	if (execution.approval) {
+		completion.planPath = execution.approval.plan.path;
+		completion.planSha256 = execution.approval.plan.sha256;
+		completion.approvedAt = execution.approval.approvedAt;
+		completion.headAtApproval = execution.approval.headAtApproval;
+	}
+	if (extra?.reviewReports && extra.reviewReports.length > 0) {
+		completion.reviewReports = extra.reviewReports.map((report) => safeRelativePath(report, "reviewReports"));
+	}
+	const versions = cp.huge.versions.map((version, i) =>
+		i === index ? { ...version, status: "done" as HugeVersionStatus, completion } : version,
+	);
+	const nextIndex = versions.findIndex((version, i) => i > index && version.status !== "done");
+	const freshExecution: ExecutionCheckpoint = {
+		approval: null,
+		doneVcIds: [],
+		implStatus: {},
+		usage: { inToks: 0, outToks: 0 },
+		tasks: {},
+		audit: { rounds: 0 },
+	};
+	if (nextIndex < 0) {
+		return {
+			...cp,
+			huge: { ...cp.huge, versions, currentIndex: index },
+			phase: "completed",
+			nextAction: "none",
+			execution: {
+				...freshExecution,
+				usage: execution.usage,
+				audit: { ...(execution.audit ?? { rounds: 0 }), passed: true },
+			},
+		};
+	}
+	return {
+		...cp,
+		huge: { ...cp.huge, versions, currentIndex: nextIndex },
+		phase: "planning",
+		nextAction: "plan-next-version",
+		execution: freshExecution,
+	};
+}
+
 /**
  * F-003/D-007: migrate a run into the current worktree. The termination
  * condition survives; completed rounds, approval, and VC validity do not.
@@ -1370,7 +1902,15 @@ export function applyMigration(
 /** F-007 (implementation review): migration must not hand accept-execute to phases that still owe review work. */
 function migrationNextAction(cp: WorkflowCheckpoint): NextAction {
 	if (cp.phase === "implementation-review") return "run-review";
-	if (cp.phase === "executing") return cp.plan !== null ? "accept-execute" : cp.nextAction;
+	if (cp.phase === "executing") {
+		if (cp.plan === null) return cp.nextAction;
+		// plan-huge: an executing huge run re-approves its current VERSION plan;
+		// the overall plan is never an execution candidate.
+		if (cp.huge && (cp.plan.stream === undefined || cp.plan.stream === "overall")) {
+			return "start-version-planning";
+		}
+		return "accept-execute";
+	}
 	return cp.nextAction;
 }
 

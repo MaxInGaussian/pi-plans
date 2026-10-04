@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { readdirSync } from "node:fs";
 import { boundRunId } from "./run-context.ts";
 import { listRuns, TERMINAL_RUN_STATUSES, type RunSummary } from "./state.ts";
+import { parseHugePlanName } from "./huge-plan.ts";
 import { truncateToWidth, visibleWidth } from "./refine-ui-helpers.ts";
 
 export interface RunPickerContext {
@@ -23,10 +24,14 @@ export interface RunPickerContext {
 /** Pick-window budget: keep labels to one selector row in normal terminals. */
 const LABEL_WIDTH_BUDGET = 88;
 
-/** True when the run's artifact dir contains at least one PLAN_vN.md. */
+/** True when the run's artifact dir contains at least one plan file: the
+ * legacy `PLAN_vN.md` or a plan-huge stream (`PLAN_overall_vN.md`,
+ * `PLAN_vX.Y.Z_vN.md`). */
 function hasPlanFile(run: RunSummary): boolean {
 	try {
-		return readdirSync(run.artifact_dir).some((name) => /^PLAN_v\d+\.md$/i.test(name));
+		return readdirSync(run.artifact_dir).some(
+			(name) => /^PLAN_v\d+\.md$/i.test(name) || parseHugePlanName(name) !== null,
+		);
 	} catch {
 		return false;
 	}

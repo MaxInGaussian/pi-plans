@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import {
+	appendRunNotice,
 	initState,
 	getRun,
 	readActive,
@@ -18,6 +19,7 @@ import {
 	setRole,
 	setRunStatus,
 	showConfig,
+	showStateView,
 	runDirPath,
 	startRun,
 	StateError,
@@ -464,5 +466,87 @@ describe("runDirPath", () => {
 		const notARepo = path.join(tmpRoot, "not-a-repo");
 		fs.mkdirSync(notARepo, { recursive: true });
 		assert.equal(runDirPath(notARepo, run.run_id), null);
+	});
+});
+
+describe("plan-huge state view", () => {
+	it("renders the version tree with pending, running and completed versions", async () => {
+		const workdir = mkWorkdir("huge-view");
+		git(workdir, "init");
+		initState(workdir);
+		const { run } = startRun(workdir, { topic: "huge-view", skill: "plan-huge", requestText: "x" });
+		const { createCheckpoint, applyHugeOverallPlanWritten, applyHugeOverallAccepted, applyHugeVersionPlanWritten, applyExecutionApproved, applyHugeVersionCompleted, loadCheckpoint, mutateCheckpoint, planIdentityOf } =
+			await import("../src/workflow-state.ts");
+		createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+		const versions = [
+			{ label: "v0.1.0", mission: "skeleton", done: "runs" },
+			{ label: "v0.2.0", mission: "store", done: "persists" },
+			{ label: "v0.3.0", mission: "users", done: "isolated" },
+		];
+		mutateCheckpoint(workdir, run.run_id, (cp) =>
+			applyHugeOverallAccepted(applyHugeOverallPlanWritten(cp, { round: 1, versions })),
+		);
+		let view = showStateView(workdir);
+		assert.ok(view.huge);
+		assert.equal(view.huge!.position, "1/3");
+		assert.equal(view.huge!.currentVersion, "v0.1.0");
+		assert.deepEqual(
+			view.huge!.versions.map((version) => version.status),
+			["planning", "pending", "pending"],
+		);
+		assert.equal(view.huge!.versions[1]!.tasksTotal, 0, "unstarted versions show no progress");
+
+		// Complete version 1 (archived evidence: task snapshot + review reports).
+		mutateCheckpoint(workdir, run.run_id, (cp) => applyHugeVersionPlanWritten(cp, { stream: "v0.1.0", round: 2 }));
+		const planPath = path.join(run.artifact_dir, "PLAN_v0.1.0_v2.md");
+		fs.mkdirSync(run.artifact_dir, { recursive: true });
+		fs.writeFileSync(planPath, "# v0.1.0 plan\n", "utf8");
+		mutateCheckpoint(workdir, run.run_id, (cp) =>
+			applyExecutionApproved(
+				{ ...cp, nextAction: "accept-execute" },
+				{ plan: planIdentityOf(planPath, 1), worktree: cp.worktreeRoot, headAtApproval: null, approvedAt: utcNow() },
+			),
+		);
+		const done = mutateCheckpoint(workdir, run.run_id, (cp) =>
+			applyHugeVersionCompleted(
+				{
+					...cp,
+					execution: {
+						...cp.execution!,
+						doneVcIds: ["VC-001"],
+						tasks: { "Task-1": { status: "complete" }, "Task-2": { status: "complete" } },
+						audit: { rounds: 1, passed: true },
+						reviewBudget: 3,
+					},
+				},
+				{ reviewReports: ["execution-review/v0.1.0/round-1-attempt-1.md"] },
+			),
+		);
+		assert.equal(done.phase, "planning");
+		view = showStateView(workdir);
+		assert.equal(view.huge!.position, "2/3");
+		assert.equal(view.huge!.currentVersion, "v0.2.0");
+		const first = view.huge!.versions[0]!;
+		assert.equal(first.status, "done");
+		assert.equal(first.round, 2);
+		assert.equal(first.tasksDone, 2);
+		assert.equal(first.tasksTotal, 2);
+		assert.deepEqual(first.reviewReports, ["execution-review/v0.1.0/round-1-attempt-1.md"]);
+		assert.ok(first.completedAt);
+		assert.equal(view.huge!.overallRound, 1);
+		assert.deepEqual(view.huge!.refGaps, []);
+		appendRunNotice(workdir, run.run_id, { kind: "huge-refs", source: "test", text: "0 GitHub references found" });
+		assert.deepEqual(showStateView(workdir).huge?.refGaps, ["0 GitHub references found"]);
+		const loaded = loadCheckpoint(workdir, run.run_id);
+		assert.equal(loaded.status, "ok");
+	});
+
+	it("shows no huge section for ordinary runs", () => {
+		const workdir = mkWorkdir("huge-view-plain");
+		git(workdir, "init");
+		initState(workdir);
+		startRun(workdir, { topic: "plain", skill: "plan-normal", requestText: "x" });
+		const view = showStateView(workdir);
+		assert.equal(view.huge ?? null, null);
 	});
 });

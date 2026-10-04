@@ -125,6 +125,79 @@ Merge the rounds' `Questions` sections into one deduped list and ask EVERY quest
 
 A refinement round is complete when all reviewer lanes have returned; each lane's output carries findings (`F-###`) and up to five questions (`Q-1..Q-5`). In the same turn: consolidate, accept or reject each finding on evidence (the user may override any disposition), revise to `PLAN_v(N+1).md` when accepted items require it (copy, edit only the new version, update the revision ledger and verifier checklist), then immediately ask the next merged accept/execute question. Never end a turn merely because a round completed.
 
+## plan-huge (Multi-Version Builds)
+
+`plan-huge` extends the single-plan workflow with a version loop inside ONE run
+and ONE flat artifact directory (`.git/pi-plans/plans/<date-topic>/`).
+
+**Stage order.** (1) Overall planning writes `PLAN_overall_v1.md` from at least
+ten `ask_choice` questions, using `references/huge-plan-artifact-template.md`
+(version table, architecture, file map, user experience, final objective; never
+`## Tasks` or `## Verification Checks`). (2) One `refine` round of three
+concurrent reviewers by default; the user may extend rounds at the merged
+accept/execute question. (3) Accepting the overall plan starts the first
+version's planning round — never execution. (4) Version planning writes
+`PLAN_vX.Y.Z_v1.md` (5–10 questions) with the `plan-big` task grammar plus the
+huge-only sections `## Deferred to vX.Y.Z` and `## Evidence`, then the same
+reviewer treatment. (5) The merged accept/execute question, the `execute_plan`
+tool, `plans_update_task` progress, and the independent execution reviewer run
+exactly as in `plan-big`. (6) When a version completes, the run returns to
+planning for the next row of the version table; only the last version makes the
+run terminal.
+
+**Names and rounds.** `PLAN_overall_vN.md` is the overall stream;
+`PLAN_vX.Y.Z_vN.md` is a version stream. The trailing `vN` is the revision
+round of that stream. The legacy `PLAN_vN.md` name keeps its old meaning and
+belongs to ordinary runs — never write it into a huge artifact directory. The
+overall plan may be revised in a controlled way as `PLAN_overall_v(N+1).md`
+with the reason and the affected versions; only not-started versions may
+change, and the current version keeps its identity from the run checkpoint.
+
+**State machine.** The checkpoint carries a `huge` section (version table
+snapshot, current index, per-version rounds and statuses, per-version
+completion archives, deferred ledger, inherited review budget). Existing
+phases are reused; the new next actions are `accept-overall`,
+`start-version-planning`, `plan-next-version`, and `complete-huge`. Run status
+cycles `planning → accepted → executing → planning → … → done`, and the
+planning write guard keeps blocking source writes while the run is
+`planning`/`accepted` between versions.
+
+**Gates and precedence.** `execute_plan` hard-rejects `PLAN_overall_vN.md`
+before any parsing, approval prompt, or state change, and names the current
+version's plan. Without an explicit `planPath` the current version's latest
+round is resolved from the checkpoint; an explicit path wins, but it must
+belong to the run's current version stream and be that stream's latest round —
+a stale round, another stream, or an already-completed version is refused.
+
+**Deferred ledger.** Version rows are
+``- `D-<this version>-<n>`: <summary> — reason: <why>`` and ids never repeat
+across the run. Before a version plan is recorded, every item of the previous
+version must be processed: absorbed items must be referenced by the new plan
+text, and a drop needs a recorded user confirmation whose question id is
+`huge-deferred-<version>--<itemId>` (double dash — the checkpoint question-id
+grammar forbids `:`) with `source === "user"`; an `auto-complete` answer never
+counts. The tool rejects a version plan that leaves items unprocessed.
+
+**References.** Every version plan cites 1–3 related open-source GitHub
+projects (at least one) in its `## Evidence` section. Zero references produce a
+run notice visible in `/plans`; the check is advisory, never a hard block.
+Download and run `analyze_refs` only when a design decision is genuinely
+contested.
+
+**Review budget.** The execution-review budget and termination condition are
+asked once, on the first version's handoff; each completion archives them in
+the version's `completion` record and the next version's approval restores
+them, so later versions do not re-ask.
+
+**VC evidence form.** The execution reviewer runs with read-only tools
+(`read`, `grep`, `find`, `ls`). Write every verification check so a reviewer
+can judge it from the worktree alone — file X contains symbol/case Y asserting
+Z — and treat command output as corroboration, not as the primary evidence.
+
+**Language.** Repository documents (README, references, skills) stay English;
+`src/ui-language.ts` keeps its `zh` table in Chinese. `CHANGELOG.md` is written
+by the maintainer, not by the workflow.
+
 ## Execution Handoff
 
 When the user picks `✓ Accept PLAN_vN and execute it now` in the merged question, mark the plan accepted and call the `execute_plan` tool (or the user runs `/plans-execute`). It re-confirms with the user (never auto-completed), then the extension enters task-tree execution mode:

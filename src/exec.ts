@@ -46,7 +46,8 @@ import {
 	type VccCompactionStats,
 } from "./compaction.ts";
 import { TERMINAL_RUN_STATUSES, getRun, latestRun, lintPlanIntoNotices, listRuns, loadConfig, readActive, resolveStateRootOrNull, runDirPath, setRunStatus, StateError, utcNow } from "./state.ts";
-import { resolveUiLanguage, terminationChrome, type UiLanguage } from "./ui-language.ts";
+import { resolveUiLanguage, hugeChrome, terminationChrome, type UiLanguage } from "./ui-language.ts";
+import { parseHugePlanName, hugePlanFileName } from "./huge-plan.ts";
 import { bindRun, resolveActiveRun } from "./run-context.ts";
 import type { SubagentProgressEvent } from "./subagent.ts";
 import { OwnershipError } from "./run-ownership.ts";
@@ -56,6 +57,7 @@ import {
 	applyExecutionHeadChanged,
 	applyExecutionProgress,
 	applyExecutionStopped,
+	applyHugeVersionCompleted,
 	createCheckpoint,
 	applyExecutionPlanAmended,
 	loadCheckpoint,
@@ -106,6 +108,7 @@ import {
 	formatElapsed,
 	renderDashboardLines,
 	renderDashboardTreeLines,
+	type HugeProgress,
 } from "./dashboard.ts";
 import { presolvedCheckIds, runCompletionAudit, writeReviewRoundReport, type AuditOutcome, type AuditRoundResult, type ReviewFinding } from "./auditor.ts";
 import {
@@ -647,6 +650,7 @@ function updatePanelWidget(ctx: ExtensionContext): void {
 					blockedRound: current.blocked?.round ?? null,
 					startedAt: current.startedAt,
 					usage: current.usage,
+					huge: hugeDashboardPayload(ctx),
 				});
 				const lines = dashboardExpanded
 					? renderDashboardTreeLines(model, width, theme)
@@ -668,6 +672,7 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 			auditRounds: execution.audit.rounds > 0 ? execution.audit.rounds : null,
 			auditFailed: execution.audit.failed,
 			auditUndeterminable: execution.audit.undeterminable,
+			huge: hugeDashboardPayload(ctx),
 			findings: execution.audit.findings,
 			reviewRunning: execution.audit.running === true || execution.review.inFlight !== null,
 			blockedTasks: blockedTaskIds(execution),
@@ -730,9 +735,48 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 function parseLatestPlanExists(artifactDir: string): boolean {
 	try {
 		const names = fs.readdirSync(artifactDir);
-		return names.some((name) => /^PLAN_v\d+\.(md|markdown)$/i.test(name));
+		return names.some((name) => /^PLAN_v\d+\.(md|markdown)$/i.test(name) || parseHugePlanName(name) !== null);
 	} catch {
 		return false;
+	}
+}
+
+/** plan-huge (v0.9.5): dashboard payload for the current version stream. */
+function hugeDashboardPayload(ctx: ExtensionContext): HugeProgress | null {
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	if (!active) return null;
+	const load = loadCheckpoint(ctx.cwd, active.run_id);
+	if (load.status !== "ok" || !load.checkpoint.huge) return null;
+	const huge = load.checkpoint.huge;
+	const current = huge.versions[huge.currentIndex];
+	if (!current) return null;
+	const statusLabel = hugeChrome(resolveUiLanguage(ctx.cwd)).statusLabel(current.status);
+	return { version: current.label, index: huge.currentIndex + 1, total: huge.versions.length, statusLabel };
+}
+
+/** plan-huge: label of the run's current version (for version-scoped review
+ * reports), or null for ordinary runs. */
+function currentHugeVersionLabel(ctx: ExtensionContext): string | null {
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	if (!active) return null;
+	const load = loadCheckpoint(ctx.cwd, active.run_id);
+	if (load.status !== "ok" || !load.checkpoint.huge) return null;
+	return load.checkpoint.huge.versions[load.checkpoint.huge.currentIndex]?.label ?? null;
+}
+
+/** plan-huge: review reports archived under the version's own directory. */
+function hugeVersionReviewReports(workdir: string, runId: string, version: string): string[] {
+	const runDir = runDirPath(workdir, runId);
+	if (runDir === null) return [];
+	const dir = path.join(runDir, "execution-review", version);
+	try {
+		return fs
+			.readdirSync(dir)
+			.filter((name) => name.endsWith(".md"))
+			.sort()
+			.map((name) => path.posix.join("execution-review", version, name));
+	} catch {
+		return [];
 	}
 }
 
@@ -793,6 +837,20 @@ export async function startExecution(
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	const activeStatus = active ? getRun(ctx.cwd, active.run_id)?.status : undefined;
 	if (active && activeStatus && TERMINAL_RUN_STATUSES.has(activeStatus)) {
+		// plan-huge (v0.9.5): a terminal status with versions still open is a
+		// contradiction — keep refusing, but say what the run actually needs.
+		const load = loadCheckpoint(ctx.cwd, active.run_id);
+		const openVersions =
+			load.status === "ok" && load.checkpoint.huge
+				? load.checkpoint.huge.versions.filter((version) => version.status !== "done").length
+				: 0;
+		if (openVersions > 0) {
+			ctx.ui.notify(
+				`run ${active.run_id} is ${activeStatus} while ${openVersions} version(s) are still open; plan the next version instead of executing this one.`,
+				"warning",
+			);
+			return false;
+		}
 		ctx.ui.notify(terminationChrome(resolveUiLanguage(ctx.cwd)).guardNotice(active.run_id, activeStatus), "warning");
 		return false;
 	}
@@ -1599,6 +1657,7 @@ async function handleReviewOutcome(
 		const runDir = runDirOf(ctx);
 		if (runDir) {
 			writeReviewRoundReport(runDir, {
+				versionSegment: currentHugeVersionLabel(ctx) ?? undefined,
 				budgetRound: round.budgetRound,
 				attempt: round.attempt,
 				outcome: "discarded",
@@ -1743,6 +1802,7 @@ async function commitReviewOutcome(
 		const runDir = runDirOf(ctx);
 		if (runDir) {
 			reportPath = writeReviewRoundReport(runDir, {
+				versionSegment: currentHugeVersionLabel(ctx) ?? undefined,
 				budgetRound: round.budgetRound,
 				attempt: round.attempt,
 				outcome: outcome === null
@@ -2854,7 +2914,55 @@ export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 		? `\n\n⚠️ The review budget was exhausted (${budgetLabel(execution)}) before these high-severity finding(s) could be resolved: ${toleratedHighs.map((f) => f.id).join(", ")} — every verification check passed; the finding(s) remain in the round reports under the run directory.`
 		: "";
 	const planPath = execution.planPath;
-	withExecutionCheckpoint(ctx, (cp) => applyExecutionCompleted(cp));
+	// plan-huge (v0.9.5): a version completion archives the version (VCs, tasks,
+	// plan identity, review reports, review budget) and loops the run back to
+	// planning; only the LAST version completes the run. The run stays
+	// non-terminal between versions, so /plans, the status widget and
+	// /resume-plans keep seeing it.
+	const activeForHuge = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	const hugeVersion = activeForHuge ? currentHugeVersionLabel(ctx) : null;
+	const hugeReports =
+		activeForHuge && hugeVersion ? hugeVersionReviewReports(ctx.cwd, activeForHuge.run_id, hugeVersion) : [];
+	let hugeLooped: { version: string; next: string | null; position: string } | null = null;
+	withExecutionCheckpoint(ctx, (cp) => {
+		if (!cp.huge) return applyExecutionCompleted(cp);
+		const index = cp.huge.currentIndex;
+		const current = cp.huge.versions[index];
+		const next = cp.huge.versions.find((version, i) => i > index && version.status !== "done") ?? null;
+		const after = applyHugeVersionCompleted(cp, { reviewReports: hugeReports });
+		if (after.phase !== "completed") {
+			hugeLooped = {
+				version: current?.label ?? "?",
+				next: next?.label ?? null,
+				position: `${index + 1}/${cp.huge.versions.length}`,
+			};
+		}
+		return after;
+	});
+	if (hugeLooped !== null) {
+		const looped = hugeLooped as { version: string; next: string | null; position: string };
+		execution = null;
+		executionRunId = null;
+		continuationRuntime = null;
+		messaging().appendEntry("pi-plans-exec-cleared", { reason: "huge-version-complete" });
+		messaging().sendMessage(
+			{
+				customType: "pi-plans-huge-version-complete",
+				content: `**Version ${looped.version} complete** ✅ (${looped.position}) \`${planPath}\` — the run stays in planning${looped.next ? `; the next version is ${looped.next}` : ""}. Plan the next version with the plan-huge skill; the overall plan is never executable.\n\n${summary}${residualNote}`,
+				display: true,
+			},
+			{ triggerTurn: false },
+		);
+		if (activeForHuge) {
+			try {
+				setRunStatus(ctx.cwd, activeForHuge.run_id, "planning");
+			} catch {
+				/* best-effort */
+			}
+		}
+		updateStatusWidget(ctx);
+		return;
+	}
 	execution = null;
 	executionRunId = null;
 	continuationRuntime = null;
@@ -3038,6 +3146,7 @@ export async function terminateExecution(ctx: ExtensionContext, summary: Termina
 		if (runDir) {
 			const { budgetRound, attempt } = effective.abortedRound;
 			writeReviewRoundReport(runDir, {
+				versionSegment: currentHugeVersionLabel(ctx) ?? undefined,
 				budgetRound,
 				attempt,
 				outcome: "cancelled",

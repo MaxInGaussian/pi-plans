@@ -74,24 +74,49 @@ import {
 } from "./src/code-graph/commands.ts";
 import { restartWatcherIfEnabled, stopGraphWatcher, disableWatcher } from "./src/code-graph/watch.ts";
 import { latestPlanVersion, nextPlanVersionPath } from "./src/plan.ts";
+import { latestHugePlan, nextHugePlanPath, parseHugePlanPath } from "./src/huge-plan.ts";
 import { configPiPlansCommand } from "./src/config-command.ts";
+import { hugeChrome, resolveUiLanguage } from "./src/ui-language.ts";
 import { resumePlansCommand } from "./src/resume-command.ts";
 import { terminatePlanCommand } from "./src/terminate-command.ts";
 import { getRun, listRuns, loadConfig, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
 import { boundRunId, resolveActiveRun, restoreRunBindingFromSession } from "./src/run-context.ts";
 import { abandonCandidates, resolveCommandRun } from "./src/run-picker.ts";
-import { applyPlanWritten, mutateCheckpoint, planIdentityOf } from "./src/workflow-state.ts";
+import { applyPlanWritten, loadCheckpoint, mutateCheckpoint, planIdentityOf } from "./src/workflow-state.ts";
 import { registerAskChoiceTool } from "./tools/ask-choice.ts";
 import { executeCommand, registerExecutePlanTool } from "./tools/execute-plan.ts";
 import { registerTaskStatusTool } from "./src/task-tool.ts";
 import { flattenTaskViews, taskIsTerminal, taskProgress } from "./src/tasks.ts";
-import { registerPlansTool } from "./tools/plans.ts";
+import { hugeRunSummary, registerPlansTool } from "./tools/plans.ts";
 import { registerRefineTool } from "./tools/refine.ts";
 import { registerAnalyzeRefsTool } from "./tools/analyze-refs.ts";
 import { messaging, setMessagingApi } from "./src/messaging.ts";
 import { stalenessLine } from "./src/staleness.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
+
+/** The plan file a write/edit should be attributed to: the legacy latest
+ * `PLAN_vN.md`, or the newest round of a huge stream (`PLAN_overall_vN.md`,
+ * `PLAN_vX.Y.Z_vN.md`). Older rounds of a huge stream never re-stamp the
+ * checkpoint, so a historical rewrite cannot move the run's plan identity. */
+function planForWrite(artifactDir: string, rawPath: string): { path: string; version: number } | null {
+	const resolved = path.resolve(rawPath);
+	const legacy = latestPlanVersion(artifactDir);
+	if (legacy && path.resolve(legacy.path) === resolved) return legacy;
+	const parsed = parseHugePlanPath(resolved);
+	if (!parsed) return null;
+	const latestOfStream = latestHugePlan(artifactDir, parsed.stream);
+	if (!latestOfStream || path.resolve(latestOfStream.path) !== resolved) return null;
+	return { path: resolved, version: parsed.round };
+}
+
+/** plan-huge: stream id of the run's current version, or null. */
+function currentHugeStream(workdir: string, runId: string): string | null {
+	const load = loadCheckpoint(workdir, runId);
+	if (load.status !== "ok" || !load.checkpoint.huge) return null;
+	const huge = load.checkpoint.huge;
+	return huge.versions[huge.currentIndex]?.label ?? null;
+}
 
 // When THIS copy of the extension was imported into the running pi process.
 // /plans compares it against the newest source-file mtime so a stale instance
@@ -159,6 +184,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			join(baseDir, "skills", "plan-small"),
 			join(baseDir, "skills", "plan-normal"),
 			join(baseDir, "skills", "plan-big"),
+			join(baseDir, "skills", "plan-huge"),
 			join(baseDir, "skills", "plan-with-refs"),
 		],
 	}));
@@ -171,6 +197,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		"plan-small",
 		"plan-normal",
 		"plan-big",
+		"plan-huge",
 		"plan-with-refs",
 	]) {
 		pi.registerCommand(name, {
@@ -206,11 +233,11 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		if (event.toolName === "write" || event.toolName === "edit") {
 			const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 			if (active) {
-				const latest = latestPlanVersion(active.artifact_dir);
-				if (latest && path.resolve(ctx.cwd, rawPath) === path.resolve(ctx.cwd, latest.path)) {
+				const written = planForWrite(active.artifact_dir, path.resolve(ctx.cwd, rawPath));
+				if (written) {
 					messaging().appendEntry(PLANNING_PLAN_WRITTEN_CUSTOM_TYPE, {
 						runId: active.run_id,
-						planPath: latest.path,
+						planPath: written.path,
 					});
 					markPlanWritten(ctx);
 				}
@@ -230,13 +257,12 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		if (!rawPath) return;
 		const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 		if (!active) return;
-		const latest = latestPlanVersion(active.artifact_dir);
-		if (!latest) return;
-		if (path.resolve(ctx.cwd, rawPath.replace(/^@/, "")) !== path.resolve(ctx.cwd, latest.path)) return;
+		const written = planForWrite(active.artifact_dir, path.resolve(ctx.cwd, rawPath.replace(/^@/, "")));
+		if (!written) return;
 		try {
-			const identity = planIdentityOf(path.resolve(ctx.cwd, latest.path), latest.version);
+			const identity = planIdentityOf(written.path, written.version);
 			mutateCheckpoint(ctx.cwd, active.run_id, (cp) => applyPlanWritten(cp, identity));
-			lintPlanIntoNotices(ctx.cwd, active.run_id, path.resolve(ctx.cwd, latest.path));
+			lintPlanIntoNotices(ctx.cwd, active.run_id, written.path);
 		} catch {
 			/* best-effort; the model can also call plans record-checkpoint explicitly */
 		}
@@ -463,6 +489,26 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			if (fs.existsSync(path.join(resolveStateRootOrNull(ctx.cwd) ?? ".git/pi-plans", "active.json"))) {
 				lines.push("Note: active.json is deprecated — the run registry now derives from runs/*/run.json; the legacy file is ignored.");
 			}
+			if (run) {
+				// plan-huge (v0.9.5): the version tree — every version of the
+				// overall plan with its status, round and deferral ledger.
+				const summary = hugeRunSummary(ctx.cwd, run.run_id) as {
+					position: string;
+					currentVersion: string | null;
+					versions: Array<{ label: string; status: string; round: number }>;
+					deferred: { absorbed: number; dropped: number };
+					refNotices: string[];
+				} | null;
+				if (summary) {
+					const chrome = hugeChrome(resolveUiLanguage(ctx.cwd));
+					lines.push(`Huge: ${summary.position} versions · current ${summary.currentVersion ?? "-"}`);
+					for (const version of summary.versions) {
+						lines.push(`  ${chrome.versionLine(version.label, chrome.statusLabel(version.status), version.round)}`);
+					}
+					lines.push(`  deferred: absorbed ${summary.deferred.absorbed} · dropped ${summary.deferred.dropped}`);
+					for (const notice of summary.refNotices) lines.push(`  ⚠ ${notice}`);
+				}
+			}
 			const execution = getExecution();
 			if (execution) {
 				const progress = taskProgress(execution.tasks);
@@ -533,7 +579,14 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 				? path.resolve(ctx.cwd, planArg.replace(/^@/, ""))
 				: null;
 			if (!sourcePlanPath && execution) sourcePlanPath = execution.planPath;
-			if (!sourcePlanPath && active) sourcePlanPath = latestPlanVersion(active.artifact_dir)?.path ?? null;
+			if (!sourcePlanPath && active) {
+				// plan-huge: revise the CURRENT version stream, not a legacy PLAN_vN.md.
+				const stream = currentHugeStream(ctx.cwd, active.run_id);
+				sourcePlanPath =
+					(stream ? latestHugePlan(active.artifact_dir, stream)?.path : null) ??
+					latestPlanVersion(active.artifact_dir)?.path ??
+					null;
+			}
 			if (!sourcePlanPath || !fs.existsSync(sourcePlanPath)) {
 				ctx.ui.notify(
 					sourcePlanPath ? `Plan file not found: ${sourcePlanPath}` : "No plan to update. Pass plan.md or start a run first.",
@@ -543,7 +596,10 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			}
 
 			const artifactDir = active?.artifact_dir ?? path.dirname(sourcePlanPath);
-			const next = nextPlanVersionPath(artifactDir);
+			// plan-huge: the revision advances the current version stream
+			// (PLAN_vX.Y.Z_v(N+1).md); ordinary runs keep PLAN_v(N+1).md.
+			const hugeStream = active ? currentHugeStream(ctx.cwd, active.run_id) : null;
+			const next = hugeStream ? nextHugePlanPath(artifactDir, hugeStream) : nextPlanVersionPath(artifactDir);
 
 			// Snapshot progress BEFORE stopping so the revision preserves finished work.
 			const doneIds = execution ? execution.items.filter((item) => item.done).map((item) => item.id) : [];

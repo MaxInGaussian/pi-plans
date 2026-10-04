@@ -129,7 +129,8 @@ Planning artifacts live under `./.git/pi-plans/plans/YYYY-MM-DD-<topic>/` by def
 
 | Capability | In short |
 |---|---|
-| Planning router + five specialist skills | Start with `/skill:planning` to route to the narrowest matching specialist (`plan-small` → `plan-big`, `debug-and-plan`, `plan-with-refs`) |
+| Planning router + six specialist skills | Start with `/skill:planning` to route to the narrowest matching specialist (`plan-small` → `plan-big`, `plan-huge`, `debug-and-plan`, `plan-with-refs`) |
+| Huge multi-version loop (`/plan-huge`) | One run, one flat artifact directory: the abstract overall plan (`PLAN_overall_v1.md`, extendable to `PLAN_overall_vN.md`) carries the `## Versions` table (2–10 strictly ascending `v0.Y.Z` versions, each with a mission and a `done:` criterion), the architecture, the file map, the user experience, and the final objective. Accepting it starts the first version's planning round instead of execution; each `PLAN_vX.Y.Z_vN.md` keeps the `plan-big` task grammar plus `## Deferred to vX.Y.Z` (version-scoped `D-…` ids, absorbed or user-confirmed dropped before the next version) and `## Evidence` (1–3 GitHub project references). Executing a version runs the same handoff, task tree, and execution reviewer as `plan-big`; completion archives the version (VCs, tasks, plan identity, review reports, review budget) and loops back to planning, and only the last version makes the run terminal. The overall plan is never executable, an explicit plan path must be the current stream's latest round, and the review budget asked once is inherited by later versions |
 | Choice prompts | `ask_choice`: recommended option first, answers auto-recorded per run; every option you author states its advantage and its drawback as `✓ <advantage> / ✗ <drawback>` in the configured language, so the user can weigh each option before answering; choosing Auto-complete enables recommendation-only answers for later eligible questions in the current planning run, with `/plans-autocomplete-stop` available to take back control. |
 | Refinement rounds | Read-only reviewer Pi subagents return findings (`F-###`) and up to five questions (`Q-1..Q-5`) in one round; the main agent asks every question with `ask_choice` and records the answers before revising. Delegated runs have a standalone `Reviewer` progress overlay; `analyze_refs` shows the same kind of overlay titled `Refs` while per-reference analysis subagents run |
 | Workspace state | Config, runs, decisions, refs, and subagent ledgers in `.git/pi-plans/` (git common dir) |
@@ -222,6 +223,7 @@ Invoked via `resources_discover`, callable as `/skill:<name>`, directly as `/<na
 | [`plan-small`](skills/plan-small/SKILL.md) | Small scoped change; 1–3 questions; one reviewer round |
 | [`plan-normal`](skills/plan-normal/SKILL.md) | Broad or risky change; 5–10 questions; reviewer rounds |
 | [`plan-big`](skills/plan-big/SKILL.md) | Open-ended/high-risk effort; 10+ questions; three concurrent reviewers |
+| [`plan-huge`](skills/plan-huge/SKILL.md) | Multi-version product builds: one abstract overall plan (`PLAN_overall_vN.md`: version table, architecture, file map, UX, final objective), then per-version plans (`PLAN_vX.Y.Z_vN.md`, 2–10 versions) each planned, reviewed, executed, and execution-reviewed before the next version; runs stay non-terminal between versions |
 | [`debug-and-plan`](skills/debug-and-plan/SKILL.md) | Bug, CI failure, regression, incident — diagnose before planning |
 | [`plan-with-refs`](skills/plan-with-refs/SKILL.md) | External references must be analyzed before planning — repos, papers (arXiv), engineering blogs, and docs sites all count; theoretical references are equal citizens. plan-normal/plan-big may optionally cite 1–2 search-found references without downloading |
 
@@ -278,7 +280,7 @@ pi-plans/
 ├── tools/                 # plans, ask-choice, refine, execute-plan, code-graph
 ├── src/                   # state, guard, plan parsing, subagent runner, refine overlay, exec loop
 │   └── code-graph/        # SQLite schema/store, parsers, indexer, summary, materialize
-├── skills/                # The planning router plus five specialist planning skills
+├── skills/                # The planning router plus six specialist planning skills
 ├── references/            # Shared workflow, state/config, plan template (normative)
 ├── agents/                # reviewer.md subagent prompt (ref-analyst.md for reference analysis)
 ├── scripts/validate.ts    # Structure + package artifact guard

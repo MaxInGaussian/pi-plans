@@ -34,6 +34,8 @@ export interface DashboardModel {
 	topic: string;
 	tasks: TaskView[];
 	checklist: CheckItem[];
+	/** plan-huge (v0.9.5): current version progress, when the run is huge. */
+	huge?: HugeProgress | null;
 	paused: boolean;
 	pausedReason?: string;
 	/** Audit round counter; null = audit not yet started. */
@@ -71,6 +73,16 @@ export interface DashboardModel {
 /** Tree marker for one task row. A rolled-back task is `pending` but still
  * carries the evidence of its previous attempt, so it gets its own marker
  * rather than reading as untouched work. */
+/** plan-huge: dashboard payload for the current version stream. The status
+ * label is already localized by the caller (`hugeChrome(lang).statusLabel`),
+ * so the renderer stays language-neutral. */
+export interface HugeProgress {
+	version: string;
+	index: number;
+	total: number;
+	statusLabel: string;
+}
+
 export function taskMarker(task: TaskView, currentId: string | null): string {
 	if (taskIsTerminal(task)) return task.status === "skipped" ? "~" : "✓";
 	if (task.id === currentId) return "▸";
@@ -176,6 +188,10 @@ export function renderDashboardLines(model: DashboardModel, width: number, theme
 	const inner = Math.max(0, width - 2);
 	lines.push(titleRow(model.topic, width, theme));
 	lines.push(progressRow(model, p.done, p.total, vcDone, width, narrow));
+	if (model.huge) {
+		const hugeText = `huge ${model.huge.version} ${model.huge.index}/${model.huge.total} · ${model.huge.statusLabel}`;
+		lines.push(boxRow("│", ` ${clip(hugeText, inner - 2)}`, " ", width));
+	}
 	if (model.paused) {
 		lines.push(boxRow("│", ` ⏸ ${clip(model.pausedReason ?? "paused", inner - 3)}`, " ", width));
 	} else if (cur) {
@@ -273,12 +289,13 @@ export function deriveDashboardModel(
 	topic: string,
 	tasks: TaskView[],
 	checklist: CheckItem[],
-	extra?: { paused?: boolean; pausedReason?: string; auditRounds?: number | null; auditFailed?: string[]; auditUndeterminable?: string[]; reviewRunning?: boolean; findings?: Array<{ id: string; severity: string; note: string; taskIds: string[] }>; blockedTasks?: string[]; blockedRound?: number | null; reviewBudget?: ReviewBudget | null; reviewRoundsTotal?: number; reviewCapExtension?: number; reviewBudgetDefaulted?: boolean; startedAt?: string; usage?: { inToks: number; outToks: number } },
+	extra?: { paused?: boolean; pausedReason?: string; auditRounds?: number | null; auditFailed?: string[]; auditUndeterminable?: string[]; reviewRunning?: boolean; findings?: Array<{ id: string; severity: string; note: string; taskIds: string[] }>; blockedTasks?: string[]; blockedRound?: number | null; reviewBudget?: ReviewBudget | null; reviewRoundsTotal?: number; reviewCapExtension?: number; reviewBudgetDefaulted?: boolean; startedAt?: string; usage?: { inToks: number; outToks: number }; huge?: HugeProgress | null },
 ): DashboardModel {
 	return {
 		topic,
 		tasks,
 		checklist,
+		huge: extra?.huge ?? null,
 		paused: extra?.paused ?? false,
 		pausedReason: extra?.pausedReason,
 		auditRounds: extra?.auditRounds ?? null,
@@ -311,7 +328,8 @@ export function formatDashboardSummaryLine(model: DashboardModel): string {
 	const highToken = highs > 0 ? ` · ${highs} high` : "";
 	const pause = model.paused ? " · ⏸ paused" : "";
 	const blocked = model.blockedTasks.length > 0 ? " · ⊘ blocked" : "";
-	return `plans: ${model.topic} ▸ tasks ${p.done}/${p.total} · VC ${vcDone}/${model.checklist.length}${wave}${audit}${highToken}${pause}${blocked}`;
+	const huge = model.huge ? ` · huge ${model.huge.version} ${model.huge.index}/${model.huge.total}` : "";
+	return `plans: ${model.topic} ▸ tasks ${p.done}/${p.total} · VC ${vcDone}/${model.checklist.length}${wave}${audit}${highToken}${pause}${blocked}${huge}`;
 }
 
 /** Expanded tree view lines (Ctrl+Shift+T overlay). Wide layout from 96 cols. */

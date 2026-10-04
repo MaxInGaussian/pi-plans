@@ -329,6 +329,8 @@ export async function runCompletionAudit(
 export function writeReviewRoundReport(
 	runDir: string,
 	entry: {
+		/** plan-huge: version label — reports land in a version subdirectory. */
+		versionSegment?: string;
 		budgetRound: number;
 		attempt: number;
 		outcome: "passed" | "failed" | "undeterminable" | "discarded" | "spawn-failed" | "cancelled";
@@ -346,7 +348,9 @@ export function writeReviewRoundReport(
 	},
 ): string | null {
 	try {
-		const dir = path.join(runDir, "execution-review");
+		const dir = entry.versionSegment
+			? path.join(runDir, "execution-review", entry.versionSegment)
+			: path.join(runDir, "execution-review");
 		fs.mkdirSync(dir, { recursive: true });
 		const file = path.join(dir, `round-${entry.budgetRound}-attempt-${entry.attempt}.md`);
 		const lines = [
