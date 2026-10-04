@@ -46,6 +46,7 @@
 		"index.ts",
 		"agents/",
 		"docs/assets",
+		"docs/benchmarks/*.md",
 		"references/",
 		"scripts/",
 		"!scripts/bench/vendor",

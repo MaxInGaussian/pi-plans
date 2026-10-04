@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
+import { README_CHECKS, collectSurface, readmeIssues } from "./readme-check.ts";
 
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
 const SKILL_ROOT = path.join(ROOT, "skills");
@@ -130,6 +131,12 @@ function validatePlansTool(): void {
 	if (!source.includes("artifactRootSource")) fail("tools/plans.ts: artifactRootSource parameter missing");
 }
 
+/** The README is a shipped surface: keep every claim it makes true. */
+function validateReadme(): void {
+	const issues = readmeIssues(collectSurface(ROOT));
+	if (issues.length) fail(`README is out of sync with the code surface:\n  - ${issues.join("\n  - ")}`);
+}
+
 function validatePackageMetadata(): void {
 	const pkgPath = path.join(ROOT, "package.json");
 	let pkg: PackageJson;
@@ -180,12 +187,14 @@ const REQUIRED_PACK_ENTRIES = [
 	"index.ts",
 	"package.json",
 	"agents/reviewer.md",
+	"docs/benchmarks/tech-note.md",
 	"references/pi-planning-workflow.md",
 	"skills/planning/SKILL.md",
 	"skills/plan-huge/SKILL.md",
 	"tools/plans.ts",
 	"src/state.ts",
 	"scripts/validate.ts",
+	"scripts/readme-check.ts",
 	"scripts/run-tests.ts",
 ];
 
@@ -291,9 +300,12 @@ function main(): void {
 
 	validateDefaultConfig();
 	validatePlansTool();
+	validateReadme();
 	validatePackageMetadata();
 	validatePackageArtifact();
-	console.log(`validated ${EXPECTED_SKILLS.size} skills, ${REQUIRED_REFERENCES.length} references, ${REQUIRED_AGENTS.length} agents, ${REQUIRED_TOOL_FILES.length} tools, ${REQUIRED_ROOT_DOCS.length} docs`);
+	console.log(
+		`validated ${EXPECTED_SKILLS.size} skills, ${REQUIRED_REFERENCES.length} references, ${REQUIRED_AGENTS.length} agents, ${REQUIRED_TOOL_FILES.length} tools, ${REQUIRED_ROOT_DOCS.length} docs, readme ${README_CHECKS.length} checks`,
+	);
 }
 
 main();
