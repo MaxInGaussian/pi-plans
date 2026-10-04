@@ -45,8 +45,8 @@ import {
 	type VccCompactionBuildResult,
 	type VccCompactionStats,
 } from "./compaction.ts";
-import { TERMINAL_RUN_STATUSES, getRun, latestRun, lintPlanIntoNotices, loadConfig, readActive, resolveStateRootOrNull, runDirPath, setRunStatus, StateError, utcNow } from "./state.ts";
-import { resolveUiLanguage, type UiLanguage } from "./ui-language.ts";
+import { TERMINAL_RUN_STATUSES, getRun, latestRun, lintPlanIntoNotices, listRuns, loadConfig, readActive, resolveStateRootOrNull, runDirPath, setRunStatus, StateError, utcNow } from "./state.ts";
+import { resolveUiLanguage, terminationChrome, type UiLanguage } from "./ui-language.ts";
 import { bindRun, resolveActiveRun } from "./run-context.ts";
 import type { SubagentProgressEvent } from "./subagent.ts";
 import { OwnershipError } from "./run-ownership.ts";
@@ -785,7 +785,35 @@ export interface StartExecutionInput {
 export async function startExecution(
 	ctx: ExtensionContext,
 	input: StartExecutionInput,
-): Promise<void> {
+): Promise<boolean> {
+	// v0.9.4 (Q-5): a terminal run must never be revived — `/plans-execute
+	// <planPath>` bypasses the run picker, and `setRunStatus` has no transition
+	// guard, so flipping a done run back to "executing" would leave the status
+	// contradicting the completed checkpoint. Refuse before any state change.
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	const activeStatus = active ? getRun(ctx.cwd, active.run_id)?.status : undefined;
+	if (active && activeStatus && TERMINAL_RUN_STATUSES.has(activeStatus)) {
+		ctx.ui.notify(terminationChrome(resolveUiLanguage(ctx.cwd)).guardNotice(active.run_id, activeStatus), "warning");
+		return false;
+	}
+	// An unbound session with nothing but terminal runs resolves `null` above
+	// (readActive skips terminal runs). Refuse only when the PLAN itself belongs
+	// to a terminal run's artifact directory: an unrelated plan in such a workdir
+	// keeps the pre-existing unattributed path instead of being refused with a
+	// notice about a run it never touched.
+	if (!active) {
+		const resolvedPlan = path.resolve(input.planPath);
+		const owner = listRuns(ctx.cwd).find((run) => {
+			if (!TERMINAL_RUN_STATUSES.has(run.status)) return false;
+			const dir = run.artifact_dir;
+			if (typeof dir !== "string" || dir.trim() === "") return false;
+			return resolvedPlan.startsWith(`${path.resolve(dir)}${path.sep}`);
+		});
+		if (owner) {
+			ctx.ui.notify(terminationChrome(resolveUiLanguage(ctx.cwd)).guardNotice(owner.run_id, owner.status), "warning");
+			return false;
+		}
+	}
 	// A fresh handoff replaces any live run — abort its in-flight review round first.
 	abortInFlightReview();
 	const tasks = buildTaskView(input.planTasks);
@@ -816,7 +844,6 @@ export async function startExecution(
 	pendingExecutionFlush = false;
 	resetExecutionCompactionState(ctx);
 	persist(ctx);
-	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
 	executionRunId = active?.run_id ?? null;
 	if (active) {
 		bindRun(ctx.sessionManager, ctx.cwd, active.run_id);
@@ -859,6 +886,7 @@ export async function startExecution(
 		{ triggerTurn: false },
 	);
 	updateStatusWidget(ctx);
+	return true;
 }
 
 /** Persist the live task progress (called by the task status tool). */
@@ -2850,6 +2878,237 @@ export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 		}
 	}
 	updateStatusWidget(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// User-authorized termination (/plans-terminate, v0.9.4)
+// ---------------------------------------------------------------------------
+
+/** What a user-authorized termination must disclose (PLAN_v2, decisions Q1–Q5). */
+export interface TerminationSummary {
+	planPath: string;
+	/** Run the termination is attributed to; null when the session is unbound. */
+	runId: string | null;
+	/** Committed review rounds across the whole run (never the per-grant counter). */
+	committedRounds: number;
+	/** The budget in force when the user terminated (`3` / `∞`). */
+	budgetLabel: string;
+	/** Auditable checks that never passed, in plan order. */
+	unverifiedVcIds: string[];
+	/** Tasks that are not terminal, in tree order. */
+	openTaskIds: string[];
+	/** High-severity findings still recorded. */
+	highFindings: string[];
+	/** Non-high findings still recorded. */
+	residualFindings: string[];
+	/** Fewer than three committed rounds — the confirm dialog warns. */
+	fewRounds: boolean;
+	/** The review round this termination aborts, when one is in flight. */
+	abortedRound: { budgetRound: number; attempt: number } | null;
+}
+
+/** Pure projection of the termination disclosure (no I/O, no state change). */
+export function terminationSummary(ex: ExecState, runId: string | null = executionRunId): TerminationSummary {
+	const auditable = new Set(auditableChecks(ex.items, ex.tasks).map((item) => item.id));
+	const inFlight = ex.review.inFlight;
+	return {
+		planPath: ex.planPath,
+		runId,
+		committedRounds: ex.reviewRoundsTotal,
+		budgetLabel: budgetLabel(ex),
+		unverifiedVcIds: ex.items.filter((item) => item.done !== true && auditable.has(item.id)).map((item) => item.id),
+		openTaskIds: flattenTaskViews(ex.tasks).filter((task) => !taskIsTerminal(task)).map((task) => task.id),
+		highFindings: ex.audit.findings.filter((finding) => finding.severity === "high").map((finding) => finding.id),
+		residualFindings: ex.audit.findings.filter((finding) => finding.severity !== "high").map((finding) => finding.id),
+		fewRounds: ex.reviewRoundsTotal < 3,
+		abortedRound: inFlight ? { budgetRound: inFlight.budgetRound, attempt: inFlight.attempt } : null,
+	};
+}
+
+/** `TERMINATION.md` body — English, like the round reports; the chat surfaces
+ * are localized through `terminationChrome`. */
+export function renderTerminationRecord(summary: TerminationSummary, meta: { at: string }): string {
+	const list = (ids: string[]): string => (ids.length > 0 ? ids.map((id) => `- ${id}`).join("\n") : "none");
+	const lines = [
+		"# Termination record — /plans-terminate",
+		"",
+		"## Terminated at",
+		meta.at,
+		"",
+		"## Plan",
+		summary.planPath,
+		"",
+		"## Run",
+		summary.runId ?? "(unbound)",
+		"",
+		"## Committed review rounds",
+		`${summary.committedRounds}${summary.fewRounds ? " (fewer than 3)" : ""}`,
+		"",
+		"## Budget",
+		summary.budgetLabel,
+		"",
+		"## Unverified checks",
+		list(summary.unverifiedVcIds),
+		"",
+		"## Open tasks",
+		list(summary.openTaskIds),
+		"",
+		"## Unresolved findings",
+		list([
+			...summary.highFindings.map((id) => `${id} (high)`),
+			...summary.residualFindings.map((id) => `${id} (residual)`),
+		]),
+	];
+	if (summary.abortedRound) {
+		const { budgetRound, attempt } = summary.abortedRound;
+		lines.push(
+			"",
+			"## Aborted in-flight round",
+			`round ${budgetRound} attempt ${attempt} — execution-review/round-${budgetRound}-attempt-${attempt}.md (outcome: cancelled)`,
+		);
+	}
+	lines.push(
+		"",
+		"## Notes",
+		"The run was terminated by the user; it is recorded as done and cannot be resumed.",
+		"Unverified checks and open tasks were left untouched — this record is the disclosure, not a waiver.",
+		"",
+	);
+	return lines.join("\n");
+}
+
+/** The chat message shown after a termination (localized, bounded per line). */
+function terminationMessage(summary: TerminationSummary, lang: UiLanguage, recordPath: string | null, recordWritten: boolean): string {
+	const chrome = terminationChrome(lang);
+	const ids = (list: string[]): string => (list.length > 0 ? `: ${list.join(", ")}` : "");
+	return [
+		// No `✅`: a terminated run deliberately keeps `audit.passed = false`, so a
+		// pass-looking tick would contradict the checkpoint. Only ⚠️ with highs.
+		`${chrome.terminatedHeading}${summary.highFindings.length > 0 ? " ⚠️" : ""} \`${summary.planPath}\``,
+		chrome.roundsLabel(summary.committedRounds, summary.budgetLabel),
+		`${chrome.unverifiedLabel(summary.unverifiedVcIds.length)}${ids(summary.unverifiedVcIds)}`,
+		`${chrome.openTasksLabel(summary.openTaskIds.length)}${ids(summary.openTaskIds)}`,
+		`${chrome.highsLabel(summary.highFindings.length)}${ids(summary.highFindings)}`,
+		`${chrome.residualLabel(summary.residualFindings.length)}${ids(summary.residualFindings)}`,
+		summary.fewRounds ? chrome.fewRoundsNote(summary.committedRounds) : "",
+		summary.abortedRound ? chrome.abortedRoundLabel(summary.abortedRound.budgetRound, summary.abortedRound.attempt) : "",
+		chrome.doneNotice,
+		recordWritten && recordPath ? chrome.recordLine(recordPath) : chrome.recordUnavailable,
+	]
+		.filter((line) => line !== "")
+		.join("\n");
+}
+
+/**
+ * End the run by explicit user decision (v0.9.4). Mirrors `completeExecution`
+ * but records the termination: the in-flight round is aborted with a
+ * `cancelled` report, the checkpoint completes with `audit.passed = false`
+ * and `audit.lastResult = "terminated by user"` (existing schema fields — no
+ * workflow-state change), `TERMINATION.md` lands next to `PLAN_vN.md`, and the
+ * session snapshot is tombstoned so a reload cannot resurrect the loop.
+ *
+ * `summary` is the disclosure snapshot the user approved, but the REVIEW-ROUND
+ * facts are re-read from the live loop here: the confirm dialog can stay open
+ * for minutes, during which a round may commit (its report file already
+ * exists) or a new one may launch. Returns false when the loop is already gone
+ * (the caller reports that to the user instead of claiming a termination).
+ */
+export async function terminateExecution(ctx: ExtensionContext, summary: TerminationSummary): Promise<boolean> {
+	if (!execution) return false;
+	const lang = execution.uiLanguage ?? "en";
+	const effective: TerminationSummary = {
+		...summary,
+		committedRounds: execution.reviewRoundsTotal,
+		budgetLabel: budgetLabel(execution),
+		fewRounds: execution.reviewRoundsTotal < 3,
+		abortedRound: execution.review.inFlight
+			? { budgetRound: execution.review.inFlight.budgetRound, attempt: execution.review.inFlight.attempt }
+			: null,
+	};
+	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
+	// 1. The aborted round leaves its own evidence line first: once `execution`
+	//    is gone the round's async handler is dropped by the ownership guard,
+	//    so this is the only chance to record the cancel. Writing it for a round
+	//    that already committed would overwrite that round's own report — hence
+	//    the live in-flight source above.
+	if (effective.abortedRound) {
+		// Same evidence root as every other round report: the execution's run
+		// (`runDirOf` is executionRunId-first), not the session binding.
+		const runDir = runDirOf(ctx);
+		if (runDir) {
+			const { budgetRound, attempt } = effective.abortedRound;
+			writeReviewRoundReport(runDir, {
+				budgetRound,
+				attempt,
+				outcome: "cancelled",
+				passed: [],
+				failed: [],
+				undeterminable: [],
+				coveredTaskIds: [],
+				report: "Round aborted by /plans-terminate before it returned; the user terminated the run.",
+			});
+		}
+	}
+	// 2. Abort before clearing: typed cancelled, no budget charge, no wake.
+	abortInFlightReview();
+	resetExecutionCompactionState(ctx);
+	pendingExecutionFlush = false;
+	persist(ctx);
+	withExecutionCheckpoint(ctx, (cp) => {
+		const completed = applyExecutionCompleted(cp);
+		if (!completed.execution) return completed;
+		return {
+			...completed,
+			execution: {
+				...completed.execution,
+				audit: {
+					...(completed.execution.audit ?? { rounds: 0 }),
+					passed: false,
+					lastResult: "terminated by user",
+				},
+			},
+		};
+	});
+	// 3. Durable record beside the plan (best-effort, like the round reports).
+	//    A missing or empty `artifact_dir` must degrade to "record unavailable":
+	//    the checkpoint is already completed here, so a throw would leave the run
+	//    `executing` with a completed checkpoint and a live loop, and an empty
+	//    path would write TERMINATION.md into the process cwd.
+	const artifactDir = active?.artifact_dir;
+	let recordPath: string | null = null;
+	let recordWritten = false;
+	if (typeof artifactDir === "string" && artifactDir.trim() !== "") {
+		try {
+			recordPath = path.join(artifactDir, "TERMINATION.md");
+			fs.mkdirSync(path.dirname(recordPath), { recursive: true });
+			fs.writeFileSync(recordPath, renderTerminationRecord(effective, { at: utcNow() }), "utf8");
+			recordWritten = true;
+		} catch {
+			recordWritten = false;
+		}
+	}
+	// 4. Drop the loop state and tombstone the snapshot.
+	execution = null;
+	executionRunId = null;
+	continuationRuntime = null;
+	messaging().appendEntry("pi-plans-exec-cleared", { reason: "terminated by user via /plans-terminate" });
+	messaging().sendMessage(
+		{
+			customType: "pi-plans-terminate",
+			content: terminationMessage(effective, lang, recordPath, recordWritten),
+			display: true,
+		},
+		{ triggerTurn: false },
+	);
+	if (active) {
+		try {
+			setRunStatus(ctx.cwd, active.run_id, "done");
+		} catch {
+			/* best-effort */
+		}
+	}
+	updateStatusWidget(ctx);
+	return true;
 }
 
 /** Injection text for before_agent_start while executing. */

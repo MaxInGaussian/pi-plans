@@ -162,4 +162,101 @@ export function reviewBudgetChrome(lang: UiLanguage): ReviewBudgetChrome {
 	return REVIEW_BUDGET_CHROME[lang];
 }
 
+// --------------------------------------------------------------------------
+// User-authorized termination chrome (/plans-terminate)
+// --------------------------------------------------------------------------
+
+/**
+ * Chrome for the manual termination path: the confirm dialog, the disclosure
+ * message that precedes it, and the notices around both. The `TERMINATION.md`
+ * record itself stays English (it is run evidence, like the round reports).
+ */
+export interface TerminationChrome {
+	/** Confirm-dialog title. */
+	confirmTitle: string;
+	/** Short confirm body: counts plus the done/unresumable contract. */
+	confirmBody(rounds: number, budget: string): string;
+	/** Committed rounds plus the budget in force (termination message). */
+	roundsLabel(rounds: number, budget: string): string;
+	/** Extra note when fewer than three rounds have been committed. */
+	fewRoundsNote(rounds: number): string;
+	/** Heading of the disclosure message shown before the confirm. */
+	disclosureHeading: string;
+	unverifiedLabel(count: number): string;
+	openTasksLabel(count: number): string;
+	highsLabel(count: number): string;
+	residualLabel(count: number): string;
+	/** Truncation notice: the full list lives in the message above. */
+	partialIds(remaining: number): string;
+	/** Post-termination message heading. */
+	terminatedHeading: string;
+	/** Where the termination record was written. */
+	recordLine(path: string): string;
+	/** The record could not be written (artifact dir missing/unwritable). */
+	recordUnavailable: string;
+	/** Terminal-state contract repeated after termination. */
+	doneNotice: string;
+	/** In-flight round that the termination aborted. */
+	abortedRoundLabel(round: number, attempt: number): string;
+	noExecution: string;
+	requiresInteractive: string;
+	cancelledNotice: string;
+	/** Terminal-run guard notice for `/plans-execute` handoffs. */
+	guardNotice(runId: string, status: string): string;
+}
+
+const TERMINATION_CHROME: Record<UiLanguage, TerminationChrome> = {
+	zh: {
+		confirmTitle: "终结当前计划？",
+		confirmBody: (rounds, budget) =>
+			`已提交 ${rounds} 轮评审（预算 ${budget}）。确认后 run 记为 done：未验证项与未解决 finding 原样保留，之后不可 resume。`,
+		roundsLabel: (rounds, budget) => `已提交 ${rounds} 轮评审（预算 ${budget}）`,
+		fewRoundsNote: (rounds) => `注意：已提交评审仅 ${rounds} 轮（少于 3 轮）。`,
+		disclosureHeading: "**终止前披露** —— 下列未完成项会原样保留",
+		unverifiedLabel: (count) => `未验证 VC：${count} 条`,
+		openTasksLabel: (count) => `未完成任务：${count} 个`,
+		highsLabel: (count) => `未解决 high finding：${count} 条`,
+		residualLabel: (count) => `非 high 残留 finding：${count} 条`,
+		partialIds: (remaining) => `… 另有 ${remaining} 项，完整清单见上一条消息。`,
+		terminatedHeading: "**计划已按用户裁定终结。**",
+		recordLine: (path) => `终止记录：\`${path}\``,
+		recordUnavailable: "终止记录未能写入（artifact 目录不可用）。",
+		doneNotice: "run 已记为 done，之后不可 resume。",
+		abortedRoundLabel: (round, attempt) => `已中断在飞轮次：round ${round} attempt ${attempt}（结局已记入轮次报告）`,
+		noExecution: "当前没有进行中的执行。",
+		requiresInteractive: "/plans-terminate 需要在交互式会话中运行。",
+		cancelledNotice: "已取消终止，未做任何改动。",
+		guardNotice: (runId, status) =>
+			`run ${runId} 已是终态（${status}），不能再执行；如需继续请新起一个 run。`,
+	},
+	en: {
+		confirmTitle: "Terminate this plan?",
+		confirmBody: (rounds, budget) =>
+			`${rounds} committed review round(s) (budget ${budget}). The run is recorded as done: unverified items and unresolved findings stay as-is, and the run cannot be resumed.`,
+		roundsLabel: (rounds, budget) => `${rounds} committed review round(s) (budget ${budget})`,
+		fewRoundsNote: (rounds) => `Note: only ${rounds} review round(s) committed (fewer than 3).`,
+		disclosureHeading: "**Termination disclosure** — the unfinished items below are kept as-is",
+		unverifiedLabel: (count) => `Unverified checks: ${count}`,
+		openTasksLabel: (count) => `Open tasks: ${count}`,
+		highsLabel: (count) => `Unresolved high findings: ${count}`,
+		residualLabel: (count) => `Residual non-high findings: ${count}`,
+		partialIds: (remaining) => `… +${remaining} more; see the message above for the full list.`,
+		terminatedHeading: "**Plan terminated by user.**",
+		recordLine: (path) => `Termination record: \`${path}\``,
+		recordUnavailable: "The termination record could not be written (artifact directory unavailable).",
+		doneNotice: "The run is recorded as done and cannot be resumed.",
+		abortedRoundLabel: (round, attempt) =>
+			`In-flight round aborted: round ${round} attempt ${attempt} (outcome recorded in the round report)`,
+		noExecution: "No execution in progress.",
+		requiresInteractive: "/plans-terminate requires an interactive session.",
+		cancelledNotice: "Termination cancelled — nothing changed.",
+		guardNotice: (runId, status) =>
+			`Run ${runId} is ${status} (terminal) — it cannot be executed again; start a new run to continue.`,
+	},
+};
+
+export function terminationChrome(lang: UiLanguage): TerminationChrome {
+	return TERMINATION_CHROME[lang];
+}
+
 

@@ -76,6 +76,7 @@ import { restartWatcherIfEnabled, stopGraphWatcher, disableWatcher } from "./src
 import { latestPlanVersion, nextPlanVersionPath } from "./src/plan.ts";
 import { configPiPlansCommand } from "./src/config-command.ts";
 import { resumePlansCommand } from "./src/resume-command.ts";
+import { terminatePlanCommand } from "./src/terminate-command.ts";
 import { getRun, listRuns, loadConfig, readActive, recordDecision, resolveStateRootOrNull, setRunStatus } from "./src/state.ts";
 import { boundRunId, resolveActiveRun, restoreRunBindingFromSession } from "./src/run-context.ts";
 import { abandonCandidates, resolveCommandRun } from "./src/run-picker.ts";
@@ -617,6 +618,14 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 			if (!ok) return;
 			await stopExecution(ctx, "stopped by user via /plans-stop");
 			ctx.ui.notify("Execution stopped.", "info");
+		},
+	});
+
+	pi.registerCommand("plans-terminate", {
+		description:
+			"Terminate the current plan by user decision: records the run as done, discloses unverified checks and unresolved findings, and is not resumable (unlike /plans-stop, which stops and can be resumed, and /plans-abandon, which voids a planning run)",
+		handler: async (_args, ctx) => {
+			await terminatePlanCommand(ctx);
 		},
 	});
 

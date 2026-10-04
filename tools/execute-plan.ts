@@ -141,7 +141,17 @@ export async function executeHandoff(
 	// the approval checkpoint and status flip land on the run the user chose.
 	if (chosenRun) bindRun(ctx.sessionManager, workdir, chosenRun.run_id);
 
-	await startExecution(ctx, { planPath, planTasks, items });
+	const started = await startExecution(ctx, { planPath, planTasks, items });
+	// v0.9.4: a terminal run (done/abandoned) is refused inside `startExecution`
+	// before any state change; report that refusal instead of claiming success.
+	if (!started) {
+		return {
+			status: "error",
+			planPath,
+			message:
+				"Execution refused: the resolved run is terminal (done or abandoned). A terminated run cannot be executed again — start a new run with the planning skills.",
+		};
+	}
 	const autoNote = autoApprove ? "[auto-approve] " : "";
 	const legacyNote = legacyPlan ? " Legacy I-### mapping active; upgrade the plan at the next revision." : "";
 	return {
