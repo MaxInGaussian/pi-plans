@@ -178,6 +178,30 @@ describe("huge checkpoint state", () => {
 		assert.equal(revised.huge?.versions[1]?.mission, "persistence v2");
 	});
 
+	it("anchors the current version by label across a controlled revision", () => {
+		const { workdir, runId } = setupRun("revision-anchor");
+		const cp = baseCheckpoint(workdir, runId);
+		const started = applyHugeOverallAccepted(
+			applyHugeOverallPlanWritten(cp, { round: 1, versions: VERSIONS }),
+		);
+		// The current version is v0.1.0 (started); the revision inserts a new
+		// not-started version BEFORE it.
+		const revised = applyHugeOverallPlanWritten(started, {
+			round: 2,
+			versions: [
+				{ label: "v0.1.0", mission: "walking skeleton", done: "cli runs" },
+				{ label: "v0.2.0", mission: "injected groundwork", done: "seam ready" },
+				{ label: "v0.3.0", mission: "persistence", done: "data survives restart" },
+				{ label: "v0.4.0", mission: "multi-user", done: "users isolated" },
+			],
+			reason: "insert a groundwork version",
+			affectedVersions: ["v0.2.0", "v0.3.0", "v0.4.0"],
+		});
+		assert.equal(revised.huge?.versions[revised.huge.currentIndex]?.label, "v0.1.0");
+		assert.equal(revised.huge?.versions[0]?.status, "planning");
+		assert.equal(revised.huge?.versions[1]?.status, "pending");
+	});
+
 	it("records version plan revisions for the current stream only", () => {
 		const { workdir, runId } = setupRun("version-plan");
 		const cp = applyHugeOverallAccepted(
@@ -312,6 +336,29 @@ describe("huge deferred ledger", () => {
 		]);
 		assert.equal(dropped.huge?.deferred[0]?.disposition, "dropped");
 		assert.equal(dropped.huge?.deferred[0]?.confirmationId, questionId);
+
+		// F-012: another (user-sourced) answer cannot stand in for this item's
+		// own confirmation, and absorbed items carry no confirmation at all.
+		const foreign = applyQuestionAsked(userAnswered, {
+			questionId: "some-other-question",
+			question: "unrelated?",
+			options: ["yes", "no"],
+		});
+		const foreignAnswered = applyQuestionAnswered(foreign, "some-other-question", "yes", "user");
+		assert.throws(
+			() =>
+				applyHugeDeferredDispositions(foreignAnswered, "v0.1.0", [
+					{ itemId: "D-v0.1.0-2", disposition: "dropped", confirmationId: "some-other-question" },
+				]),
+			/must reference its own confirmation/,
+		);
+		assert.throws(
+			() =>
+				applyHugeDeferredDispositions(userAnswered, "v0.1.0", [
+					{ itemId: "D-v0.1.0-1", disposition: "absorbed", confirmationId: questionId },
+				]),
+			/carries no confirmationId/,
+		);
 	});
 });
 

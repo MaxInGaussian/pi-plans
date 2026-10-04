@@ -170,13 +170,14 @@ const PlansParams = Type.Object({
 			/** overall-plan-written (controlled revision): why, and which not-started versions change. */
 			reason: Type.Optional(Type.String()),
 			affectedVersions: Type.Optional(Type.Array(Type.String())),
-			/** version-plan-written: how the previous version's deferred items were processed. */
+			/** version-plan-written: how the previous version's deferred items were processed
+			 * (a drop is bound to its own `huge-deferred-<version>--<itemId>` confirmation; no
+			 * caller-supplied confirmation id). */
 			deferred: Type.Optional(
 				Type.Array(
 					Type.Object({
 						itemId: Type.String(),
 						disposition: StringEnum(["absorbed", "dropped"] as const),
-						confirmationId: Type.Optional(Type.String()),
 					}),
 				),
 			),
@@ -322,7 +323,7 @@ export function recordCheckpointTransition(
 		dispositionArtifact?: string;
 		reason?: string;
 		affectedVersions?: string[];
-		deferred?: Array<{ itemId: string; disposition: "absorbed" | "dropped"; confirmationId?: string }>;
+		deferred?: Array<{ itemId: string; disposition: "absorbed" | "dropped" }>;
 		reviewReports?: string[];
 	},
 ): WorkflowCheckpoint {

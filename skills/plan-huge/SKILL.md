@@ -29,12 +29,16 @@ inspection.
    transition `overall-plan-written`).
 2. **Accept the overall plan** — the merged accept/execute question offers
    `✓ Accept & execute now`; for the overall stream, accepting starts the
-   `v0.1.0` planning round and never execution.
+   `v0.1.0` planning round and never execution. Record it with `plans`
+   (`record-checkpoint`, transition `overall-accepted`).
 3. **Version planning** — plan **only** the current version:
    `PLAN_vX.Y.Z_v1.md` in the same artifact directory, structured exactly like
    a `plan-big` plan plus the huge-only sections (`## Deferred to vX.Y.Z`,
    `## Evidence`). Question depth: 5-10 questions. Then the same reviewer
-   treatment as step 1 (`refine` with `reviewers: 3` by default).
+   treatment as step 1 (`refine` with `reviewers: 3` by default). Recording
+   the plan is mandatory: `plans` (`record-checkpoint`, transition
+   `version-plan-written`) is what runs the deferred gate and the reference
+   lint and what stores this version's round.
 4. **Execution and execution review** — identical to `plan-big`: the merged
    accept/execute question, the `execute_plan` tool, task progress through
    `plans_update_task`, and the independent execution reviewer verifying every
@@ -43,6 +47,27 @@ inspection.
    (non-terminal) and the loop continues at step 3 for the next row of the
    version table, until the last version has executed and passed review. Only
    then does the run become terminal (`done`).
+
+## Checkpoint Transitions
+
+Every stage boundary is a `plans` `record-checkpoint` call; skipping one
+disables the gate that rides on it:
+
+- `overall-plan-written` — after writing/revising `PLAN_overall_vN.md`
+  (validates the version table; a controlled revision records its reason and
+  affected versions). Add `overall-review-consolidated` with the round id
+  after the overall reviewer round.
+- `overall-accepted` — after the user accepts the overall plan (moves the run
+  to the first version's planning round).
+- `version-plan-written` — after writing/revising the current version's plan.
+  This transition runs the deferred gate (every previous item absorbed or
+  dropped with its own recorded confirmation) and the GitHub reference lint,
+  and it stores the version's round.
+- `version-review-consolidated` — after the version's reviewer round; it is
+  what moves the run to the execution handoff.
+- `version-completed` — only when a version's execution must be closed
+  outside the normal completion path; the ordinary completion archives the
+  version automatically and returns the run to planning.
 
 ## Contracts
 

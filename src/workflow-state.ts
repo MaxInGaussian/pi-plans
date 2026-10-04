@@ -1673,7 +1673,12 @@ export function applyHugeOverallPlanWritten(cp: WorkflowCheckpoint, input: HugeO
 		if (existing) return { ...existing, mission: row.mission, done: row.done, overallRound: input.round };
 		return { label: row.label, mission: row.mission, done: row.done, status: "pending", round: 0, overallRound: input.round };
 	});
-	const currentIndex = Math.min(cp.huge?.currentIndex ?? 0, versions.length - 1);
+	// F-013: the current version is anchored by its LABEL, not its position —
+	// a revision that inserts a new not-started version before the current one
+	// must not silently re-point the run at the inserted row.
+	const previousCurrent = cp.huge?.versions[cp.huge.currentIndex];
+	const anchored = previousCurrent ? versions.findIndex((version) => version.label === previousCurrent.label) : -1;
+	const currentIndex = anchored >= 0 ? anchored : Math.min(cp.huge?.currentIndex ?? 0, versions.length - 1);
 	// A revision must keep every version that already started or completed:
 	// dropping one would silently re-point the run (or orphan its archive).
 	if (input.round > 1) {
@@ -1736,7 +1741,8 @@ export function applyHugeVersionPlanWritten(
 /** Record how the previous version's deferred items were processed. A drop
  * needs a recorded user confirmation for the exact item
  * (`deferredQuestionId(version, itemId)`, `source === "user"`); an
- * `auto-complete` answer never counts. */
+ * `auto-complete` answer never counts. A caller cannot substitute another
+ * confirmation id: a drop is bound to its own item's question. */
 export function applyHugeDeferredDispositions(
 	cp: WorkflowCheckpoint,
 	fromVersion: string,
@@ -1749,14 +1755,24 @@ export function applyHugeDeferredDispositions(
 			throw new StateError(`deferred item ids must be D-vX.Y.Z-n: ${entry.itemId}`);
 		}
 		const expected = deferredQuestionId(fromVersion, entry.itemId);
-		const confirmationId = entry.disposition === "dropped" ? (entry.confirmationId ?? expected) : undefined;
-		if (entry.disposition === "dropped") {
+		if (entry.disposition === "absorbed") {
+			if (entry.confirmationId !== undefined) {
+				throw new StateError(`absorbed deferred item ${entry.itemId} carries no confirmationId`);
+			}
+		} else {
+			// F-012: only THIS item's question may confirm the drop — an unrelated
+			// user-sourced answer must not be reusable as a substitute.
+			if (entry.confirmationId !== undefined && entry.confirmationId !== expected) {
+				throw new StateError(
+					`dropping ${entry.itemId} must reference its own confirmation ${expected} (got ${entry.confirmationId})`,
+				);
+			}
 			const confirmed = cp.answeredQuestions.some(
-				(question) => question.questionId === confirmationId && question.source === "user",
+				(question) => question.questionId === expected && question.source === "user",
 			);
 			if (!confirmed) {
 				throw new StateError(
-					`dropping ${entry.itemId} needs a recorded user confirmation (${confirmationId}); an auto-complete answer does not count`,
+					`dropping ${entry.itemId} needs a recorded user confirmation (${expected}); an auto-complete answer does not count`,
 				);
 			}
 		}
@@ -1766,7 +1782,7 @@ export function applyHugeDeferredDispositions(
 			disposition: entry.disposition,
 			at: utcNow(),
 		};
-		if (confirmationId !== undefined) next.confirmationId = confirmationId;
+		if (entry.disposition === "dropped") next.confirmationId = expected;
 		recorded.push(next);
 	}
 	const deferred = [...cp.huge.deferred];

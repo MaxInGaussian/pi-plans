@@ -153,6 +153,16 @@ overall plan may be revised in a controlled way as `PLAN_overall_v(N+1).md`
 with the reason and the affected versions; only not-started versions may
 change, and the current version keeps its identity from the run checkpoint.
 
+**Transitions.** Each stage boundary is a `plans` `record-checkpoint` call:
+`overall-plan-written` (validates the version table; a controlled revision
+also carries its reason and affected versions), `overall-review-consolidated`,
+`overall-accepted`, `version-plan-written` (deferred gate + reference lint +
+this version's round), `version-review-consolidated`, and `version-completed`
+(only for closing a version outside the ordinary completion path). An agent
+that records only the overall plan silently disables the deferred gate, the
+reference lint, and the per-version round — and with it the `vX.Y.Z round N`
+resume display.
+
 **State machine.** The checkpoint carries a `huge` section (version table
 snapshot, current index, per-version rounds and statuses, per-version
 completion archives, deferred ledger, inherited review budget). Existing
