@@ -201,3 +201,185 @@ describe("execution lifecycle on the real host", () => {
 		}
 	});
 });
+
+/**
+ * v0.10: the non-high repair flag and its derived credit travel the whole
+ * checkpoint/session surface. This is the lifecycle-level round-trip (the
+ * predicate and loop behaviour live in tests/exec-review-loop.test.ts).
+ */
+describe("non-high repair checkpoint plumbing (v0.10)", () => {
+	it("round-trips all three flag states with the derived credit and drops them on stop", async () => {
+		serial += 1;
+		const cwd = path.join(root, `repair-${serial}`);
+		fs.mkdirSync(cwd);
+		spawnSync("git", ["init"], { cwd });
+		spawnSync("git", ["config", "user.email", "t@e.com"], { cwd });
+		spawnSync("git", ["config", "user.name", "T"], { cwd });
+		initState(cwd);
+		const { run } = startRun(cwd, { topic: "repair-plumbing", skill: "plan-small", requestText: "x" });
+		createCheckpoint(cwd, { runId: run.run_id, originWorkdir: cwd, workdir: cwd });
+		fs.mkdirSync(run.artifact_dir, { recursive: true });
+		const planPath = path.join(run.artifact_dir, "PLAN_v1.md");
+		fs.writeFileSync(planPath, PLAN, "utf8");
+		const {
+			applyExecutionApproved,
+			applyExecutionCompleted,
+			applyExecutionProgress,
+			applyExecutionStopped,
+			applyPlanWritten,
+			mutateCheckpoint,
+			planIdentityOf,
+		} = await import("../src/workflow-state.ts");
+		const plan = planIdentityOf(planPath, 1);
+		mutateCheckpoint(cwd, run.run_id, (cp) => applyExecutionApproved(
+			applyPlanWritten({ ...cp, nextAction: "accept-execute" }, plan),
+			{ plan, worktree: cwd, headAtApproval: null, approvedAt: cp.updatedAt },
+		));
+		for (const state of ["available", "granted", "used"] as const) {
+			mutateCheckpoint(cwd, run.run_id, (cp) => applyExecutionProgress(cp, { reviewNonHighRepair: state, reviewNonHighCredits: 1 }));
+			const loaded = loadCheckpoint(cwd, run.run_id);
+			assert.equal(loaded.status, "ok");
+			assert.equal(loaded.checkpoint.execution?.reviewNonHighRepair, state, `${state} round-trips`);
+			assert.equal(
+				loaded.checkpoint.execution?.reviewNonHighCredits,
+				state === "granted" ? 1 : 0,
+				`${state} credit is derived from the flag`,
+			);
+		}
+		// A legacy shape (no flag at all) stays absent, not corrupt.
+		mutateCheckpoint(cwd, run.run_id, (cp) => {
+			const { reviewNonHighRepair: _flag, reviewNonHighCredits: _credits, ...execution } = cp.execution!;
+			return { ...cp, execution: execution as typeof cp.execution };
+		});
+		const legacy = loadCheckpoint(cwd, run.run_id);
+		assert.equal(legacy.status, "ok");
+		assert.equal(legacy.checkpoint.execution?.reviewNonHighRepair, undefined, "absent stays absent");
+		// A stop drops the flag and the credit with the rest of the budget state;
+		// completion drops them too (a review that no longer runs carries neither).
+		const liveCp = loadCheckpoint(cwd, run.run_id).checkpoint;
+		mutateCheckpoint(cwd, run.run_id, () => applyExecutionProgress(liveCp, { reviewNonHighRepair: "granted", reviewNonHighCredits: 1 }));
+		const finalCp = loadCheckpoint(cwd, run.run_id).checkpoint;
+		const stopped = applyExecutionStopped(finalCp as never, "user stop");
+		assert.equal(stopped.execution?.reviewNonHighRepair, undefined);
+		assert.equal(stopped.execution?.reviewNonHighCredits, undefined);
+		const completed = applyExecutionCompleted(finalCp as never);
+		assert.equal(completed.execution?.reviewNonHighRepair, undefined);
+		assert.equal(completed.execution?.reviewNonHighCredits, undefined);
+	});
+
+	it("derives the credit on write and read, rejects unknown flags, and treats a negative credit as corrupt", async () => {
+		serial += 1;
+		const cwd = path.join(root, `repair-normalize-${serial}`);
+		fs.mkdirSync(cwd);
+		spawnSync("git", ["init"], { cwd });
+		spawnSync("git", ["config", "user.email", "t@e.com"], { cwd });
+		spawnSync("git", ["config", "user.name", "T"], { cwd });
+		initState(cwd);
+		const { run } = startRun(cwd, { topic: "repair-normalize", skill: "plan-small", requestText: "x" });
+		createCheckpoint(cwd, { runId: run.run_id, originWorkdir: cwd, workdir: cwd });
+		fs.mkdirSync(run.artifact_dir, { recursive: true });
+		const planPath = path.join(run.artifact_dir, "PLAN_v1.md");
+		fs.writeFileSync(planPath, PLAN, "utf8");
+		const {
+			applyExecutionApproved,
+			applyExecutionProgress,
+			applyPlanWritten,
+			mutateCheckpoint,
+			planIdentityOf,
+		} = await import("../src/workflow-state.ts");
+		const plan = planIdentityOf(planPath, 1);
+		mutateCheckpoint(cwd, run.run_id, (cp) => applyExecutionApproved(
+			applyPlanWritten({ ...cp, nextAction: "accept-execute" }, plan),
+			{ plan, worktree: cwd, headAtApproval: null, approvedAt: cp.updatedAt },
+		));
+		// The WRITE path derives the credit from the flag it stores.
+		mutateCheckpoint(cwd, run.run_id, (cp) => applyExecutionProgress(cp, { reviewNonHighRepair: "available", reviewNonHighCredits: 1 }));
+		const file = path.join(cwd, ".git", "pi-plans", "runs", run.run_id, "checkpoint.json");
+		assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).execution.reviewNonHighCredits, 0, "write derivation");
+		// A hand-edited (or pre-fix) file that disagrees is normalized on read.
+		const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+		raw.execution.reviewNonHighCredits = 1; // claim a credit while the flag is `available`
+		fs.writeFileSync(file, JSON.stringify(raw), "utf8");
+		assert.equal(loadCheckpoint(cwd, run.run_id).checkpoint.execution?.reviewNonHighCredits, 0, "read derivation");
+		assert.throws(
+			() => mutateCheckpoint(cwd, run.run_id, (cp) => applyExecutionProgress(cp, { reviewNonHighRepair: "granted " as never })),
+			/reviewNonHighRepair/,
+		);
+		// null clears the flag (delete-on-null).
+		mutateCheckpoint(cwd, run.run_id, (cp) => applyExecutionProgress(cp, { reviewNonHighRepair: "granted", reviewNonHighCredits: 1 }));
+		mutateCheckpoint(cwd, run.run_id, (cp) => applyExecutionProgress(cp, { reviewNonHighRepair: null }));
+		assert.equal(loadCheckpoint(cwd, run.run_id).checkpoint.execution?.reviewNonHighRepair, undefined, "null clears the flag");
+		// A negative stored credit is a corrupt checkpoint, never silently used.
+		raw.execution.reviewNonHighCredits = -1;
+		fs.writeFileSync(file, JSON.stringify(raw), "utf8");
+		assert.equal(loadCheckpoint(cwd, run.run_id).status, "corrupt", "a negative credit is rejected on read");
+	});
+
+	it("a huge-version completion resets the non-high repair state for the next version", async () => {
+		serial += 1;
+		const cwd = path.join(root, `repair-huge-${serial}`);
+		fs.mkdirSync(cwd);
+		spawnSync("git", ["init"], { cwd });
+		spawnSync("git", ["config", "user.email", "t@e.com"], { cwd });
+		spawnSync("git", ["config", "user.name", "T"], { cwd });
+		initState(cwd);
+		const { run } = startRun(cwd, { topic: "repair-per-version", skill: "plan-huge", requestText: "x" });
+		const {
+			applyExecutionApproved,
+			applyExecutionProgress,
+			applyHugeOverallAccepted,
+			applyHugeOverallPlanWritten,
+			applyHugeVersionCompleted,
+			applyHugeVersionPlanWritten,
+			planIdentityOf,
+		} = await import("../src/workflow-state.ts");
+		let cp = createCheckpoint(cwd, { runId: run.run_id, originWorkdir: cwd, workdir: cwd });
+		cp = applyHugeOverallAccepted(applyHugeOverallPlanWritten(cp, {
+			round: 1,
+			versions: [
+				{ label: "v0.1.0", mission: "a", done: "b" },
+				{ label: "v0.2.0", mission: "c", done: "d" },
+			],
+		}));
+		cp = applyHugeVersionPlanWritten(cp, { stream: "v0.1.0", round: 1 });
+		fs.mkdirSync(run.artifact_dir, { recursive: true });
+		const planPath = path.join(run.artifact_dir, "PLAN_v0.1.0_v1.md");
+		fs.writeFileSync(planPath, "# plan\n", "utf8");
+		cp = applyExecutionApproved({ ...cp, nextAction: "accept-execute" }, {
+			plan: planIdentityOf(planPath, 1),
+			worktree: cp.worktreeRoot,
+			headAtApproval: null,
+			approvedAt: "2026-10-05T00:00:00Z",
+		});
+		cp = applyExecutionProgress(cp, { reviewNonHighRepair: "granted", reviewNonHighCredits: 1, reviewRoundsTotal: 2, audit: { rounds: 1, passed: true } });
+		const next = applyHugeVersionCompleted(cp, {});
+		assert.equal(next.execution?.reviewNonHighRepair, undefined, "the repair flag resets with the version");
+		assert.equal(next.execution?.reviewNonHighCredits, undefined, "the credit resets with the version");
+	});
+});
+
+/**
+ * v0.10 (F-008): the huge-version completion headline is keyed on the newest
+ * round's finding count, never on the completion ledger's line count — a fully
+ * repaired cycle still renders `fixed` lines but keeps the ✅ headline.
+ */
+describe("huge-version completion headline (v0.10)", () => {
+	it("keeps the pass framing for a repaired-only ledger and warns only on real leftovers", async () => {
+		const { hugeVersionCompletionMessage } = await import("../src/exec.ts");
+		const base = {
+			version: "v0.1.0",
+			position: "1/2",
+			planPath: "/tmp/PLAN_v0.1.0_v1.md",
+			next: "v0.2.0",
+			summary: "- ✓ `Task-1` a",
+			residualNote: "\n\nExecution-review findings repaired during the cycle:\n- F-001 — fixed (repaired by Task-3; no longer reported)",
+		};
+		const repaired = hugeVersionCompletionMessage({ ...base, findingCount: 0, unresolvedCount: 0, deferredCount: 0 });
+		assert.match(repaired, /✅/, "a repaired-only ledger keeps the pass framing");
+		assert.doesNotMatch(repaired, /⚠️/, "no warning icon for a resolved cycle");
+		const leftover = hugeVersionCompletionMessage({ ...base, findingCount: 2, unresolvedCount: 1, deferredCount: 1 });
+		assert.match(leftover, /2 review finding\(s\) without a resolved verdict: 1 unresolved, 1 deferred/);
+		assert.match(leftover, /⚠️/);
+		assert.doesNotMatch(leftover, /✅/);
+	});
+});

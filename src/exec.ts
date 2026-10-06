@@ -70,6 +70,7 @@ import {
 	type ExecutionApproval,
 	type ExecutionBlocked,
 	type ExecutionCheckpoint,
+	type ReviewNonHighRepairState,
 	type WorkflowCheckpoint,
 } from "./workflow-state.ts";
 import { graphBlockForExecutor } from "./code-graph/prompts.ts";
@@ -202,6 +203,14 @@ export interface ExecState {
 	reviewCapExtension: number;
 	/** v0.9.3: no-progress valve state (unlimited budget only). */
 	reviewNoProgress?: NoProgressState;
+	/** v0.10: execution-review non-high repair flag. ABSENT = a checkpoint
+	 * written by a pre-v0.10 build (or a run that never committed a reported
+	 * round): non-high findings keep the legacy no-owed semantics. */
+	reviewNonHighRepair?: ReviewNonHighRepairState;
+	/** v0.10: mirror of `reviewNonHighCredit(ex)` (1 iff the flag is
+	 * `"granted"`), persisted so checkpoints are self-describing. All budget
+	 * arithmetic reads the derived helper, never this field. */
+	reviewNonHighCredits: number;
 }
 
 /** Live blocker record (see `ExecutionBlocked` in workflow-state.ts). */
@@ -343,7 +352,9 @@ function backfillBlocked(
 	checklist: CheckItem[],
 ): ExecBlocked | null {
 	const last = checkpoint.audit?.lastResult?.trim() ?? "";
-	if (last.length === 0 || last.startsWith("highs:")) return null;
+	// A findings-only ledger (`highs:` / `medium/low:`) carries no check ids —
+	// there is no coverage cascade to reconstruct from it.
+	if (last.length === 0 || last.startsWith("highs:") || last.startsWith("medium/low:")) return null;
 	const failed = last.split(",").map((id) => id.trim()).filter((id) => id.length > 0);
 	return blockedFromFailedIds(failed, checkpoint.audit?.rounds ?? 0, tasks, checklist);
 }
@@ -448,6 +459,10 @@ export function loadExecutionFromCheckpoint(
 		reviewRoundsTotal: cp.execution.reviewRoundsTotal ?? 0,
 		reviewCapExtension: cp.execution.reviewCapExtension ?? 0,
 		reviewNoProgress: cp.execution.reviewNoProgress ?? undefined,
+		// v0.10: the flag is the source of truth; the persisted credit mirror is
+		// recomputed (never trusted) so a contradictory checkpoint normalizes.
+		reviewNonHighRepair: cp.execution.reviewNonHighRepair ?? undefined,
+		reviewNonHighCredits: cp.execution.reviewNonHighRepair === "granted" ? 1 : 0,
 	};
 	execution.stall.lastSnapshot = stallSnapshot();
 	executionRunId = runId;
@@ -641,7 +656,7 @@ function updatePanelWidget(ctx: ExtensionContext): void {
 				const model = deriveDashboardModel(panelTopic(ctx), current.tasks, current.items, {
 					paused: current.stall.paused,
 					pausedReason: current.stall.pausedReason,
-					auditRounds: current.audit.rounds > 0 || current.audit.running ? current.audit.rounds : null,
+					auditRounds: billedRounds(current) > 0 || current.audit.running || nonHighRepairPending(current) ? billedRounds(current) : null,
 					auditFailed: current.audit.failed,
 					auditUndeterminable: current.audit.undeterminable,
 					findings: current.audit.findings,
@@ -669,7 +684,7 @@ export function updateStatusWidget(ctx: ExtensionContext): void {
 		const model = deriveDashboardModel(panelTopic(ctx), execution.tasks, execution.items, {
 			paused: execution.stall.paused,
 			pausedReason: execution.stall.pausedReason,
-			auditRounds: execution.audit.rounds > 0 ? execution.audit.rounds : null,
+			auditRounds: billedRounds(execution) > 0 || nonHighRepairPending(execution) ? billedRounds(execution) : null,
 			auditFailed: execution.audit.failed,
 			auditUndeterminable: execution.audit.undeterminable,
 			huge: hugeDashboardPayload(ctx),
@@ -800,6 +815,8 @@ function persist(ctx: ExtensionContext): void {
 		reviewRoundsTotal: execution.reviewRoundsTotal,
 		reviewCapExtension: execution.reviewCapExtension,
 		reviewNoProgress: execution.reviewNoProgress,
+		reviewNonHighRepair: execution.reviewNonHighRepair,
+		reviewNonHighCredits: reviewNonHighCredit(execution),
 		audit: { rounds: execution.audit.rounds, failed: execution.audit.failed, findings: execution.audit.findings },
 	});
 }
@@ -894,6 +911,7 @@ export async function startExecution(
 		reviewBudget: undefined,
 		reviewRoundsTotal: 0,
 		reviewCapExtension: 0,
+		reviewNonHighCredits: 0,
 	};
 	// Seed the watchdog baseline only after `execution` points at the new state
 	// (stallSnapshot reads the live execution).
@@ -1001,10 +1019,10 @@ export function recordExecutionTurn(
 }
 
 /** Test hook: replace the audit subagent with a deterministic function. */
-let auditRunnerForTests: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number; priorFindings: ReviewFinding[] }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null = null;
+let auditRunnerForTests: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number; priorFindings: ReviewFinding[]; findingDispositions?: ReadonlyMap<string, string> }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null = null;
 
 export function __setAuditRunnerForTests(
-	runner: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number; priorFindings: ReviewFinding[] }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null,
+	runner: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number; priorFindings: ReviewFinding[]; findingDispositions?: ReadonlyMap<string, string> }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null,
 ): void {
 	auditRunnerForTests = runner;
 }
@@ -1147,7 +1165,17 @@ function activeBudget(ex: ExecState): ReviewBudget {
 }
 
 function budgetSpent(ex: ExecState): boolean {
-	return budgetExhausted(activeBudget(ex), ex.audit.rounds, budgetCounters(ex));
+	// v0.10: the numeric budget bills committed rounds MINUS the single exempt
+	// non-high repair cycle (credit 1 iff the flag is `"granted"`); the
+	// unlimited hard cap keeps counting raw `reviewRoundsTotal` (decision 7).
+	return budgetExhausted(activeBudget(ex), Math.max(0, ex.audit.rounds - reviewNonHighCredit(ex)), budgetCounters(ex));
+}
+
+/** v0.10: the committed-round count as BILLED against a numeric budget — raw
+ * rounds minus the single exempt non-high cycle. Display and message surfaces
+ * use this so a granted cycle never reads as exhausted. */
+function billedRounds(ex: ExecState): number {
+	return Math.max(0, ex.audit.rounds - reviewNonHighCredit(ex));
 }
 
 /** `3` / `∞` — the budget as shown in status lines and messages. */
@@ -1269,6 +1297,31 @@ function toReviewFindings(records?: ReviewFindingRecord[]): ReviewFinding[] {
 	});
 }
 
+/** v0.10: unresolved non-high findings — the repair-eligible set. `malformed`
+ * severities are recorded but never actionable (same never-fail posture as
+ * the report parser). */
+function unresolvedRepairableFindings(ex: ExecState): ReviewFinding[] {
+	return ex.audit.findings.filter((f) => f.severity === "medium" || f.severity === "low");
+}
+
+/** v0.10 (Q1): billed-round credit of the single non-high repair cycle — 1
+ * exactly while the flag is `"granted"`, 0 otherwise. NEVER read the persisted
+ * mirror for arithmetic: the flag is the source of truth, so a fresh
+ * `/plans-execute` window (which zeroes `audit.rounds`) cannot bill negative. */
+function reviewNonHighCredit(ex: ExecState): number {
+	return ex.reviewNonHighRepair === "granted" ? 1 : 0;
+}
+
+/** v0.10: the review is owed while a non-high repair cycle is pending — the
+ * flag is `"available"`/`"granted"` (present, i.e. this run has committed a
+ * reported round under the new policy) and repairable findings exist. An
+ * ABSENT flag means a legacy checkpoint: non-high findings never widen the
+ * owed predicate there (decision 6). */
+function nonHighRepairPending(ex: ExecState): boolean {
+	if (ex.reviewNonHighRepair !== "available" && ex.reviewNonHighRepair !== "granted") return false;
+	return unresolvedRepairableFindings(ex).length > 0;
+}
+
 /** v0.9: findings widen the owed predicate — an unresolved high finding keeps
  * the review owed even when every check is done (the stranded-high path),
  * mirroring how a failed check keeps it owed today. */
@@ -1277,12 +1330,13 @@ function reviewOwed(ex: ExecState): boolean {
 }
 
 /** v0.9.2: the review is outstanding wherever the tree stands — checks still
- * owed or an unresolved high finding. `reviewOwed` ANDs this with
- * allTasksTerminal; the blocked wake needs exactly the half that stays true
- * while tasks are open, because that is the state in which the review cannot
- * start (and in which `pendingAudit` is false by construction). */
+ * owed, an unresolved high finding, or a pending non-high repair cycle.
+ * `reviewOwed` ANDs this with allTasksTerminal; the blocked wake needs exactly
+ * the half that stays true while tasks are open, because that is the state in
+ * which the review cannot start (and in which `pendingAudit` is false by
+ * construction). */
 function reviewOutstanding(ex: ExecState): boolean {
-	return auditableChecks(ex.items, ex.tasks).some((item) => !item.done) || unresolvedHighFindings(ex).length > 0;
+	return auditableChecks(ex.items, ex.tasks).some((item) => !item.done) || unresolvedHighFindings(ex).length > 0 || nonHighRepairPending(ex);
 }
 
 /** v0.9.2: live blocker ids — the newest failed round's rollback set
@@ -1529,8 +1583,10 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 	const pendingChecks = auditableChecks(ex.items, ex.tasks).filter((item) => !item.done);
 	// v0.9: unresolved high findings block the fast completion path — they
 	// keep the review owed instead (liveness: a high can never be completed
-	// around, only fixed or paused at the cap).
-	if (pendingChecks.length === 0 && unresolvedHighFindings(ex).length === 0) {
+	// around, only fixed or paused at the cap). v0.10: a pending non-high
+	// repair cycle blocks it too, so the credited re-review round always runs
+	// before any disclosure-only completion.
+	if (pendingChecks.length === 0 && unresolvedHighFindings(ex).length === 0 && !nonHighRepairPending(ex)) {
 		await completeExecution(ctx);
 		return;
 	}
@@ -1577,13 +1633,16 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 	let result: AuditRoundResult;
 	try {
 		result = auditRunnerForTests
-			? await auditRunnerForTests({ planPath: ex.planPath, checklist: ex.items, tasks: ex.tasks, round: round.attempt, priorFindings: ex.audit.findings })
+			? await auditRunnerForTests({ planPath: ex.planPath, checklist: ex.items, tasks: ex.tasks, round: round.attempt, priorFindings: ex.audit.findings, findingDispositions: findingDispositionMap(ex) })
 			: await runCompletionAudit(ctx, {
 				planPath: ex.planPath,
 				checklist: ex.items,
 				tasks: ex.tasks,
 				round: round.attempt,
 				priorFindings: ex.audit.findings,
+				// v0.10: the previous round's per-finding dispositions ride the
+				// brief so a deliberate decline is visible to the reviewer.
+				findingDispositions: findingDispositionMap(ex),
 				model: spawn.model,
 				thinkingLevel: spawn.thinkingLevel,
 				timeoutMs: REVIEW_ROUND_TIMEOUT_MS,
@@ -1701,8 +1760,19 @@ async function handleReviewOutcome(
  * id rides in the task title for traceability. Best-effort: an unwritable
  * plan must not crash the loop (the finding then stays stranded and the cap
  * pause surfaces it). Returns the appended task ids. */
-function appendFindingTasks(ex: ExecState, highs: ReviewFinding[]): string[] {
+function appendFindingTasks(ex: ExecState, findings: ReviewFinding[]): string[] {
 	const appended: string[] = [];
+	// v0.10 (F-008): idempotency — a finding whose `fix <id>:` task already
+	// exists in the tree is never appended twice. The title carries a round
+	// suffix, so the match is a PREFIX match; this applies to highs too (a
+	// repeatedly reported unmapped high double-appended before this).
+	const alreadyAppended = new Set<string>();
+	for (const task of flattenTaskViews(ex.tasks)) {
+		const match = /^fix (F-\d+):/.exec(task.title);
+		if (match) alreadyAppended.add(match[1]);
+	}
+	const pending = findings.filter((finding) => !alreadyAppended.has(finding.id));
+	if (pending.length === 0) return appended;
 	let next = flattenTaskViews(ex.tasks).reduce((max, t) => {
 		const m = /^Task-(\d+)$/.exec(t.id);
 		return m ? Math.max(max, Number(m[1])) : max;
@@ -1730,7 +1800,7 @@ function appendFindingTasks(ex: ExecState, highs: ReviewFinding[]): string[] {
 		const sanitize = (text: string): string => text.replace(/[—–]/g, "-").replace(/-{2,}/g, "-").replace(/;/g, ",");
 		const entries: Array<{ id: string; title: string }> = [];
 		const newLines: string[] = [];
-		for (const h of highs) {
+		for (const h of pending) {
 			next += 1;
 			const id = `Task-${next}`;
 			const title = `fix ${h.id}: ${sanitize(h.proposedTask ?? h.note ?? "address the finding")} (appended by execution review round ${ex.audit.rounds})`;
@@ -1795,6 +1865,28 @@ async function commitReviewOutcome(
 	// Findings are actionable only when this round actually reported them;
 	// see the fix-loop branch below (v0.9.1, F-001).
 	const actionableHighs = reported ? highs : [];
+	// v0.10: the non-high classification. `medium` rides the union rollback;
+	// `low` never rolls back verified work (decision 1); both are appended
+	// when they own no task. `malformed` is never actionable.
+	const actionableNonHighs = reported
+		? findings.filter((f) => f.severity === "medium" || f.severity === "low")
+		: [];
+	// v0.10 flag state machine: ONLY a real report advances it (a no-report
+	// round preserves findings and flag alike, exactly like the unresolved set
+	// above). `granted` → `used` HERE — the re-review round just committed, so
+	// the single non-high cycle is spent whatever its verdicts say.
+	if (reported) {
+		ex.reviewNonHighRepair = ex.reviewNonHighRepair === "granted" ? "used" : (ex.reviewNonHighRepair ?? "available");
+		// Keep the persisted mirror in sync with the flag it is derived from.
+		ex.reviewNonHighCredits = reviewNonHighCredit(ex);
+	}
+	// v0.10: one ledger string for the checkpoint's `lastResult` — failed
+	// check ids keep their existing shape, findings get a severity-tagged list
+	// that the v0.9.2 blocker backfill knows not to parse as check ids.
+	const findingLedger = [
+		actionableHighs.length > 0 ? `highs: ${actionableHighs.map((f) => f.id).join(",")}` : "",
+		actionableNonHighs.length > 0 ? `medium/low: ${actionableNonHighs.map((f) => f.id).join(",")}` : "",
+	].filter((part) => part.length > 0).join(" | ");
 	const coveredTaskIds = flattenTaskViews(ex.tasks).map((task) => task.id);
 	const reportText = outcome?.report ?? "(review subagent failed to run)";
 	let reportPath: string | null = null;
@@ -1807,7 +1899,7 @@ async function commitReviewOutcome(
 				attempt: round.attempt,
 				outcome: outcome === null
 					? "spawn-failed"
-					: failed.length > 0 || actionableHighs.length > 0
+					: failed.length > 0 || actionableHighs.length > 0 || actionableNonHighs.length > 0
 						? "failed"
 						: undeterminable.length > 0 ? "undeterminable" : "passed",
 				passed,
@@ -1845,6 +1937,8 @@ async function commitReviewOutcome(
 				blocked: null,
 				reviewRoundsTotal: ex.reviewRoundsTotal,
 				reviewNoProgress: ex.reviewNoProgress ?? null,
+				reviewNonHighRepair: ex.reviewNonHighRepair ?? null,
+				reviewNonHighCredits: reviewNonHighCredit(ex),
 				audit: { rounds: ex.audit.rounds, passed: true, findings },
 			}),
 		);
@@ -1859,6 +1953,90 @@ async function commitReviewOutcome(
 		);
 		await completeExecution(ctx);
 		return;
+	}
+
+	// v0.10 (decisions 1/2/7, Q3/Q5): the single non-high repair cycle. It is
+	// granted only when this report's actionable findings are ALL non-high, the
+	// one-shot is still `"available"`, and it runs BEFORE the tolerant/high
+	// paths below so a spent numeric budget cannot swallow it — the credit
+	// bills the cycle instead. A high/fail-driven pass (next branch) carries
+	// non-highs as ride-alongs WITHOUT consuming the one-shot.
+	if (
+		failed.length === 0
+		&& actionableHighs.length === 0
+		&& actionableNonHighs.length > 0
+		&& ex.reviewNonHighRepair === "available"
+	) {
+		ex.reviewNonHighRepair = "granted";
+		ex.reviewNonHighCredits = reviewNonHighCredit(ex);
+		ex.audit.failed = [];
+		ex.audit.undeterminable = undeterminable;
+		const knownIds = new Set(coveredTaskIds);
+		// `medium` (and only medium) rolls back its mapped tasks — a PURE
+		// finding-driven rollback keeps earlier VC passes (no invalidation),
+		// exactly like a high's. `low` never touches the task tree's verified
+		// work; it (and any unmapped medium) is appended as a repair task.
+		const mappedMediumIds = [...new Set(
+			actionableNonHighs.filter((f) => f.severity === "medium").flatMap((f) => f.taskIds).filter((id) => knownIds.has(id)),
+		)];
+		const mediumRolledBack = findingsRollbackSet(ex.tasks, mappedMediumIds);
+		const appendable = actionableNonHighs.filter(
+			(f) => f.severity === "low" || !f.taskIds.some((id) => knownIds.has(id)),
+		);
+		const amended = appendable.length > 0 ? appendFindingTasks(ex, appendable) : [];
+		ex.blocked = mediumRolledBack.length > 0
+			? {
+				rolledBack: [...mediumRolledBack],
+				tasks: blockedReviewTasks(ex.tasks, mediumRolledBack),
+				round: ex.audit.rounds,
+				escalatedRounds: 0,
+				since: utcNow(),
+			}
+			: null;
+		ex.blockedWakeTasks = undefined;
+		withExecutionCheckpoint(ctx, (cp) => {
+			const amendedCp = amended.length > 0
+				? applyExecutionPlanAmended(cp, planIdentityOf(ex.planPath, cp.plan?.version ?? 1), ex.audit.rounds)
+				: cp;
+			return applyExecutionProgress(amendedCp, {
+				tasks: taskProgressMap(ex.tasks),
+				doneVcIds: ex.items.filter((item) => item.done).map((item) => item.id),
+				blocked: ex.blocked,
+				reviewRoundsTotal: ex.reviewRoundsTotal,
+				reviewNoProgress: ex.reviewNoProgress ?? null,
+				reviewNonHighRepair: ex.reviewNonHighRepair,
+				reviewNonHighCredits: reviewNonHighCredit(ex),
+				audit: { rounds: ex.audit.rounds, lastResult: findingLedger, findings },
+			});
+		});
+		if (mediumRolledBack.length > 0 || amended.length > 0) {
+			ex.stall.rounds = 0;
+			ex.stall.lastSnapshot = stallSnapshot();
+			setRunStatusForReview(ctx, "executing");
+		}
+		persist(ctx);
+		updateStatusWidget(ctx);
+		if (!round.wakeSent) {
+			round.wakeSent = true;
+			const openTasks = flattenTaskViews(ex.tasks).filter((task) => !taskIsTerminal(task)).map((task) => task.id);
+			const stranded = mediumRolledBack.length === 0 && amended.length === 0;
+			const nonHighLines = actionableNonHighs
+				.map((f) => `- ${f.id} (${f.severity})${f.taskIds.length ? ` (${f.taskIds.join(", ")})` : ""}: ${f.note}`)
+				.join("\n");
+			const reportRef = reportPath
+				? `Full round report: ${reportPath}`
+				: `Full round report (run dir unwritable — inline):\n\n---\n${reportText.slice(0, 4000)}`;
+			const content = `**pi-plans: execution review round ${ex.audit.rounds} found ${actionableNonHighs.length} medium/low finding(s)** — this grants the single non-high repair cycle (exempt from the numeric budget; the hard cap still counts it). Medium findings rolled back their mapped tasks: ${mediumRolledBack.join(", ") || "(none mapped)"}.${amended.length > 0 ? ` Repair tasks appended to the plan: ${amended.join(", ")}.` : ""}\n\nNon-high findings:\n${nonHighLines}\n\nFix them and re-close the affected tasks with \`plans_update_task\` (evidence records the repair), or decline one with status \`skipped\` and \`skipReason: "deferred: <reason>"\`. The re-review round runs automatically once all tasks are terminal again.${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
+			messaging().sendMessage(
+				{
+					customType: "pi-plans-audit-failed",
+					content: `${content}\n\nStill open: ${openTasks.join(", ") || "(none — the tree is terminal)"}`,
+					display: true,
+				},
+				{ triggerTurn: true },
+			);
+		}
+		return; // The agent repairs; the credited re-review round is owed.
 	}
 
 	// v0.9 fix loop — evaluated BEFORE the completion branch so an unresolved
@@ -1885,9 +2063,21 @@ async function commitReviewOutcome(
 		const knownIds = new Set(coveredTaskIds);
 		const mappedHighIds = [...new Set(actionableHighs.flatMap((h) => h.taskIds).filter((id) => knownIds.has(id)))];
 		const highRolledBack = findingsRollbackSet(ex.tasks, mappedHighIds);
+		// v0.10: this pass is high/fail-driven, so this round's non-highs ride
+		// along WITHOUT consuming the one-shot (decision 3). Mapped mediums roll
+		// back with the high cascade; unmapped mediums and every low are appended.
+		const mappedMediumIds = [...new Set(
+			actionableNonHighs.filter((f) => f.severity === "medium").flatMap((f) => f.taskIds).filter((id) => knownIds.has(id)),
+		)];
+		const mediumRolledBack = findingsRollbackSet(ex.tasks, mappedMediumIds);
 		const unmappedHighs = actionableHighs.filter((h) => !h.taskIds.some((id) => knownIds.has(id)));
-		const amended = unmappedHighs.length > 0 ? appendFindingTasks(ex, unmappedHighs) : [];
-		const allRolledBack = [...new Set([...rolledBack, ...highRolledBack])];
+		const appendableNonHighs = actionableNonHighs.filter(
+			(f) => f.severity === "low" || !f.taskIds.some((id) => knownIds.has(id)),
+		);
+		const amended = unmappedHighs.length > 0 || appendableNonHighs.length > 0
+			? appendFindingTasks(ex, [...unmappedHighs, ...appendableNonHighs])
+			: [];
+		const allRolledBack = [...new Set([...rolledBack, ...highRolledBack, ...mediumRolledBack])];
 		// v0.9.2: capture the round's rollback set HERE. The reopen helpers above
 		// mutate the tree and report only flipped nodes, so this is the only
 		// moment the authoritative provenance exists; the still-open subset is
@@ -1916,7 +2106,9 @@ async function commitReviewOutcome(
 				blocked: ex.blocked,
 				reviewRoundsTotal: ex.reviewRoundsTotal,
 				reviewNoProgress: ex.reviewNoProgress ?? null,
-				audit: { rounds: ex.audit.rounds, lastResult: failed.join(",") || `highs: ${actionableHighs.map((h) => h.id).join(",")}`, findings },
+				reviewNonHighRepair: ex.reviewNonHighRepair ?? null,
+				reviewNonHighCredits: reviewNonHighCredit(ex),
+				audit: { rounds: ex.audit.rounds, lastResult: failed.join(",") || findingLedger || undefined, findings },
 			});
 		});
 		if (allRolledBack.length > 0 || amended.length > 0) {
@@ -1940,16 +2132,21 @@ async function commitReviewOutcome(
 				.map((task) => task.id);
 			const stranded = allRolledBack.length === 0 && amended.length === 0;
 			const highLines = actionableHighs.map((h) => `- ${h.id}${h.taskIds.length ? ` (${h.taskIds.join(", ")})` : ""}: ${h.note}`).join("\n");
+			const nonHighLines = actionableNonHighs
+				.map((f) => `- ${f.id} (${f.severity})${f.taskIds.length ? ` (${f.taskIds.join(", ")})` : ""}: ${f.note}`)
+				.join("\n");
 			const reportRef = reportPath
 				? `Full round report: ${reportPath}`
 				: `Full round report (run dir unwritable — inline):\n\n---\n${reportText.slice(0, 4000)}`;
 			// v0.9.1 (F-004): a pure VC-fail round keeps the v0.8 lead — never
-			// announce "0 high-severity findings" over an empty block.
+			// announce "0 high-severity findings" over an empty block. v0.10: the
+			// lead names non-high findings when the round carries them too.
 			const findingsLead = actionableHighs.length > 0
-				? `**pi-plans: execution review round ${ex.audit.rounds} found ${actionableHighs.length} high-severity finding(s)**${failed.length > 0 ? ` and failed checks: ${failed.join(", ")}` : ""}.`
-				: `**pi-plans: execution review round ${ex.audit.rounds} failed** — checks: ${failed.join(", ")}.`;
+				? `**pi-plans: execution review round ${ex.audit.rounds} found ${actionableHighs.length} high-severity finding(s)**${failed.length > 0 ? ` and failed checks: ${failed.join(", ")}` : ""}${actionableNonHighs.length > 0 ? ` and ${actionableNonHighs.length} medium/low finding(s)` : ""}.`
+				: `**pi-plans: execution review round ${ex.audit.rounds} failed** — checks: ${failed.join(", ")}${actionableNonHighs.length > 0 ? ` and ${actionableNonHighs.length} medium/low finding(s)` : ""}.`;
 			const findingsBlock = actionableHighs.length > 0 ? `\n\nHigh findings:\n${highLines}` : "";
-			const content = `${findingsLead} Rolled back tasks: ${allRolledBack.join(", ") || "(none covered)"}${amended.length > 0 ? `. Tasks appended to the plan for unmapped findings: ${amended.join(", ")}` : ""}.${findingsBlock}\n\nFix them and re-close the affected tasks with \`plans_update_task\`; the review reruns automatically once all tasks are terminal again.${budgetSpent(ex) ? (activeBudget(ex) === "unlimited" ? ` This was round ${ex.reviewRoundsTotal} against the unlimited budget's ${unlimitedHardCapCeiling(budgetCounters(ex))}-round safety cap: the next terminal-task cycle pauses the run for review.` : ` This was round ${ex.audit.rounds} of ${budgetLabel(ex)}: the next terminal-task cycle pauses the run for review (or completes if every check passed).`) : ""}${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
+			const nonHighBlock = actionableNonHighs.length > 0 ? `\n\nNon-high findings (medium/low):\n${nonHighLines}` : "";
+			const content = `${findingsLead} Rolled back tasks: ${allRolledBack.join(", ") || "(none covered)"}${amended.length > 0 ? `. Tasks appended to the plan for unmapped findings: ${amended.join(", ")}` : ""}.${findingsBlock}${nonHighBlock}\n\nFix them and re-close the affected tasks with \`plans_update_task\` (evidence records the repair), or decline one with status \`skipped\` and \`skipReason: "deferred: <reason>"\`. The review reruns automatically once all tasks are terminal again.${budgetSpent(ex) ? (activeBudget(ex) === "unlimited" ? ` This was round ${ex.reviewRoundsTotal} against the unlimited budget's ${unlimitedHardCapCeiling(budgetCounters(ex))}-round safety cap: the next terminal-task cycle pauses the run for review.` : ` This was round ${billedRounds(ex)} of ${budgetLabel(ex)}: the next terminal-task cycle pauses the run for review (or completes if every check passed).`) : ""}${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
 			messaging().sendMessage(
 				{
 					customType: "pi-plans-audit-failed",
@@ -1968,7 +2165,10 @@ async function commitReviewOutcome(
 	// against vacuously completing an empty-pendingIds round with an
 	// unresolved high. An all-undeterminable round yields failed === [] —
 	// completing here would be fail-open, marking a run done with nothing
-	// verified.
+	// verified. v0.10 (plan Task-2.5): the condition is deliberately UNCHANGED
+	// by the non-high repair flag — findings preserved by a no-report round
+	// complete here with the honest disclosure instead of spinning another
+	// round (and possibly a cap pause) that only a real report could repair.
 	if (passed.length === pendingIds.length && highs.length === 0) {
 		ex.audit.failed = [];
 		ex.audit.undeterminable = [];
@@ -1981,6 +2181,8 @@ async function commitReviewOutcome(
 				blocked: null,
 				reviewRoundsTotal: ex.reviewRoundsTotal,
 				reviewNoProgress: ex.reviewNoProgress ?? null,
+				reviewNonHighRepair: ex.reviewNonHighRepair ?? null,
+				reviewNonHighCredits: reviewNonHighCredit(ex),
 				audit: { rounds: ex.audit.rounds, passed: true, findings },
 			}),
 		);
@@ -1998,6 +2200,8 @@ async function commitReviewOutcome(
 			doneVcIds: ex.items.filter((item) => item.done).map((item) => item.id),
 			reviewRoundsTotal: ex.reviewRoundsTotal,
 			reviewNoProgress: ex.reviewNoProgress ?? null,
+			reviewNonHighRepair: ex.reviewNonHighRepair ?? null,
+			reviewNonHighCredits: reviewNonHighCredit(ex),
 			audit: { rounds: ex.audit.rounds, lastResult: failed.join(",") || undefined, findings },
 		}),
 	);
@@ -2602,8 +2806,9 @@ function pendingAudit(ex: ExecState | null = execution): ex is ExecState {
 	if (ex.review.inFlight) return false;
 	// The budget menu is open: the review is being resolved, not owed anew.
 	if (ex.review.budgetAsking) return false;
-	return allTasksTerminal(ex.tasks)
-		&& (auditableChecks(ex.items, ex.tasks).some((item) => !item.done) || unresolvedHighFindings(ex).length > 0);
+	// One owed predicate, shared with reviewOwed/reviewOutstanding (v0.10):
+	// pending checks, unresolved highs, or a pending non-high repair cycle.
+	return allTasksTerminal(ex.tasks) && reviewOutstanding(ex);
 }
 
 /** v0.7.1: record that this settle already ran (or declined) its audit, so a
@@ -2891,6 +3096,84 @@ export async function resumeActiveExecution(ctx: ExtensionContext): Promise<Resu
 	return { resumed: true };
 }
 
+/** v0.10: index of the repair tasks the review appended (`fix <id>:` title
+ * prefix) — the provenance the completion ledger and the reviewer brief read. */
+function repairTaskIndex(ex: ExecState): Map<string, TaskView> {
+	const repairTasks = new Map<string, TaskView>();
+	for (const task of flattenTaskViews(ex.tasks)) {
+		const match = /^fix (F-\d+):/.exec(task.title);
+		if (match && !repairTasks.has(match[1])) repairTasks.set(match[1], task);
+	}
+	return repairTasks;
+}
+
+/** v0.10: per-finding disposition text, resolved from task provenance:
+ * `deferred: <reason>` (the finding's appended `fix <id>:` task was skipped
+ * with a `deferred:` skipReason), `repair claimed — still reported` (that task
+ * is complete but the newest round still lists the id), `unresolved` (no such
+ * task, or it is not terminal), and `fixed (...)` for a repair task whose
+ * finding no longer appears in the newest round. */
+function findingDispositionMap(ex: ExecState): Map<string, string> {
+	const repairTasks = repairTaskIndex(ex);
+	const dispositions = new Map<string, string>();
+	for (const finding of ex.audit.findings) {
+		const task = repairTasks.get(finding.id);
+		const skipReason = task?.skipReason?.trim() ?? "";
+		if (task && task.status === "skipped" && /^deferred\b/i.test(skipReason)) {
+			dispositions.set(finding.id, `deferred: ${skipReason.replace(/^deferred\s*:?\s*/i, "") || "no reason recorded"}`);
+		} else if (task && task.status === "complete") {
+			dispositions.set(finding.id, `repair claimed — still reported (task ${task.id})`);
+		} else {
+			dispositions.set(finding.id, `unresolved${task ? ` (task ${task.id} is ${task.status})` : " (no repair task)"}`);
+		}
+	}
+	for (const [id, task] of repairTasks) {
+		if (task.status === "complete" && !dispositions.has(id)) dispositions.set(id, `fixed (repaired by ${task.id}; no longer reported)`);
+	}
+	return dispositions;
+}
+
+/** v0.10: the honest completion ledger — one line per finding the review left
+ * behind (plus `fixed` lines for repaired ones), and the split the completion
+ * headline needs: a finding is "unresolved" unless its repair task was closed
+ * (`fixed`) or explicitly declined (`deferred: …`). */
+function completionFindingLedger(ex: ExecState): { lines: string[]; unresolvedIds: string[]; deferredIds: string[] } {
+	const severity = new Map(ex.audit.findings.map((f) => [f.id, f.severity]));
+	const dispositions = findingDispositionMap(ex);
+	const lines: string[] = [];
+	const unresolvedIds: string[] = [];
+	const deferredIds: string[] = [];
+	for (const [id, disposition] of dispositions) {
+		const sev = severity.get(id);
+		lines.push(sev === undefined ? `${id} — ${disposition}` : `${id} (${sev}) — ${disposition}`);
+		if (sev === undefined) continue; // a `fixed` line: the finding is gone from the round
+		if (/^deferred\b/i.test(disposition)) deferredIds.push(id);
+		else if (!/^fixed\b/.test(disposition)) unresolvedIds.push(id);
+	}
+	return { lines, unresolvedIds, deferredIds };
+}
+
+/** v0.10 (F-008): the huge-version completion message. It is keyed on the
+ * newest round's finding COUNT, never on the completion ledger's line count —
+ * a fully repaired cycle still renders `fixed` lines but must keep the ✅
+ * headline (the same rule the non-huge branch follows). Exported for tests. */
+export function hugeVersionCompletionMessage(input: {
+	version: string;
+	position: string;
+	planPath: string;
+	next: string | null;
+	findingCount: number;
+	unresolvedCount: number;
+	deferredCount: number;
+	summary: string;
+	residualNote: string;
+}): string {
+	const tail = `(${input.position}) \`${input.planPath}\` — the run stays in planning${input.next ? `; the next version is ${input.next}` : ""}. Plan the next version with the plan-huge skill; the overall plan is never executable.\n\n${input.summary}${input.residualNote}`;
+	return input.findingCount > 0
+		? `**Version ${input.version} complete — ${input.findingCount} review finding(s) without a resolved verdict: ${input.unresolvedCount} unresolved, ${input.deferredCount} deferred.** ⚠️ ${tail}`
+		: `**Version ${input.version} complete** ✅ ${tail}`;
+}
+
 export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 	if (!execution) return;
 	resetExecutionCompactionState(ctx);
@@ -2900,12 +3183,25 @@ export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 	const summary = flat
 		.map((task) => `- ${taskIsTerminal(task) && task.status === "skipped" ? "~" : "✓"} \`${task.id}\` ${task.title}`)
 		.join("\n");
-	// v0.9: residual (non-high) findings are summarized, never silent — the
-	// loop converged because nothing high-blocking remained.
-	const residualFindings = execution.audit.findings.filter((f) => f.severity !== "high");
-	const residualNote = residualFindings.length > 0
-		? `\n\nRecorded findings that did not block completion: ${residualFindings.map((f) => `${f.id} (${f.severity})`).join(", ")} — see the execution-review round reports under the run directory.`
+	// v0.10: residual findings are summarized HONESTLY — never as "did not
+	// block completion". The ledger resolves each finding's disposition from
+	// task provenance (`fixed` / `repair claimed — still reported` / `deferred:
+	// <reason>` / `unresolved`), so a reader can tell a repaired-and-cleared
+	// finding from one the executor declined. Captured BEFORE `execution` is
+	// cleared below.
+	const remainingFindings = execution.audit.findings;
+	const findingLedger = completionFindingLedger(execution);
+	const residualNote = findingLedger.lines.length > 0
+		? `\n\n${remainingFindings.length > 0 ? "Execution-review findings left behind:" : "Execution-review findings repaired during the cycle:"}\n${findingLedger.lines.map((line) => `- ${line}`).join("\n")}\n  Every finding also stays in the round reports under the run directory.`
 		: "";
+	// v0.10: a completion may NOT claim the review passed while the newest
+	// round still lists findings — the headline states what is left and names
+	// the one-shot cycle's state.
+	const cycleNote = remainingFindings.length === 0
+		? ""
+		: execution.reviewNonHighRepair === "granted"
+			? " The single non-high repair cycle was granted but could not be re-judged (the review cap was reached); it counts as spent."
+			: execution.reviewNonHighRepair === "used" ? " The single non-high repair cycle has already been spent." : "";
 	// v0.9.3 (Q-2, round-1 F-004): an exhausted budget may complete WITH
 	// unresolved high findings — the completion surface must say so instead of
 	// claiming "execution review passed".
@@ -2948,7 +3244,17 @@ export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 		messaging().sendMessage(
 			{
 				customType: "pi-plans-huge-version-complete",
-				content: `**Version ${looped.version} complete** ✅ (${looped.position}) \`${planPath}\` — the run stays in planning${looped.next ? `; the next version is ${looped.next}` : ""}. Plan the next version with the plan-huge skill; the overall plan is never executable.\n\n${summary}${residualNote}`,
+				content: hugeVersionCompletionMessage({
+					version: looped.version,
+					position: looped.position,
+					planPath,
+					next: looped.next,
+					findingCount: remainingFindings.length,
+					unresolvedCount: findingLedger.unresolvedIds.length,
+					deferredCount: findingLedger.deferredIds.length,
+					summary,
+					residualNote,
+				}),
 				display: true,
 			},
 			{ triggerTurn: false },
@@ -2972,7 +3278,9 @@ export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 			customType: "pi-plans-complete",
 			content: toleratedHighs.length > 0
 				? `**Plan complete (review budget exhausted).** ⚠️ \`${planPath}\` — all verification checks passed; ${toleratedHighs.length} high-severity finding(s) stayed unresolved.\n\n${summary}${residualNote}${toleratedNote}`
-				: `**Plan complete!** ✅ \`${planPath}\` — execution review passed.\n\n${summary}${residualNote}`,
+				: remainingFindings.length > 0
+					? `**Plan complete — every verification check passed; the execution review left ${remainingFindings.length} finding(s) without a resolved verdict: ${findingLedger.unresolvedIds.length} unresolved, ${findingLedger.deferredIds.length} deferred.** ⚠️ \`${planPath}\`${cycleNote}\n\n${summary}${residualNote}`
+					: `**Plan complete!** ✅ \`${planPath}\` — execution review passed.\n\n${summary}${residualNote}`,
 			display: true,
 		},
 		{ triggerTurn: false },
@@ -3064,7 +3372,7 @@ export function renderTerminationRecord(summary: TerminationSummary, meta: { at:
 		"## Unresolved findings",
 		list([
 			...summary.highFindings.map((id) => `${id} (high)`),
-			...summary.residualFindings.map((id) => `${id} (residual)`),
+			...summary.residualFindings.map((id) => `${id} (unresolved)`),
 		]),
 	];
 	if (summary.abortedRound) {
@@ -3243,6 +3551,13 @@ export function executionContextMessage(ctx: ExtensionContext): string | null {
 	const highFindingsNote = unresolvedHighs.length > 0
 		? `\nExecution review round ${execution.audit.rounds} unresolved high-severity findings:\n${unresolvedHighs.map((f) => `- ${f.id}${f.taskIds.length ? ` (${f.taskIds.join(", ")})` : ""}: ${f.note}`).join("\n")}\nFix them, then re-close the affected tasks with evidence.`
 		: "";
+	// v0.10: while the single non-high repair cycle is pending, the executor's
+	// per-turn context names the medium/low findings too — the wake message
+	// alone would be lost on a session that resumed after the wake.
+	const pendingNonHighs = nonHighRepairPending(execution) ? unresolvedRepairableFindings(execution) : [];
+	const nonHighFindingsNote = pendingNonHighs.length > 0
+		? `\nExecution review round ${execution.audit.rounds} pending medium/low findings (the single non-high repair cycle):\n${pendingNonHighs.map((f) => `- ${f.id} (${f.severity})${f.taskIds.length ? ` (${f.taskIds.join(", ")})` : ""}: ${f.note}`).join("\n")}\nFix them and re-close the affected tasks with evidence, or decline one with status "skipped" and skipReason "deferred: <reason>".`
+		: "";
 	// v0.9.2: the wake must answer "is the review running?" explicitly. The
 	// previous text left the executor waiting for a round that cannot start
 	// while the tree is open (the exact stall this feature fixes).
@@ -3250,9 +3565,9 @@ export function executionContextMessage(ctx: ExtensionContext): string | null {
 	const blockedRound = execution.blocked?.round ?? execution.audit.rounds;
 	const outstanding = reviewOutstanding(execution);
 	const reviewLine = execution.review.inFlight
-		? `\nReview: round ${execution.audit.rounds + 1}/${budgetLabel(execution)} IS RUNNING (read-only reviewer verifying) — do not wait on it and do not re-close tasks for it.`
+		? `\nReview: round ${billedRounds(execution) + 1}/${budgetLabel(execution)} IS RUNNING (read-only reviewer verifying) — do not wait on it and do not re-close tasks for it.`
 		: blockedIds.length > 0 && outstanding
-			? `\nReview: NO round is running — the task tree is not terminal, so the review cannot start. It starts by itself the moment every task is terminal (round ${execution.audit.rounds + 1}/${budgetLabel(execution)}).`
+			? `\nReview: NO round is running — the task tree is not terminal, so the review cannot start. It starts by itself the moment every task is terminal (round ${billedRounds(execution) + 1}/${budgetLabel(execution)}).`
 			: "";
 	const escalated = (execution.blocked?.escalatedRounds ?? 0) > 0;
 	const blockedLine = blockedIds.length > 0 && outstanding
@@ -3264,7 +3579,7 @@ Implement the accepted plan at ${execution.planPath} (tasks ${progress.done}/${p
 Current wave ${currentWave} open tasks:
 ${waveList}
 
-Remaining open tasks (all waves): ${open.map((task) => task.id).join(", ") || "(none)"}.${rollbackNote}${highFindingsNote}${reviewLine}${blockedLine}
+Remaining open tasks (all waves): ${open.map((task) => task.id).join(", ") || "(none)"}.${rollbackNote}${highFindingsNote}${nonHighFindingsNote}${reviewLine}${blockedLine}
 
 ${graphLine}
 
@@ -3374,6 +3689,8 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 		reviewRoundsTotal: snapshot.reviewRoundsTotal ?? 0,
 		reviewCapExtension: snapshot.reviewCapExtension ?? 0,
 		reviewNoProgress: snapshot.reviewNoProgress ?? undefined,
+		reviewNonHighRepair: snapshot.reviewNonHighRepair ?? undefined,
+		reviewNonHighCredits: snapshot.reviewNonHighRepair === "granted" ? 1 : 0,
 	};
 	execution.stall.lastSnapshot = stallSnapshot();
 	resetContinuationRuntime(ctx);

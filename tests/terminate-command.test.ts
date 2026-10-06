@@ -288,7 +288,7 @@ describe("/plans-terminate (v0.9.4)", () => {
 		}
 		assert.ok(record.includes("- VC-002") && record.includes("- VC-003"), "unverified checks are listed");
 		assert.ok(record.includes("- Task-1") && record.includes("- Task-2"), "open tasks are listed");
-		assert.ok(record.includes("- F-001 (high)") && record.includes("- F-002 (residual)"), "findings are listed by severity");
+		assert.ok(record.includes("- F-001 (high)") && record.includes("- F-002 (unresolved)"), "findings are listed by severity (non-high is unresolved, not residual)");
 
 		const message = entryOf(captured.entries, "pi-plans-terminate");
 		assert.ok(message, "termination message sent");

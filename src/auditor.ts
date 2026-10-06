@@ -143,6 +143,10 @@ export function buildAuditTask(
 	tasks: TaskView[],
 	round: number,
 	priorFindings: ReviewFinding[] = [],
+	/** v0.10: per-finding disposition resolved by the caller (`fixed …` /
+	 * `deferred: <reason>` / `repair claimed — still reported` / `unresolved`),
+	 * so the reviewer sees how the executor answered the previous round. */
+	dispositions?: ReadonlyMap<string, string>,
 ): string {
 	const checks = auditablePendingChecks(checklist, tasks)
 		.map((check) => `- \`${check.id}\`: ${check.text}`)
@@ -153,7 +157,7 @@ export function buildAuditTask(
 	const prior = priorFindings.length
 			? `Unresolved findings from earlier rounds (reuse these exact ids while the problem persists; a problem is resolved only by no longer reporting it):
 
-${priorFindings.map((f) => `- \`${f.id}\` — severity: ${f.severity}; tasks: ${f.taskIds.join(", ") || "none"}; note: ${f.note}`).join("\n")}`
+${priorFindings.map((f) => `- \`${f.id}\` — severity: ${f.severity}; tasks: ${f.taskIds.join(", ") || "none"}; note: ${f.note}${dispositions?.get(f.id) ? `; disposition: ${dispositions.get(f.id)}` : ""}`).join("\n")}`
 			: "(none — this is the first round with findings in scope)";
 	return `Goal: verify that the implemented worktree satisfies the accepted plan's verification checks, and report implementation findings that drive the fix loop.
 
@@ -185,7 +189,7 @@ Emit every listed check exactly once. \`undeterminable\` is a legitimate answer:
 
 - \`F-###\` — severity: high | medium | low; tasks: Task-N, Task-M | none; proposed-task: <imperative one-line title>; note: <one line>; evidence: <repo path or quoted excerpt>
 
-\`high\` wakes the executor for a fix round; \`medium\`/\`low\` are recorded. When no existing task owns the defect use \`tasks: none\` and (required for high) a self-contained \`proposed-task:\` title. If nothing is worth reporting, emit exactly \`- none.\` under the findings heading.`;
+\`high\` wakes the executor for a fix round, and so do \`medium\`/\`low\`: each reported finding gets a repair task (a \`medium\` may reopen its mapped tasks) and the run wakes the executor for one non-high repair cycle per version before any left-over finding is disclosed. When no existing task owns the defect use \`tasks: none\` and (required for high) a self-contained \`proposed-task:\` title. If nothing is worth reporting, emit exactly \`- none.\` under the findings heading.`;
 }
 
 /** Parse the audit subagent's verdict lines. Exported for tests. */
@@ -275,6 +279,9 @@ export async function runCompletionAudit(
 		/** Unresolved findings from earlier committed rounds, injected into
 		 * the brief so the reviewer reuses stable ids (v0.9). */
 		priorFindings?: ReviewFinding[];
+		/** v0.10: per-finding disposition text injected beside each prior
+		 * finding, so a deliberate decline (`deferred: …`) is visible. */
+		findingDispositions?: ReadonlyMap<string, string>;
 		model?: string;
 		thinkingLevel?: string;
 		timeoutMs?: number;
@@ -284,7 +291,7 @@ export async function runCompletionAudit(
 ): Promise<AuditRoundResult> {
 	const { runPiSubagent } = await import("./subagent.ts");
 	const pending = auditablePendingChecks(opts.checklist, opts.tasks);
-	const task = buildAuditTask(opts.planPath, opts.checklist, opts.tasks, opts.round, opts.priorFindings ?? []);
+	const task = buildAuditTask(opts.planPath, opts.checklist, opts.tasks, opts.round, opts.priorFindings ?? [], opts.findingDispositions);
 	// agents/auditor.md, not agents/reviewer.md: the reviewer prompt mandates a
 	// plan-review shape (`## Findings` / `## Questions`, F-###) and never says
 	// "verdict", so auditing under it produced reports this parser could not

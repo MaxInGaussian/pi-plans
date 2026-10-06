@@ -63,6 +63,16 @@ describe("review budget arithmetic (v0.9.3)", () => {
 		assert.equal(unlimitedHardCapCeiling({ reviewRoundsTotal: 12, reviewCapExtension: 50 }), 100);
 	});
 
+	it("bills the exempt non-high repair cycle as one round (v0.10 caller contract)", () => {
+		// The credit lives in the caller (`reviewNonHighCredit` in exec.ts): the
+		// engine passes `audit.rounds - credit`, so one granted cycle unspends a
+		// numeric budget by exactly one round without touching the unlimited cap.
+		const counters = { reviewRoundsTotal: 1, reviewCapExtension: 0 };
+		assert.equal(budgetExhausted(1, 1, counters), true, "raw round 1 of 1 is exhausted");
+		assert.equal(budgetExhausted(1, 0, counters), false, "billed with the exempt cycle: not exhausted");
+		assert.equal(budgetExhausted("unlimited", 0, { reviewRoundsTotal: 1, reviewCapExtension: 0 }), false, "the hard cap counts raw rounds only");
+	});
+
 	it("recognizes every review pause reason and nothing else (shared predicate)", () => {
 		assert.equal(isReviewPauseReason("execution review exhausted 3 rounds (failed: VC-002). Only /plans-execute"), true);
 		assert.equal(isReviewPauseReason("execution review exhausted 50 rounds (unlimited budget safety cap)"), true);

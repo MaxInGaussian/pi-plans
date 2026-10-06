@@ -158,6 +158,14 @@ export interface ExecutionBlocked {
 	since: string;
 }
 
+/** v0.10: execution-review non-high repair flag. `"available"` — a reported
+ * round left medium/low findings and the single non-high repair cycle has not
+ * been granted yet; `"granted"` — the cycle is in flight (repair wake sent,
+ * re-review round owed); `"used"` — the cycle's re-review round committed.
+ * ABSENT means a pre-v0.10 checkpoint (or a run that never committed a
+ * reported round): non-high findings keep the legacy no-owed semantics. */
+export type ReviewNonHighRepairState = "available" | "granted" | "used";
+
 export interface ExecutionCheckpoint {
 	approval: ExecutionApproval | null;
 	doneVcIds: string[];
@@ -204,6 +212,16 @@ export interface ExecutionCheckpoint {
 	/** v0.9.3: no-progress valve state for the unlimited budget (signature of
 	 * the last committed round's outcome plus its consecutive streak). */
 	reviewNoProgress?: NoProgressState | null;
+	/** v0.10: execution-review non-high repair flag (`available | granted |
+	 * used`); absent = legacy. Optional on read so pre-feature checkpoints
+	 * keep loading with the old no-owed semantics. */
+	reviewNonHighRepair?: ReviewNonHighRepairState | null;
+	/** v0.10: billed-round credit of the single non-high repair cycle: 1
+	 * exactly while `reviewNonHighRepair` is `"granted"`, 0 otherwise. The
+	 * live value is DERIVED from the flag (`reviewNonHighCredit` in exec.ts);
+	 * this persisted mirror exists so a checkpoint is self-describing, and a
+	 * contradictory stored value is normalized on read. Optional on read. */
+	reviewNonHighCredits?: number;
 	/** v0.9.1 (F-002): set when the execution-review loop mechanically
 	 * appended finding tasks to the approved plan. The checkpoint's plan
 	 * identity is re-stamped at that moment so /resume-plans accepts the
@@ -647,7 +665,7 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	const record = asRecord(value, label);
 	rejectExtraKeys(
 		record,
-		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "stallRounds", "blocked", "planAmended", "audit", "reviewBudget", "reviewBudgetDefaulted", "reviewRoundsTotal", "reviewCapExtension", "reviewNoProgress"]),
+		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "stallRounds", "blocked", "planAmended", "audit", "reviewBudget", "reviewBudgetDefaulted", "reviewRoundsTotal", "reviewCapExtension", "reviewNoProgress", "reviewNonHighRepair", "reviewNonHighCredits"]),
 		label,
 	);
 	const execution: ExecutionCheckpoint = {
@@ -737,6 +755,18 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 			key: asString(np.key, `${label}.reviewNoProgress.key`),
 			streak: asInt(np.streak, `${label}.reviewNoProgress.streak`, 0),
 		};
+	}
+	// v0.10 non-high repair. The flag is a small closed enum; the credit is
+	// DERIVED from the flag on read (a stored contradiction normalizes, so a
+	// hand-edited or pre-fix checkpoint can never bill a negative count).
+	if (record.reviewNonHighRepair !== undefined && record.reviewNonHighRepair !== null) {
+		execution.reviewNonHighRepair = asEnum(record.reviewNonHighRepair, new Set<ReviewNonHighRepairState>(["available", "granted", "used"]), `${label}.reviewNonHighRepair`);
+	}
+	if (record.reviewNonHighCredits !== undefined && record.reviewNonHighCredits !== null) {
+		asInt(record.reviewNonHighCredits, `${label}.reviewNonHighCredits`, 0);
+	}
+	if (execution.reviewNonHighRepair !== undefined) {
+		execution.reviewNonHighCredits = execution.reviewNonHighRepair === "granted" ? 1 : 0;
 	}
 	if (record.audit !== undefined && record.audit !== null) {
 		const audit = asRecord(record.audit, `${label}.audit`);
@@ -1524,6 +1554,10 @@ export interface ExecutionProgressInput {
 	reviewCapExtension?: number;
 	/** v0.9.3: no-progress valve state; null clears it (delete-on-null). */
 	reviewNoProgress?: NoProgressState | null;
+	/** v0.10: non-high repair flag; null clears it (delete-on-null). */
+	reviewNonHighRepair?: ReviewNonHighRepairState | null;
+	/** v0.10: persisted mirror of the derived credit (0/1). */
+	reviewNonHighCredits?: number;
 }
 
 export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: ExecutionProgressInput): WorkflowCheckpoint {
@@ -1554,6 +1588,12 @@ export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: Executi
 	if (progress.reviewCapExtension !== undefined) execution.reviewCapExtension = progress.reviewCapExtension;
 	if (progress.reviewNoProgress === null) delete execution.reviewNoProgress;
 	else if (progress.reviewNoProgress !== undefined) execution.reviewNoProgress = progress.reviewNoProgress;
+	if (progress.reviewNonHighRepair === null) delete execution.reviewNonHighRepair;
+	else if (progress.reviewNonHighRepair !== undefined) execution.reviewNonHighRepair = progress.reviewNonHighRepair;
+	if (progress.reviewNonHighCredits !== undefined) {
+		// Derived, never trusted: the credit mirrors the RESULTING flag.
+		execution.reviewNonHighCredits = execution.reviewNonHighRepair === "granted" ? 1 : 0;
+	}
 	if (progress.audit !== undefined) execution.audit = progress.audit;
 	return { ...cp, execution };
 }
@@ -1593,6 +1633,8 @@ export function applyExecutionCompleted(cp: WorkflowCheckpoint): WorkflowCheckpo
 		reviewRoundsTotal: _reviewRoundsTotal,
 		reviewCapExtension: _reviewCapExtension,
 		reviewNoProgress: _reviewNoProgress,
+		reviewNonHighRepair: _reviewNonHighRepair,
+		reviewNonHighCredits: _reviewNonHighCredits,
 		...execution
 	} = cp.execution;
 	return {
@@ -1943,6 +1985,8 @@ export function applyExecutionStopped(cp: WorkflowCheckpoint, reason: string): W
 		reviewRoundsTotal: _reviewRoundsTotal,
 		reviewCapExtension: _reviewCapExtension,
 		reviewNoProgress: _reviewNoProgress,
+		reviewNonHighRepair: _reviewNonHighRepair,
+		reviewNonHighCredits: _reviewNonHighCredits,
 		...execution
 	} = cp.execution;
 	// A stop also revokes any outstanding audit-rollback authorization.

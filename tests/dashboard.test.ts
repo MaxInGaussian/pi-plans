@@ -564,3 +564,17 @@ describe("review-budget visibility (v0.9.3)", () => {
 		}
 	});
 });
+
+/**
+ * v0.10: the review chrome that the dashboard and the completion/termination
+ * summaries share. Non-high findings are no longer "residual": they drive the
+ * single non-high repair cycle and are labelled unresolved.
+ */
+describe("review chrome labels (v0.10)", () => {
+	it("both locales label non-high findings unresolved, not residual", async () => {
+		const { terminationChrome } = await import("../src/ui-language.ts");
+		assert.match(terminationChrome("zh").residualLabel(2), /未解决非 high/, "zh carries the unresolved wording");
+		assert.match(terminationChrome("en").residualLabel(2), /Unresolved non-high findings/, "en carries the unresolved wording");
+		assert.doesNotMatch(terminationChrome("en").residualLabel(2), /Residual/, "the old residual wording is gone");
+	});
+});

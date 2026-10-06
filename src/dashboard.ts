@@ -38,7 +38,9 @@ export interface DashboardModel {
 	huge?: HugeProgress | null;
 	paused: boolean;
 	pausedReason?: string;
-	/** Audit round counter; null = audit not yet started. */
+	/** Audit round counter; null = audit not yet started. v0.10: the engine
+	 * feeds the BILLED count (`audit.rounds - the exempt non-high cycle's
+	 * credit`), so a granted repair cycle never reads as an exhausted budget. */
 	auditRounds: number | null;
 	auditFailed: string[];
 	/** Checks whose verdict the auditor could not be read for. Neither passed
@@ -49,7 +51,9 @@ export interface DashboardModel {
 	 * showed the tick for the whole duration of a running audit. */
 	reviewRunning: boolean;
 	/** v0.9: unresolved findings from the newest committed review round
-	 * (stable ids). High entries block completion; the rest are recorded. */
+	 * (stable ids). `high` entries block completion; `medium`/`low` entries
+	 * (v0.10) drive the single non-high repair cycle and are disclosed
+	 * per-finding when the cycle is spent. */
 	findings: Array<{ id: string; severity: string; note: string; taskIds: string[] }>;
 	/** v0.9.2: tasks that keep the review from starting — the newest failed
 	 * round's rollback set intersected with the still-open tasks. Empty = the

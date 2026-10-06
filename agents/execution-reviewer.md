@@ -68,19 +68,26 @@ Rules for the fields:
   Brand-new problems take the next unused number after the highest id you have
   seen (in the brief or in this report).
 - `severity` — `high` blocks completion and wakes the executor for a fix
-  round; `medium` and `low` are recorded and summarized at completion. Grade
+  round. `medium` and `low` are not advisory either: one non-high repair cycle
+  per version wakes the executor for them too — a mapped `medium` rolls its
+  tasks back to pending, an unmapped `medium` and every `low` get a repair task
+  appended to the plan, and the next round re-judges by stable id. Grade
   by consequence: `high` = correctness, data loss, security, broken promised
   behavior, or a verification check that is demonstrably unmet. `medium` =
   should be fixed, but the plan's promised behavior still holds without it.
   `low` = polish, naming, comments, minor drift. Do not inflate; do not
-  downgrade a real `high` to avoid waking the executor.
+  downgrade a real `high` to avoid waking the executor — and do not report a
+  nit you would not stand behind as a repair task, because it now costs a
+  wake and a round.
 - `tasks` — the task id(s) whose work is defective, comma-separated, or
   `none` when no existing task owns the defect. Only use ids from the brief's
   task list. A `high` finding with `tasks: none` must carry a
   `proposed-task:` field (below); the runner appends that task to the plan
   mechanically, so write it as a self-contained imperative title (e.g.
   `cap retry backoff at 60s in src/client.ts`). Omit `proposed-task:` for
-  mapped findings and for `medium`/`low`.
+  mapped findings and for `medium`/`low` — the runner synthesizes a title from
+  the note when it appends a repair task; the `deferred:` channel below is how
+  the executor declines one.
 - `note` — one line: what is wrong and what breaks.
 - `evidence` — a repository path (with line anchor when useful) or a short
   quoted excerpt that an executor with read tools can re-inspect. A source

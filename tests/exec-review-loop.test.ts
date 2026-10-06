@@ -25,6 +25,7 @@ import {
 import { parseChecklist, parsePlanTasks } from "../src/plan.ts";
 import { setMessagingApi } from "../src/messaging.ts";
 import { applyTaskUpdate } from "../src/task-tool.ts";
+import { buildTaskView } from "../src/tasks.ts";
 import { spawnSync } from "node:child_process";
 import { getRun, initState, setRunStatus, startRun } from "../src/state.ts";
 import { createCheckpoint, loadCheckpoint, mutateCheckpoint, applyExecutionApproved, applyExecutionProgress, applyPlanWritten, planIdentityOf, resolveHeadAt } from "../src/workflow-state.ts";
@@ -466,7 +467,7 @@ describe("findings-driven fix loop (v0.9)", () => {
 		ctl.drainAll();
 	});
 
-	it("completion with residual medium/low findings summarizes them in the completion message", async () => {
+	it("a medium/low-only round grants the non-high repair cycle instead of completing", async () => {
 		const { workdir, planPath, runId } = freshWorkdir();
 		const ctx = await startTerminal(planPath, workdir);
 		const ctl = controlledRunner();
@@ -476,12 +477,17 @@ describe("findings-driven fix loop (v0.9)", () => {
 		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "clean", findings: [finding("F-002", "medium", []), finding("F-003", "low", ["Task-1"])] } as never);
 		await restoring;
 		await __awaitReviewRoundForTests();
-		assert.equal(getExecution(), null, "no high findings: the run completes");
-		assert.equal(loadCheckpoint(workdir, runId).checkpoint.phase, "completed");
-		const done = ctx.entries.filter((e) => e.customType === "pi-plans-complete");
-		assert.equal(done.length, 1);
-		assert.match(String(done[0].content), /Recorded findings that did not block completion: F-002 \(medium\), F-003 \(low\)/);
+		assert.ok(getExecution(), "medium/low findings keep the run open for the repair cycle");
+		assert.equal(getExecution()!.reviewNonHighRepair, "granted", "the one-shot is marked granted");
+		assert.equal(loadCheckpoint(workdir, runId).checkpoint.execution?.reviewNonHighCredits, 1, "the checkpoint carries the derived credit");
+		const wakes = ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed");
+		assert.equal(wakes.length, 1, "exactly one wake for the cycle");
+		assert.match(String(wakes[0].content), /single non-high repair cycle/);
+		assert.match(String(wakes[0].content), /F-002 \(medium\)/);
+		assert.match(String(wakes[0].content), /F-003 \(low\)/);
+		assert.match(String(wakes[0].content), /deferred: <reason>/);
 		ctl.drainAll();
+		await stopExecution(ctx, "teardown");
 	});
 
 	it("findings persist across the session snapshot and survive the fresh-budget renewal", async () => {
@@ -1353,5 +1359,454 @@ describe("execution-review budget (v0.9.3)", () => {
 		assert.deepEqual(ex.reviewNoProgress, { key: "VC-002|VC-001|", streak: 2 }, "the valve streak survives");
 		await stopExecution(ctx, "teardown");
 		__setAuditRunnerForTests(null);
+	});
+});
+
+/**
+ * v0.10: the single non-high repair cycle. A round whose actionable findings
+ * are all `medium`/`low` grants one repair wake (mapped `medium` rolls back
+ * through the pure finding-driven union; unmapped `medium` and every `low`
+ * get a `fix <id>:` task appended) and the immediately following round
+ * re-judges. The cycle is exempt from a numeric budget but still bounded by
+ * the unlimited hard cap, and a completion with findings left over must
+ * disclose every disposition instead of claiming the review passed.
+ */
+describe("non-high repair cycle (v0.10)", () => {
+	const finding = (
+		id: string,
+		severity: "high" | "medium" | "low",
+		taskIds: string[],
+		extra: Partial<{ note: string; proposedTask: string }> = {},
+	) => ({ id, severity, taskIds, note: `${id} note`, evidence: "src/lib", raw: `- \` ${id}\` raw`, ...extra });
+
+	const snapshot = () => [{ type: "custom" as const, customType: "pi-plans-exec", data: getExecution() }];
+	/** A ctx whose native budget select answers with the given pick. */
+	const menuCtx = (workdir: string, pick: string) => {
+		const base = makeCtx(workdir, "tui");
+		const ui = (base as { ui: Record<string, unknown> }).ui;
+		return {
+			...base,
+			ui: {
+				...ui,
+				select: async (_title: string, options: string[]): Promise<string | undefined> =>
+					options.find((option) => option.startsWith(pick)) ?? options[0],
+			},
+		} as typeof base;
+	};
+	const wakes = (ctx: { entries: Array<{ customType: string; content?: string }> }) =>
+		ctx.entries.filter((e) => e.customType === "pi-plans-audit-failed");
+	const completions = (ctx: { entries: Array<{ customType: string; content?: string }> }) =>
+		ctx.entries.filter((e) => e.customType === "pi-plans-complete");
+
+	it("medium: mapped tasks roll back, the unmapped one is appended, exactly one wake", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-001", "medium", ["Task-1"]), finding("F-002", "medium", [])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.ok(ex, "the run stays open for the repair cycle");
+		assert.equal(ex.reviewNonHighRepair, "granted");
+		assert.equal(ex.tasks.find((t) => t.id === "Task-1")!.status, "pending", "a mapped medium rolls back");
+		assert.equal(ex.tasks.find((t) => t.id === "Task-2")!.status, "complete", "untouched work stays done");
+		const appended = ex.tasks.find((t) => /^fix F-002:/.test(t.title));
+		assert.ok(appended, "the unmapped medium gets a repair task");
+		assert.match(appended!.title, /appended by execution review round 1/);
+		assert.match(fs.readFileSync(planPath, "utf8"), /- `Task-3`: fix F-002: F-002 note/, "the plan file carries the bullet");
+		assert.equal(wakes(ctx).length, 1, "exactly one wake");
+		// v0.10 (VC-004): a pure finding-driven medium rollback keeps the VC
+		// passes — only a fail-driven rollback invalidates them.
+		assert.deepEqual(ex.items.map((item) => item.done), [true, true], "the medium rollback invalidates no VC pass");
+		// v0.10 (VC-004): the per-turn injection names the pending non-highs
+		// while the cycle is in flight (a wake alone would be lost on resume).
+		const injection = executionContextMessage(ctx);
+		assert.ok(injection, "the executor still gets a context message");
+		assert.match(String(injection), /pending medium\/low findings \(the single non-high repair cycle\)/);
+		assert.match(String(injection), /F-001 \(medium\)/);
+		assert.match(String(injection), /F-002 \(medium\)/);
+		assert.match(String(injection), /skipReason "deferred: <reason>"/);
+		const cp = loadCheckpoint(workdir, runId).checkpoint;
+		assert.equal(cp.execution?.reviewNonHighRepair, "granted", "the flag rides the checkpoint");
+		assert.equal(cp.execution?.reviewNonHighCredits, 1, "credit 1 while granted");
+		ctl.drainAll();
+		await stopExecution(ctx, "teardown");
+	});
+
+	it("low: never rolls back verified work and appends one task per finding", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-010", "low", ["Task-2"]), finding("F-011", "low", [])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.equal(ex.tasks.find((t) => t.id === "Task-2")!.status, "complete", "a low never rolls back");
+		assert.equal(ex.tasks.find((t) => t.id === "Task-1")!.status, "complete");
+		assert.ok(ex.tasks.find((t) => /^fix F-010:/.test(t.title)), "the mapped low is appended, not rolled back");
+		assert.ok(ex.tasks.find((t) => /^fix F-011:/.test(t.title)), "the unmapped low is appended");
+		assert.equal(wakes(ctx).length, 1);
+		ctl.drainAll();
+		await stopExecution(ctx, "teardown");
+	});
+
+	it("a high/fail-driven pass carries lows without consuming the one-shot", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({
+			round: 1,
+			passed: ["VC-002"],
+			failed: ["VC-001"],
+			undeterminable: [],
+			report: "r1",
+			findings: [finding("F-020", "high", ["Task-1"]), finding("F-021", "low", [])],
+		} as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.equal(ex.reviewNonHighRepair, "available", "the fail-driven pass leaves the one-shot available");
+		assert.ok(ex.tasks.find((t) => /^fix F-021:/.test(t.title)), "the low rode along as an appended task");
+		// Re-close the reopened/appended work; the low-only round now gets the cycle.
+		for (const t of ex.tasks) if (t.status !== "complete" && t.status !== "skipped") applyTaskUpdate(ex.tasks, t.id, "complete", "fixed");
+		persistTaskProgress(ctx);
+		const settle = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 2, passed: ["VC-001"], failed: [], undeterminable: [], report: "r2", findings: [finding("F-021", "low", [])] } as never);
+		await settle;
+		await __awaitReviewRoundForTests();
+		const after = getExecution()!;
+		assert.equal(after.reviewNonHighRepair, "granted", "the low-only round now grants the cycle");
+		assert.equal(wakes(ctx).length, 2, "a second wake for the cycle");
+		ctl.drainAll();
+		await stopExecution(ctx, "teardown");
+	});
+
+	it("the credited re-review round launches and a still-reported finding completes with an honest ledger", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-001", "medium", ["Task-1"]), finding("F-002", "low", [])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		const appended = ex.tasks.find((t) => /^fix F-002:/.test(t.title))!;
+		// The executor repairs and re-closes; the re-review round must still run.
+		applyTaskUpdate(ex.tasks, "Task-1", "complete", "fixed the medium");
+		applyTaskUpdate(ex.tasks, appended.id, "complete", "fixed the low");
+		persistTaskProgress(ctx);
+		const callsBefore = ctl.calls();
+		const settle2 = restoreFromSession(ctx, snapshot());
+		await tick();
+		assert.equal(ctl.calls(), callsBefore + 1, "the credited re-review round launched");
+		ctl.resolveRound({ round: 2, passed: [], failed: [], undeterminable: [], report: "r2", findings: [finding("F-001", "medium", ["Task-1"]), finding("F-002", "low", [])] } as never);
+		await settle2;
+		await __awaitReviewRoundForTests();
+		assert.equal(getExecution(), null, "the one-shot is spent, so the run completes");
+		const done = completions(ctx);
+		assert.equal(done.length, 1);
+		const text = String(done[0].content);
+		assert.doesNotMatch(text, /execution review passed/, "a finding-bearing completion never claims the review passed");
+		assert.match(text, /2 finding\(s\) without a resolved verdict: 2 unresolved, 0 deferred/);
+		assert.match(text, /F-001 \(medium\) — unresolved/, "the rolled-back medium has no repair task");
+		assert.match(text, /F-002 \(low\) — repair claimed — still reported \(task Task-3\)/, "a closed repair task with a still-reported id is labelled honestly");
+		assert.match(text, /The single non-high repair cycle has already been spent\./);
+		ctl.drainAll();
+	});
+
+	it("deferred: a skipped repair task is disclosed with its reason", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-030", "low", [])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		const appended = ex.tasks.find((t) => /^fix F-030:/.test(t.title))!;
+		const skipped = applyTaskUpdate(ex.tasks, appended.id, "skipped", undefined, "deferred: not worth the churn");
+		assert.equal(skipped.ok, true);
+		persistTaskProgress(ctx);
+		const settle2 = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 2, passed: [], failed: [], undeterminable: [], report: "r2", findings: [finding("F-030", "low", [])] } as never);
+		await settle2;
+		await __awaitReviewRoundForTests();
+		assert.equal(getExecution(), null);
+		const text = String(completions(ctx)[0].content);
+		assert.doesNotMatch(text, /execution review passed/);
+		assert.match(text, /F-030 \(low\) — deferred: not worth the churn/);
+		assert.match(text, /0 unresolved, 1 deferred/);
+		ctl.drainAll();
+	});
+
+	it("a replay does not double-append a repeatedly reported unmapped finding", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-040", "high", [], { proposedTask: "harden the guard" })] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		const appended = ex.tasks.find((t) => /^fix F-040:/.test(t.title))!;
+		applyTaskUpdate(ex.tasks, appended.id, "complete", "tried");
+		persistTaskProgress(ctx);
+		const settle2 = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 2, passed: [], failed: [], undeterminable: [], report: "r2", findings: [finding("F-040", "high", [], { proposedTask: "harden the guard" })] } as never);
+		await settle2;
+		await __awaitReviewRoundForTests();
+		const planText = fs.readFileSync(planPath, "utf8");
+		const bullets = planText.split("\n").filter((line) => line.startsWith("- `Task-") && line.includes("fix F-040:"));
+		assert.equal(bullets.length, 1, "the prefix dedup keeps exactly one repair task");
+		ctl.drainAll();
+		await stopExecution(ctx, "teardown");
+	});
+
+	it("a spent numeric budget still funds the exempt cycle and its re-review", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		getExecution()!.reviewBudget = 1;
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-050", "medium", [])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		assert.ok(ex, "a spent budget does not swallow the non-high cycle");
+		assert.equal(ex.audit.rounds, 1, "round 1 is a committed round");
+		assert.equal(ex.reviewNonHighCredits, 1, "billed count = 1 - 1 = 0: not exhausted");
+		const appended = ex.tasks.find((t) => /^fix F-050:/.test(t.title))!;
+		applyTaskUpdate(ex.tasks, appended.id, "complete", "fixed");
+		persistTaskProgress(ctx);
+		const callsBefore = ctl.calls();
+		const settle2 = restoreFromSession(ctx, snapshot());
+		await tick();
+		assert.equal(ctl.calls(), callsBefore + 1, "the exempt re-review round commits past the numeric budget");
+		ctl.resolveRound({ round: 2, passed: [], failed: [], undeterminable: [], report: "r2", findings: [] } as never);
+		await settle2;
+		await __awaitReviewRoundForTests();
+		assert.equal(getExecution(), null, "the clean re-review completes");
+		assert.match(String(completions(ctx)[0].content), /execution review passed/, "a finding-free completion keeps the pass framing");
+		assert.match(String(completions(ctx)[0].content), /repaired during the cycle/, "the cleared repair is shown as repaired, not left behind");
+		ctl.drainAll();
+	});
+
+	it("a spent budget with a mixed high+medium round keeps the high-priority tolerant completion", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		getExecution()!.reviewBudget = 1;
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-060", "high", ["Task-1"]), finding("F-061", "medium", [])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		assert.equal(getExecution(), null, "the tolerated high completion fires");
+		const ex = loadCheckpoint(workdir, "unused").checkpoint; // no-op read guard (path checked below)
+		void ex;
+		const text = String(completions(ctx)[0].content);
+		assert.match(text, /review budget exhausted/);
+		assert.doesNotMatch(text, /execution review passed/);
+		assert.match(text, /F-061 \(medium\) — unresolved/, "the medium is disclosed, not cycled");
+		assert.equal(wakes(ctx).length, 0, "no wake: the tolerant path never rolls back or appends");
+		ctl.drainAll();
+	});
+
+	it("unlimited at the hard cap with a granted cycle completes and discloses the unjudged cycle", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const live = getExecution()!;
+		live.reviewBudget = "unlimited";
+		live.reviewRoundsTotal = 50;
+		live.audit.rounds = 50;
+		live.reviewNonHighRepair = "granted";
+		live.reviewNonHighCredits = 1;
+		live.audit.findings = [finding("F-070", "low", [])] as never;
+		// Every check already passed (the granted cycle is the only thing owed).
+		for (const item of live.items) item.done = true;
+		__setAuditRunnerForTests(async () => {
+			throw new Error("no round may spawn at the cap");
+		});
+		await restoreFromSession(ctx, snapshot());
+		await __awaitReviewRoundForTests();
+		assert.equal(getExecution(), null, "the cap completes the run");
+		const text = String(completions(ctx)[0].content);
+		assert.doesNotMatch(text, /execution review passed/);
+		assert.match(text, /granted but could not be re-judged/);
+		assert.match(text, /F-070 \(low\) — unresolved/);
+		__setAuditRunnerForTests(null);
+	});
+
+	it("a legacy checkpoint without the flag never reopens a cycle for already-recorded findings", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const live = getExecution()!;
+		live.audit.rounds = 1;
+		live.audit.findings = [finding("F-080", "medium", [])] as never;
+		// Checks already passed before the upgrade; the residual is what a
+		// pre-v0.10 checkpoint carries (no flag at all).
+		for (const item of live.items) item.done = true;
+		delete (live as { reviewNonHighRepair?: unknown }).reviewNonHighRepair;
+		delete (live as { reviewNonHighCredits?: unknown }).reviewNonHighCredits;
+		let spawned = 0;
+		__setAuditRunnerForTests(async () => {
+			spawned += 1;
+			return { round: 1, passed: [], failed: [], undeterminable: [], report: "", findings: [] } as never;
+		});
+		await restoreFromSession(ctx, snapshot());
+		await __awaitReviewRoundForTests();
+		assert.equal(spawned, 0, "legacy findings never owe a repair round");
+		assert.ok(getExecution(), "legacy findings neither grant a cycle nor spuriously complete the run");
+		assert.equal(getExecution()!.reviewNonHighRepair, undefined, "the flag stays absent");
+		assert.equal(wakes(ctx).length, 0);
+		__setAuditRunnerForTests(null);
+	});
+
+	it("a no-report re-review round completes with the honest ledger instead of spinning", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		const restoring = restoreFromSession(ctx, snapshot());
+		await tick();
+		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "r1", findings: [finding("F-090", "low", [])] } as never);
+		await restoring;
+		await __awaitReviewRoundForTests();
+		const ex = getExecution()!;
+		const appended = ex.tasks.find((t) => /^fix F-090:/.test(t.title))!;
+		applyTaskUpdate(ex.tasks, appended.id, "complete", "fixed");
+		persistTaskProgress(ctx);
+		const settle2 = restoreFromSession(ctx, snapshot());
+		await tick();
+		// Round 2 produces NO report. Plan Task-2.5 pins the fail-closed
+		// boundary: the preserved finding completes with the honest ledger (the
+		// granted cycle counts as spent) instead of spawning another round that
+		// only ever burns budget toward a cap pause.
+		ctl.resolveRound(null);
+		await settle2;
+		await __awaitReviewRoundForTests();
+		assert.equal(getExecution(), null, "a no-report round completes with disclosure, not a spin");
+		assert.equal(ctl.calls(), 2, "no third round was spawned");
+		const text = String(completions(ctx)[0].content);
+		assert.doesNotMatch(text, /execution review passed/);
+		assert.match(text, /F-090 \(low\) — repair claimed — still reported \(task Task-3\)/);
+		assert.match(text, /granted but could not be re-judged/);
+		ctl.drainAll();
+	});
+
+	it("a /plans-execute grant normalizes the credit against the flag (no stale free round)", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		// A granted cycle pending at an exhausted (billed) numeric budget with a
+		// check still owed: the restore pauses at the cap, and the grant zeroes
+		// `audit.rounds` — the credit must be re-derived from the flag there.
+		const live = getExecution()!;
+		live.audit.rounds = 4; // billed 4 - 1 = 3 of 3 → exhausted
+		live.audit.findings = [finding("F-095", "medium", [])] as never;
+		live.reviewBudget = 3;
+		live.reviewRoundsTotal = 4;
+		live.reviewNonHighRepair = "granted";
+		live.reviewNonHighCredits = 1;
+		const ctl = controlledRunner();
+		__setAuditRunnerForTests(ctl.runner);
+		await restoreFromSession(ctx, snapshot());
+		assert.equal(getExecution()!.stall.paused, true, "billed 3 of 3 pauses");
+		const { resumeActiveExecution } = await import("../src/exec.ts");
+		const granted = await resumeActiveExecution(menuCtx(workdir, "2"));
+		assert.equal(granted.resumed, true);
+		assert.equal(granted.grantedBudget, 2);
+		const ex = getExecution()!;
+		assert.equal(ex.audit.rounds, 0, "the per-grant counter resets");
+		assert.equal(ex.reviewNonHighRepair, "granted", "the pending cycle survives the grant");
+		assert.equal(ex.reviewNonHighCredits, 1, "the credit is re-derived from the flag, never stale");
+		assert.equal(ex.stall.paused, false);
+		await tick();
+		assert.equal(ctl.calls(), 1, "the credited re-review round launches inside the fresh window (billed from 0)");
+		ctl.drainAll();
+		await stopExecution(ctx, "teardown");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("a used flag never carries a stale credit into a restored window", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const live = getExecution()!;
+		for (const item of live.items) item.done = true;
+		live.audit.findings = [finding("F-098", "low", [])] as never;
+		live.reviewNonHighRepair = "used";
+		live.reviewNonHighCredits = 1; // a stale monotonic counter from a pre-fix build
+		__setAuditRunnerForTests(async () => {
+			throw new Error("no round may spawn for a spent cycle");
+		});
+		await restoreFromSession(ctx, snapshot());
+		assert.equal(getExecution()!.reviewNonHighCredits, 0, "the credit is derived from `used`, not trusted");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("the dashboard review counter reports the billed round count (v0.10)", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const live = getExecution()!;
+		live.audit.rounds = 1;
+		live.audit.findings = [finding("F-096", "low", [])] as never;
+		live.reviewBudget = 3;
+		live.reviewNonHighRepair = "granted";
+		live.reviewNonHighCredits = 1;
+		const statuses: string[] = [];
+		(ctx as { ui: { setStatus: (key: string, text: string) => void } }).ui.setStatus = (_key, text) => statuses.push(text);
+		const { updateStatusWidget } = await import("../src/exec.ts");
+		updateStatusWidget(ctx);
+		const text = statuses.join("\n");
+		assert.match(text, /review r0\/3/, "the granted cycle is billed: round 0 of 3, not the raw 1");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("TERMINATION.md lists non-high findings as unresolved (v0.10)", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const live = getExecution()!;
+		live.audit.findings = [finding("F-097", "medium", [])] as never;
+		const { terminationSummary, renderTerminationRecord } = await import("../src/exec.ts");
+		const record = renderTerminationRecord(terminationSummary(live, "run-1"), { at: "2026-10-05T00:00:00Z" });
+		assert.match(record, /- F-097 \(unresolved\)/, "non-high ids are labelled unresolved, never residual");
+		__setAuditRunnerForTests(null);
+	});
+
+	it("the reviewer brief renders the executor's per-finding disposition (v0.10)", async () => {
+		const { buildAuditTask } = await import("../src/auditor.ts");
+		const checks = [{ id: "VC-001", text: "`VC-001` covers `Task-1`; pass condition: x", done: false }];
+		const tasks = buildTaskView(parsePlanTasks("## Tasks\n\n- Task-1: a — wave: 1\n"), {});
+		const prior = [
+			{ id: "F-001", severity: "medium" as const, taskIds: ["Task-1"], note: "medium item", evidence: "src/a.ts", raw: "" },
+			{ id: "F-002", severity: "low" as const, taskIds: [], note: "low item", evidence: "src/b.ts", raw: "" },
+		];
+		const dispositions = new Map([
+			["F-001", "repaired by Task-3; no longer reported"],
+			["F-002", "deferred: not worth the churn"],
+		]);
+		const task = buildAuditTask("/tmp/PLAN_v1.md", checks, tasks, 4, prior, dispositions);
+		assert.match(task, /`F-001` — severity: medium; tasks: Task-1; note: medium item; disposition: repaired by Task-3/);
+		assert.match(task, /`F-002` — severity: low; tasks: none; note: low item; disposition: deferred: not worth the churn/);
 	});
 });
