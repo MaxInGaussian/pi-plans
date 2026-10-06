@@ -48,6 +48,18 @@ inspection.
    version table, until the last version has executed and passed review. Only
    then does the run become terminal (`done`).
 
+## Entry From plan-with-refs
+
+A huge build that also needs external references enters here through
+`plan-with-refs`, which fixes the plan's shape after analyzing them. Keep that
+same run: never start a new run and never restart the existing one — its
+recorded `skill` stays `plan-with-refs`, and this skill's stage order,
+question depth, checkpoint transitions and gates apply unchanged. The
+reference analyses and adoption answers already recorded in `REF_ANALYSIS.md`
+are the evidence for the overall plan and every version; do not download those
+references again. Append a reference only when a version introduces a new
+technology or when a key design decision is genuinely contested.
+
 ## Checkpoint Transitions
 
 Every stage boundary is a `plans` `record-checkpoint` call; skipping one
@@ -89,9 +101,10 @@ disables the gate that rides on it:
 - **References** (`## Evidence`): every version plan cites 1-3 related
   open-source GitHub projects (at least one) whose ideas informed it, with a
   one-line takeaway each. A version plan with zero GitHub references gets a
-  run notice visible in `/plans`; the check is advisory. Only when a key
-  design decision is genuinely contested, download references and run the
-  `analyze_refs` tool (respect `refs_root` from `plans` `show`).
+  run notice visible in `/plans`; the check is advisory. Append a reference,
+  download it, and run the `analyze_refs` tool only when a version introduces
+  a new technology or when a key design decision is genuinely contested
+  (respect `refs_root` from `plans` `show`).
 - **Rounds and names**: `PLAN_overall_vN.md` for the overall stream and
   `PLAN_vX.Y.Z_vN.md` for a version stream, where the trailing `vN` is the
   revision round of that stream. Never write a plain `PLAN_vN.md` into a huge

@@ -127,7 +127,9 @@ export interface ImplementationReviewState {
 	/** Serialized termination condition chosen by the user; undefined = not yet asked. */
 	terminationCondition?: string;
 	/** Concurrent reviewers per round (1-3), chosen per run; undefined = falls
-	 * back to the skill-level default (plan-big / plan-with-refs → 3, others → 1). */
+	 * back to the skill-level default (plan-big / plan-huge → 3; plan-with-refs
+	 * follows the shape it chose after reference analysis — plan-normal → 1,
+	 * plan-big / plan-huge → 3; others → 1). */
 	reviewerCount?: number;
 	/** Whole rounds fully disposed in the CURRENT worktree (source-worktree rounds are history only). */
 	completedRounds: number;

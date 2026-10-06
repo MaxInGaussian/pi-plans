@@ -6,7 +6,7 @@ This reference is shared by the `pi-plans` skills. It is a planning workflow onl
 
 This skill set is written for the Pi coding agent's documented behavior:
 
-- the five skills are contributed by the pi-plans extension and loaded as Pi skills (also invokable as `/skill:<name>`);
+- the seven skills are contributed by the pi-plans extension and loaded as Pi skills (also invokable as `/skill:<name>`);
 - skill references and helper sources are resolved relative to the directory containing `SKILL.md`;
 - Planning and reference analysis run with the extension tools `plans`, `ask_choice`, `refine`, `analyze_refs`, and `execute_plan`;
 - `refine` spawns read-only Pi subagents (`pi --mode json -p --no-session --tools read,grep,find,ls`, plus `code_graph` when workspace `graph_enabled` is true) with isolated context; delegated reviewer runs show a standalone aggregate overlay titled `Reviewer` (78% × 78% top-center, ≥72 cols, no input row), stream assistant/thinking/tool events into per-lane transcripts with follow-bottom scroll, dismiss on `Esc` (close-only — the refiner child keeps running and its result still flows back as tool output), replace any retained finished overlay when a new round begins, and return conclusions to the main session as tool output; `analyze_refs` spawns one read-only subagent per downloaded reference (cwd = that ref's directory) reusing the reviewer role gates, shows the same overlay titled `Refs` in batches of at most 3 lanes, and returns structured per-reference sections for `REF_ANALYSIS.md`;
@@ -109,7 +109,7 @@ After each plan version, ask one merged accept/execute question via `ask_choice`
 2. `Accept PLAN_vN, don't execute yet` — mark accepted; resume later via `/plans-execute`.
 3. `Run another round: <the level's default next refine mode>` — only while the level's default sequence is unfinished.
 
-The recommended option follows the skill level's default sequence: while the default round is unfinished it is option 3 (`plan-small` / `plan-normal`: one reviewer round; `plan-big` / `plan-with-refs`: three concurrent reviewers via `refine` with `reviewers: 3`); once the default round is complete it is option 1. Every round returns findings (`F-###`) and up to five questions (`Q-1..Q-5`) in the same output.
+The recommended option follows the skill level's default sequence: while the default round is unfinished it is option 3 (`plan-small` / `plan-normal`: one reviewer round; `plan-big` / `plan-huge`: three concurrent reviewers via `refine` with `reviewers: 3`; `plan-with-refs`: three concurrent reviewers, or one when its plan shape is `plan-normal`); once the default round is complete it is option 1. Every round returns findings (`F-###`) and up to five questions (`Q-1..Q-5`) in the same output.
 
 If the user selects another round, run the `refine` tool with the plan path and any focus. Reviewer output consolidates into `PLAN_vN_reviewer_comments.md` with findings IDs, severity, affected plan IDs, evidence, impact, recommended fix, and disposition. Revise the next plan only for findings accepted on evidence.
 
@@ -124,6 +124,33 @@ Merge the rounds' `Questions` sections into one deduped list and ask EVERY quest
 ### Round Lifecycle
 
 A refinement round is complete when all reviewer lanes have returned; each lane's output carries findings (`F-###`) and up to five questions (`Q-1..Q-5`). In the same turn: consolidate, accept or reject each finding on evidence (the user may override any disposition), revise to `PLAN_v(N+1).md` when accepted items require it (copy, edit only the new version, update the revision ledger and verifier checklist), then immediately ask the next merged accept/execute question. Never end a turn merely because a round completed.
+
+## plan-with-refs (Plan Shape Branch)
+
+`plan-with-refs` fixes the plan's shape only after every downloaded reference has an `analyze_refs`
+analysis and its adoption answers recorded, and before the run's first plan file is written. The
+agent recommends the shape — `plan-normal`, `plan-big`, or `plan-huge` — and asks for it as one
+`ask_choice` single-question call with `questionId: refs-plan-shape` and `autoComplete: false`; the
+recorded answer lands in the run's decision ledger and in the `## Plan Shape` section of
+`REF_ANALYSIS.md`. That routing question never counts against a skill's question minimum, it comes
+before the final scope confirmation, and the final scope confirmation stays its own single-question
+call. Recommend `plan-huge` when the prompt asks for multiple product versions planned, executed,
+and reviewed one at a time (2–10 strictly ascending versions) or when the workload clearly exceeds
+a single `plan-big` plan; default to `plan-big` when the shape is genuinely ambiguous; choose
+`plan-normal` when the analyzed references shrink the work to a broad but bounded change (the ≥3
+qualifying references and ≥3 adoption questions per reference still apply).
+
+Depth and reviewers follow the chosen shape: `plan-normal` keeps that skill's single reviewer and
+bounded refinement, while `plan-big` and `plan-huge` keep at least ten questions and `refine` with
+`reviewers: 3`. A `plan-huge` shape continues in the SAME run — the run's recorded `skill` stays
+`plan-with-refs` and no new run is started — by writing `PLAN_overall_vN.md` and recording `plans`
+`record-checkpoint` transition `overall-plan-written`, after which the whole plan-huge stage order
+applies (all six transitions, the deferred gate, the Evidence lint). The versions reuse the
+analyzed references recorded in `REF_ANALYSIS.md` instead of downloading them again, and append a
+new reference only when a version introduces a new technology or when a key design decision is
+genuinely contested. A version plan whose references are all papers, blogs, or documentation sites
+cites those analyzed URLs in `## Evidence` and accepts the advisory `huge-refs` run notice rather
+than inventing a GitHub URL.
 
 ## plan-huge (Multi-Version Builds)
 
@@ -191,8 +218,8 @@ counts. The tool rejects a version plan that leaves items unprocessed.
 **References.** Every version plan cites 1–3 related open-source GitHub
 projects (at least one) in its `## Evidence` section. Zero references produce a
 run notice visible in `/plans`; the check is advisory, never a hard block.
-Download and run `analyze_refs` only when a design decision is genuinely
-contested.
+Download and run `analyze_refs` only when a version introduces a new
+technology or when a key design decision is genuinely contested.
 
 **Review budget.** The execution-review budget and termination condition are
 asked once, on the first version's handoff; each completion archives them in

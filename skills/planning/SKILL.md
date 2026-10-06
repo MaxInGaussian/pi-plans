@@ -10,8 +10,8 @@ Use this skill when a task is planning-related but the right specialist is not o
 ## Routing
 
 1. If the request is a bug, CI failure, regression, incident, or debug-why case, route to `debug-and-plan`.
-2. If the plan depends on external projects, articles, papers, or docs, route to `plan-with-refs`.
-3. If the work spans multiple product versions the user wants to plan, build, and review one at a time (a huge build), route to `plan-huge`.
+2. If the plan depends on external projects, articles, papers, or docs, route to `plan-with-refs` — including when the work spans multiple product versions, because that skill fixes the plan's shape (plan-normal, plan-big, or plan-huge) after the references are analyzed and can continue the same run as a huge build.
+3. If the work spans multiple product versions the user wants to plan, build, and review one at a time (a huge build) and no external references are needed, route to `plan-huge`.
 4. If the work is open-ended, cross-system, high-risk, or likely beyond ten decisions, route to `plan-big`.
 5. If the work is broad or risky but bounded, route to `plan-normal`.
 6. Otherwise route to `plan-small`.

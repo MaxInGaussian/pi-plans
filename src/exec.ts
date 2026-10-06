@@ -3294,7 +3294,7 @@ export function hugeVersionCompletionMessage(input: {
 	summary: string;
 	residualNote: string;
 }): string {
-	const tail = `(${input.position}) \`${input.planPath}\` — the run stays in planning${input.next ? `; the next version is ${input.next}` : ""}. Plan the next version with the plan-huge skill; the overall plan is never executable.\n\n${input.summary}${input.residualNote}`;
+	const tail = `(${input.position}) \`${input.planPath}\` — the run stays in planning${input.next ? `; the next version is ${input.next}` : ""}. Plan the next version with the plan-huge skill — or with plan-with-refs when references must shape it; the overall plan is never executable.\n\n${input.summary}${input.residualNote}`;
 	return input.findingCount > 0
 		? `**Version ${input.version} complete — ${input.findingCount} review finding(s) without a resolved verdict: ${input.unresolvedCount} unresolved, ${input.deferredCount} deferred.** ⚠️ ${tail}`
 		: `**Version ${input.version} complete** ✅ ${tail}`;

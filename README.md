@@ -29,7 +29,7 @@
 - **Nothing is writable before you approve.** Planning, questions, and refinement run read-only: `edit`/`write` are blocked outside planning artifacts until the merged, never-auto-completed handoff lifts the guard. → [Safety model](#safety-model)
 - **One tabbed form per round.** Related questions are submitted together as one `questions: [...]` form (2–8 items) with a submit page, and every option states its advantage and its drawback as `✓ … / ✗ …`. → [What it does](#what-it-does)
 - **Reviewer subagents that converge.** Read-only `refine` lanes return severity-graded findings (`F-###`) plus up to five questions, rendered in a `Reviewer` overlay; `plan-big` and `plan-huge` run three concurrent lanes. → [Visible Refiner overlay](#visible-refiner-overlay)
-- **Multi-version product builds.** `plan-huge` keeps one run and one artifact directory: an abstract overall plan with a 2–10 version table, then each version planned, executed, and execution-reviewed before the next one starts. → [Skills](#skills)
+- **Multi-version product builds.** `plan-huge` — reachable directly or through `plan-with-refs` once the analyzed references fix the shape — keeps one run and one artifact directory: an abstract overall plan with a 2–10 version table, then each version planned, executed, and execution-reviewed before the next one starts. → [Skills](#skills)
 - **Tracked execution with evidence.** The current wave and remaining tasks are injected every turn, and `plans_update_task` records status plus evidence per task; a compact dashboard, a stall watchdog, and a live status bar follow along. → [What it does](#what-it-does)
 - **Independent execution review.** When the task tree goes terminal, a detached read-only round verifies every `VC-###` check and reports findings of its own, under a per-run budget you choose once. → [What it does](#what-it-does)
 - **Deterministic compaction.** Active planning and execution compactions use a no-LLM VCC-style compiler with five bracket sections, a smart recent tail, and `keep:N`. → [VCC compact](#vcc-compact)
@@ -178,7 +178,7 @@ Planning artifacts live under `./.git/pi-plans/plans/YYYY-MM-DD-<topic>/` by def
 <details>
 <summary><b>Planning router + six specialist skills</b></summary>
 
-`planning` inspects the request and routes to the narrowest specialist: `plan-small` (1–3 questions, one reviewer round), `plan-normal` (5–10 questions), `plan-big` (10+ questions, three concurrent reviewers), `plan-huge` (multi-version streams), `plan-with-refs` (external references analyzed before planning), and `debug-and-plan` (diagnose a bug or CI failure before planning). Every specialist shares the same state, language, question, and reviewer rules, so switching depth never changes what is recorded.
+`planning` inspects the request and routes to the narrowest specialist: `plan-small` (1–3 questions, one reviewer round), `plan-normal` (5–10 questions), `plan-big` (10+ questions, three concurrent reviewers), `plan-huge` (multi-version streams), `plan-with-refs` (external references analyzed before planning; it then fixes the plan's shape — `plan-normal`, `plan-big`, or `plan-huge` — and a huge shape continues the same run as a multi-version build), and `debug-and-plan` (diagnose a bug or CI failure before planning). Every specialist shares the same state, language, question, and reviewer rules, so switching depth never changes what is recorded.
 
 </details>
 
@@ -341,7 +341,7 @@ Invoked via `resources_discover`, callable as `/skill:<name>`, directly as `/<na
 | [`plan-big`](skills/plan-big/SKILL.md) | Open-ended/high-risk effort; 10+ questions | three concurrent reviewers |
 | [`plan-huge`](skills/plan-huge/SKILL.md) | Multi-version product builds: one abstract overall plan (`PLAN_overall_vN.md`: version table, architecture, file map, UX, final objective), then per-version plans (`PLAN_vX.Y.Z_vN.md`, 2–10 versions) each planned, reviewed, executed, and execution-reviewed before the next version; runs stay non-terminal between versions | three concurrent reviewers per version |
 | [`debug-and-plan`](skills/debug-and-plan/SKILL.md) | Bug, CI failure, regression, incident — diagnose before planning | follows the routed level |
-| [`plan-with-refs`](skills/plan-with-refs/SKILL.md) | External references must be analyzed before planning — repos, papers (arXiv), engineering blogs, and docs sites all count; theoretical references are equal citizens. plan-normal/plan-big may optionally cite 1–2 search-found references without downloading | three concurrent reviewers |
+| [`plan-with-refs`](skills/plan-with-refs/SKILL.md) | External references must be analyzed before planning — repos, papers (arXiv), engineering blogs, and docs sites all count; theoretical references are equal citizens. After the analyses it fixes the plan's shape (`plan-normal`, `plan-big`, or `plan-huge`) from the prompt's workload, and a huge shape continues in the same run as a multi-version build. plan-normal/plan-big may optionally cite 1–2 search-found references without downloading | three concurrent reviewers (one for the plan-normal shape) |
 
 ## Installation details
 
