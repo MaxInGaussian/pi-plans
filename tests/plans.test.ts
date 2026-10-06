@@ -104,13 +104,10 @@ describe("pre-plan compaction wiring", () => {
 		assert.match(source, /markPrePlanCompactPending\(ctx, result\.run\.run_id\);/);
 	});
 
-	it("index.ts consumes the pending flag from the plans tool_result hook", () => {
-		const source = fs.readFileSync(path.join(ROOT, "index.ts"), "utf8");
-		assert.match(source, /consumePrePlanCompactPending/);
-		assert.match(source, /customInstructions: PLANNING_PREPLAN_COMPACT_HINT/);
-		assert.match(source, /sendPrePlanCompactResume\(ctx\)/);
-		assert.match(source, /pre-plan compaction skipped; continuing planning\./);
-	});
+	// The rest of the pre-plan contract is behavioural and lives in
+	// tests/preplan-compaction.test.ts: the request becomes a `turn_end`
+	// compaction draft (no abort, no resume), the execution guard drops it, the
+	// setting-off path stays silent, and a manual compaction resumes once.
 });
 
 

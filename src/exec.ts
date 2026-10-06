@@ -45,6 +45,13 @@ import {
 	type VccCompactionBuildResult,
 	type VccCompactionStats,
 } from "./compaction.ts";
+import {
+	clearDisplacedAbort,
+	consumeDisplacedAbort,
+	isAbortErrorMessage,
+	markPrePlanCompactPending,
+	pendingDisplacedAbort,
+} from "./compaction-lifecycle.ts";
 import { TERMINAL_RUN_STATUSES, getRun, latestRun, lintPlanIntoNotices, listRuns, loadConfig, readActive, resolveStateRootOrNull, runDirPath, setRunStatus, StateError, utcNow } from "./state.ts";
 import { resolveUiLanguage, hugeChrome, terminationChrome, type UiLanguage } from "./ui-language.ts";
 import { parseHugePlanName, hugePlanFileName } from "./huge-plan.ts";
@@ -2273,7 +2280,9 @@ function isInteractiveSession(ctx: ExtensionContext): boolean {
 
 const EXECUTION_RESUME_CUSTOM_TYPE = "pi-plans-exec-resume";
 
-function activeVccSettings(ctx: ExtensionContext, phase: PiPlansCompactionPhase): { settings: PiPlansVccSettings; runId: string; artifactDir: string } | null {
+/** Exported for the `turn_end` pre-plan draft path (index.ts): it needs the
+ *  same active-settings/run resolution the `session_before_compact` path uses. */
+export function activeVccSettings(ctx: ExtensionContext, phase: PiPlansCompactionPhase): { settings: PiPlansVccSettings; runId: string; artifactDir: string } | null {
 	const stateRoot = resolveStateRootOrNull(ctx.cwd);
 	if (!stateRoot) return null;
 	const active = resolveActiveRun(ctx.sessionManager, ctx.cwd);
@@ -2297,7 +2306,7 @@ function executionVccContext(): PiPlansVccPhaseContext {
 	};
 }
 
-function planningVccContext(branchEntries: CompactionEntryLike[], fallback: { runId?: string; artifactDir?: string }): PiPlansVccPhaseContext {
+export function planningVccContext(branchEntries: CompactionEntryLike[], fallback: { runId?: string; artifactDir?: string }): PiPlansVccPhaseContext {
 	let runId: string | null = fallback.runId ?? null;
 	let artifactDir: string | null = fallback.artifactDir ?? null;
 	let planPath: string | null = null;
@@ -2375,6 +2384,125 @@ function runtimePiVersion(ctx: ExtensionContext): unknown {
 	return (ctx as ExtensionContext & { piVersion?: unknown }).piVersion ?? VERSION;
 }
 
+// ---------------------------------------------------------------------------
+// Manual compaction resume
+//
+// A manual compaction (`/compact`, RPC, or an extension request) starts with
+// `AgentSession.abort()` and never continues the interrupted turn. When such a
+// compaction displaces live pi-plans work, the run would otherwise strand
+// until the user types something. The abort is observed from the message
+// stream (`noteAssistantMessage` in index.ts) and consumed at the compaction's
+// terminal event, so exactly one resume is sent per displaced manual
+// compaction — on success AND on failure (a failed compaction still aborted
+// the turn).
+//
+// The gate is the RAW `continueAfterThresholdCompact` setting. It must NOT be
+// `shouldScheduleAutoContinue`: that predicate is version-gated by
+// PI_SELF_RESUME_VERSION and returns false on pi >= 0.84.4, which would make
+// this resume dead code on every supported host.
+// ---------------------------------------------------------------------------
+
+interface ManualResumeCarrier {
+	__piPlansManualCompactionResume?: { sent: boolean } | null;
+}
+
+function manualResumeCarrier(ctx: ExtensionContext): ManualResumeCarrier | null {
+	return (ctx.sessionManager as unknown as ManualResumeCarrier) ?? null;
+}
+
+/** Clears the once-per-compaction latch (compaction start, user input, or a
+ *  fresh agent run). */
+export function resetManualCompactionResume(ctx: ExtensionContext): void {
+	const carrier = manualResumeCarrier(ctx);
+	if (carrier) carrier.__piPlansManualCompactionResume = null;
+}
+
+function loadContinueAfterThresholdCompact(ctx: ExtensionContext): boolean {
+	const stateRoot = resolveStateRootOrNull(ctx.cwd);
+	if (!stateRoot) return false;
+	try {
+		scaffoldVccSettings(stateRoot);
+		return loadVccSettings(stateRoot).continueAfterThresholdCompact;
+	} catch {
+		return false;
+	}
+}
+
+/** Lifts the stall pause the settle path latched when the aborted turn looked
+ *  like an agent failure, so the resume cannot wake an already-paused run.
+ *  A review-budget pause is fail-closed and stays untouched (only
+ *  `/plans-execute` lifts it). */
+function clearCompactionStallPause(ctx: ExtensionContext): void {
+	const ex = getExecution();
+	if (!ex?.stall.paused) return;
+	if (isReviewPauseReason(ex.stall.pausedReason)) return;
+	ex.stall.paused = false;
+	ex.stall.pausedReason = undefined;
+	ex.stall.rounds = 0;
+	ex.stall.lastSnapshot = stallSnapshot();
+	if (ex.blocked) {
+		ex.blocked.escalatedRounds = 0;
+		ex.blockedWakeTasks = undefined;
+	}
+	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { pausedReason: null, blocked: ex.blocked }));
+	persist(ctx);
+	updateStatusWidget(ctx);
+}
+
+/** Sends the one resume owed to a displaced manual compaction. Returns whether
+ *  a resume was sent; a failed send leaves the attribution in place so the
+ *  next compaction end can retry. */
+function resumeAfterDisplacedManualCompaction(
+	ctx: ExtensionContext,
+	phase: CompactionPhase,
+	pendingContinueSetting: boolean,
+): boolean {
+	if (!pendingDisplacedAbort(ctx)) return false;
+	if (!pendingContinueSetting && !loadContinueAfterThresholdCompact(ctx)) {
+		// Auto-continue disabled: still consume the attribution so it cannot leak
+		// into a later compaction of a different kind.
+		consumeDisplacedAbort(ctx);
+		return false;
+	}
+	const carrier = manualResumeCarrier(ctx);
+	if (carrier?.__piPlansManualCompactionResume?.sent) {
+		consumeDisplacedAbort(ctx);
+		return false;
+	}
+	try {
+		if (phase === "execution") {
+			clearCompactionStallPause(ctx);
+			const state = executionCompactionState(ctx);
+			if (state) state.resumeGuard = true;
+			messaging().sendMessage(
+				{
+					customType: EXECUTION_RESUME_CUSTOM_TYPE,
+					content: EXECUTION_COMPACTION_RESUME_MESSAGE,
+					display: false,
+				},
+				{ triggerTurn: true },
+			);
+		} else {
+			const session = ctx.sessionManager as unknown as { __planningCompaction?: PlanningCompactionState };
+			if (session.__planningCompaction) session.__planningCompaction.resumeGuard = true;
+			messaging().sendMessage(
+				{
+					customType: PLANNING_RESUME_CUSTOM_TYPE,
+					content: "Continue planning.",
+					display: false,
+				},
+				{ triggerTurn: true },
+			);
+		}
+		// Latch only AFTER a successful send.
+		if (carrier) carrier.__piPlansManualCompactionResume = { sent: true };
+		clearDisplacedAbort(ctx);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export async function handleExecutionCompact(ctx: ExtensionContext, event: SessionCompactEvent): Promise<void> {
 	if (!execution) return;
 	const state = ensureExecutionCompactionState(ctx);
@@ -2408,6 +2536,12 @@ export async function handleExecutionCompact(ctx: ExtensionContext, event: Sessi
 			);
 		}
 	}
+	// Outside the stats gate on purpose: a manual compaction can land with
+	// pi-default (non-VCC) content or no stats at all, and a displaced turn
+	// still needs its single resume.
+	if (event.reason === "manual") {
+		resumeAfterDisplacedManualCompaction(ctx, "execution", continueAfterThresholdCompact);
+	}
 	requestExecutionFlush();
 	updateStatusWidget(ctx);
 }
@@ -2433,6 +2567,9 @@ export function handleExecutionCompactFailed(ctx: ExtensionContext, event: Sessi
 			? "pi-plans: compaction found nothing to summarize; backing off until the session grows past the keep-recent window."
 			: "pi-plans: compaction was aborted (provider interruption, user cancel, or a competing manual compact); backing off until the session grows or usage nears the window.";
 		ctx.ui.notify(message, "info");
+		if (event.reason === "manual") {
+			resumeAfterDisplacedManualCompaction(ctx, "execution", false);
+		}
 		requestExecutionFlush();
 		return;
 	}
@@ -2450,6 +2587,9 @@ export function handleExecutionCompactFailed(ctx: ExtensionContext, event: Sessi
 		`pi-plans: compaction failed (${event.reason}); execution remains active and will wait for the next eligible turn.`,
 		"warning",
 	);
+	if (event.reason === "manual") {
+		resumeAfterDisplacedManualCompaction(ctx, "execution", false);
+	}
 	requestExecutionFlush();
 }
 
@@ -2469,32 +2609,11 @@ const PLANNING_RESUME_CUSTOM_TYPE = "pi-plans-plan-resume";
 export { PLANNING_PREPLAN_COMPACT_HINT };
 export const PLANNING_PREPLAN_RESUME_CUSTOM_TYPE = "pi-plans-preplan-resume";
 
-interface PrePlanCompactPending {
-	runId: string;
-}
-
-export function markPrePlanCompactPending(ctx: ExtensionContext, runId: string): void {
-	const session = ctx.sessionManager as unknown as { __piPlansPrePlanCompact?: PrePlanCompactPending | null };
-	session.__piPlansPrePlanCompact = { runId };
-}
-
-export function consumePrePlanCompactPending(ctx: ExtensionContext): PrePlanCompactPending | null {
-	const session = ctx.sessionManager as unknown as { __piPlansPrePlanCompact?: PrePlanCompactPending | null };
-	const pending = session.__piPlansPrePlanCompact ?? null;
-	session.__piPlansPrePlanCompact = null;
-	return pending;
-}
-
-export function sendPrePlanCompactResume(ctx: ExtensionContext): void {
-	messaging().sendMessage(
-		{
-			customType: PLANNING_PREPLAN_RESUME_CUSTOM_TYPE,
-			content: "Continue planning.",
-			display: false,
-		},
-		{ triggerTurn: true },
-	);
-}
+/** Pre-plan requests live in `src/compaction-lifecycle.ts`; re-exported here so
+ *  the `plans start-run` call site (tools/plans.ts) keeps its import path. The
+ *  old consume-and-compact pair is gone: the request now becomes a `turn_end`
+ *  boundary draft that never aborts the running turn. */
+export { markPrePlanCompactPending };
 
 interface PlanningCompactionState {
 	inFlight: boolean;
@@ -2530,15 +2649,9 @@ function isTerminalCompactionFailure(event: { errorMessage?: string; aborted?: b
 	if (message.includes("nothing to compact") || message.includes("already compacted") || message.includes("session too small")) {
 		return { kind: "content" };
 	}
-	const abortPatterns = [
-		"this operation was aborted",
-		"aborted",
-		"stream ended before a terminal response event",
-		"turn prefix summarization failed",
-		"auto-compaction failed",
-		"context overflow recovery failed",
-	];
-	if (abortPatterns.some((pattern) => message.includes(pattern))) {
+	// Shared abort predicate (src/compaction-lifecycle.ts) so the compaction
+	// classifier and the displaced-turn observation cannot drift apart.
+	if (isAbortErrorMessage(message)) {
 		return { kind: "abort-stream" };
 	}
 	if (event.aborted === true) {
@@ -2570,6 +2683,8 @@ function isExecutionCustomInstructions(hint: unknown): boolean {
 
 export function noteCompactionStarted(ctx: ExtensionContext, customInstructions: unknown): void {
 	const store = compactionLifecycleStore(ctx);
+	// Each compaction gets a fresh once-per-compaction resume latch.
+	resetManualCompactionResume(ctx);
 	if (isPlanningCustomInstructions(customInstructions)) {
 		store.planning = true;
 	} else if (isExecutionCustomInstructions(customInstructions)) {
@@ -2699,6 +2814,11 @@ export async function handlePlanningCompact(ctx: ExtensionContext, event: Sessio
 			);
 		}
 	}
+	// A user `/compact` during a live planning run aborts the turn and the host
+	// never continues it; resume it once when the abort displaced real work.
+	if (event.reason === "manual") {
+		resumeAfterDisplacedManualCompaction(ctx, "planning", continueAfterThresholdCompact);
+	}
 }
 
 export function handlePlanningCompactFailed(ctx: ExtensionContext, event: SessionCompactFailedEvent): void {
@@ -2721,6 +2841,9 @@ export function handlePlanningCompactFailed(ctx: ExtensionContext, event: Sessio
 			? "pi-plans: compaction found nothing to summarize; backing off until the session grows past the keep-recent window."
 			: "pi-plans: compaction was aborted (provider interruption, user cancel, or a competing manual compact); backing off until the session grows or usage nears the window.";
 		ctx.ui.notify(message, "info");
+		if (event.reason === "manual") {
+			resumeAfterDisplacedManualCompaction(ctx, "planning", false);
+		}
 		return;
 	}
 	state.inFlight = false;
@@ -2734,6 +2857,9 @@ export function handlePlanningCompactFailed(ctx: ExtensionContext, event: Sessio
 		`pi-plans: planning compaction failed (${event.reason}); will try again on the next eligible turn.`,
 		"warning",
 	);
+	if (event.reason === "manual") {
+		resumeAfterDisplacedManualCompaction(ctx, "planning", false);
+	}
 }
 
 export function filterPlanningResumeMessages<T extends { customType?: string }>(messages: T[]): T[] {

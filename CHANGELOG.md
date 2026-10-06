@@ -4,11 +4,19 @@
 
 ### Fixed
 
+- **Pre-plan compaction aborted the running turn before every compaction.** Creating a run (`plans start-run`) triggered the pre-plan VCC compaction through the host's manual compaction path, whose first step is `await abort()` — so every compaction was preceded by an aborted assistant message (`This operation was aborted`), sibling tool calls of the same batch died with `Operation aborted`, and the user saw an error they never caused. The compaction now travels as a `turn_end` **compaction boundary draft** (the host appends it and refreshes the finalized context), so nothing is aborted at all. Diagnosed from three real session logs: all 14 compactions were `reason: "manual"`, every one immediately preceded by the aborted-turn record.
+
+- **A compaction could end without continuing the run.** The resume had been attached to the host's `onComplete`/`onError` callbacks with a one-shot latch that closed *before* the send, so a single failed send stranded the session until the user typed something (2 of 12 observed compactions ended with no resume message and no assistant turn). Continuation is no longer needed for the pre-plan path (the turn is never interrupted), and every path that really does displace a live turn now resumes from a terminal compaction event with the latch closing only after a successful send.
+
+- **A manual `/compact` that displaced a live run left it stranded.** A user compaction aborts the in-flight turn and the host never continues it, which parked planning and execution runs mid-flight. pi-plans now resumes the displaced run exactly once when the compaction ends — success or failure — gated by `continueAfterThresholdCompact`, and it lifts the compaction-caused stall pause in the same step so a warning pause and an automatic resume can never coexist.
+
 - **Ctrl+Shift+T dead while an overlay is open.** pi-tui routes key input only to the focused component (no bubbling), so any focused refine/refs/execution-review overlay swallowed every global shortcut — including the dashboard toggle, exactly when users watch the dashboard during the minutes-long review phase. The overlay component now forwards unhandled keys through an `onUnhandledKey` hook, and all three overlay call sites re-dispatch Ctrl+Shift+T to the dashboard toggle. `reopenReviewOverlay` also gained an anti-stacking guard so Ctrl+Shift+R can no longer open a second overlay on a live one.
 
 - **First-use reviewer panel crash after model selection.** The F-008 selector re-validation in `refine` and `analyze_refs` read the first-use outcome's snake_case `model_selector`, but the outcome carries the camelCase `modelSelector` — the undefined value slipped past the `!== null` guard and crashed `findModel` with `Cannot read properties of undefined (reading 'indexOf')` immediately after the user confirmed a model in the native panel. Both call sites now read the typed field (latent since v0.7.0; it only fired on a first-use with an unconfirmed reviewer role).
 
 ### Changed
+
+- **Pre-plan compaction is silent about its own skips.** Small sessions, already-compacted sessions, stale requests (the request expires after 30 minutes without reaching its boundary), executions taking over, and `prePlanCompact:false` all drop the request without a user-facing notice; only a successful compaction reports its VCC stats.
 
 - **analyze_refs no longer head-truncates the combined analysis.** The merged per-reference sections used to be cut to 2000 lines / 50 KB with a truncation note; they now flow into the tool result (and REF_ANALYSIS.md) verbatim, so the tail of large reference analyses is no longer silently dropped.
 

@@ -20,7 +20,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	consumePlanningCompactionResumeGuard,
-	consumePrePlanCompactPending,
 	drainExecutionFlush,
 	executionContextMessage,
 	filterExecutionResumeMessages,
@@ -34,11 +33,12 @@ import {
 	handlePlanningBeforeCompact,
 	handlePlanningCompact,
 	handlePlanningCompactFailed,
+	activeVccSettings,
 	noteCompactionEnded,
 	noteCompactionStarted,
+	planningVccContext,
 	PLANNING_PLAN_WRITTEN_CUSTOM_TYPE,
-	PLANNING_PREPLAN_COMPACT_HINT,
-	sendPrePlanCompactResume,
+	resetManualCompactionResume,
 	registerExecutionTurnHandlers,
 	refreshPlanningCompactionCooldown,
 	requestPlanningCompaction,
@@ -48,6 +48,14 @@ import {
 	updateStatusWidget,
 	shouldTriggerPlanningCompaction,
 } from "./src/exec.ts";
+import {
+	buildPrePlanCompactionDraft,
+	clearDisplacedAbort,
+	clearPrePlanCompaction,
+	noteAssistantMessage,
+	takePrePlanCompactionRequest,
+} from "./src/compaction-lifecycle.ts";
+import { formatVccCompactionStats } from "./src/compaction.ts";
 import {
 	autoCompleteStatus,
 	disableAutoComplete,
@@ -268,39 +276,76 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Pre-plan compaction: right after `plans start-run` creates a new planning
-	// run, trigger one VCC compaction (PLANNING_PREPLAN_COMPACT_HINT routes it
-	// through the planning session_before_compact path) so the new plan starts
-	// on a lean context. ctx.compact() aborts the current agent operation
-	// first, so it must fire here — after the tool result is appended, never
-	// inside the tool execute stack. Pi's manual compaction never continues the
-	// aborted turn, so resume planning exactly once on success AND failure.
-	pi.on("tool_result", async (event, ctx) => {
-		if (event.isError) return;
-		if (event.toolName !== "plans") return;
-		if (!consumePrePlanCompactPending(ctx)) return;
-		if (typeof ctx.compact !== "function") {
-			sendPrePlanCompactResume(ctx);
+	// Pre-plan compaction (v0.10.x): `plans start-run` marks the session, and the
+	// `turn_end` carrying that `plans` tool result returns a `compaction`
+	// boundary draft. The host applies it with `appendCompaction` and refreshes
+	// the finalized context, so the next provider request already sees the lean
+	// context — with NO abort of the running turn and therefore no resume.
+	//
+	// `ctx.compact()` is deliberately not used here: the manual path starts with
+	// `await abort()` (killing the live turn, which was the source of the
+	// "This operation was aborted" error before every pre-plan compaction), and
+	// calling it inside `agent_before_settle` would veto that boundary's
+	// continuations. Everything that is skipped stays silent (a pre-plan
+	// compaction is an optimization: small sessions, already-compacted sessions,
+	// stale requests, and executions taking over all just drop the request).
+	pi.on("turn_end", async (event, ctx) => {
+		// A displaced-turn observation feeds the manual-compaction resume path.
+		noteAssistantMessage(ctx, (event as { message?: unknown }).message);
+		const toolResults = (event as { toolResults?: Array<{ toolName?: string; isError?: boolean }> }).toolResults ?? [];
+		if (!toolResults.some((result) => result.toolName === "plans" && result.isError !== true)) return;
+		const active = activeVccSettings(ctx, "planning");
+		const request = takePrePlanCompactionRequest(ctx, {
+			hasExecution: getExecution() !== null,
+			activeRunId: active?.runId ?? null,
+		});
+		if (!request) return;
+		if (!active || !active.settings.prePlanCompact) {
+			clearPrePlanCompaction(ctx);
 			return;
 		}
-		let resumed = false;
-		const resumeOnce = () => {
-			if (resumed) return;
-			resumed = true;
-			sendPrePlanCompactResume(ctx);
-		};
-		ctx.compact({
-			customInstructions: PLANNING_PREPLAN_COMPACT_HINT,
-			onComplete: () => resumeOnce(),
-			onError: () => {
-				try {
-					ctx.ui?.notify?.("pi-plans: pre-plan compaction skipped; continuing planning.", "info");
-				} catch {
-					/* notify is best-effort */
-				}
-				resumeOnce();
-			},
-		});
+		// The VCC builder needs real session entries (`getBranch()`, the same
+		// source the `session_before_compact` path receives as `branchEntries`).
+		// `event.context.contextEntries` is a PROJECTED shape
+		// (`{ sourceEntry, messages }`) that the cut cannot read, which would make
+		// every draft cancel silently.
+		const branchEntries = (
+			(ctx.sessionManager as unknown as { getBranch?: () => unknown[] }).getBranch?.() ?? []
+		) as never[];
+		if (branchEntries.length === 0) {
+			clearPrePlanCompaction(ctx);
+			return;
+		}
+		let draft = null as ReturnType<typeof buildPrePlanCompactionDraft>;
+		try {
+			draft = buildPrePlanCompactionDraft({
+				branchEntries: branchEntries as never,
+				settings: active.settings,
+				phaseContext: planningVccContext(branchEntries as never, active),
+			});
+		} catch {
+			draft = null;
+		}
+		clearPrePlanCompaction(ctx);
+		if (!draft) return;
+		try {
+			ctx.ui?.notify?.(formatVccCompactionStats(draft.stats), "info");
+		} catch {
+			/* notify is best-effort */
+		}
+		return { entries: draft.entries } as never;
+	});
+
+	// A user `/compact` during a live pi-plans run aborts the turn. The
+	// observation recorded above is consumed at the compaction's terminal event
+	// (src/exec.ts), which resumes the run exactly once. Clear it whenever fresh
+	// user input or a new run makes the attribution stale.
+	pi.on("agent_start", async (_event, ctx) => {
+		clearDisplacedAbort(ctx);
+		resetManualCompactionResume(ctx);
+	});
+	pi.on("input", async (_event, ctx) => {
+		clearDisplacedAbort(ctx);
 	});
 
 	// Bidirectional code-graph reminder hook: separate from the planning guard
