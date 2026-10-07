@@ -25,6 +25,9 @@ import { getRun, normalizeWorkdir, type RunSummary } from "../src/state.ts";
 import { bindRun, boundRunId, resolveActiveRun } from "../src/run-context.ts";
 import { executionCandidates, resolveCommandRun } from "../src/run-picker.ts";
 import { resolveUiLanguage } from "../src/ui-language.ts";
+import { askExecutionMode, type ExecModeHost } from "../src/exec-mode-picker.ts";
+import { executorLabel, isDelegated, type ExecutorChoice } from "../src/executor-config.ts";
+import { loadGlobalConfig } from "../src/global-state.ts";
 
 
 const ExecutePlanParams = Type.Object({
@@ -229,11 +232,33 @@ export async function executeHandoff(
 		return { status: "declined", message: "User declined execution. Stay in planning; ask how to proceed.", planPath };
 	}
 
+	// Where the plan runs: the current session (same model) or delegated
+	// workers on a model/effort the user picks. Headless and auto-approved
+	// handoffs have nobody to ask and always use the current session.
+	let executor: ExecutorChoice | undefined;
+	if (!autoApprove && ctx.hasUI) {
+		let last: ExecutorChoice | null = null;
+		try {
+			last = loadGlobalConfig().config.executor_last ?? null;
+		} catch {
+			last = null;
+		}
+		const picked = await askExecutionMode(ctx as unknown as ExecModeHost, { lang: resolveUiLanguage(workdir), last });
+		if (picked.status === "cancelled") {
+			return {
+				status: "declined",
+				message: "User closed the execution-mode choice without picking. Stay in planning; ask how to proceed.",
+				planPath,
+			};
+		}
+		executor = picked.choice;
+	}
+
 	// Attribute the handoff to the picked run before any state transition so
 	// the approval checkpoint and status flip land on the run the user chose.
 	if (chosenRun) bindRun(ctx.sessionManager, workdir, chosenRun.run_id);
 
-	const started = await startExecution(ctx, { planPath, planTasks, items });
+	const started = await startExecution(ctx, { planPath, planTasks, items, executor });
 	// v0.9.4: a terminal run (done/abandoned) is refused inside `startExecution`
 	// before any state change; report that refusal instead of claiming success.
 	if (!started) {
@@ -246,6 +271,14 @@ export async function executeHandoff(
 	}
 	const autoNote = autoApprove ? "[auto-approve] " : "";
 	const legacyNote = legacyPlan ? " Legacy I-### mapping active; upgrade the plan at the next revision." : "";
+	if (isDelegated(executor)) {
+		return {
+			status: "executing",
+			planPath,
+			itemCount: items.length,
+			message: `Execution approved and delegated to ${executorLabel(executor)}. ${planTasks.tasks.length} task(s) run in wave order on worker sessions that report progress on their own; do NOT implement the tasks yourself and do not call plans_update_task. Press Down with an empty editor to watch the workers. The execution reviewer verifies every check once all tasks are terminal.${legacyPlan ? " Legacy I-### mapping active; upgrade the plan at the next revision." : ""}`,
+		};
+	}
 	return {
 		status: "executing",
 		planPath,

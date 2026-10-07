@@ -15,7 +15,7 @@ import { getExecution, persistTaskProgress, updateStatusWidget } from "./exec.ts
 import { canTransition, flattenTaskViews } from "./tasks.ts";
 import { StateError } from "./state.ts";
 
-const UpdateTaskParams = Type.Object({
+export const UpdateTaskParams = Type.Object({
 	taskId: Type.String({ description: "Task id from the plan (e.g. Task-3, Task-3.1)" }),
 	status: StringEnum(["complete", "skipped"] as const, { description: "New status for the task (pending is audit-only)" }),
 	evidence: Type.Optional(

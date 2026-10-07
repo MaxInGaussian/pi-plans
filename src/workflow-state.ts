@@ -31,6 +31,8 @@ import { StateError, atomicWriteJson, resolveStateRootOrNull, runGit, runDirPath
 import { assertOwnership, heldOwnershipRecord } from "./run-ownership.ts";
 import { HUGE_MAX_VERSIONS, HUGE_MIN_VERSIONS, parseHugePlanName } from "./huge-plan.ts";
 import type { NoProgressState, ReviewBudget } from "./review-budget.ts";
+import { parseExecutorChoice, type ExecutorChoice } from "./executor-config.ts";
+import { VALID_THINKING_LEVELS } from "./global-state.ts";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -183,6 +185,10 @@ export interface ExecutionCheckpoint {
 	 * stale after a restart (orphaned delegate — the child died with the parent).
 	 * Removed with delegated execution in v0.6.1; read-tolerated on legacy checkpoints. */
 	delegate?: { modelSelector: string; startedAt: string };
+	/** Where this run executes (current session, or delegated workers on a
+	 * chosen model/effort). Absent on checkpoints written before the choice
+	 * existed — those run in the current session. */
+	executor?: ExecutorChoice;
 	/** v0.6.1: task-tree progress (task id → status/evidence), the primary
 	 * progress record. doneVcIds stays for legacy checkpoints and the final
 	 * audit pass. */
@@ -667,7 +673,7 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	const record = asRecord(value, label);
 	rejectExtraKeys(
 		record,
-		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "tasks", "stallRounds", "blocked", "planAmended", "audit", "reviewBudget", "reviewBudgetDefaulted", "reviewRoundsTotal", "reviewCapExtension", "reviewNoProgress", "reviewNonHighRepair", "reviewNonHighCredits"]),
+		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "executor", "tasks", "stallRounds", "blocked", "planAmended", "audit", "reviewBudget", "reviewBudgetDefaulted", "reviewRoundsTotal", "reviewCapExtension", "reviewNoProgress", "reviewNonHighRepair", "reviewNonHighCredits"]),
 		label,
 	);
 	const execution: ExecutionCheckpoint = {
@@ -707,6 +713,11 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 			modelSelector: asString(delegate.modelSelector, `${label}.delegate.modelSelector`),
 			startedAt: asString(delegate.startedAt, `${label}.delegate.startedAt`),
 		};
+	}
+	if (record.executor !== undefined && record.executor !== null) {
+		const parsed = parseExecutorChoice(record.executor, VALID_THINKING_LEVELS);
+		if ("error" in parsed) throw new StateError(`${label}.executor: ${parsed.error}`);
+		execution.executor = parsed;
 	}
 	if (record.tasks !== undefined && record.tasks !== null) {
 		const tasksRecord = asRecord(record.tasks, `${label}.tasks`);
@@ -1534,6 +1545,8 @@ export interface ExecutionProgressInput {
 	pausedReason?: string | null;
 	/** v0.6.0: set/clear the delegated-executor record; null clears it. */
 	delegate?: { modelSelector: string; startedAt: string } | null;
+	/** Execution choice for this run; null clears it (delete-on-null). */
+	executor?: ExecutorChoice | null;
 	/** v0.6.1: task-tree progress snapshot (authoritative). */
 	tasks?: Record<string, { status: string; evidence?: string; skipReason?: string }>;
 	/** v0.6.1: completion-audit bookkeeping update. v0.9: findings rides the
@@ -1578,6 +1591,8 @@ export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: Executi
 	else if (progress.pausedReason !== undefined) execution.pausedReason = progress.pausedReason;
 	if (progress.delegate === null) delete execution.delegate;
 	else if (progress.delegate !== undefined) execution.delegate = progress.delegate;
+	if (progress.executor === null) delete execution.executor;
+	else if (progress.executor !== undefined) execution.executor = progress.executor;
 	if (progress.tasks !== undefined) execution.tasks = progress.tasks;
 	if (progress.stallRounds !== undefined) execution.stallRounds = progress.stallRounds;
 	if (progress.blocked === null) delete execution.blocked;
@@ -1981,6 +1996,7 @@ export function applyExecutionStopped(cp: WorkflowCheckpoint, reason: string): W
 	// next execution of this plan picks its own budget.
 	const {
 		delegate: _delegate,
+		executor: _executor,
 		blocked: _blocked,
 		reviewBudget: _reviewBudget,
 		reviewBudgetDefaulted: _reviewBudgetDefaulted,

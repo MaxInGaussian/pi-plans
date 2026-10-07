@@ -16,6 +16,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { parseExecutorChoice, type ExecutorChoice } from "./executor-config.ts";
 
 export class GlobalStateError extends Error {}
 
@@ -62,6 +63,9 @@ export interface GlobalRoleConfig {
 export interface GlobalConfig {
 	schema: 1;
 	reviewer: GlobalRoleConfig;
+	/** Non-binding: the last execution choice, preselected by the next
+	 * handoff's picker. Never read as a decision. */
+	executor_last?: ExecutorChoice;
 }
 
 export const DEFAULT_GLOBAL_ROLE: GlobalRoleConfig = {
@@ -167,7 +171,14 @@ export function loadGlobalConfig(): GlobalLoadResult {
 		return { config: structuredClone(DEFAULT_GLOBAL_CONFIG), notices, fresh: false, corrupt: true };
 	}
 	const reviewer = normalizeGlobalRole((data as Record<string, unknown>).reviewer, notices, "global config");
-	return { config: { schema: 1, reviewer }, notices, fresh: false, corrupt: false };
+	const config: GlobalConfig = { schema: 1, reviewer };
+	const lastRaw = (data as Record<string, unknown>).executor_last;
+	if (lastRaw !== undefined && lastRaw !== null) {
+		const parsed = parseExecutorChoice(lastRaw, VALID_THINKING_LEVELS);
+		if ("error" in parsed) notices.push(`global config: ignoring executor_last (${parsed.error})`);
+		else config.executor_last = parsed;
+	}
+	return { config, notices, fresh: false, corrupt: false };
 }
 
 /** Atomic write with a unique temp name (concurrent writers never collide
@@ -265,9 +276,17 @@ export interface SetGlobalRoleResult {
 export function setGlobalRole(options: SetGlobalRoleOptions): SetGlobalRoleResult {
 	const loaded = loadGlobalConfig();
 	const reviewer = applyGlobalRoleOptions(loaded.config.reviewer, options);
-	const config: GlobalConfig = { schema: 1, reviewer };
+	const config: GlobalConfig = { ...loaded.config, schema: 1, reviewer };
 	writeGlobalConfig(config);
 	return { global: config, notices: loaded.notices };
+}
+
+/** Remember the last execution choice as the next handoff's preselection.
+ * Best-effort: a corrupt global file is never overwritten for this. */
+export function rememberLastExecutor(choice: ExecutorChoice): void {
+	const loaded = loadGlobalConfig();
+	if (loaded.corrupt) return;
+	writeGlobalConfig({ ...loaded.config, schema: 1, executor_last: choice });
 }
 
 /** True when a legacy workspace reviewer block carries real user intent

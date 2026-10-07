@@ -143,6 +143,7 @@ import type { ReviewFindingRecord } from "./workflow-state.ts";
 import { staleReloadHint as probeStaleReload } from "./staleness.ts";
 import { messaging } from "./messaging.ts";
 import { fleetUi, fleetUiHost } from "./fleet-ui.ts";
+import { executorLabel, isDelegated, type ExecutorChoice } from "./executor-config.ts";
 import { openFleetGroup, type FleetRun } from "./fleet-run.ts";
 import { resolveReviewerSpawn } from "./thinking-levels.ts";
 import { loadGlobalConfig, reviewerReady } from "./global-state.ts";
@@ -150,6 +151,10 @@ import { matchesTerminalKey } from "./terminal-keys.ts";
 
 export interface ExecState {
 	planPath: string;
+	/** Where this run executes. Absent / current-session: the main session does
+	 * the work. Delegated: worker sessions on another model do it
+	 * (src/exec-delegate.ts) and the main session only supervises. */
+	executor?: ExecutorChoice;
 	/** Verification checks (VC-###) — the audit's contract. */
 	items: CheckItem[];
 	/** Parsed plan task model (kept for re-deriving the view). */
@@ -246,9 +251,72 @@ export function refreshUiLanguage(ctx: ExtensionContext): void {
 }
 
 /** Consecutive no-progress rounds before the watchdog pauses (D-021). */
-const STALL_MAX_ROUNDS = 3;
+export const STALL_MAX_ROUNDS = 3;
 
 let execution: ExecState | null = null;
+
+/** Drives delegated worker sessions (registered by src/exec-delegate.ts,
+ * which this module loads lazily so the two never import each other at
+ * load time). */
+export interface DelegateDriver {
+	/** (Re)start driving workers for `ex`; idempotent while a run is live. */
+	resume(ctx: ExtensionContext, ex: ExecState): void;
+	/** Forward a review round's repair brief to the workers owning the reopened tasks. */
+	repair(ctx: ExtensionContext, ex: ExecState, content: string): void;
+	/** The run ended or was replaced: tear down every worker session. */
+	dispose(outcome: "completed" | "stopped"): void;
+}
+
+let delegateDriver: DelegateDriver | null = null;
+
+export function setDelegateDriver(driver: DelegateDriver | null): void {
+	delegateDriver = driver;
+}
+
+export function isDelegatedExecution(ex: ExecState | null = execution): boolean {
+	return isDelegated(ex?.executor);
+}
+
+async function ensureDelegateDriver(): Promise<DelegateDriver | null> {
+	if (!delegateDriver) await import("./exec-delegate.ts");
+	return delegateDriver;
+}
+
+function disposeDelegate(outcome: "completed" | "stopped"): void {
+	delegateDriver?.dispose(outcome);
+}
+
+/** Start (or continue) the delegated workers for the live execution. */
+async function resumeDelegation(ctx: ExtensionContext): Promise<void> {
+	const ex = execution;
+	if (!ex || !isDelegatedExecution(ex)) return;
+	const driver = await ensureDelegateDriver();
+	if (driver && execution === ex) driver.resume(ctx, ex);
+}
+
+/** One owed-review entry for the delegated orchestrator: the main session
+ * never settles, so it launches the same round the settle handler would. */
+export function triggerOwedReview(ctx: ExtensionContext): Promise<void> | null {
+	if (!pendingAudit()) return null;
+	latchAuditThisSettle();
+	return launchReviewRound(ctx);
+}
+
+/** A review round found work to repair. Normally one triggerTurn wakes the
+ * executor in the main session; a delegated run forwards the same brief to
+ * the workers instead (the message still shows in the transcript). */
+function sendRepairWake(
+	ctx: ExtensionContext,
+	ex: ExecState,
+	message: { customType: string; content: string; display: boolean },
+): void {
+	if (isDelegatedExecution(ex) && delegateDriver) {
+		messaging().sendMessage(message, { triggerTurn: false });
+		delegateDriver.repair(ctx, ex, message.content);
+		return;
+	}
+	messaging().sendMessage(message, { triggerTurn: true });
+}
 
 export const EXECUTION_CONTINUE_CUSTOM_TYPE = "pi-plans-exec-continue";
 /** v0.9.2: visible escalation line — never replays after a restart. */
@@ -418,6 +486,7 @@ export function loadExecutionFromCheckpoint(
 	const wasReviewCapPause = isReviewCapPause(cp.execution.pausedReason);
 	// Any live round from the replaced session graph dies here (CF2-002).
 	abortInFlightReview();
+	disposeDelegate("stopped");
 	if (!reverifyAll) {
 		for (const id of cp.execution.doneVcIds) {
 			const item = items.find((candidate) => candidate.id === id);
@@ -429,6 +498,7 @@ export function loadExecutionFromCheckpoint(
 		items,
 		planTasks,
 		tasks,
+		executor: cp.execution.executor,
 		legacyPlan: planTasks.legacy,
 		startedAt: utcNow(),
 		usage: { inToks: cp.execution.usage.inToks, outToks: cp.execution.usage.outToks },
@@ -511,6 +581,8 @@ export function loadExecutionFromCheckpoint(
 	}
 	persist(ctx);
 	updateStatusWidget(ctx);
+	// A delegated run restores its workers; they pick up the open tasks.
+	void resumeDelegation(ctx);
 	return {
 		status: "loaded",
 		planPath,
@@ -809,6 +881,7 @@ function persist(ctx: ExtensionContext): void {
 		items: execution.items,
 		planTasks: execution.planTasks,
 		tasks: execution.tasks,
+		executor: execution.executor,
 		legacyPlan: execution.legacyPlan,
 		startedAt: execution.startedAt,
 		usage: execution.usage,
@@ -848,6 +921,8 @@ export interface StartExecutionInput {
 	planPath: string;
 	planTasks: PlanTasks;
 	items: CheckItem[];
+	/** Chosen at the handoff; absent = the current session. */
+	executor?: ExecutorChoice;
 }
 
 export async function startExecution(
@@ -898,9 +973,11 @@ export async function startExecution(
 	}
 	// A fresh handoff replaces any live run — abort its in-flight review round first.
 	abortInFlightReview();
+	disposeDelegate("stopped");
 	const tasks = buildTaskView(input.planTasks);
 	execution = {
 		planPath: input.planPath,
+		executor: input.executor,
 		items: input.items,
 		planTasks: input.planTasks,
 		tasks,
@@ -946,7 +1023,8 @@ export async function startExecution(
 				const aligned = withPlan.nextAction === "accept-execute"
 					? withPlan
 					: { ...withPlan, nextAction: "accept-execute" as const };
-				return applyExecutionApproved(aligned, approval);
+				const approved = applyExecutionApproved(aligned, approval);
+				return input.executor ? applyExecutionProgress(approved, { executor: input.executor }) : approved;
 			});
 			lintPlanIntoNotices(ctx.cwd, active.run_id, path.resolve(input.planPath));
 		} catch (error) {
@@ -969,6 +1047,7 @@ export async function startExecution(
 		{ triggerTurn: false },
 	);
 	updateStatusWidget(ctx);
+	if (isDelegated(input.executor)) await resumeDelegation(ctx);
 	return true;
 }
 
@@ -1063,7 +1142,7 @@ export function registerExecutionTurnHandlers(
 	// boundary. It is what makes a terminal-but-unaudited run self-heal with
 	// zero user input, instead of stranding until a manual /plans-execute.
 	ext.on("agent_before_settle", async (_event, ctx) => {
-		if (!pendingAudit()) return;
+		if (!pendingAudit() || isDelegatedExecution()) return;
 		const runtime = currentContinuationRuntime(ctx);
 		if (runtime?.handled) return;
 		// The continuation wake owns this settle: if the loop already woke the
@@ -1084,6 +1163,7 @@ export function registerExecutionTurnHandlers(
 	ext.on("session_shutdown", async (_event, ctx) => {
 		drainExecutionFlush(ctx);
 		abortInFlightReview();
+		disposeDelegate("stopped");
 		execution = null;
 		executionRunId = null;
 		continuationRuntime = null;
@@ -1122,7 +1202,7 @@ export function registerExecutionTurnHandlers(
 		lastAssistantUsage = null;
 		const usage = raw ? { input: raw.input ?? 0, output: raw.output ?? 0 } : undefined;
 		if (usage) recordExecutionTurn(ctx, usage);
-		if (getExecution() && pendingAudit() && !auditLatchOf(execution!).auditedThisSettle) {
+		if (getExecution() && !isDelegatedExecution() && pendingAudit() && !auditLatchOf(execution!).auditedThisSettle) {
 			latchAuditThisSettle();
 			const chain = launchReviewRound(ctx);
 			if (chain) await chain;
@@ -2001,14 +2081,11 @@ async function commitReviewOutcome(
 				? `Full round report: ${reportPath}`
 				: `Full round report (run dir unwritable — inline):\n\n---\n${reportText.slice(0, 4000)}`;
 			const content = `**pi-plans: execution review round ${ex.audit.rounds} found ${actionableNonHighs.length} medium/low finding(s)** — this grants the single non-high repair cycle (exempt from the numeric budget; the hard cap still counts it). Medium findings rolled back their mapped tasks: ${mediumRolledBack.join(", ") || "(none mapped)"}.${amended.length > 0 ? ` Repair tasks appended to the plan: ${amended.join(", ")}.` : ""}\n\nNon-high findings:\n${nonHighLines}\n\nFix them and re-close the affected tasks with \`plans_update_task\` (evidence records the repair), or decline one with status \`skipped\` and \`skipReason: "deferred: <reason>"\`. The re-review round runs automatically once all tasks are terminal again.${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
-			messaging().sendMessage(
-				{
-					customType: "pi-plans-audit-failed",
-					content: `${content}\n\nStill open: ${openTasks.join(", ") || "(none — the tree is terminal)"}`,
-					display: true,
-				},
-				{ triggerTurn: true },
-			);
+			sendRepairWake(ctx, ex, {
+				customType: "pi-plans-audit-failed",
+				content: `${content}\n\nStill open: ${openTasks.join(", ") || "(none — the tree is terminal)"}`,
+				display: true,
+			});
 		}
 		return; // The agent repairs; the credited re-review round is owed.
 	}
@@ -2121,14 +2198,11 @@ async function commitReviewOutcome(
 			const findingsBlock = actionableHighs.length > 0 ? `\n\nHigh findings:\n${highLines}` : "";
 			const nonHighBlock = actionableNonHighs.length > 0 ? `\n\nNon-high findings (medium/low):\n${nonHighLines}` : "";
 			const content = `${findingsLead} Rolled back tasks: ${allRolledBack.join(", ") || "(none covered)"}${amended.length > 0 ? `. Tasks appended to the plan for unmapped findings: ${amended.join(", ")}` : ""}.${findingsBlock}${nonHighBlock}\n\nFix them and re-close the affected tasks with \`plans_update_task\` (evidence records the repair), or decline one with status \`skipped\` and \`skipReason: "deferred: <reason>"\`. The review reruns automatically once all tasks are terminal again.${budgetSpent(ex) ? (activeBudget(ex) === "unlimited" ? ` This was round ${ex.reviewRoundsTotal} against the unlimited budget's ${unlimitedHardCapCeiling(budgetCounters(ex))}-round safety cap: the next terminal-task cycle pauses the run for review.` : ` This was round ${billedRounds(ex)} of ${budgetLabel(ex)}: the next terminal-task cycle pauses the run for review (or completes if every check passed).`) : ""}${stranded ? ` No task covers the finding(s) and none could be appended — the task tree stayed terminal; the next settle re-runs the review automatically.` : ""}\n\n${reportRef}`;
-			messaging().sendMessage(
-				{
-					customType: "pi-plans-audit-failed",
-					content: `${content}\n\nStill open: ${openTasks.join(", ") || "(none — the tree is terminal)"}`,
-					display: true,
-				},
-				{ triggerTurn: true },
-			);
+			sendRepairWake(ctx, ex, {
+				customType: "pi-plans-audit-failed",
+				content: `${content}\n\nStill open: ${openTasks.join(", ") || "(none — the tree is terminal)"}`,
+				display: true,
+			});
 		}
 		return; // The agent repairs; the next settle re-enters the loop.
 	}
@@ -2836,8 +2910,9 @@ export function filterPlanningResumeMessages<T extends { customType?: string }>(
 export async function stopExecution(ctx: ExtensionContext, reason: string): Promise<void> {
 	if (!execution) return;
 	// A stopped run's in-flight review round dies with it (typed cancelled —
-	// no budget, no wake).
+	// no budget, no wake), and so do its delegated workers.
 	abortInFlightReview();
+	disposeDelegate("stopped");
 	resetExecutionCompactionState(ctx);
 	pendingExecutionFlush = false;
 	persist(ctx);
@@ -2919,7 +2994,7 @@ function resetSettleLatch(): void {
 	latch.activity = 0;
 }
 
-function pauseForStall(ctx: ExtensionContext, reason: string): void {
+export function pauseForStall(ctx: ExtensionContext, reason: string): void {
 	const ex = getExecution();
 	if (!ex) return;
 	ex.stall.paused = true;
@@ -2949,6 +3024,8 @@ function canWakeExecution(ctx: ExtensionContext, runtime: ContinuationRuntime): 
 }
 
 function sendContinuationWake(ctx: ExtensionContext, runtime: ContinuationRuntime): boolean {
+	// A delegated run is driven by its workers, never by waking the main model.
+	if (isDelegatedExecution(runtime.owner)) return false;
 	if (!canWakeExecution(ctx, runtime)) return false;
 	try {
 		const content = executionContextMessage(ctx);
@@ -2972,6 +3049,7 @@ function sendContinuationWake(ctx: ExtensionContext, runtime: ContinuationRuntim
 function maybeContinuationFollowUp(ctx: ExtensionContext): void {
 	const runtime = currentContinuationRuntime(ctx);
 	if (!runtime || runtime.handled || !ctx.isIdle()) return;
+	if (isDelegatedExecution(runtime.owner)) return;
 	if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
 	if (runtime.stopReason === "error" || runtime.stopReason === "aborted" || ctx.signal?.aborted) {
 		runtime.handled = true;
@@ -3076,6 +3154,7 @@ export function resumeGoalWaitIfPaused(ctx: ExtensionContext): boolean {
 	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { pausedReason: null, blocked: ex.blocked }));
 	persist(ctx);
 	updateStatusWidget(ctx);
+	void resumeDelegation(ctx);
 	return true;
 }
 
@@ -3269,6 +3348,7 @@ export function hugeVersionCompletionMessage(input: {
 
 export async function completeExecution(ctx: ExtensionContext): Promise<void> {
 	if (!execution) return;
+	disposeDelegate("completed");
 	resetExecutionCompactionState(ctx);
 	pendingExecutionFlush = false;
 	persist(ctx);
@@ -3622,8 +3702,22 @@ export async function terminateExecution(ctx: ExtensionContext, summary: Termina
 }
 
 /** Injection text for before_agent_start while executing. */
+/** Supervisor brief for a delegated run: the main session must not do the
+ * workers' job. */
+function delegatedContextMessage(ex: ExecState): string {
+	const progress = taskProgress(ex.tasks);
+	const open = flattenTaskViews(ex.tasks).filter((task) => !taskIsTerminal(task)).map((task) => task.id);
+	return `[PI-PLANS EXECUTION — delegated]
+The accepted plan at ${ex.planPath} is being implemented by delegated worker sessions (${executorLabel(ex.executor)}); tasks ${progress.done}/${progress.total}.
+
+You are the supervisor. Do NOT edit or write files yourself and do NOT call \`plans_update_task\`: the workers report progress and the dashboard updates live. Answer the user's questions, relay status, and use /plans-stop if they ask to stop. The independent execution review starts by itself once every task is terminal; failed rounds are repaired by the same workers.
+
+Open tasks: ${open.join(", ") || "(none)"}.`;
+}
+
 export function executionContextMessage(ctx: ExtensionContext): string | null {
 	if (!execution) return null;
+	if (isDelegatedExecution(execution)) return delegatedContextMessage(execution);
 	const flat = flattenTaskViews(execution.tasks);
 	const open = flat.filter((task) => !taskIsTerminal(task));
 	const cur = currentTask(execution.tasks);
@@ -3703,6 +3797,7 @@ interface SessionEntry {
  * snapshot (tool-driven progress survives restarts without text replay).
  */
 export async function restoreFromSession(ctx: ExtensionContext, entries: SessionEntry[]): Promise<void> {
+	disposeDelegate("stopped");
 	pendingExecutionFlush = false;
 	continuationRuntime = null;
 	resetExecutionCompactionState(ctx);
@@ -3756,6 +3851,7 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 		items,
 		planTasks,
 		tasks,
+		executor: snapshot.executor,
 		legacyPlan: snapshot.legacyPlan,
 		startedAt: snapshot.startedAt,
 		usage: snapshot.usage ?? { inToks: 0, outToks: 0 },
@@ -3799,5 +3895,6 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 		const chain = launchReviewRound(ctx);
 		if (chain) await chain;
 	}
+	await resumeDelegation(ctx);
 	updateStatusWidget(ctx);
 }

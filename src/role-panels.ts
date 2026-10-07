@@ -238,6 +238,21 @@ export class BorderedPanel implements Component {
 	}
 }
 
+/** Wording of the pickers, so one flow can serve several roles. */
+export interface PickTitles {
+	levelTitle: string;
+	levelSubtitle: string;
+	modelMenu: string;
+	levelMenu: string;
+}
+
+export const REVIEWER_TITLES: PickTitles = {
+	levelTitle: "Reviewer Thinking Level",
+	levelSubtitle: "Applies to spawned reviewer subagents only",
+	modelMenu: "Reviewer model? (type Other… to enter an exact provider/model string)",
+	levelMenu: "Reviewer thinking level? (first row = default: no --thinking flag)",
+};
+
 export interface EffortItem {
 	value: string; // "default" or a concrete level
 	label: string;
@@ -296,15 +311,15 @@ export class EffortPanelComponent extends Container {
 		this.searchInput.focused = value;
 	}
 
-	constructor(items: EffortItem[], preselect: string, onSelect: (value: string) => void, onCancel: () => void) {
+	constructor(items: EffortItem[], preselect: string, onSelect: (value: string) => void, onCancel: () => void, titles: Pick<PickTitles, "levelTitle" | "levelSubtitle"> = REVIEWER_TITLES) {
 		super();
 		this.allItems = items;
 		this.onSelect = onSelect;
 		this.onCancel = onCancel;
 		this.addChild(new Spacer(1));
-		this.addChild(new Text("Reviewer Thinking Level", 0, 0));
+		this.addChild(new Text(titles.levelTitle, 0, 0));
 		this.addChild(new Spacer(1));
-		this.addChild(new Text("Applies to spawned reviewer subagents only", 0, 0));
+		this.addChild(new Text(titles.levelSubtitle, 0, 0));
 		this.addChild(new Spacer(1));
 		this.searchInput = new Input();
 		this.searchInput.onSubmit = () => this.selectList.handleInput("\r");
@@ -382,12 +397,13 @@ const OVERLAY_OPTIONS = {
 
 /** /model-style searchable panel. Returns null when the host cannot show
  * overlays (RPC custom() returns undefined) — callers fall back to menus. */
-async function pickModelViaPanel(host: RolePanelHost): Promise<Model | null | undefined> {
+async function pickModelViaPanel(host: RolePanelHost, preselect?: { provider: string; id: string } | null): Promise<Model | null | undefined> {
 	if (typeof host.ui.custom !== "function") return undefined;
 	const runtime = adapterModelRuntime(host);
 	if (runtime === null) return undefined;
 	const scoped = (host.scopedModels ?? []) as never;
-	const currentModel = host.model ? ({ ...host.model } as never) : undefined;
+	const initial = preselect ?? host.model;
+	const currentModel = initial ? ({ ...initial } as never) : undefined;
 	return (await host.ui.custom<Model | null>((tui, theme, _kb, done) => {
 		let settled = false;
 		const finish = (value: Model | null) => {
@@ -419,6 +435,7 @@ async function pickLevelViaPanel(
 	host: RolePanelHost,
 	model: Model,
 	currentLevel: string | null,
+	titles: PickTitles = REVIEWER_TITLES,
 ): Promise<string | null | undefined> {
 	const items = effortItems(model, currentLevel);
 	return (await host.ui.custom<string | null>((_tui, theme, _kb, done) => {
@@ -428,19 +445,19 @@ async function pickLevelViaPanel(
 			settled = true;
 			done(value);
 		};
-		const panel = new EffortPanelComponent(items, currentLevel ?? DEFAULT_LEVEL_SENTINEL, (value) => finish(value), () => finish(null));
+		const panel = new EffortPanelComponent(items, currentLevel ?? DEFAULT_LEVEL_SENTINEL, (value) => finish(value), () => finish(null), titles);
 		return new BorderedPanel(panel, borderColorFrom(theme));
 	}, OVERLAY_OPTIONS as never)) as string | null | undefined;
 }
 
 /** Native menus for hasUI-but-not-TUI sessions (Q-2=A) — shared with the
  * TUI panel-construction fallback. */
-async function pickModelViaMenu(host: RolePanelHost): Promise<string | undefined> {
+async function pickModelViaMenu(host: RolePanelHost, title: string = REVIEWER_TITLES.modelMenu): Promise<string | undefined> {
 	if (typeof host.ui.select !== "function") return undefined;
 	const models = availableModels(host);
 	if (models.length === 0) return undefined;
 	const options = models.map((model) => `${model.provider}/${model.id}`);
-	const picked = await host.ui.select("Reviewer model? (type Other… to enter an exact provider/model string)", options);
+	const picked = await host.ui.select(title, options);
 	return typeof picked === "string" ? picked : undefined;
 }
 
@@ -454,18 +471,32 @@ function modelForEffort(host: RolePanelHost, selector: string): Model | null {
 	return findModel(host, selector);
 }
 
+export interface PickOptions {
+	/** Level preselected on the effort step (null = the "default" row). */
+	storedLevel: string | null;
+	/** Model highlighted first in the picker; defaults to the session's model. */
+	preselectModel?: { provider: string; id: string } | null;
+	titles?: PickTitles;
+}
+
+export type PickOutcome =
+	| { status: "picked"; modelSelector: string; model: Model | null; thinkingLevel: string | null; via: "panel" | "menu" }
+	| { status: "cancelled"; via: "panel" | "menu" }
+	| { status: "unavailable"; reason: "no-custom" | "no-runtime" | "no-models" | "no-select" };
+
 /**
- * Run the first-use flow and, on full completion, persist the confirmed
- * role to the global config and return it. Esc anywhere cancels the whole
- * gate without persisting (F-005). The returned role is what the caller
- * must use for THIS invocation (never a stale pre-gate snapshot).
+ * The model-then-effort picker, with no persistence: panels in a TUI, native
+ * menus in other UI sessions. Esc anywhere cancels the whole pick. Both the
+ * reviewer first-use gate and the execution-model chooser run on this.
  */
-export async function runFirstUseFlow(host: RolePanelHost, storedLevel: string | null): Promise<FirstUseOutcome> {
+export async function pickModelAndEffort(host: RolePanelHost, options: PickOptions): Promise<PickOutcome> {
+	const titles = options.titles ?? REVIEWER_TITLES;
+	const storedLevel = options.storedLevel;
 	const tui = host.mode === "tui" && typeof host.ui.custom === "function";
 	if (tui) {
 		let picked: Model | null | undefined;
 		try {
-			picked = await pickModelViaPanel(host);
+			picked = await pickModelViaPanel(host, options.preselectModel);
 		} catch {
 			// Construction/refresh failure (pi upgrade drift, F-010): fall back
 			// to menus instead of failing the gate.
@@ -476,9 +507,9 @@ export async function runFirstUseFlow(host: RolePanelHost, storedLevel: string |
 		} else if (picked === null) {
 			return { status: "cancelled", via: "panel" };
 		} else {
-			const level = await pickLevelViaPanel(host, picked, storedLevel);
+			const level = await pickLevelViaPanel(host, picked, storedLevel, titles);
 			if (level === undefined || level === null) return { status: "cancelled", via: "panel" };
-			return confirmRole(selectorOf(picked), level === DEFAULT_LEVEL_SENTINEL ? null : level, picked, "panel");
+			return { status: "picked", modelSelector: selectorOf(picked), model: picked, thinkingLevel: level === DEFAULT_LEVEL_SENTINEL ? null : level, via: "panel" };
 		}
 	}
 	// Menus (hasUI non-TUI, or TUI panel fallback).
@@ -487,21 +518,33 @@ export async function runFirstUseFlow(host: RolePanelHost, storedLevel: string |
 	}
 	const models = availableModels(host);
 	if (models.length === 0 && tui) return { status: "unavailable", reason: "no-models" };
-	const selector = await pickModelViaMenu(host);
+	const selector = await pickModelViaMenu(host, titles.modelMenu);
 	if (selector === undefined) return { status: "cancelled", via: "menu" };
 	const model = modelForEffort(host, selector);
 	if (model) {
 		const items = effortItems(model, storedLevel);
 		const labels = items.map((item) => `${item.label} — ${item.description}`);
-		const picked = await host.ui.select("Reviewer thinking level? (first row = default: no --thinking flag)", labels);
+		const picked = await host.ui.select(titles.levelMenu, labels);
 		if (picked === undefined) return { status: "cancelled", via: "menu" };
 		const index = labels.indexOf(picked);
 		const value = index >= 0 ? items[index]!.value : DEFAULT_LEVEL_SENTINEL;
-		return confirmRole(selector, value === DEFAULT_LEVEL_SENTINEL ? null : value, model, "menu");
+		return { status: "picked", modelSelector: selector, model, thinkingLevel: value === DEFAULT_LEVEL_SENTINEL ? null : value, via: "menu" };
 	}
-	// Selector not in the registry (manually entered): confirm as-is with the
+	// Selector not in the registry (manually entered): take it as-is with the
 	// default level — spawn-side validation catches typos with a precise error.
-	return confirmRole(selector, null, null, "menu");
+	return { status: "picked", modelSelector: selector, model: null, thinkingLevel: null, via: "menu" };
+}
+
+/**
+ * Run the first-use flow and, on full completion, persist the confirmed
+ * role to the global config and return it. Esc anywhere cancels the whole
+ * gate without persisting (F-005). The returned role is what the caller
+ * must use for THIS invocation (never a stale pre-gate snapshot).
+ */
+export async function runFirstUseFlow(host: RolePanelHost, storedLevel: string | null): Promise<FirstUseOutcome> {
+	const outcome = await pickModelAndEffort(host, { storedLevel });
+	if (outcome.status !== "picked") return outcome;
+	return confirmRole(outcome.modelSelector, outcome.thinkingLevel, outcome.model, outcome.via);
 }
 
 function confirmRole(modelSelector: string, thinkingLevel: string | null, model: Model | null, via: "panel" | "menu"): FirstUseOutcome {
