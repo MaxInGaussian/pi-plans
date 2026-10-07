@@ -324,6 +324,8 @@ describe("delegated execution: review repairs and stalls", () => {
 		assert.match(repairBrief!, /VC-001/);
 		const wake = entries.filter((entry) => entry.customType === "pi-plans-audit-failed").at(-1);
 		assert.equal(wake?.triggerTurn, false, "the main session is NOT woken to repair");
+		assert.match(wake!.content!, /^\[delegated run\] This review brief was forwarded to the workers/, "the transcript copy tells the supervisor not to act");
+		assert.doesNotMatch(repairBrief!, /\[delegated run\]/, "the workers get the brief without the supervisor note");
 	});
 
 	it("re-prompts a worker that ends with tasks still open, then pauses at the stall cap", async () => {
@@ -399,6 +401,27 @@ describe("delegated execution: persistence and restore", () => {
 		const after = loadCheckpoint(workdir, runId);
 		assert.ok(after.status === "ok");
 		assert.equal(after.checkpoint.execution?.executor, undefined, "a stop drops the choice; the next handoff asks again");
+	});
+
+	it("a delegated start message tells the main session it supervises; a current-session one still asks for plans_update_task", async () => {
+		installWorkers(async ({ api }) => {
+			await api.aborted;
+		});
+		entries.length = 0;
+		await begin(2);
+		const delegated = entries.find((entry) => entry.customType === "pi-plans-exec-start");
+		assert.ok(delegated, "start message sent");
+		assert.match(delegated!.content!, /delegated to 2 workers · fake\/worker:high/);
+		assert.match(delegated!.content!, /you supervise — do not implement the tasks or call `plans_update_task` yourself/);
+		assert.doesNotMatch(delegated!.content!, /Report progress with the `plans_update_task` tool/);
+		await stopExecution(makeCtx(root), "next");
+
+		entries.length = 0;
+		const { workdir, planPath } = freshWorkdir();
+		await startExecution(makeCtx(workdir), { planPath, planTasks: parsePlanTasks(PLAN), items: parseChecklist(PLAN) });
+		const local = entries.find((entry) => entry.customType === "pi-plans-exec-start");
+		assert.match(local!.content!, /Report progress with the `plans_update_task` tool/);
+		assert.doesNotMatch(local!.content!, /delegated/);
 	});
 
 	it("a current-session handoff stores no executor block and never starts workers", async () => {
@@ -501,6 +524,35 @@ describe("delegated scheduling helpers", () => {
 		const plan = assignGroups(groups, [1], () => 0);
 		assert.equal(plan.size, 1);
 		assert.equal(plan.get(1)!.length, 3);
+	});
+
+	it("lists unresolved review findings that touch the assigned tasks (or no task) in the brief", () => {
+		const units = unitsOf(tasks).filter((unit) => unit.task.id === "Task-2");
+		const brief = buildWorkerBrief({
+			ex: {
+				planPath: "/p/PLAN_v1.md",
+				items: parseChecklist(PLAN),
+				tasks,
+				audit: {
+					findings: [
+						{ id: "F-001", severity: "high", taskIds: ["Task-2"], note: "report drops the last row" },
+						{ id: "F-002", severity: "medium", taskIds: ["Task-1"], note: "belongs to someone else" },
+						{ id: "F-003", severity: "low", taskIds: [], note: "unmapped naming nit" },
+					],
+				},
+			} as never,
+			workerLabel: "executor-2",
+			workerCount: 2,
+			units,
+			otherOpenIds: [],
+			repairNotes: [],
+		});
+		assert.match(brief, /Unresolved review findings you must address/);
+		assert.match(brief, /- F-001 \(high\) \[Task-2\]: report drops the last row/);
+		assert.match(brief, /- F-003 \(low\): unmapped naming nit/);
+		assert.doesNotMatch(brief, /F-002/);
+		const clean = buildWorkerBrief({ ex: { planPath: "/p", items: parseChecklist(PLAN), tasks, audit: { findings: [] } } as never, workerLabel: "executor", workerCount: 1, units, otherOpenIds: [], repairNotes: [] });
+		assert.doesNotMatch(clean, /Unresolved review findings/);
 	});
 
 	it("writes a brief with the assignment, files, parallel workers and the report contract", () => {

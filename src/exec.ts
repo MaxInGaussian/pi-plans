@@ -305,13 +305,21 @@ export function triggerOwedReview(ctx: ExtensionContext): Promise<void> | null {
 /** A review round found work to repair. Normally one triggerTurn wakes the
  * executor in the main session; a delegated run forwards the same brief to
  * the workers instead (the message still shows in the transcript). */
+const DELEGATED_REPAIR_NOTE =
+	"[delegated run] This review brief was forwarded to the workers that own the reopened tasks. You are the supervisor: do not act on it yourself (no edits, no plans_update_task).";
+
 function sendRepairWake(
 	ctx: ExtensionContext,
 	ex: ExecState,
 	message: { customType: string; content: string; display: boolean },
 ): void {
 	if (isDelegatedExecution(ex) && delegateDriver) {
-		messaging().sendMessage(message, { triggerTurn: false });
+		// The workers get the brief as written; the transcript copy the main
+		// session sees says it is forwarded, so the supervisor does not act on it.
+		messaging().sendMessage(
+			{ ...message, content: `${DELEGATED_REPAIR_NOTE}\n\n${message.content}` },
+			{ triggerTurn: false },
+		);
 		delegateDriver.repair(ctx, ex, message.content);
 		return;
 	}
@@ -373,6 +381,8 @@ export function getExecution(): ExecState | null {
 }
 
 export interface CheckpointExecutionLoad {
+	/** Where the run executes (absent = the current session). */
+	executor?: ExecutorChoice;
 	status: "loaded" | "no-execution" | "plan-missing" | "plan-mismatch" | "no-checkpoint" | "corrupt";
 	planPath?: string;
 	doneVcIds?: string[];
@@ -585,6 +595,7 @@ export function loadExecutionFromCheckpoint(
 	void resumeDelegation(ctx);
 	return {
 		status: "loaded",
+		executor: execution?.executor,
 		planPath,
 		doneVcIds: [...cp.execution.doneVcIds],
 		reverifyAll,
@@ -1041,7 +1052,9 @@ export async function startExecution(
 	messaging().sendMessage(
 		{
 			customType: "pi-plans-exec-start",
-			content: `**pi-plans: executing** \`${input.planPath}\` — ${progress.total} task(s) in ${input.planTasks.legacy ? "legacy" : "task-tree"} mode, ${input.items.length} verification check(s). Report progress with the \`plans_update_task\` tool; the dashboard tracks every task (Ctrl+Shift+T expands the tree).`,
+			content: isDelegated(input.executor)
+				? `**pi-plans: executing** \`${input.planPath}\` — ${progress.total} task(s) in ${input.planTasks.legacy ? "legacy" : "task-tree"} mode, ${input.items.length} verification check(s), delegated to ${executorLabel(input.executor)}. The workers report progress themselves and the dashboard tracks every task (Ctrl+Shift+T expands the tree); you supervise — do not implement the tasks or call \`plans_update_task\` yourself.`
+				: `**pi-plans: executing** \`${input.planPath}\` — ${progress.total} task(s) in ${input.planTasks.legacy ? "legacy" : "task-tree"} mode, ${input.items.length} verification check(s). Report progress with the \`plans_update_task\` tool; the dashboard tracks every task (Ctrl+Shift+T expands the tree).`,
 			display: true,
 		},
 		{ triggerTurn: false },

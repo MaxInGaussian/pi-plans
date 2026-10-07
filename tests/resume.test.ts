@@ -13,6 +13,11 @@ import { acquireOwnership, processStartOf } from "../src/run-ownership.ts";
 import { resetRunBindingForTests } from "../src/run-context.ts";
 import { initState, setArtifactRoot, setRunStatus, startRun, StateError } from "../src/state.ts";
 import { setMessagingApi } from "../src/messaging.ts";
+import { stopExecution } from "../src/exec.ts";
+import { __setSessionFactoryForTests } from "../src/agent-session.ts";
+import { fleet } from "../src/agent-fleet.ts";
+import { fleetUi } from "../src/fleet-ui.ts";
+import { FakeSession } from "./fake-agent-session.ts";
 
 let tmpRoot: string;
 
@@ -441,5 +446,58 @@ describe("execution resume brief with a blocked review (v0.9.2)", () => {
 		assert.match(brief, /Review blocked: Task-2 was reopened by execution review round 1 and is still open/);
 		assert.match(brief, /close it with plans_update_task/);
 		assert.match(brief, /no review round is running while these are open\./i);
+	});
+
+	it("a delegated run's brief makes the main session a supervisor, not an executor", async () => {
+		resetRunBindingForTests();
+		const sessions: FakeSession[] = [];
+		let adaptedForStop: unknown;
+		__setSessionFactoryForTests(async () => {
+			const session = new FakeSession(async (api) => {
+				await api.aborted;
+			});
+			sessions.push(session);
+			return { session };
+		});
+		try {
+			const workdir = setupRepo("delegated-brief", { commit: true });
+			const run = startRun(workdir, { topic: "delegatedbrief", skill: "plan-normal", requestText: "b" }).run;
+			const planPath = path.join(run.artifact_dir, "PLAN_v1.md");
+			fs.mkdirSync(run.artifact_dir, { recursive: true });
+			fs.writeFileSync(planPath, BLOCKED_PLAN, "utf8");
+			createCheckpoint(workdir, { runId: run.run_id, originWorkdir: workdir, workdir });
+			mutateCheckpoint(workdir, run.run_id, (cp) => {
+				const plan = planIdentityOf(planPath, 1);
+				let next = applyPlanWritten({ ...cp, nextAction: "accept-execute" }, plan);
+				next = applyExecutionApproved(next, { plan, worktree: workdir, headAtApproval: resolveHeadAt(workdir), approvedAt: next.updatedAt });
+				return applyExecutionProgress(next, {
+					executor: { mode: "delegated", workers: 2, model_selector: "fake/worker", thinking_level: "high" },
+					tasks: { "Task-1": { status: "complete", evidence: "e" }, "Task-2": { status: "pending" } },
+					blocked: { rolledBack: ["Task-2"], tasks: ["Task-2"], round: 1, escalatedRounds: 0, since: next.updatedAt },
+				});
+			});
+			setRunStatus(workdir, run.run_id, "executing");
+			const mock = makeCtx(workdir);
+			const adapted = ctxAdapter(mock) as { modelRegistry?: unknown };
+			adapted.modelRegistry = { find: (provider: string, id: string) => ({ provider, id }) };
+			adaptedForStop = adapted;
+			await resumePlansCommand(adapted as never, BASE_DIR);
+			assert.equal(mock.userMessages.length, 1, "one resume brief");
+			const brief = mock.userMessages[0]!;
+			assert.match(brief, /continues on delegated workers \(2 workers · fake\/worker:high\)/);
+			assert.match(brief, /You are the supervisor/);
+			assert.match(brief, /Do NOT implement tasks, edit files, or call plans_update_task/);
+			assert.match(brief, /being repaired by the workers/);
+			assert.doesNotMatch(brief, /report every task with the plans_update_task tool/);
+			assert.doesNotMatch(brief, /close it with plans_update_task/);
+			// The same resume restarted the workers for the open task.
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assert.ok(sessions.length >= 1, "a worker session was started for the open task");
+		} finally {
+			if (adaptedForStop) await stopExecution(adaptedForStop as never, "teardown").catch(() => undefined);
+			__setSessionFactoryForTests(null);
+			fleetUi.detach();
+			fleet.clear();
+		}
 	});
 });

@@ -212,7 +212,7 @@ A delegated run works like this:
 - **Scheduling is per wave.** The open tasks of the lowest open wave are grouped by shared files (tasks without declared files share one group), balanced over the workers, and sent as a prompt. A wave starts only after the previous one is fully terminal. Workers keep their session across waves and repair rounds, so they keep their context; a reopened task goes back to the worker that owned it.
 - **Stalls.** A worker whose run ends with assigned tasks still open is re-prompted in the same session; after three such rounds, or two failed runs, the run pauses with the reason (`/plans-execute` resumes, resetting the ladders). Stopping one worker from its overlay pauses the run.
 - **Review.** When every task is terminal the orchestrator starts the same read-only execution review. A failed round's repair brief goes to the owning workers instead of waking the main model.
-- **The main session supervises.** It is told the plan is delegated, is not woken for continuation, and `edit`/`write` are blocked in it until the run ends. `/plans-stop` stops the workers.
+- **The main session supervises.** It is told the plan is delegated (the start banner, the per-turn context, the transcript copy of each repair brief, and the `/resume-plans` brief all say so), is not woken for continuation, and `edit`/`write` are blocked in it until the run ends. Workers' briefs include the still-unresolved review findings for their tasks, so a restarted worker knows why a task reopened. `/plans-stop` stops the workers.
 - Each worker's spawn lands in `subagents.jsonl` with role `executor`. Workers run without extensions, so graph-aware edits are not available to them; run `/update-graph` afterwards when the code graph is enabled.
 
 ## Run State

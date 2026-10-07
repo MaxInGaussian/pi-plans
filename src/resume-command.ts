@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { loadExecutionFromCheckpoint } from "./exec.ts";
+import { executorLabel, isDelegated } from "./executor-config.ts";
 import { formatReviewBudget, isReviewPauseReason, unlimitedHardCapCeiling } from "./review-budget.ts";
 import { bindRun, boundRunId } from "./run-context.ts";
 import { acquireOwnership, OwnershipError, releaseOwnership } from "./run-ownership.ts";
@@ -328,14 +329,25 @@ async function buildBrief(
 			// only in the per-turn injection.
 			const highs = (load.findings ?? []).filter((f) => f.severity === "high");
 			const highLine = highs.length > 0
-				? `\nUnresolved high-severity findings from review round (stable ids): ${highs.map((f) => `${f.id}${f.taskIds.length ? ` (${f.taskIds.join(", ")})` : ""}: ${f.note}`).join("; ")} — fix them, then re-close the affected tasks.`
+				? `\nUnresolved high-severity findings from review round (stable ids): ${highs.map((f) => `${f.id}${f.taskIds.length ? ` (${f.taskIds.join(", ")})` : ""}: ${f.note}`).join("; ")} ${isDelegated(load.executor) ? "— the workers fix them." : "— fix them, then re-close the affected tasks."}`
 				: "";
-			const blockedLine = (load.blocked?.tasks.length ?? 0) > 0
+			const delegated = isDelegated(load.executor);
+			const blockedLine = (load.blocked?.tasks.length ?? 0) > 0 && delegated
+				? `\nReview blocked: ${load.blocked!.tasks.join(", ")} ${load.blocked!.tasks.length === 1 ? "was" : "were"} reopened by execution review round ${load.blocked!.round} and ${load.blocked!.tasks.length === 1 ? "is" : "are"} being repaired by the workers; the review starts by itself once every task is terminal.`
+				: (load.blocked?.tasks.length ?? 0) > 0
 				? `\nReview blocked: ${load.blocked!.tasks.join(", ")} ${load.blocked!.tasks.length === 1 ? "was" : "were"} reopened by execution review round ${load.blocked!.round} and ${load.blocked!.tasks.length === 1 ? "is" : "are"} still open — close ${load.blocked!.tasks.length === 1 ? "it" : "them"} with plans_update_task (complete + evidence, or skipped + skipReason); the review starts by itself once every task is terminal. No review round is running while these are open.`
 				: "";
 			// v0.8: a verifying run keeps checkpoint phase "executing" but the run
 			// STATUS is verifying — surface which loop owns the run right now.
 			const verifying = run.status === "verifying";
+			if (delegated) {
+				// A delegated run is driven by its workers (restarted by the load
+				// above); the main session only supervises.
+				return {
+					phaseLabel: verifying ? "verifying" : "executing",
+					text: `[PI-PLANS RESUME] ${verifying ? "Execution review of" : "Execution of"} run ${runId} continues on delegated workers (${executorLabel(load.executor)}).\nPlan: ${load.planPath}${reverify}${budgetLine}${paused}${legacy}${highLine}${blockedLine}\nYou are the supervisor: the workers were restarted and pick up the open tasks, and they report progress themselves. Do NOT implement tasks, edit files, or call plans_update_task. ${verifying ? "The execution-review loop owns the run right now." : "The independent execution review starts by itself once every task is terminal."} Press Down with an empty editor to watch the workers; /plans-stop stops them.`,
+				};
+			}
 			return {
 				phaseLabel: verifying ? "verifying" : "executing",
 				text: `[PI-PLANS RESUME] ${verifying ? "Execution review of" : "Execution of"} run ${runId} continues in this session.\nPlan: ${load.planPath}${reverify}${budgetLine}${paused}${legacy}${highLine}${blockedLine}\n${verifying ? "The task tree is terminal and the execution-review loop owns the run: when all tasks are terminal and checks are still owed, a read-only reviewer round runs automatically (status verifying → done when every check passes). If a check fails, its tasks roll back to pending — fix and re-close them with plans_update_task." : "Follow the execution-loop contract: work through tasks in wave order, report every task with the plans_update_task tool (status + evidence / skipReason), and let the execution reviewer verify the checks. The current wave and remaining tasks are injected each turn."}`,

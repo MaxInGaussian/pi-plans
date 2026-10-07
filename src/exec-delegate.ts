@@ -154,6 +154,15 @@ export function buildWorkerBrief(input: BriefInput): string {
 		return `- ${unit.task.id}${children}: ${unit.task.title}${deps}${files}`;
 	});
 	const done = flattenTaskViews(ex.tasks).filter((task) => taskIsTerminal(task)).map((task) => task.id);
+	// Findings still unresolved after a review round: after a restart the
+	// workers would otherwise see reopened tasks without knowing why.
+	const assigned = new Set(units.flatMap((unit) => unit.ids));
+	const findings = (ex.audit?.findings ?? []).filter((finding) => finding.taskIds.length === 0 || finding.taskIds.some((id) => assigned.has(id)));
+	const findingsText = findings.length > 0
+		? `Unresolved review findings you must address (stable ids; the reviewer reuses them until the problem is gone):\n${findings
+				.map((finding) => `- ${finding.id} (${finding.severity})${finding.taskIds.length ? ` [${finding.taskIds.join(", ")}]` : ""}: ${finding.note}`)
+				.join("\n")}`
+		: "";
 	const checks = ex.items.map((item) => `- ${item.id}: ${item.text.length > 220 ? `${item.text.slice(0, 217)}...` : item.text}`).join("\n");
 	const parts = [
 		`[PI-PLANS EXECUTION — worker ${input.workerLabel} of ${input.workerCount}]`,
@@ -164,6 +173,7 @@ export function buildWorkerBrief(input: BriefInput): string {
 			? `Other workers are implementing ${input.otherOpenIds.join(", ")} in parallel in the same worktree. Stay inside your own tasks' files.`
 			: "",
 		`Report each task the moment it is done with the plans_update_task tool (taskId, status "complete" with evidence, or "skipped" with a skipReason). The tool returns at once: keep working through your remaining tasks in this same session and stop only when every assigned task is closed.`,
+		findingsText,
 		`After all tasks are terminal an independent reviewer verifies these checks:\n${checks}`,
 		...input.repairNotes.map((note) => `Repair brief from the supervisor (a review round reopened tasks):\n${note}`),
 		input.nudge ?? "",
