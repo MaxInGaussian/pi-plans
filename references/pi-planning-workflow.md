@@ -9,7 +9,7 @@ This skill set is written for the Pi coding agent's documented behavior:
 - the seven skills are contributed by the pi-plans extension and loaded as Pi skills (also invokable as `/skill:<name>`);
 - skill references and helper sources are resolved relative to the directory containing `SKILL.md`;
 - Planning and reference analysis run with the extension tools `plans`, `ask_choice`, `refine`, `analyze_refs`, and `execute_plan`;
-- `refine` runs read-only delegated reviewers as in-process agent sessions (tools `read,grep,find,ls`, plus a read-only `code_graph` when workspace `graph_enabled` is true) with isolated context; in TUI every delegated agent is a bullet in a subagent list above the editor — with an empty editor `↓` focuses the list, `↑/↓` pick an agent, `Enter` opens that one agent's live transcript overlay (78% × 78% top-center, ≥72 cols, no input row, follow-bottom scroll), `Esc` closes the overlay or hands focus back (close-only — the session keeps running and its result still flows back as tool output); finished agents stay listed until the next round replaces them (or ten minutes pass), and conclusions return to the main session as tool output; `analyze_refs` runs one read-only session per downloaded reference (cwd = that ref's directory) reusing the reviewer role gates, at most 3 at once with the rest queued in the same list, and returns structured per-reference sections for `REF_ANALYSIS.md`;
+- `refine` runs read-only delegated reviewers as in-process agent sessions (tools `read,grep,find,ls`, plus a read-only `code_graph` when workspace `graph_enabled` is true) with isolated context; with more than one reviewer the planner writes a tailor-made direction for each (`directions`, required); in TUI every delegated agent is a bullet in a subagent list above the editor — with an empty editor `↓` focuses the list, `↑/↓` pick an agent, `Enter` opens that one agent's live transcript overlay (78% × 78% top-center, ≥72 cols, no input row, follow-bottom scroll), `Esc` closes the overlay or hands focus back (close-only — the session keeps running and its result still flows back as tool output); finished agents stay listed until the next round replaces them (or ten minutes pass), and conclusions return to the main session as tool output; `analyze_refs` runs one read-only session per downloaded reference (cwd = that ref's directory) reusing the reviewer role gates, at most 3 at once with the rest queued in the same list, and returns structured per-reference sections for `REF_ANALYSIS.md`;
 - when graph mode is enabled, graph-aware `read`/`edit` overrides are active for indexed source files: `read` returns a capped function digest (≤50 lines, synthetic anonymous entries folded) by default — drill in via `offset/limit` or `code_graph get-function`, and `full: true` is the only whole-file exit (small/zero-function files return full text; safety truncation matches native read); `write`/`edit` stage DB-first mutations until materialized via the `code_graph` tool's `apply` action (same planning/accepted gate as /apply-graph; refused for read-only refiner subagents via the PI_PLANS_REFINER marker; returns a per-file report with counts and a post-apply drift summary, and never changes run status); unexpected fallbacks (`not indexed` / `runtime unavailable` / `config read failed`) are marked at the top of the result while flag-off fallbacks stay unmarked;
 - the execution loop is extension-managed and task-tree driven: the current wave and remaining tasks are injected each turn, progress is reported exclusively through the `plans_update_task` tool (status + evidence / skipReason), the task dashboard tracks every task (compact widget; Ctrl+Shift+T expands the tree), and an independent execution reviewer verifies the verification checks before the run completes;
 - execution and planning compaction keep Pi's SessionManager as the history owner; during active pi-plans runs, `session_before_compact` uses a deterministic no-LLM VCC-style summary with `[Session Goal]`, `[Files And Changes]`, `[Commits]`, `[Outstanding Context]`, `[User Preferences]`, and a ranked brief transcript; Pi core owns manual `/compact`, threshold, and overflow scheduling, while pi-plans handles smart tail keep, `keep:N`, stats, and phase-specific run/plan/current-I/checklist context; in addition, creating a new planning run (`plans start-run`) applies one pre-plan VCC compaction on that turn's `turn_end` boundary as a host compaction draft (no abort of the running turn, no aborted-turn error, no resume message) so the new plan continues on a lean context (default on, `prePlanCompact` in `pi-vcc-config.json`); a manual `/compact` that displaces a live planning or execution turn is resumed exactly once by pi-plans when the compaction ends (success or failure, gated by `continueAfterThresholdCompact`);
@@ -109,13 +109,32 @@ After each plan version, ask one merged accept/execute question via `ask_choice`
 2. `Accept PLAN_vN, don't execute yet` — mark accepted; resume later via `/plans-execute`.
 3. `Run another round: <the level's default next refine mode>` — only while the level's default sequence is unfinished.
 
-The recommended option follows the skill level's default sequence: while the default round is unfinished it is option 3 (`plan-small` / `plan-normal`: one reviewer round; `plan-big` / `plan-huge`: three concurrent reviewers via `refine` with `reviewers: 3`; `plan-with-refs`: three concurrent reviewers, or one when its plan shape is `plan-normal`); once the default round is complete it is option 1. Every round returns findings (`F-###`) and up to five questions (`Q-1..Q-5`) in the same output.
+The recommended option follows the skill level's default sequence: while the default round is unfinished it is option 3 (`plan-small`: one reviewer round; `plan-normal`: two concurrent reviewers via `refine` with `reviewers: 2`; `plan-big` / `plan-huge`: three via `refine` with `reviewers: 3`; `plan-with-refs`: by its chosen shape — two for `plan-normal`, three for `plan-big` / `plan-huge`; every multi-reviewer round also passes tailor-made `directions`); once the default round is complete it is option 1. Every round returns findings (`F-###`) and up to five questions (`Q-1..Q-5`) in the same output.
 
 If the user selects another round, run the `refine` tool with the plan path and any focus. Reviewer output consolidates into `PLAN_vN_reviewer_comments.md` with findings IDs, severity, affected plan IDs, evidence, impact, recommended fix, and disposition. Revise the next plan only for findings accepted on evidence.
 
-### Concurrent Reviewers (big plans)
+### Concurrent Reviewers And Tailored Directions
 
-A big-plan reviewer round runs three independent reviewer subagents (`reviewers: 3`); each gets its own emphasis lens but forms its own priorities. After they return, merge and dedupe their findings into one consolidated `PLAN_vN_reviewer_comments.md`, keeping each finding's source reviewer, severity, evidence, and disposition, and surface at most five high-priority comments to the user. Treat agreement between independent reviewers as stronger evidence, not as authority; every accepted finding still needs repo or reference evidence.
+`plan-normal` runs two independent reviewer subagents (`refine` with `reviewers: 2`) and `plan-big` / `plan-huge` run three (`reviewers: 3`); `plan-small` and `debug-and-plan` keep one. With more than one reviewer you — the planner — write each reviewer's **direction** for the project at hand and pass them as `directions: [{ id, direction }, …]` (exactly one per reviewer; `refine` refuses the round without them). There are no fixed lenses: the point is that the reviewers are complementary and dig deeper where you or the executor are most likely to overlook something, instead of three generic passes that repeat each other.
+
+Authoring rules:
+
+- **Start from the plan and the repository, not from a checklist.** Ask where this plan is most likely to be wrong in ways you cannot see from inside it: hidden coupling and blast radius of the touched modules, migration/rollback and state transitions (including a half-applied change), concurrency and ordering, failure and degraded modes, security and permissions, performance cliffs, integration points and external contracts, whether the verification checks would really fail if the behavior were broken, and assumptions the user's answers left unstated. Pick the two or three with the highest expected miss rate for THIS plan.
+- **Name the project.** Each direction cites concrete modules, flows, files or risks of this repository (20–800 characters) and says why a planner or executor could miss it. A direction that would read the same for any project is not tailored.
+- **Complementary, not overlapping.** Every direction covers different ground; each reviewer's brief lists the other directions so it does not duplicate them. A reviewer still reports a high-severity problem it stumbles on outside its direction, briefly.
+- **`id` is a short slug** (`migration-rollback`, `check-strength`); it becomes the lane id, the bullet label in the subagent list, and the section title in the result.
+- **Drop what you cannot justify.** If you cannot say why a direction matters for this project, do not use it.
+- **Resume.** `resumeRoundId` without `directions` reuses the lanes (and direction text) stored in that round, so an interrupted round resumes without re-supplying them; supplying different directions for an existing round is refused.
+
+Illustrative only (never reuse these ids or text for a different project) — a plan that adds a payment-retry queue to a billing service:
+
+- `idempotency-and-duplicates` — "Trace every retry path through `billing/retry.ts` and the webhook handler and find where a replayed event or a crash between charge and ledger write can double-charge or lose a charge."
+- `queue-failure-modes` — "Probe what happens when the queue backend is down, slow or full: backpressure, poison messages, dead-letter handling, and whether the tasks cover the operational runbook."
+- `check-strength` — "Test whether each verification check could still pass with a broken retry path; name behaviors no check exercises (clock skew, partial failure)."
+
+A plan that migrates a CLI tool's config format: `legacy-config-compat` (every reader of the old format in `src/config/*`), `upgrade-path-and-rollback` (what a user with a half-migrated file sees, and how they go back), `docs-and-help-drift` (help text, README and error messages that still describe the old format).
+
+After the reviewers return, merge and dedupe their findings into one consolidated `PLAN_vN_reviewer_comments.md`, keeping each finding's source reviewer (its direction id), severity, evidence, and disposition, and surface at most five high-priority comments to the user. Treat agreement between independent reviewers as stronger evidence, not as authority; every accepted finding still needs repo or reference evidence.
 
 ### Reviewer Questions
 
@@ -140,7 +159,7 @@ a single `plan-big` plan; default to `plan-big` when the shape is genuinely ambi
 `plan-normal` when the analyzed references shrink the work to a broad but bounded change (the ≥3
 qualifying references and ≥3 adoption questions per reference still apply).
 
-Depth and reviewers follow the chosen shape: `plan-normal` keeps that skill's single reviewer and
+Depth and reviewers follow the chosen shape: `plan-normal` keeps that skill's two reviewers and
 bounded refinement, while `plan-big` and `plan-huge` keep at least ten questions and `refine` with
 `reviewers: 3`. A `plan-huge` shape continues in the SAME run — the run's recorded `skill` stays
 `plan-with-refs` and no new run is started — by writing `PLAN_overall_vN.md` and recording `plans`
@@ -161,7 +180,7 @@ and ONE flat artifact directory (`.git/pi-plans/plans/<date-topic>/`).
 ten `ask_choice` questions, using `references/huge-plan-artifact-template.md`
 (version table, architecture, file map, user experience, final objective; never
 `## Tasks` or `## Verification Checks`). (2) One `refine` round of three
-concurrent reviewers by default; the user may extend rounds at the merged
+concurrent reviewers (with tailored directions) by default; the user may extend rounds at the merged
 accept/execute question. (3) Accepting the overall plan starts the first
 version's planning round — never execution. (4) Version planning writes
 `PLAN_vX.Y.Z_v1.md` (5–10 questions) with the `plan-big` task grammar plus the

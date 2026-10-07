@@ -24,7 +24,7 @@ inspection.
    architecture, file map (path / responsibility / version), expected user
    experience, and the final objective. Question depth: at least 10
    `ask_choice` questions. Reviewer default: one `refine` round with
-   `reviewers: 3`; the user may extend rounds at the merged accept/execute
+   `reviewers: 3` plus tailored `directions` (see the shared workflow); the user may extend rounds at the merged accept/execute
    question. Record the boundary with `plans` (`record-checkpoint`,
    transition `overall-plan-written`).
 2. **Accept the overall plan** — the merged accept/execute question offers
@@ -35,7 +35,7 @@ inspection.
    `PLAN_vX.Y.Z_v1.md` in the same artifact directory, structured exactly like
    a `plan-big` plan plus the huge-only sections (`## Deferred to vX.Y.Z`,
    `## Evidence`). Question depth: 5-10 questions. Then the same reviewer
-   treatment as step 1 (`refine` with `reviewers: 3` by default). Recording
+   treatment as step 1 (`refine` with `reviewers: 3` and tailored `directions` by default). Recording
    the plan is mandatory: `plans` (`record-checkpoint`, transition
    `version-plan-written`) is what runs the deferred gate and the reference
    lint and what stores this version's round.

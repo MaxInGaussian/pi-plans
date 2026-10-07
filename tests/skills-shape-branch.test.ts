@@ -41,7 +41,7 @@ describe("plan-with-refs plan shape branch", () => {
 				"ask_choice",
 				"autoComplete: false",
 				"reviewers: 3",
-				"reviewers: 1",
+				"reviewers: 2",
 				"overall-plan-written",
 				"overall-review-consolidated",
 				"overall-accepted",

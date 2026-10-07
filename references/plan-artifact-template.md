@@ -122,6 +122,7 @@ review rounds, refs), not in the plan file. `## Execution Handoff Notes` and
 
 One Reviewer role: each round returns findings (`F-###`) and up to five
 questions (`Q-1..Q-5`). Default sequences: plan-big → one round of three
-concurrent reviewers (questions included); plan-normal / plan-small → one
-reviewer round. The main agent asks every question with `ask_choice` and
+concurrent reviewers (questions included); plan-normal → one round of two
+concurrent reviewers; plan-small → one reviewer round. Multi-reviewer rounds
+use directions the planner writes for the project (`refine` `directions`). The main agent asks every question with `ask_choice` and
 records the answers before revising the plan.

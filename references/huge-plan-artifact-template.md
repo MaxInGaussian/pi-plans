@@ -80,5 +80,5 @@ permitted auxiliary section.
   version keeps its identity from the run checkpoint.
 - Acceptance semantics: an accepted overall plan starts the `v0.1.0`
   planning round; it never starts execution.
-- Reviewer default: one round of three concurrent reviewers, extendable by
+- Reviewer default: one round of three concurrent reviewers (tailored directions), extendable by
   the user through the merged accept/execute question.
