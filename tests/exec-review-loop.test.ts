@@ -31,6 +31,8 @@ import { getRun, initState, setRunStatus, startRun } from "../src/state.ts";
 import { createCheckpoint, loadCheckpoint, mutateCheckpoint, applyExecutionApproved, applyExecutionProgress, applyPlanWritten, planIdentityOf, resolveHeadAt } from "../src/workflow-state.ts";
 
 import { loadExecutionFromCheckpoint } from "../src/exec.ts";
+import { fleet } from "../src/agent-fleet.ts";
+import { fleetUi } from "../src/fleet-ui.ts";
 
 const PLAN = `# PLAN_v1 - review-loop fixture
 
@@ -80,7 +82,7 @@ function freshWorkdir(): { workdir: string; planPath: string; runId: string } {
 	return { workdir, planPath, runId: run.run_id };
 }
 
-function makeCtx(workdir: string, mode: "print" | "tui" = "print", customOpens?: { count: number }, components?: RefineOverlayComponent[]) {
+function makeCtx(workdir: string, mode: "print" | "tui" = "print", customOpens?: { count: number }, components?: Array<{ handleInput(data: string): void }>) {
 	const entries: Array<{ customType: string; data?: unknown; content?: string }> = [];
 	const ctx = {
 		cwd: workdir,
@@ -92,14 +94,18 @@ function makeCtx(workdir: string, mode: "print" | "tui" = "print", customOpens?:
 			notify: () => {},
 			setStatus: () => {},
 			setWidget: () => {},
+			onTerminalInput: () => () => undefined,
+			getEditorText: () => "",
 			theme: { fg: (_c: string, t: string) => t, bold: (t: string) => t },
-			// Minimal overlay host: counts ui.custom opens (one per controller)
-			// and captures the rendered component so tests can drive its input.
+			// Minimal overlay host: counts ui.custom opens and captures the
+			// rendered component so tests can drive its input. The overlay
+			// stays "open" until its component calls done().
 			custom: (render: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => { handleInput(data: string): void }) => {
 				if (customOpens) customOpens.count += 1;
-				const component = render({ requestRender() {}, terminal: undefined }, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, undefined, () => {});
-				if (components) components.push(component);
-				return Promise.resolve();
+				return new Promise<void>((resolve) => {
+					const component = render({ requestRender() {}, terminal: undefined }, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, undefined, () => resolve());
+					if (components) components.push(component);
+				});
 			},
 		},
 		isIdle: () => true,
@@ -310,31 +316,37 @@ describe("execution-review loop (v0.8)", () => {
 		__setAuditRunnerForTests(null);
 	});
 
-	it("every attempt opens a fresh overlay; the reopen shortcut is inert with no in-flight round", async () => {
+	it("the round is one fleet agent; the reopen shortcut opens its overlay once and never stacks", async () => {
 		const { workdir, planPath } = freshWorkdir();
 		await startTerminal(planPath, workdir);
 		const ctl = controlledRunner();
 		__setAuditRunnerForTests(ctl.runner);
+		fleet.clear();
+		fleetUi.detach();
 		const opens = { count: 0 };
 		const components: Array<{ handleInput(data: string): void }> = [];
 		const ctx = makeCtx(workdir, "tui", opens, components);
 		await restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
-		assert.equal(opens.count, 1, "the round opened its overlay before spawning");
-		// ESC closed the (one-shot) controller — only THEN may reopen rebuild it
-		// (the anti-stacking guard keeps a second overlay off a live one).
-		components[0]!.handleInput("\x1b");
+		const auditors = fleet.list().filter((entry) => entry.role === "auditor");
+		assert.equal(auditors.length, 1, "the round registered one auditor agent before spawning");
+		assert.equal(opens.count, 0, "the list does not pop an overlay on its own");
 		const { reopenReviewOverlay } = await import("../src/exec.ts");
 		reopenReviewOverlay(ctx);
-		assert.equal(opens.count, 2, "reopen builds a fresh controller for the same round after ESC");
-		// A second reopen while the new controller is live must NOT stack.
+		assert.equal(opens.count, 1, "the shortcut opens the round's overlay");
 		reopenReviewOverlay(ctx);
-		assert.equal(opens.count, 2, "reopen never stacks a second live overlay");
+		assert.equal(opens.count, 1, "reopen never stacks a second live overlay");
+		components[0]!.handleInput("\x1b"); // Esc closes it
+		await tick();
+		reopenReviewOverlay(ctx);
+		assert.equal(opens.count, 2, "after Esc the shortcut can open it again");
+		components[1]!.handleInput("\x1b");
+		await tick();
 		ctl.resolveRound({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "done" });
 		await __awaitReviewRoundForTests();
-		// No round in flight → the shortcut is inert.
-		reopenReviewOverlay(ctx);
-		assert.equal(opens.count, 2, "reopen is inert with no in-flight round");
+		assert.equal(fleet.list().find((entry) => entry.role === "auditor")?.lane.status, "complete", "the finished round stays readable in the list");
 		__setAuditRunnerForTests(null);
+		fleetUi.detach();
+		fleet.clear();
 	});
 
 	it("a legacy cap pause (old prefix) survives restore paused at its round count", async () => {

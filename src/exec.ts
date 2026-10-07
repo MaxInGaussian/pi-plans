@@ -142,8 +142,8 @@ import {
 import type { ReviewFindingRecord } from "./workflow-state.ts";
 import { staleReloadHint as probeStaleReload } from "./staleness.ts";
 import { messaging } from "./messaging.ts";
-import { RefineOverlayController, refineOverlayContext } from "./refine-ui.ts";
-import { applyRefineProgress, applyRefineResult, type RefineLaneState } from "./refine-ui-state.ts";
+import { fleetUi, fleetUiHost } from "./fleet-ui.ts";
+import { openFleetGroup, type FleetRun } from "./fleet-run.ts";
 import { resolveReviewerSpawn } from "./thinking-levels.ts";
 import { loadGlobalConfig, reviewerReady } from "./global-state.ts";
 import { matchesTerminalKey } from "./terminal-keys.ts";
@@ -1460,61 +1460,20 @@ function reviewSpawnProfile(): { model?: string; thinkingLevel?: string; label: 
 	return { label: "session default" };
 }
 
-/** Engine-held lane state for the in-flight round: the reopen path builds a
- * fresh one-shot controller seeded from THIS object, so the accumulated
- * transcript survives ESC + reopen (CF2-001 / Q-reopen-seed). */
-let reviewLane: RefineLaneState | null = null;
-let reviewOverlay: RefineOverlayController | null = null;
-let reviewModelLabel: string | undefined;
+/** Fleet group of the in-flight (or most recent) execution-review round. */
+let reviewRun: FleetRun | null = null;
 
-function freshReviewLane(attempt: number): RefineLaneState {
-	return {
-		id: `review-round-${attempt}`,
-		label: `Execution review round ${attempt}`,
-		status: "queued",
-		phase: "queued",
-		detail: "",
-		transcript: [],
-		currentTurnIndex: 0,
-		scrollOffset: 0,
-		followTranscript: true,
-		viewportHeight: 1,
-	};
-}
-
-/** Fresh controller per round (the controller is one-shot: closed latch,
- * overlayPromise bail, terminal-lane early return — reuse drops progress).
- * A UI failure must NEVER kill the round itself — best-effort only. The
- * overlay forwards unhandled keys so Ctrl+Shift+T keeps working while the
- * review overlay holds focus (pi-tui has no key bubbling). */
-function openReviewOverlay(ctx: ExtensionContext, lane: RefineLaneState, lang: "en" | "zh" | undefined, modelLabel: string): RefineOverlayController | null {
-	if (ctx.mode !== "tui" || ctx.hasUI !== true) return null;
-	try {
-		const controller = new RefineOverlayController(
-			"auditor",
-			[{ id: lane.id, label: lane.label }],
-			() => {},
-			lang ?? "en",
-			(data) => {
-				if (matchesTerminalKey(data, "ctrl+shift+t")) toggleDashboardExpanded(ctx);
-			},
-		);
-		controller.seedLane(lane);
-		controller.open(refineOverlayContext(ctx), modelLabel);
-		return controller;
-	} catch {
-		return null;
-	}
-}
-
-/** The reopen surface (Task-3.4): rebuilds the overlay from engine-held lane
- * state; inert when no round is in flight. */
+/** The reopen surface: focuses the newest execution-review agent's overlay.
+ * Inert when no review round has run yet. */
 export function reopenReviewOverlay(ctx: ExtensionContext): void {
-	if (!execution?.review.inFlight || !reviewLane) return;
-	// Never stack a second overlay on a live one (Ctrl+Shift+R while open).
-	if (reviewOverlay && !reviewOverlay.isClosed()) return;
-	const controller = openReviewOverlay(ctx, reviewLane, execution.uiLanguage, reviewModelLabel ?? "session default");
-	if (controller) reviewOverlay = controller;
+	if (ctx.mode !== "tui" || ctx.hasUI !== true) return;
+	fleetUi.attach(fleetUiHost(ctx), {
+		lang: execution?.uiLanguage,
+		onUnhandledKey: (data) => {
+			if (matchesTerminalKey(data, "ctrl+shift+t")) toggleDashboardExpanded(ctx);
+		},
+	});
+	fleetUi.openLatest("auditor");
 }
 
 function pauseReviewCap(ctx: ExtensionContext, ex: ExecState): void {
@@ -1632,10 +1591,21 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 	ex.review.inFlight = round;
 	ex.audit.running = true; // dashboard mirror (the v0.8 model lands with the overlay task)
 	const spawn = reviewSpawnProfile();
-	reviewModelLabel = spawn.label;
-	const lane = freshReviewLane(round.attempt);
-	reviewLane = lane;
-	reviewOverlay = openReviewOverlay(ctx, lane, ex.uiLanguage, spawn.label);
+	const laneId = `review-round-${round.attempt}`;
+	// A UI failure must NEVER kill the round itself: the fleet list is
+	// best-effort chrome.
+	const run = openFleetGroup(ctx, {
+		role: "auditor",
+		groupId: `execution-review-${round.attempt}-${Date.now().toString(36)}`,
+		lanes: [{ id: laneId, label: `Execution review round ${round.attempt}` }],
+		modelLabel: spawn.label,
+		lang: ex.uiLanguage,
+		// pi-tui has no key bubbling: forward the dashboard toggle.
+		onUnhandledKey: (data) => {
+			if (matchesTerminalKey(data, "ctrl+shift+t")) toggleDashboardExpanded(ctx);
+		},
+	});
+	reviewRun = run;
 	updateStatusWidget(ctx);
 	let result: AuditRoundResult;
 	try {
@@ -1654,19 +1624,16 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 				thinkingLevel: spawn.thinkingLevel,
 				timeoutMs: REVIEW_ROUND_TIMEOUT_MS,
 				signal: round.controller.signal,
-				onProgress: (event) => {
-					// The engine owns the lane state; the live controller only repaints.
-					applyRefineProgress(lane, event);
-					reviewOverlay?.rerender();
-				},
+				onProgress: (event) => run.group.update(laneId, event),
 			});
 	} catch (error) {
 		if (ex.review.inFlight === round) {
 			ex.review.inFlight = null;
 			ex.audit.running = false;
 		}
-		void reviewOverlay?.close();
-		reviewOverlay = null;
+		run.group.complete(laneId, { ok: false, output: "", stderr: "", turns: 0, errorMessage: String(error) });
+		run.close();
+		if (reviewRun === run) reviewRun = null;
 		messaging().sendMessage(
 			{ customType: "pi-plans-review-error", content: `pi-plans: execution review round threw: ${String(error)}`, display: true },
 			{ triggerTurn: false },
@@ -1674,11 +1641,11 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 		updateStatusWidget(ctx);
 		return;
 	}
-	// Overlay terminal state + close (the controller is one-shot; the engine-held
-	// lane keeps the transcript for a later reopen within this round).
+	// Terminal lane state; the finished agent stays in the list so its
+	// transcript can still be read until the next round replaces it.
 	const cancelledResult = result !== null && typeof result === "object" && "cancelled" in result;
 	try {
-		applyRefineResult(lane, {
+		run.group.complete(laneId, {
 			ok: !cancelledResult,
 			output: result && "report" in result ? result.report : "",
 			stderr: "",
@@ -1688,8 +1655,8 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 	} catch {
 		/* cosmetic only */
 	}
-	void reviewOverlay?.close();
-	reviewOverlay = null;
+	run.close();
+	if (reviewRun === run) reviewRun = null;
 	await handleReviewOutcome(ctx, ex, round, result, pendingChecks.map((item) => item.id));
 }
 

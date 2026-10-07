@@ -289,7 +289,7 @@ export async function runCompletionAudit(
 		onProgress?: (event: import("./subagent.ts").SubagentProgressEvent) => void;
 	},
 ): Promise<AuditRoundResult> {
-	const { runPiSubagent } = await import("./subagent.ts");
+	const { runAgentSession, agentHostOf } = await import("./agent-session.ts");
 	const pending = auditablePendingChecks(opts.checklist, opts.tasks);
 	const task = buildAuditTask(opts.planPath, opts.checklist, opts.tasks, opts.round, opts.priorFindings ?? [], opts.findingDispositions);
 	// agents/auditor.md, not agents/reviewer.md: the reviewer prompt mandates a
@@ -300,10 +300,11 @@ export async function runCompletionAudit(
 	// fallback once swapped in a minimal prompt that produced unparsable
 	// reports and burned whole audit budgets as undeterminable.
 	const agentPrompt = fs.readFileSync(new URL("../agents/execution-reviewer.md", import.meta.url), "utf8");
-	const result = await runPiSubagent({
+	const result = await runAgentSession({
 		systemPrompt: agentPrompt,
 		task,
 		cwd: ctx.cwd,
+		host: agentHostOf(ctx),
 		model: opts.model,
 		thinkingLevel: opts.thinkingLevel,
 		timeoutMs: opts.timeoutMs,

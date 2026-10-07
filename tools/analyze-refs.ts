@@ -2,11 +2,11 @@
  * `analyze_refs` tool — plan-with-refs per-reference analysis via read-only Pi
  * subagents with isolated context. One lane per reference (cwd = the ref's own
  * directory), reusing the reviewer model confirmation from the GLOBAL config
- * (`~/.pi/pi-plans/config.json`) and the concurrent overlay (title "Refs").
+ * (`~/.pi/pi-plans/config.json`) and the shared subagent list.
  * analyze_refs is spawn-only by nature, so the reviewer MODE is deliberately
  * not consulted here (Q-4=B): a current-session reviewer still gets spawned
- * ref-analyst lanes, with a one-time notice in the result. Batches are capped
- * at three concurrent lanes; larger ref sets run as sequential batches.
+ * ref-analyst lanes, with a one-time notice in the result. At most three lanes run
+ * concurrently; larger ref sets queue.
  *
  * Recording is best-effort: spawns land in `subagents.jsonl` (role
  * `ref-analyst`) only when an active planning run exists. Analysis output is
@@ -34,13 +34,16 @@ import { roleModelLabel } from "../src/thinking-levels.ts";
 import type { SubagentUsage } from "../src/subagent.ts";
 import { resolveActiveRun } from "../src/run-context.ts";
 import { buildRefAnalystTask, type RefAnalystTaskInput } from "../src/refine-prompts.ts";
-import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
-import { RefineOverlayController, refineOverlayContext } from "../src/refine-ui.ts";
+import { stripFrontmatter } from "../src/subagent.ts";
+import { agentHostOf, runAgentSession } from "../src/agent-session.ts";
+import { runLimited } from "../src/agent-fleet.ts";
+import { openFleetGroup } from "../src/fleet-run.ts";
 import { matchesTerminalKey } from "../src/terminal-keys.ts";
 import { toggleDashboardExpanded } from "../src/exec.ts";
 import { resolveUiLanguage } from "../src/ui-language.ts";
 
-const BATCH_SIZE = 3;
+/** At most this many reference lanes run at once; the rest wait as queued entries. */
+const MAX_CONCURRENT = 3;
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 
 const AnalyzeRefsParams = Type.Object({
@@ -108,7 +111,7 @@ export function registerAnalyzeRefsTool(ext: ExtensionAPI, baseDir: string): voi
 		name: "analyze_refs",
 		label: "Analyze Refs",
 		description:
-			"plan-with-refs: analyze downloaded references via independent read-only Pi subagents — one lane per reference (cwd = the ref directory), reusing the reviewer model confirmation from the global config and the concurrent overlay. Batches of at most 3 lanes run sequentially; results are structured per-reference sections for REF_ANALYSIS.md. Recording into subagents.jsonl is best-effort (active run only); refs.jsonl stays owned by the main agent via the plans record-ref action. The reviewer mode is not consulted (spawn-only); first use pops native model/effort panels in TUI.",
+			"plan-with-refs: analyze downloaded references via independent read-only Pi subagents — one lane per reference (cwd = the ref directory), reusing the reviewer model confirmation from the global config and the shared subagent list. At most 3 lanes run at once and the rest wait in the subagent list; results are structured per-reference sections for REF_ANALYSIS.md. Recording into subagents.jsonl is best-effort (active run only); refs.jsonl stays owned by the main agent via the plans record-ref action. The reviewer mode is not consulted (spawn-only); first use pops native model/effort panels in TUI.",
 		promptSnippet: "Analyze plan-with-refs references with per-ref read-only subagents",
 		parameters: AnalyzeRefsParams,
 
@@ -185,29 +188,45 @@ export function registerAnalyzeRefsTool(ext: ExtensionAPI, baseDir: string): voi
 				}
 			};
 
-			const runJob = async (job: AnalysisJob, overlay: RefineOverlayController | undefined, relay: AbortController) => {
+			const run = openFleetGroup(ctx, {
+				role: "refs",
+				groupId: `refs-${Date.now().toString(36)}`,
+				lanes: jobs.map((job) => ({ id: job.laneId, label: job.laneId })),
+				modelLabel,
+				lang: resolveUiLanguage(workdir),
+				signal,
+				// Forward the dashboard toggle (no key bubbling in pi-tui).
+				onUnhandledKey: (data) => {
+					if (matchesTerminalKey(data, "ctrl+shift+t")) toggleDashboardExpanded(ctx);
+				},
+			});
+
+			const runJob = async (job: AnalysisJob) => {
 				if (job.missing) {
-					return { ok: false as const, output: "", model: undefined, errorMessage: job.missing, stderr: "", turns: 0 };
+					const result = { ok: false as const, output: "", model: undefined, errorMessage: job.missing, stderr: "", turns: 0 };
+					run.group.complete(job.laneId, result);
+					return result;
 				}
 				try {
-					const result = await runPiSubagent({
+					const result = await runAgentSession({
 						systemPrompt: agentPrompt,
 						task: buildRefAnalystTask({ ...job.input, languageTag }),
 						cwd: job.dir,
+						host: agentHostOf(ctx),
 						model,
 						thinkingLevel: reviewer.thinking_level ?? undefined,
 						tools: READ_ONLY_TOOLS,
-						signal: relay.signal,
-						onProgress: (event) => overlay?.update(job.laneId, event),
+						signal: run.signalFor(job.laneId),
+						onProgress: (event) => run.group.update(job.laneId, event),
 					});
-					overlay?.complete(job.laneId, result);
+					run.group.complete(job.laneId, result);
 					record(job.name, result.ok ? result.model ?? model : null, result.usage);
 					return result;
 				} catch (error) {
 					record(job.name, null);
 					const message = error instanceof Error ? error.message : String(error);
 					const result = { ok: false as const, output: "", model: model ?? undefined, errorMessage: message, stderr: "", turns: 0 };
-					overlay?.complete(job.laneId, result);
+					run.group.complete(job.laneId, result);
 					return result;
 				}
 			};
@@ -216,55 +235,32 @@ export function registerAnalyzeRefsTool(ext: ExtensionAPI, baseDir: string): voi
 			const outputs: Array<{ name: string; lane: string; refId: string; ok: boolean; output: string; errorMessage?: string; turns: number }> = [];
 			let failures = 0;
 
-			// Sequential batches of at most BATCH_SIZE lanes; each batch gets its
-			// own overlay with the same lifecycle as a single refine round.
-			for (let start = 0; start < jobs.length; start += BATCH_SIZE) {
-				const batch = jobs.slice(start, start + BATCH_SIZE);
-				const controller = new AbortController();
-				const relayAbort = () => controller.abort();
-				if (signal?.aborted) controller.abort();
-				else signal?.addEventListener("abort", relayAbort, { once: true });
-
-				const overlay =
-					ctx.mode === "tui"
-						? new RefineOverlayController(
-							"refs",
-							batch.map((job) => ({ id: job.laneId, label: job.laneId })),
-							relayAbort,
-							resolveUiLanguage(workdir),
-							// Forward the dashboard toggle (no key bubbling in pi-tui).
-							(data) => {
-								if (matchesTerminalKey(data, "ctrl+shift+t")) toggleDashboardExpanded(ctx);
-							},
-						)
-						: undefined;
-				overlay?.open(refineOverlayContext(ctx), modelLabel);
-				try {
-					const results = await Promise.all(batch.map((job) => runJob(job, overlay, controller)));
-					for (let i = 0; i < batch.length; i += 1) {
-						const job = batch[i]!;
-						const result = results[i]!;
-						const title = `${job.name} — ${job.input.title ?? job.input.refId}`;
-						if (!result.ok) {
-							failures += 1;
-							sections.push(`### ${title} — FAILED\n${result.errorMessage ?? "unknown error"}`);
-						} else {
-							sections.push(`### ${title}\n${result.output}`);
-						}
-						outputs.push({
-							name: job.name,
-							lane: job.laneId,
-							refId: job.input.refId,
-							ok: result.ok,
-							output: result.output,
-							errorMessage: result.errorMessage,
-							turns: result.turns,
-						});
+			// Every reference is one bullet in the fleet list; at most
+			// MAX_CONCURRENT run at once and the rest show as queued.
+			try {
+				const results = await runLimited(MAX_CONCURRENT, jobs.map((job) => () => runJob(job)));
+				for (let i = 0; i < jobs.length; i += 1) {
+					const job = jobs[i]!;
+					const result = results[i]!;
+					const title = `${job.name} — ${job.input.title ?? job.input.refId}`;
+					if (!result.ok) {
+						failures += 1;
+						sections.push(`### ${title} — FAILED\n${result.errorMessage ?? "unknown error"}`);
+					} else {
+						sections.push(`### ${title}\n${result.output}`);
 					}
-				} finally {
-					await overlay?.close();
-					signal?.removeEventListener("abort", relayAbort);
+					outputs.push({
+						name: job.name,
+						lane: job.laneId,
+						refId: job.input.refId,
+						ok: result.ok,
+						output: result.output,
+						errorMessage: result.errorMessage,
+						turns: result.turns,
+					});
 				}
+			} finally {
+				run.close();
 			}
 
 			if (failures === jobs.length) {
@@ -290,7 +286,7 @@ export function registerAnalyzeRefsTool(ext: ExtensionAPI, baseDir: string): voi
 					mode: "delegated-subagent",
 					role: "ref-analyst",
 					reviewerGates: { mode: initialReviewer.mode, modeIgnored: modeIgnoredNotice !== null, model, thinkingLevel: reviewer.thinking_level },
-					batches: Math.ceil(jobs.length / BATCH_SIZE),
+					batches: Math.ceil(jobs.length / MAX_CONCURRENT),
 					model,
 					outputs,
 				},

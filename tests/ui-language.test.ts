@@ -9,7 +9,7 @@ import { after, before, describe, it } from "node:test";
 import {
 	formChrome,
 	hugeChrome,
-	refineChrome,
+	fleetChrome,
 	resolveUiLanguage,
 	uiLanguageFromTag,
 } from "../src/ui-language.ts";
@@ -108,12 +108,14 @@ describe("chrome tables", () => {
 		assert.equal(zh.submitAllHint, "[Enter] 提交全部  [←→] 返回修改  [Esc] 取消");
 	});
 
-	it("keeps the zh refine strings byte-identical to 0.5.6", () => {
-		const refine = refineChrome("zh");
-		assert.equal(refine.close, "Esc 关闭");
-		assert.equal(refine.scroll, "↑/↓ 滚动");
-		assert.equal(refine.page, "PgUp/PgDn 翻页");
-		assert.equal(refine.switchLane, "Tab & Shift + Tab 切换 lane");
+	it("keeps the zh overlay footer strings and localizes the subagent list", () => {
+		const fleet = fleetChrome("zh");
+		assert.equal(fleet.close, "Esc 关闭");
+		assert.equal(fleet.scroll, "↑/↓ 滚动");
+		assert.equal(fleet.page, "PgUp/PgDn 翻页");
+		assert.equal(fleet.switchAgent, "Tab & Shift + Tab 切换子代理");
+		assert.equal(fleet.browseHint, "↓ 浏览子代理");
+		assert.equal(fleet.listHint, "↑/↓ 选择 · Enter 查看 · Esc 返回");
 	});
 
 	it("keeps the huge chrome tables paired and localized", () => {
@@ -149,8 +151,8 @@ describe("chrome tables", () => {
 			f.blockedSubmitHint([0]),
 			f.submitAllHint,
 		]);
-		const r = refineChrome("en");
-		groups.push([r.close, r.scroll, r.page, r.switchLane]);
+		const r = fleetChrome("en");
+		groups.push([r.title, r.browseHint, r.listHint, r.running, r.done, r.queued, r.idle, r.tools, r.more, r.close, r.scroll, r.page, r.switchAgent, r.stop, r.stopArmed, r.reopen, r.noAgents]);
 		const h = hugeChrome("en");
 		groups.push([
 			h.progress("v0.1.0", 2, 3, h.statusLabel("executing")),

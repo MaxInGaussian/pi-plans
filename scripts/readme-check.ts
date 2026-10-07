@@ -28,7 +28,7 @@ export interface ReadmeSurface {
 	commands: string[];
 	/** Skill aliases registered in a loop (counted, not name-asserted). */
 	aliasCommands: string[];
-	/** Literal `registerTool({ name: "…" })` names. */
+	/** Literal `registerTool({ name: "…" })` / `defineTool({ name: "…" })` names. */
 	tools: string[];
 	/** The `plans` tool's `action` enum. */
 	actions: string[];
@@ -150,7 +150,7 @@ export function collectSurface(root: string): ReadmeSurface {
 		if (array) aliasCommands = matchAll(array[1], /"([a-z0-9-]+)"/g);
 	}
 
-	const tools = matchAll(combined, /registerTool\(\s*\{[\s\S]{0,120}?name:\s*"([a-z0-9_]+)"/g);
+	const tools = matchAll(combined, /(?:registerTool|defineTool)\(\s*\{[\s\S]{0,120}?name:\s*"([a-z0-9_]+)"/g);
 
 	const plansSource = texts.get(path.join(root, "tools", "plans.ts")) ?? "";
 	const actionEnum = plansSource.match(/action:\s*StringEnum\(\s*\[([\s\S]*?)\]/);

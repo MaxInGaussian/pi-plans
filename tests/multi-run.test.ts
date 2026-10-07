@@ -17,7 +17,6 @@ import {
 import { resolveActiveRun, resetRunBindingForTests } from "../src/run-context.ts";
 import { planningWriteBlockReason } from "../src/guard.ts";
 import { executionCandidates, abandonCandidates, runPickerLabel } from "../src/run-picker.ts";
-import { subagentChildEnv } from "../src/subagent.ts";
 import {
 	getExecution,
 	startExecution,
@@ -162,23 +161,6 @@ describe("run picker candidates", () => {
 		assert.match(label, /^★ demo-topic · planning · plan-big · 2026-09-26T00:00:00Z/);
 		const long = { ...run, topic: "x".repeat(200) };
 		assert.ok(runPickerLabel(long, false).length <= 200, "long topics truncate");
-	});
-});
-
-describe("subagent child env markers", () => {
-	it("refiner (default) sets PI_PLANS_REFINER and strips executor keys", () => {
-		const env = subagentChildEnv({}, { PI_PLANS_EXECUTOR: "1", PI_PLANS_RUN_ID: "r", PATH: "/bin" });
-		assert.equal(env.PI_PLANS_REFINER, "1");
-		assert.equal(env.PI_PLANS_EXECUTOR, undefined);
-		assert.equal(env.PI_PLANS_RUN_ID, undefined);
-	});
-
-
-	it("none clears every marker", () => {
-		const env = subagentChildEnv({ envMarker: "none" }, { PI_PLANS_REFINER: "1", PI_PLANS_EXECUTOR: "1", PI_PLANS_RUN_ID: "r" });
-		assert.equal(env.PI_PLANS_REFINER, undefined);
-		assert.equal(env.PI_PLANS_EXECUTOR, undefined);
-		assert.equal(env.PI_PLANS_RUN_ID, undefined);
 	});
 });
 

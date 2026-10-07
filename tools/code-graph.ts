@@ -4,7 +4,7 @@
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
 	loadGraphRuntime,
@@ -129,7 +129,19 @@ export async function ensureRuntime(workdir: string, ctx: CodeGraphContext): Pro
 }
 
 export function registerCodeGraphTool(ext: ExtensionAPI): void {
-	ext.registerTool({
+	ext.registerTool(buildCodeGraphTool());
+}
+
+/**
+ * The code_graph tool definition. `readOnly` builds the variant handed to
+ * in-process reviewer sessions: `apply` is refused and snapshot loads never
+ * self-heal. (`PI_PLANS_REFINER=1` keeps forcing the same behavior for
+ * externally launched read-only hosts.)
+ */
+export function buildCodeGraphTool(options: { readOnly?: boolean } = {}) {
+	// Evaluated per call so the env gate also holds for tools registered earlier.
+	const isReadOnly = (): boolean => options.readOnly === true || process.env.PI_PLANS_REFINER === "1";
+	return defineTool({
 		name: "code_graph",
 		label: "Code Graph",
 		description:
@@ -139,7 +151,7 @@ export function registerCodeGraphTool(ext: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const workdir = params.workdir ?? ctx.cwd;
 			if (params.action === "apply") {
-				if (process.env.PI_PLANS_REFINER === "1") {
+				if (isReadOnly()) {
 					return {
 						content: [{ type: "text", text: JSON.stringify({ ok: false, reason: "code-graph apply refused: read-only refiner subagents cannot materialize worktree edits (PI_PLANS_REFINER)" }) }],
 						details: {},
@@ -274,7 +286,7 @@ export function registerCodeGraphTool(ext: ExtensionAPI): void {
 					let origin = "db-fresh";
 					if (langRow) {
 						const info = fileInfoFor(entry.paths.worktreeRoot, row.file_dir, row.file_name, langRow.language);
-						const snap = await loadValidatedSnapshot(entry, info, { selfHeal: process.env.PI_PLANS_REFINER !== "1" });
+						const snap = await loadValidatedSnapshot(entry, info, { selfHeal: !isReadOnly() });
 						if (snap) {
 							marker = snap.marker;
 							origin = snap.origin;

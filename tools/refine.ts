@@ -42,8 +42,10 @@ import {
 } from "../src/workflow-state.ts";
 import { buildReviewerTask, reviewerLanes } from "../src/refine-prompts.ts";
 import { graphBlockForRefiner } from "../src/code-graph/prompts.ts";
-import { runPiSubagent, stripFrontmatter } from "../src/subagent.ts";
-import { RefineOverlayController, refineOverlayContext } from "../src/refine-ui.ts";
+import { stripFrontmatter } from "../src/subagent.ts";
+import { agentHostOf, runAgentSession } from "../src/agent-session.ts";
+import { openFleetGroup } from "../src/fleet-run.ts";
+import { buildCodeGraphTool } from "./code-graph.ts";
 import { matchesTerminalKey } from "../src/terminal-keys.ts";
 import { toggleDashboardExpanded } from "../src/exec.ts";
 
@@ -73,7 +75,7 @@ const RefineParams = Type.Object({
 function roleGateError(problem: "mode" | "confirm", guidance?: string): StateError {
 	if (problem === "mode") {
 		return new StateError(
-			`The reviewer role mode is missing or invalid. Ask the role-setting question with ask_choice first: 1. Delegated subagent (recommended; read-only pi subprocess with isolated context) 2. Current session (run the pass yourself in this session) 3. Other 4. Auto-complete — then persist with the plans tool (set-role). The reviewer role lives in the global config (${resolveGlobalConfigPath()}).`,
+			`The reviewer role mode is missing or invalid. Ask the role-setting question with ask_choice first: 1. Delegated subagent (recommended; read-only in-process subagent with isolated context) 2. Current session (run the pass yourself in this session) 3. Other 4. Auto-complete — then persist with the plans tool (set-role). The reviewer role lives in the global config (${resolveGlobalConfigPath()}).`,
 		);
 	}
 	return new StateError(
@@ -115,38 +117,24 @@ async function ensureReviewerReady(
 function setupRefinementExecution(
 	ctx: ExtensionContext,
 	parentSignal: AbortSignal | undefined,
+	groupId: string,
 	lanes: Array<{ id: string; label?: string }>,
 	modelLabel?: string,
 	lang: UiLanguage = "en",
 ) {
-	const controller = new AbortController();
-	const relayAbort = () => controller.abort();
-	if (parentSignal?.aborted) controller.abort();
-	else parentSignal?.addEventListener("abort", relayAbort, { once: true });
-
-	const overlay = ctx.mode === "tui"
-		? new RefineOverlayController(
-			"reviewer",
-			lanes,
-			relayAbort,
-			lang,
-			// pi-tui has no key bubbling: forward the dashboard toggle so
-			// Ctrl+Shift+T keeps working while the refine overlay holds focus.
-			(data) => {
-				if (matchesTerminalKey(data, "ctrl+shift+t")) toggleDashboardExpanded(ctx);
-			},
-		)
-		: undefined;
-	overlay?.open(refineOverlayContext(ctx), modelLabel);
-
-	return {
-		signal: controller.signal,
-		overlay,
-		async close() {
-			await overlay?.close();
-			parentSignal?.removeEventListener("abort", relayAbort);
+	return openFleetGroup(ctx, {
+		role: "reviewer",
+		groupId,
+		lanes,
+		modelLabel,
+		lang,
+		signal: parentSignal,
+		// pi-tui has no key bubbling: forward the dashboard toggle so
+		// Ctrl+Shift+T keeps working while an agent overlay holds focus.
+		onUnhandledKey: (data) => {
+			if (matchesTerminalKey(data, "ctrl+shift+t")) toggleDashboardExpanded(ctx);
 		},
-	};
+	});
 }
 
 export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
@@ -249,6 +237,9 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 			const systemPrompt = loadAgentPrompt();
 			const graphEnabled = config.graph_enabled === true;
 			const subagentTools = graphEnabled ? ["read", "grep", "find", "ls", "code_graph"] : undefined;
+				// In-process sessions load no extensions: hand the reviewers a
+				// read-only code_graph tool directly when the graph is on.
+				const subagentCustomTools = graphEnabled ? [buildCodeGraphTool({ readOnly: true })] : undefined;
 			const graphPrompt = graphBlockForRefiner(graphEnabled);
 			const model = roleConfig.mode === "current-session" ? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined) : roleConfig.model_selector ?? undefined;
 			const modelLabel = roleModelLabel(model ?? "inherit", roleConfig.mode === "current-session" ? null : roleConfig.thinking_level);
@@ -288,17 +279,19 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 				const results = await Promise.all(
 					runnableJobs.map(async (job) => {
 						try {
-							const result = await runPiSubagent({
+							const result = await runAgentSession({
 								systemPrompt: `${systemPrompt}\n\n${graphPrompt}`,
 								task: job.task,
 								cwd: workdir,
+								host: agentHostOf(ctx),
 								model,
 								thinkingLevel: roleConfig.thinking_level ?? undefined,
 								tools: subagentTools,
-								signal: execution.signal,
-								onProgress: (event) => execution.overlay?.update(job.lane.id, event),
+								customTools: subagentCustomTools,
+								signal: execution.signalFor(job.lane.id),
+								onProgress: (event) => execution.group.update(job.lane.id, event),
 							});
-							execution.overlay?.complete(job.lane.id, result);
+							execution.group.complete(job.lane.id, result);
 							record(job.name, result.ok ? result.model ?? model : null, result.usage);
 							// Persist BEFORE returning: a crash after this point
 							// still leaves the lane reusable.
@@ -316,7 +309,7 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 								stderr: "",
 								turns: 0,
 							};
-							execution.overlay?.complete(job.lane.id, result);
+							execution.group.complete(job.lane.id, result);
 							return { job, result };
 						}
 					}),
@@ -373,7 +366,7 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 					},
 				};
 			} finally {
-				await execution.close();
+				execution.close();
 			}
 		},
 
