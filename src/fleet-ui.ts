@@ -403,6 +403,13 @@ export interface FleetUiAttachOptions {
 	onUnhandledKey?: (data: string) => void;
 }
 
+/** The prompt editor: pi-tui's `Editor`, or anything with its `getText()` API
+ * (a second copy of the module would defeat `instanceof`). */
+function isEditorLike(component: unknown, EditorClass: (new (...args: never[]) => unknown) | undefined): boolean {
+	if (EditorClass && component instanceof EditorClass) return true;
+	return typeof (component as { getText?: unknown } | null)?.getText === "function";
+}
+
 export class FleetUiController {
 	private readonly fleet: AgentFleet;
 	private ui: FleetUiHost["ui"] | undefined;
@@ -524,8 +531,7 @@ export class FleetUiController {
 		// Only act while the editor owns focus; select dialogs and other
 		// overlays must keep their own arrow keys.
 		const focusedComponent = this.tui?.getFocusedComponent?.();
-		const EditorClass = pi?.Editor;
-		if (focusedComponent && EditorClass && !(focusedComponent instanceof EditorClass)) return undefined;
+		if (focusedComponent && !isEditorLike(focusedComponent, pi?.Editor)) return undefined;
 
 		if (!this.focused) {
 			if (!matchesTerminalKey(data, "down")) return undefined;
