@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.1] - 2026-10-07
+
+### Added
+
+- **Multi-reviewer execution review.** Right before round 1 (when at least two checks are pending) a menu asks for 1, 2, or 3 parallel execution reviewers; the choice is stored in the run checkpoint (`execution.reviewers`) and reused by later rounds, and a session with no UI keeps one reviewer. The pending checks are split evenly across the reviewers and each one also looks for defects and improvements along its own direction, suggested by the executor through the new optional `plans_review_directions` tool (also given to delegated workers) with three fixed back-up aspects filling any gap. Each reviewer numbers new findings from a disjoint `F-###` range, and the lane reports merge into a single outcome, so a multi-reviewer round is still one budgeted round; a failed reviewer makes only its own checks undeterminable and aborting any reviewer cancels the round. The fleet list shows one bullet per reviewer.
+
 ## [0.9.0] - 2026-10-07
 
 ### Added
@@ -11,8 +17,6 @@
 - **The main session supervises a delegated run.** It is told the plan is delegated, is never woken to continue the work, and `edit`/`write` are blocked in it until the run ends. A failed review round sends its repair brief to the workers that own the reopened tasks instead of waking the main model, and `/plans-stop` stops the workers. Everything the supervising session is shown says so: the start banner names the delegation instead of asking it to call `plans_update_task`, repair briefs in its transcript are marked as forwarded, and the `/resume-plans` brief makes it a supervisor; after a restart the workers' briefs also list the still-unresolved review findings for their tasks. Each worker's spawn is recorded in `subagents.jsonl` with role `executor`.
 
 - **Reviewer directions are written for your project.** `refine` takes a new `directions` argument — one `{ id, direction }` per reviewer (slug id, 20-800 characters) — and requires it whenever more than one reviewer runs, so the planner model tailors each reviewer's direction to the project and plan (hidden coupling and blast radius, migration and rollback, failure modes, whether the verification checks really prove the claims, unstated assumptions, …) instead of the fixed `correctness` / `ordering` / `verification` lenses, which are gone. Missing, miscounted, duplicate, or out-of-range directions are refused with guidance before any model panel opens and before anything spawns; the direction id becomes the lane id, the bullet label, and the result section title; a resumed round without `directions` reuses the lanes and direction text stored in its checkpoint (rounds recorded with the old lenses still resume), and current-session mode lists the directions in its single brief. The shared workflow gains an authoring guide with project-specific examples.
-
-- **Multi-reviewer execution review.** Right before round 1 (when at least two checks are pending) a menu asks for 1, 2, or 3 parallel execution reviewers; the choice is stored in the run checkpoint (`execution.reviewers`) and reused by later rounds, and a session with no UI keeps one reviewer. The pending checks are split evenly across the reviewers and each one also looks for defects and improvements along its own direction, suggested by the executor through the new optional `plans_review_directions` tool (also given to delegated workers) with three fixed back-up aspects filling any gap. Each reviewer numbers new findings from a disjoint `F-###` range, and the lane reports merge into a single outcome, so a multi-reviewer round is still one budgeted round; a failed reviewer makes only its own checks undeterminable and aborting any reviewer cancels the round. The fleet list shows one bullet per reviewer.
 
 ### Changed
 
