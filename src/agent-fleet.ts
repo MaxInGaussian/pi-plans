@@ -22,7 +22,10 @@ export interface FleetEntry {
 	role: FleetRole;
 	lane: RefineLaneState;
 	modelLabel?: string;
-	startedAt?: number;
+	/** Milliseconds spent working so far; queued and idle time never counts. */
+	workedMs: number;
+	/** Set while the agent is working: the moment the current stretch began. */
+	workingSince?: number;
 	finishedAt?: number;
 	/** A long-lived worker waiting for its next assignment. */
 	idle: boolean;
@@ -61,6 +64,22 @@ function isTerminal(entry: FleetEntry): boolean {
 	return entry.lane.status === "complete" || entry.lane.status === "failed" || entry.lane.status === "cancelled";
 }
 
+function beginWork(entry: FleetEntry): void {
+	if (entry.workingSince === undefined && !entry.idle && !isTerminal(entry)) entry.workingSince = Date.now();
+}
+
+function endWork(entry: FleetEntry): void {
+	if (entry.workingSince === undefined) return;
+	entry.workedMs += Math.max(0, Date.now() - entry.workingSince);
+	entry.workingSince = undefined;
+}
+
+/** Time the agent has actually been working: excludes the time it sat queued
+ * and the stretches a long-lived worker spent idle between assignments. */
+export function workedMs(entry: Pick<FleetEntry, "workedMs" | "workingSince">, now: number = Date.now()): number {
+	return entry.workedMs + (entry.workingSince === undefined ? 0 : Math.max(0, now - entry.workingSince));
+}
+
 /** Handle a spawn site uses to report on its lanes. */
 export class FleetGroup {
 	readonly groupId: string;
@@ -78,8 +97,9 @@ export class FleetGroup {
 	update(laneId: string, event: SubagentProgressEvent): void {
 		const entry = this.entry(laneId);
 		if (!entry || isTerminal(entry)) return;
-		if (entry.startedAt === undefined && event.type !== "process") entry.startedAt = Date.now();
-		if (event.type === "process" && event.phase === "started" && entry.startedAt === undefined) entry.startedAt = Date.now();
+		// The first event of a queued lane starts its clock; events that arrive
+		// while a worker is idle (a late "exited") do not.
+		beginWork(entry);
 		if (event.type === "transcript" && event.entryType === "tool-call" && event.phase === "start" && event.key.startsWith("tool:")) {
 			entry.toolCalls += 1;
 		}
@@ -90,6 +110,7 @@ export class FleetGroup {
 	complete(laneId: string, result: SubagentResult): void {
 		const entry = this.entry(laneId);
 		if (!entry) return;
+		endWork(entry);
 		applyRefineResult(entry.lane, result);
 		entry.idle = false;
 		entry.finishedAt = Date.now();
@@ -107,6 +128,9 @@ export class FleetGroup {
 		const entry = this.entry(laneId);
 		if (!entry || entry.idle === idle) return;
 		entry.idle = idle;
+		// Waiting between assignments stops the clock; a new assignment restarts it.
+		if (idle) endWork(entry);
+		else beginWork(entry);
 		this.fleet.notify();
 	}
 
@@ -183,6 +207,7 @@ export class AgentFleet {
 				role: spec.role,
 				lane: newLane(lane.id, label),
 				modelLabel: spec.modelLabel,
+				workedMs: 0,
 				idle: false,
 				note: "",
 				toolCalls: 0,

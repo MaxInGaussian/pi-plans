@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { afterEach, describe, it, mock } from "node:test";
 import { AgentFleet } from "../src/agent-fleet.ts";
 import { FleetUiController, SubagentOverlay, formatElapsed, renderFleetLines, FLEET_WIDGET_KEY } from "../src/fleet-ui.ts";
 import { visibleWidth } from "../src/refine-ui-helpers.ts";
@@ -169,6 +169,77 @@ describe("collapsing a finished list", () => {
 		assert.ok(rendered[0]!().length > 3, "↓ expands it for browsing");
 		controller.handleKey("\x1b");
 		assert.equal(rendered[0]!().length, 1, "Esc collapses it again");
+	});
+});
+
+describe("elapsed time counts only while an agent is working", () => {
+	afterEach(() => mock.timers.reset());
+
+	const rowOf = (fleet: AgentFleet): string => {
+		const lines = renderFleetLines({ entries: fleet.list(), selected: 0, now: Date.now(), lang: "en", theme: fakeTheme, width: 200 });
+		return lines.find((line) => line.startsWith("▸")) ?? "";
+	};
+	const event = { type: "turn", phase: "start", turnIndex: 1 } as const;
+
+	it("excludes idle stretches of a long-lived worker and resumes when it works again", () => {
+		mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+		const fleet = new AgentFleet();
+		const group = fleet.registerGroup({ groupId: "g", role: "executor", lanes: [{ id: "w", label: "worker" }] });
+		group.setIdle("w", true); // registered but waiting for its first wave
+		mock.timers.tick(120_000);
+		assert.doesNotMatch(rowOf(fleet), /\d+s/, "no time shown before the first assignment");
+
+		group.setIdle("w", false); // a wave arrives
+		group.update("w", event);
+		mock.timers.tick(5_000);
+		assert.match(rowOf(fleet), / · 5s/);
+
+		group.setIdle("w", true); // wave done: waiting for the next one
+		mock.timers.tick(60_000);
+		assert.match(rowOf(fleet), / · 5s/, "idle minutes are not counted");
+		assert.doesNotMatch(rowOf(fleet), /1m/);
+
+		group.setIdle("w", false); // next wave
+		mock.timers.tick(10_000);
+		assert.match(rowOf(fleet), / · 15s/, "working time accumulates across waves");
+
+		group.complete("w", { ok: true, output: "done", stderr: "", turns: 1 });
+		mock.timers.tick(30_000);
+		assert.match(rowOf(fleet), / · 15s/, "the clock stops when the agent finishes");
+	});
+
+	it("does not count the time a lane spent queued", () => {
+		mock.timers.enable({ apis: ["Date"], now: 5_000_000 });
+		const fleet = new AgentFleet();
+		const group = fleet.registerGroup({ groupId: "g", role: "refs", lanes: [{ id: "r1", label: "ref-1" }] });
+		mock.timers.tick(30_000);
+		assert.doesNotMatch(rowOf(fleet), /\d+s/, "a queued lane shows no time");
+		group.update("r1", event);
+		mock.timers.tick(4_000);
+		assert.match(rowOf(fleet), / · 4s/);
+	});
+
+	it("freezes the clock for a finished agent even if the list is rendered much later", () => {
+		mock.timers.enable({ apis: ["Date"], now: 0 });
+		const fleet = new AgentFleet();
+		const group = fleet.registerGroup({ groupId: "g", role: "reviewer", lanes: [{ id: "a", label: "a" }] });
+		group.update("a", event);
+		mock.timers.tick(7_000);
+		group.complete("a", { ok: true, output: "x", stderr: "", turns: 1 });
+		mock.timers.tick(9 * 60_000);
+		assert.match(rowOf(fleet), / · 7s/);
+	});
+
+	it("an agent cancelled while idle keeps only the time it actually worked", () => {
+		mock.timers.enable({ apis: ["Date"], now: 0 });
+		const fleet = new AgentFleet();
+		const group = fleet.registerGroup({ groupId: "g", role: "executor", lanes: [{ id: "w", label: "worker" }] });
+		group.update("w", event);
+		mock.timers.tick(3_000);
+		group.setIdle("w", true);
+		mock.timers.tick(50_000);
+		group.complete("w", { ok: false, output: "", stderr: "", turns: 0, cancelled: true });
+		assert.match(rowOf(fleet), / · 3s/);
 	});
 });
 

@@ -10,7 +10,7 @@
 
 import type { ExtensionCommandContext, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import { fleet as sharedFleet, type AgentFleet, type FleetEntry } from "./agent-fleet.ts";
+import { fleet as sharedFleet, workedMs, type AgentFleet, type FleetEntry } from "./agent-fleet.ts";
 import { getPiTui, matchesTerminalKey } from "./terminal-keys.ts";
 import { fleetChrome, type UiLanguage } from "./ui-language.ts";
 import {
@@ -153,7 +153,8 @@ export function renderFleetLines(view: FleetListView): string[] {
 		const label = isSelected ? theme.fg("accent", theme.bold(entry.label)) : theme.bold(entry.label);
 		const phase = entry.lane.status === "running" && !entry.idle && entry.lane.phase ? theme.fg("muted", ` · ${entry.lane.phase}`) : "";
 		const tools = entry.toolCalls > 0 ? ` · ${entry.toolCalls} ${chrome.tools}` : "";
-		const elapsed = entry.startedAt !== undefined ? ` · ${formatElapsed((entry.finishedAt ?? now) - entry.startedAt)}` : "";
+		const worked = workedMs(entry, now);
+		const elapsed = worked > 0 || entry.workingSince !== undefined ? ` · ${formatElapsed(worked)}` : "";
 		const note = entry.note ? ` · ${entry.note}` : "";
 		lines.push(`${bullet} ${label} ${theme.fg(color, entryStatus(entry, lang))}${phase}${theme.fg("dim", `${tools}${elapsed}${note}`)}`);
 	}
