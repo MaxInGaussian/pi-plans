@@ -28,8 +28,9 @@
 
 - **Nothing is writable before you approve.** Planning, questions, and refinement run read-only: `edit`/`write` are blocked outside planning artifacts until the merged, never-auto-completed handoff lifts the guard. → [Safety model](#safety-model)
 - **One tabbed form per round.** Related questions are submitted together as one `questions: [...]` form (2–8 items) with a submit page, and every option states its advantage and its drawback as `✓ … / ✗ …`. → [What it does](#what-it-does)
-- **Reviewer subagents that converge.** Read-only `refine` reviewers return severity-graded findings (`F-###`) plus up to five questions; `plan-big` and `plan-huge` run three concurrent reviewers, listed as bullets above the editor — `↓` focuses the list and `Enter` opens one agent's live transcript. → [Delegated subagents](#delegated-subagents)
-- **Execute on a different model.** At the handoff you choose the current session, one delegated subagent, or several; delegated workers report each finished task into the live panel while they keep working. → [Delegated subagents](#delegated-subagents)
+- **Reviewer subagents that converge.** Read-only `refine` reviewers return severity-graded findings (`F-###`) plus up to five questions; `plan-big` and `plan-huge` run three concurrent reviewers. Every delegated agent is a bullet in a list above the editor — `↓` focuses it, `Enter` opens one agent's live transcript. → [Delegated subagents](#delegated-subagents)
+- **Execute on a different model.** At the handoff you choose where the plan runs: this session, one delegated subagent, or several, on a model and effort you pick with the same picker the reviewer uses. → [Delegated subagents](#delegated-subagents)
+- **Workers report live, without stopping.** Delegated workers close each task through their own `plans_update_task` tool, so the dashboard moves as work happens while the worker keeps going; waves run in order and the main session only supervises. → [Delegated subagents](#delegated-subagents)
 - **Multi-version product builds.** `plan-huge` — reachable directly or through `plan-with-refs` once the analyzed references fix the shape — keeps one run and one artifact directory: an abstract overall plan with a 2–10 version table, then each version planned, executed, and execution-reviewed before the next one starts. → [Skills](#skills)
 - **Tracked execution with evidence.** The current wave and remaining tasks are injected every turn, and `plans_update_task` records status plus evidence per task; a compact dashboard, a stall watchdog, and a live status bar follow along. → [What it does](#what-it-does)
 - **Independent execution review.** When the task tree goes terminal, a detached read-only round verifies every `VC-###` check and reports findings of its own, under a per-run budget you choose once. → [What it does](#what-it-does)
@@ -38,6 +39,12 @@
 - **Several sessions, one repository.** Run registry derived from `runs/` (no shared pointer to race), per-session run binding, and binding-first resume/execute/abandon. → [Interface overview](#interface-overview)
 - **Fewer detours per turn.** A four-line fused executor rule set costs almost nothing and buys back fewer wrong turns and shorter implementation paths. → [The execution rules](#the-execution-rules)
 - **Evidence, kept honest.** An exploratory paired A/B on Terminal-Bench 2.0 is published with its numbers, its instability across seeds, and its disclosures. → [Benchmarked](#benchmarked-single-seed-exploratory-result)
+
+### New in 0.9.0
+
+- **Where the plan runs is now your call.** After you approve the handoff, a second question picks the current session (same model, as before), one delegated subagent, or two to four. The previous choice is offered first and stored with the run, so a resumed run does not ask again. → [Choosing where the plan runs](#choosing-where-the-plan-runs)
+- **One list for every delegated agent.** Reviewers, reference analysts, the execution reviewer, and execution workers are bullets above the editor with status, phase, tool-call count, and elapsed time; the three-pane overlay is gone, and references beyond the third wait as `queued` bullets. → [Delegated subagents](#delegated-subagents)
+- **In-process sessions instead of child processes.** Delegated agents run inside the Pi host, so a session stays addressable — it can be re-prompted with the next wave of work and report progress while it keeps running. → [Delegated subagents](#delegated-subagents)
 
 ## Benchmarked: single-seed exploratory result
 
@@ -92,11 +99,15 @@ One paired A/B run on <b>Terminal-Bench 2.0</b> (36-task stratified sample, GLM-
                  v
      explicit approval (never auto-completed)
                  |
+     where it runs: this session, or delegated
+     workers on a model + effort you pick
+                 |
    =============================================== write guard OFF
                  |
      task-tree execution loop
    current wave + tasks injected each turn,
-   plans_update_task reports status + evidence,
+   plans_update_task reports status + evidence
+   (workers report live while they keep going),
    execution reviewer verifies every check
                  |
                  v

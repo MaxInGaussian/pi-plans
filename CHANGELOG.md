@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.9.0] - 2026-10-07
+
+### Added
+
+- **Run the plan on a different model.** After you approve the execution handoff, a second question asks where the plan runs: the current session (same model, the previous behavior), one delegated subagent, or several (2-4). Delegated choices open the same model and effort picker the reviewer gate uses (native panels in a TUI, menus on RPC), titled for the executor, and never touch the reviewer role. The question is asked at every handoff with the last choice listed first; it is stored per run in the checkpoint (`execution.executor`, strictly validated, dropped by a stop) so `/resume-plans` and a reload restore the same workers without asking again, and `executor_last` in the global config only seeds the picker. Headless and auto-approved handoffs always use the current session.
+
+- **Workers report live without stopping.** A delegated run is implemented by in-process worker sessions (write tools, `agents/executor.md`) that each receive their own `plans_update_task` tool, closed over the live execution state. A finished task updates the dashboard, the checkpoint, and the worker's `n/m tasks` note immediately and returns at once, so the worker's loop continues with its next task; completion is never inferred from a session ending, and a worker can only close tasks assigned to it. Work is scheduled per wave: tasks that share a file stay on one worker (tasks without declared files share one group), groups are balanced over the workers, a wave starts only after the previous one is fully terminal, and workers keep their session across waves and repair rounds. A worker that ends with tasks still open is re-prompted in the same session; three such rounds, or two failed runs, pause the run with the reason, and `/plans-execute` resumes it. Workers are restored from the checkpoint or the session snapshot after a restart.
+
+- **The main session supervises a delegated run.** It is told the plan is delegated, is never woken to continue the work, and `edit`/`write` are blocked in it until the run ends. A failed review round sends its repair brief to the workers that own the reopened tasks instead of waking the main model, and `/plans-stop` stops the workers. Each worker's spawn is recorded in `subagents.jsonl` with role `executor`.
+
+### Changed
+
+- **Delegated agents are a bulleted list, not three lanes.** Reviewers, reference analysts, the execution reviewer, and workers all appear as bullets above the editor with status, phase, tool-call count, and elapsed time. With an empty editor `↓` focuses the list, `↑/↓` select, `Enter` opens that one agent's live transcript overlay (scroll, `Tab` to switch agent, `x` twice to stop just that agent), and `Esc` hands focus back; any other key stays with the editor, and the list never reacts while a dialog holds focus. The stacked three-pane overlay is gone, `analyze_refs` no longer runs sequential batches (at most three references run at once and the rest wait as `queued` bullets), finished agents are dropped from the list after ten minutes, and `Ctrl+Shift+R` opens the newest execution-review overlay directly. The execution review no longer opens an overlay on its own.
+
+- **Delegated roles run as in-process sessions.** Plan reviewers, reference analysts, and the execution reviewer no longer spawn `pi` child processes. Their sessions load no extensions and no skills, use a strict tool allowlist (read-only for reviewers), and are created with the exact `provider/model` and, only when one is stored, an explicit thinking level. Reviewers get a read-only `code_graph` tool when the workspace graph is enabled (the `PI_PLANS_REFINER` gate still holds for externally launched read-only hosts). Reviewers keep their usage metering and `subagents.jsonl` records.
+
+- **The model and effort picker is shared.** The persistence-free `pickModelAndEffort` now backs both the reviewer first-use gate (which still saves to the global reviewer config) and the execution chooser; its titles are parameterized per role.
+
+- **The default effort row says "no explicit level".** With no stored level the delegated session resolves its own default chain; the picker rows, menus, `references/`, and the `plans` tool description no longer talk about a `--thinking` flag or a child pi.
+
+- **README section renamed.** "Visible Refiner overlay" is now "Delegated subagents" (the readme check mandates the new heading), and the reference docs describe the subagent list and the execution placement.
+
+### Fixed
+
+- **Latent `SubagentUsage` type mismatch.** `tools/refine.ts` and `tools/analyze-refs.ts` imported a type `src/subagent.ts` did not export; the type is now exported and carried on `SubagentResult`.
+
 ## [Unreleased]
 
 ### Fixed
