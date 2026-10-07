@@ -91,6 +91,87 @@ describe("renderFleetLines", () => {
 	});
 });
 
+describe("collapsing a finished list", () => {
+	const view = (fleet: AgentFleet, selected: number | null, lang: "en" | "zh" = "en") =>
+		renderFleetLines({ entries: fleet.list(), selected, now: Date.now(), lang, theme: fakeTheme, width: 100 });
+
+	it("collapses to a single summary line once every agent has finished", () => {
+		const fleet = new AgentFleet();
+		const group = seed(fleet, ["a", "b", "c"]);
+		assert.equal(view(fleet, null).filter((line) => line.startsWith("•")).length, 3, "expanded while running");
+		for (const id of ["a", "b", "c"]) group.complete(id, { ok: true, output: "done", stderr: "", turns: 1 });
+		const lines = view(fleet, null);
+		assert.equal(lines.length, 1, `collapsed: ${JSON.stringify(lines)}`);
+		assert.match(lines[0]!, /^Subagents \(3\) · 3 done · ↓ browse subagents$/);
+	});
+
+	it("counts failed and cancelled agents in the summary", () => {
+		const fleet = new AgentFleet();
+		const group = seed(fleet, ["a", "b", "c"]);
+		group.complete("a", { ok: true, output: "x", stderr: "", turns: 1 });
+		group.complete("b", { ok: false, output: "", stderr: "", turns: 0, errorMessage: "boom" });
+		group.complete("c", { ok: false, output: "", stderr: "", turns: 0, cancelled: true });
+		const [line] = view(fleet, null);
+		assert.match(line!, /1 done · 1 failed · 1 cancelled/);
+		assert.match(view(fleet, null, "zh")[0]!, /1 已完成 · 1 失败 · 1 已取消 · ↓ 浏览子代理/);
+	});
+
+	it("stays expanded while anything is running, queued or idle", () => {
+		const fleet = new AgentFleet();
+		const group = seed(fleet, ["a", "b"]);
+		group.complete("a", { ok: true, output: "x", stderr: "", turns: 1 });
+		assert.ok(view(fleet, null).length > 1, "one agent still running");
+
+		const queued = new AgentFleet();
+		const g2 = queued.registerGroup({ groupId: "g", role: "refs", lanes: [{ id: "r1" }, { id: "r2" }] });
+		g2.update("r1", { type: "turn", phase: "start", turnIndex: 1 });
+		g2.complete("r1", { ok: true, output: "x", stderr: "", turns: 1 });
+		assert.ok(view(queued, null).length > 1, "a queued agent keeps the list open");
+
+		const workers = new AgentFleet();
+		const g3 = seed(workers, ["w"], "executor");
+		g3.setIdle("w", true);
+		assert.ok(view(workers, null).length > 1, "an idle worker is still live");
+	});
+
+	it("expands again while the list is focused and collapses when focus leaves", () => {
+		const fleet = new AgentFleet();
+		const group = seed(fleet, ["a", "b"]);
+		for (const id of ["a", "b"]) group.complete(id, { ok: true, output: "x", stderr: "", turns: 1 });
+		const focused = view(fleet, 0);
+		assert.ok(focused.some((line) => line.startsWith("▸ a")), "browsing shows the bullets");
+		assert.ok(focused.at(-1)!.includes("Enter view"));
+		assert.equal(view(fleet, null).length, 1);
+	});
+
+	it("the controller collapses the widget when the round ends and expands it on ↓", () => {
+		const fleet = new AgentFleet();
+		const controller = new FleetUiController(fleet);
+		const { host, calls, state } = fakeHost();
+		const rendered: Array<() => string[]> = [];
+		const ui = host.ui as unknown as { setWidget: (key: string, content: unknown) => void };
+		const original = ui.setWidget;
+		ui.setWidget = (key, content) => {
+			original(key, content);
+			if (typeof content === "function") {
+				const component = (content as (tui: unknown, theme: unknown) => { render(w: number): string[] })({ requestRender() {}, getFocusedComponent: () => null }, fakeTheme);
+				rendered.push(() => component.render(100));
+			}
+		};
+		controller.attach(host);
+		const group = seed(fleet, ["a", "b", "c"]);
+		assert.ok(rendered[0]!().length > 3, "expanded while running");
+		for (const id of ["a", "b", "c"]) group.complete(id, { ok: true, output: "x", stderr: "", turns: 1 });
+		assert.equal(rendered[0]!().length, 1, "collapsed after the last agent finished");
+		assert.equal(calls.widgets.filter((entry) => entry.shown).length, 1, "the widget stays registered");
+		state.editorText = "";
+		controller.handleKey("\x1b[B");
+		assert.ok(rendered[0]!().length > 3, "↓ expands it for browsing");
+		controller.handleKey("\x1b");
+		assert.equal(rendered[0]!().length, 1, "Esc collapses it again");
+	});
+});
+
 describe("AgentFleet", () => {
 	it("drops finished agents after the retention window but keeps running ones", async () => {
 		const fleet = new AgentFleet(20);

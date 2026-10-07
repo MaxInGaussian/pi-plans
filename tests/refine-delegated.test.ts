@@ -172,9 +172,16 @@ describe("refine: delegated reviewers", () => {
 			assert.ok(entries.every((entry) => entry.lane.status === "complete"), "every finished lane stays listed as done");
 			assert.ok(entries.every((entry) => entry.modelLabel?.includes("fake/reviewer")), "the model label reaches the list");
 			assert.equal(widgets.length, 1, "one fleet widget");
+			// Once the three reviewers have returned the panel collapses by itself…
+			const collapsed = widgets[0]!(120);
+			assert.deepEqual(collapsed, ["Subagents (3) · 3 done · ↓ browse subagents"]);
+			// …and ↓ with an empty editor expands it into one bullet per reviewer.
+			assert.deepEqual(fleetUi.handleKey("\x1b[B"), { consume: true });
 			const lines = widgets[0]!(120);
-			assert.equal(lines.filter((line) => line.startsWith("•")).length, 3, "three bullets");
+			assert.equal(lines.filter((line) => line.startsWith("•") || line.startsWith("▸")).length, 3, "three bullets");
 			assert.ok(lines.some((line) => line.includes("state-transitions")));
+			assert.deepEqual(fleetUi.handleKey("\x1b"), { consume: true });
+			assert.equal(widgets[0]!(120).length, 1, "Esc collapses it again");
 		} finally {
 			restore();
 		}

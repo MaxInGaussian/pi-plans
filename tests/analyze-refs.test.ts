@@ -166,9 +166,15 @@ describe("analyze_refs subagent list chrome language (issue #3)", () => {
 				const widgets: Array<(width: number) => string[]> = [];
 				await tool.execute("c1", { refs: [{ id: "ref-1", localPath: refDir }] }, undefined, undefined, tuiCtx(workdir, widgets));
 				assert.equal(widgets.length, 1, "the list must register one widget");
-				const lines = widgets[0]!(120);
-				assert.ok(lines.some((line) => line.includes(expected)), `expected "${expected}" in the list for tag ${tag}: ${JSON.stringify(lines)}`);
-				assert.ok(lines.some((line) => line.includes("ref-1")), "one bullet per reference");
+				// The finished round has collapsed to one summary line that still
+				// carries the localized browse hint; ↓ expands it to one bullet per ref.
+				const collapsed = widgets[0]!(120);
+				assert.equal(collapsed.length, 1, `collapsed after the round: ${JSON.stringify(collapsed)}`);
+				assert.ok(collapsed[0]!.includes(expected), `expected "${expected}" in the summary for tag ${tag}: ${JSON.stringify(collapsed)}`);
+				assert.deepEqual(fleetUi.handleKey("\x1b[B"), { consume: true });
+				const expanded = widgets[0]!(120);
+				assert.ok(expanded.some((line) => line.includes("ref-1")), "one bullet per reference once expanded");
+				fleetUi.handleKey("\x1b");
 			}
 		} finally {
 			restore();

@@ -74,6 +74,10 @@ function laneColor(status: RefineLaneState["status"]): ThemeColor {
 	}
 }
 
+function isFinished(entry: FleetEntry): boolean {
+	return entry.lane.status === "complete" || entry.lane.status === "failed" || entry.lane.status === "cancelled";
+}
+
 function entryColor(entry: FleetEntry): ThemeColor {
 	return entry.idle ? "muted" : laneColor(entry.lane.status);
 }
@@ -114,10 +118,24 @@ export function renderFleetLines(view: FleetListView): string[] {
 	const running = entries.filter((entry) => entry.lane.status === "running" && !entry.idle).length;
 	const queued = entries.filter((entry) => entry.lane.status === "queued").length;
 	const done = entries.filter((entry) => entry.lane.status === "complete").length;
-	const counts = [running > 0 ? `${running} ${chrome.running}` : "", queued > 0 ? `${queued} ${chrome.queued}` : "", `${done} ${chrome.done}`]
+	const failed = entries.filter((entry) => entry.lane.status === "failed").length;
+	const cancelled = entries.filter((entry) => entry.lane.status === "cancelled").length;
+	const counts = [
+		running > 0 ? `${running} ${chrome.running}` : "",
+		queued > 0 ? `${queued} ${chrome.queued}` : "",
+		done > 0 || failed + cancelled === 0 ? `${done} ${chrome.done}` : "",
+		failed > 0 ? `${failed} ${chrome.failed}` : "",
+		cancelled > 0 ? `${cancelled} ${chrome.cancelled}` : "",
+	]
 		.filter(Boolean)
 		.join(" · ");
-	const lines: string[] = [`${theme.fg("accent", theme.bold(`${chrome.title} (${entries.length})`))}${theme.fg("dim", ` · ${counts}`)}`];
+	const header = `${theme.fg("accent", theme.bold(`${chrome.title} (${entries.length})`))}${theme.fg("dim", ` · ${counts}`)}`;
+	// Everything has finished and nobody is browsing: collapse to one summary
+	// line. The finished agents stay reachable — ↓ expands the list again.
+	if (selected === null && entries.every((entry) => !entry.idle && isFinished(entry))) {
+		return [fitLine(`${header}${theme.fg("dim", ` · ${chrome.browseHint}`)}`, width)];
+	}
+	const lines: string[] = [header];
 
 	const rowBudget = maxLines - 2; // header + hint
 	let start = 0;

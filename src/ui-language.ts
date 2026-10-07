@@ -106,6 +106,8 @@ export interface FleetChrome {
 	listHint: string;
 	running: string;
 	done: string;
+	failed: string;
+	cancelled: string;
 	queued: string;
 	idle: string;
 	tools: string;
@@ -129,6 +131,8 @@ const FLEET_CHROME: Record<UiLanguage, FleetChrome> = {
 		listHint: "↑/↓ 选择 · Enter 查看 · Esc 返回",
 		running: "运行中",
 		done: "已完成",
+		failed: "失败",
+		cancelled: "已取消",
 		queued: "排队中",
 		idle: "空闲",
 		tools: "次工具调用",
@@ -148,6 +152,8 @@ const FLEET_CHROME: Record<UiLanguage, FleetChrome> = {
 		listHint: "↑/↓ select · Enter view · Esc back",
 		running: "running",
 		done: "done",
+		failed: "failed",
+		cancelled: "cancelled",
 		queued: "queued",
 		idle: "idle",
 		tools: "tool calls",
