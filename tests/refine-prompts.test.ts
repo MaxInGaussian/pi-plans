@@ -2,24 +2,29 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { buildRefAnalystTask, buildReviewerTask, refAnalystSections, reviewerLanes } from "../src/refine-prompts.ts";
+import { GENERAL_LANE, buildRefAnalystTask, buildReviewerTask, lanesFromDirections, refAnalystSections } from "../src/refine-prompts.ts";
 
-describe("reviewerLanes", () => {
-	it("uses stable lane ids for the big-plan fanout", () => {
-		assert.deepEqual(reviewerLanes(3).map((lane) => lane.id), ["correctness", "ordering", "verification"]);
+describe("reviewer lanes", () => {
+	it("uses the planner's direction ids as the lane ids for a multi-reviewer fanout", () => {
+		const lanes = lanesFromDirections([
+			{ id: "migration-rollback", direction: "Probe the migration and the way back from a half-applied change." },
+			{ id: "check-strength", direction: "Test whether each verification check could pass while the behavior is broken." },
+		]);
+		assert.deepEqual(lanes.map((lane) => lane.id), ["migration-rollback", "check-strength"]);
 	});
 
 	it("falls back to a general lane for one-off review passes", () => {
-		assert.deepEqual(reviewerLanes(1), [{ id: "general", lens: null }]);
+		assert.deepEqual(lanesFromDirections([]), [{ id: "general", direction: null }]);
+		assert.deepEqual(GENERAL_LANE, { id: "general", direction: null });
 	});
 });
 
 describe("buildReviewerTask", () => {
-	it("includes a compact read-only contract and lane emphasis", () => {
+	it("includes a compact read-only contract and the assigned direction", () => {
 		const text = buildReviewerTask({
 			planText: "# plan",
 			planPath: "/tmp/PLAN_v1.md",
-			lens: "verification rigor",
+			direction: "verification rigor",
 			focus: "check the checklist",
 			context: "repo evidence",
 		});
@@ -27,7 +32,7 @@ describe("buildReviewerTask", () => {
 		assert.match(text, /Goal: review the plan against the repository and surface what needs the user's judgment\./);
 		assert.match(text, /Target: \/tmp\/PLAN_v1\.md/);
 		assert.match(text, /Authority boundary: read-only analysis only\./);
-		assert.match(text, /Review lens: verification rigor\./);
+		assert.match(text, /Your assigned direction: verification rigor/);
 		assert.match(text, /Specific concerns from the main agent: check the checklist/);
 		assert.match(text, /Context: repo evidence/);
 		assert.match(text, /Surface at most five high-priority findings/);

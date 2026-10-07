@@ -106,12 +106,18 @@ function tuiCtx(workdir: string, widgets: Array<(width: number) => string[]>) {
 	};
 }
 
-/** The lens id a brief was written for ("general" when it carries none). */
+const DIRECTIONS = [
+	{ id: "state-transitions", direction: "Probe how the plan changes persisted run state and what a half-applied or interrupted change leaves behind." },
+	{ id: "blast-radius", direction: "Find the callers and modules the planned edits touch indirectly and check whether the tasks cover them." },
+	{ id: "check-strength", direction: "Test whether each verification check could still pass while the behavior is broken, and what no check covers." },
+];
+const three = () => DIRECTIONS.map((entry) => ({ ...entry }));
+const two = () => DIRECTIONS.slice(0, 2).map((entry) => ({ ...entry }));
+
+/** The lane (direction id) a brief was written for ("general" when it has none). */
 function laneOf(prompt: string): string {
-	if (prompt.includes("requirements fit")) return "correctness";
-	if (prompt.includes("architecture, sequencing")) return "ordering";
-	if (prompt.includes("verification rigor")) return "verification";
-	return "general";
+	const match = DIRECTIONS.find((entry) => prompt.includes(`Your assigned direction: ${entry.direction}`));
+	return match?.id ?? "general";
 }
 
 function spawnLedger(workdir: string): Array<{ role: string; name: string; model: string; thinking_level: string | null }> {
@@ -122,7 +128,7 @@ function spawnLedger(workdir: string): Array<{ role: string; name: string; model
 }
 
 describe("refine: delegated reviewers", () => {
-	it("reviewers: 3 runs one in-process session per lens and returns three sections", async () => {
+	it("reviewers: 3 runs one in-process session per planner direction and returns three sections", async () => {
 		const { workdir, runId, planPath } = setup();
 		const seen: Array<{ lane: string; model: unknown; thinking: unknown; tools: unknown }> = [];
 		const restore = installFakeAgents(({ prompt, options }) => {
@@ -131,14 +137,14 @@ describe("refine: delegated reviewers", () => {
 			return `## Findings\nNone from ${lane}.\n\n## Questions\nNone.`;
 		});
 		try {
-			const result = await loadTool().execute("t1", { planPath, reviewers: 3 }, undefined, undefined, headlessCtx(workdir));
+			const result = await loadTool().execute("t1", { planPath, reviewers: 3, directions: three() }, undefined, undefined, headlessCtx(workdir));
 			const text = result.content[0]!.text;
-			for (const lane of ["correctness", "ordering", "verification"]) {
+			for (const lane of DIRECTIONS.map((entry) => entry.id)) {
 				assert.match(text, new RegExp(`None from ${lane}\\.`), `section for ${lane}`);
 			}
 			assert.equal((text.match(/^### /gm) ?? []).length, 3, "three reviewer sections");
 			assert.doesNotMatch(text, /FAILED/);
-			assert.deepEqual(seen.map((entry) => entry.lane).sort(), ["correctness", "ordering", "verification"], "each lane got its own lens brief");
+			assert.deepEqual(seen.map((entry) => entry.lane).sort(), DIRECTIONS.map((entry) => entry.id).sort(), "each lane got its own direction");
 			for (const entry of seen) {
 				assert.deepEqual(entry.model, { provider: "fake", id: "reviewer" });
 				assert.equal(entry.thinking, "high");
@@ -160,15 +166,15 @@ describe("refine: delegated reviewers", () => {
 		const widgets: Array<(width: number) => string[]> = [];
 		const restore = installFakeAgents(() => "## Findings\nNone.\n\n## Questions\nNone.");
 		try {
-			await loadTool().execute("t1", { planPath, reviewers: 3 }, undefined, undefined, tuiCtx(workdir, widgets));
+			await loadTool().execute("t1", { planPath, reviewers: 3, directions: three() }, undefined, undefined, tuiCtx(workdir, widgets));
 			const entries = fleet.list().filter((entry) => entry.role === "reviewer");
-			assert.deepEqual(entries.map((entry) => entry.laneId), ["correctness", "ordering", "verification"]);
+			assert.deepEqual(entries.map((entry) => entry.laneId), DIRECTIONS.map((entry) => entry.id));
 			assert.ok(entries.every((entry) => entry.lane.status === "complete"), "every finished lane stays listed as done");
 			assert.ok(entries.every((entry) => entry.modelLabel?.includes("fake/reviewer")), "the model label reaches the list");
 			assert.equal(widgets.length, 1, "one fleet widget");
 			const lines = widgets[0]!(120);
 			assert.equal(lines.filter((line) => line.startsWith("•")).length, 3, "three bullets");
-			assert.ok(lines.some((line) => line.includes("correctness")));
+			assert.ok(lines.some((line) => line.includes("state-transitions")));
 		} finally {
 			restore();
 		}
@@ -194,17 +200,17 @@ describe("refine: delegated reviewers", () => {
 		const { workdir, planPath } = setup();
 		__setSessionFactoryForTests(async (options) => ({
 			session: new FakeSession(async (api) => {
-				if (laneOf(api.prompt) === "ordering") throw new Error("provider exploded");
+				if (laneOf(api.prompt) === "blast-radius") throw new Error("provider exploded");
 				api.say(`ok from ${laneOf(api.prompt)} (${String(options.cwd).length > 0})`);
 			}),
 		}));
-		const result = await loadTool().execute("t1", { planPath, reviewers: 3 }, undefined, undefined, headlessCtx(workdir));
+		const result = await loadTool().execute("t1", { planPath, reviewers: 3, directions: three() }, undefined, undefined, headlessCtx(workdir));
 		const text = result.content[0]!.text;
 		assert.match(text, /— FAILED\nprovider exploded/);
-		assert.match(text, /ok from correctness/);
-		assert.match(text, /ok from verification/);
+		assert.match(text, /ok from state-transitions/);
+		assert.match(text, /ok from check-strength/);
 		assert.deepEqual(result.details.outputs.map((output: { ok: boolean }) => output.ok), [true, false, true]);
-		assert.equal(fleet.list().find((entry) => entry.laneId === "ordering")?.lane.status, "failed");
+		assert.equal(fleet.list().find((entry) => entry.laneId === "blast-radius")?.lane.status, "failed");
 	});
 
 	it("throws when every reviewer fails", async () => {
@@ -215,40 +221,74 @@ describe("refine: delegated reviewers", () => {
 			}),
 		}));
 		await assert.rejects(
-			loadTool().execute("t1", { planPath, reviewers: 2 }, undefined, undefined, headlessCtx(workdir)),
+			loadTool().execute("t1", { planPath, reviewers: 2, directions: two() }, undefined, undefined, headlessCtx(workdir)),
 			/all reviewer subagents failed: no capacity/,
 		);
 	});
 
-	it("resuming a round runs only the lanes that are not complete and reuses the rest", async () => {
+	function startStoredRound(workdir: string, runId: string, planPath: string, roundId: string, lanes: Array<{ laneId: string; lens?: string }>) {
+		startReviewRound(workdir, runId, { roundId, role: "reviewer", target: "plan", reviewers: lanes.length, planPath, lanes });
+	}
+
+	it("resuming a round without directions reuses the stored lanes and runs only the incomplete ones", async () => {
 		const { workdir, runId, planPath } = setup();
 		const roundId = "plan-reviewer-resume";
-		startReviewRound(workdir, runId, {
-			roundId,
-			role: "reviewer",
-			target: "plan",
-			reviewers: 3,
-			planPath,
-			lanes: [
-				{ laneId: "correctness", lens: "requirements fit and correctness of claims against the repository" },
-				{ laneId: "ordering", lens: "architecture, sequencing, and dependency ordering" },
-				{ laneId: "verification", lens: "verification rigor, risks, and evidence gaps" },
-			],
-		});
-		recordLaneOutcome(workdir, runId, roundId, "correctness", { ok: true, output: "PERSISTED correctness output" });
+		startStoredRound(workdir, runId, planPath, roundId, three().map((entry) => ({ laneId: entry.id, lens: entry.direction })));
+		recordLaneOutcome(workdir, runId, roundId, "state-transitions", { ok: true, output: "PERSISTED state-transitions output" });
 		const lanes: string[] = [];
+		const briefs: string[] = [];
 		const restore = installFakeAgents(({ prompt }) => {
 			lanes.push(laneOf(prompt));
+			briefs.push(prompt);
 			return `fresh output for ${laneOf(prompt)}`;
 		});
 		try {
-			const result = await loadTool().execute("t1", { planPath, reviewers: 3, resumeRoundId: roundId }, undefined, undefined, headlessCtx(workdir));
-			assert.deepEqual(lanes.sort(), ["ordering", "verification"], "the completed lane is not re-run");
-			assert.deepEqual(fleet.list().map((entry) => entry.laneId).sort(), ["ordering", "verification"], "only the runnable lanes enter the list");
+			const result = await loadTool().execute("t1", { planPath, resumeRoundId: roundId }, undefined, undefined, headlessCtx(workdir));
+			assert.deepEqual(lanes.sort(), ["blast-radius", "check-strength"], "the completed lane is not re-run");
+			assert.deepEqual(fleet.list().map((entry) => entry.laneId).sort(), ["blast-radius", "check-strength"], "only the runnable lanes enter the list");
+			assert.ok(briefs.every((brief) => brief.includes(DIRECTIONS[0]!.direction)), "the reused lane's stored direction is still listed for the others");
 			const text = result.content[0]!.text;
-			assert.match(text, /REUSED \(round plan-reviewer-resume, no re-run\)\nPERSISTED correctness output/);
-			assert.match(text, /fresh output for ordering/);
-			assert.deepEqual(result.details.reusedLanes, ["correctness"]);
+			assert.match(text, /REUSED \(round plan-reviewer-resume, no re-run\)\nPERSISTED state-transitions output/);
+			assert.match(text, /fresh output for blast-radius/);
+			assert.deepEqual(result.details.reusedLanes, ["state-transitions"]);
+			assert.equal(result.details.reviewers, 3);
+		} finally {
+			restore();
+		}
+	});
+
+	it("resuming with different directions than the stored lanes is refused", async () => {
+		const { workdir, runId, planPath } = setup();
+		startStoredRound(workdir, runId, planPath, "r-mismatch", two().map((entry) => ({ laneId: entry.id, lens: entry.direction })));
+		const other = [
+			{ id: "something-else", direction: "A direction whose id does not match the stored round at all." },
+			{ id: "and-another", direction: "Another direction that also does not match the stored round." },
+		];
+		await assert.rejects(
+			loadTool().execute("t1", { planPath, reviewers: 2, directions: other, resumeRoundId: "r-mismatch" }, undefined, undefined, headlessCtx(workdir)),
+			/different lanes/,
+		);
+	});
+
+	it("a round recorded with the old fixed lenses still resumes without directions", async () => {
+		const { workdir, runId, planPath } = setup();
+		const roundId = "legacy-lenses";
+		startStoredRound(workdir, runId, planPath, roundId, [
+			{ laneId: "correctness", lens: "requirements fit and correctness of claims against the repository" },
+			{ laneId: "ordering", lens: "architecture, sequencing, and dependency ordering" },
+		]);
+		recordLaneOutcome(workdir, runId, roundId, "correctness", { ok: true, output: "legacy persisted" });
+		const prompts: string[] = [];
+		const restore = installFakeAgents(({ prompt }) => {
+			prompts.push(prompt);
+			return "fresh";
+		});
+		try {
+			const result = await loadTool().execute("t1", { planPath, resumeRoundId: roundId }, undefined, undefined, headlessCtx(workdir));
+			assert.equal(prompts.length, 1, "only the incomplete legacy lane runs");
+			assert.match(prompts[0]!, /Your assigned direction: architecture, sequencing, and dependency ordering/);
+			assert.match(prompts[0]!, /- correctness: requirements fit and correctness/);
+			assert.match(result.content[0]!.text, /legacy persisted/);
 		} finally {
 			restore();
 		}
@@ -262,9 +302,118 @@ describe("refine: delegated reviewers", () => {
 				await api.aborted;
 			}),
 		}));
-		const pending = loadTool().execute("t1", { planPath, reviewers: 2 }, controller.signal, undefined, headlessCtx(workdir));
+		const pending = loadTool().execute("t1", { planPath, reviewers: 2, directions: two() }, controller.signal, undefined, headlessCtx(workdir));
 		setTimeout(() => controller.abort(), 30);
 		await assert.rejects(pending, /all reviewer subagents failed/);
 		assert.ok(fleet.list().every((entry) => entry.lane.status === "cancelled"), "aborted lanes end as cancelled");
+	});
+});
+
+describe("refine: tailored reviewer directions", () => {
+	async function run(params: Record<string, unknown>, ctxFor: (workdir: string) => unknown = headlessCtx) {
+		const { workdir, planPath } = setup();
+		const spawned: string[] = [];
+		const restore = installFakeAgents(({ prompt }) => {
+			spawned.push(prompt);
+			return "## Findings\nNone.\n\n## Questions\nNone.";
+		});
+		try {
+			const outcome = await loadTool().execute("t1", { planPath, ...params }, undefined, undefined, ctxFor(workdir)).then(
+				(result) => ({ result }),
+				(error: Error) => ({ error }),
+			);
+			return { workdir, spawned, ...outcome };
+		} finally {
+			restore();
+		}
+	}
+
+	it("each brief carries its own direction and lists only the OTHER reviewers' directions", async () => {
+		const { spawned } = await run({ reviewers: 3, directions: three() });
+		assert.equal(spawned.length, 3);
+		for (const prompt of spawned) {
+			const own = DIRECTIONS.find((entry) => prompt.includes(`Your assigned direction: ${entry.direction}`))!;
+			assert.ok(own, "an assigned direction");
+			assert.equal(prompt.split(own.direction).length - 1, 1, "the own direction appears exactly once");
+			assert.match(prompt, /Other reviewers in this round cover different directions/);
+			for (const other of DIRECTIONS.filter((entry) => entry.id !== own.id)) {
+				assert.ok(prompt.includes(`- ${other.id}: ${other.direction}`), `lists ${other.id}`);
+			}
+			assert.doesNotMatch(prompt, new RegExp(`- ${own.id}: `), "does not list itself among the others");
+			assert.match(prompt, /high-severity problem outside your direction, report it briefly/);
+		}
+	});
+
+	it("reviewers: 2 runs two directions", async () => {
+		const { spawned, result } = await run({ reviewers: 2, directions: two() });
+		assert.equal(spawned.length, 2);
+		assert.equal(result!.details.reviewers, 2);
+		assert.deepEqual(result!.details.outputs.map((output: { lane: string }) => output.lane), ["state-transitions", "blast-radius"]);
+		assert.equal(result!.details.outputs[0].direction, DIRECTIONS[0]!.direction);
+	});
+
+	it("more than one reviewer without directions is refused with guidance and spawns nothing", async () => {
+		const { spawned, error, workdir } = await run({ reviewers: 2 });
+		assert.ok(error);
+		assert.match(error!.message, /needs tailor-made directions, but none were given/);
+		assert.match(error!.message, /Name the concrete modules, flows or risks/);
+		assert.equal(spawned.length, 0);
+		assert.deepEqual(fleet.list(), []);
+		const active = readActive(workdir)!;
+		const checkpoint = loadCheckpoint(workdir, active.run_id);
+		assert.ok(checkpoint.status === "ok" && checkpoint.checkpoint.reviewRounds.length === 0, "no round was started");
+	});
+
+	it("rejects a wrong count, duplicate ids, bad slugs and out-of-range text", async () => {
+		const good = two();
+		for (const [params, pattern] of [
+			[{ reviewers: 3, directions: two() }, /needs exactly 3 directions, got 2/],
+			[{ reviewers: 2, directions: [good[0], { ...good[1], id: good[0]!.id }] }, /used twice/],
+			[{ reviewers: 2, directions: [good[0], { ...good[1], id: "Bad Slug" }] }, /not a valid slug/],
+			[{ reviewers: 2, directions: [good[0], { ...good[1], direction: "too short" }] }, /must be 20-800 characters/],
+			[{ reviewers: 2, directions: [good[0], { ...good[1], direction: "x".repeat(801) }] }, /must be 20-800 characters/],
+			[{ reviewers: 1, directions: two() }, /reviewers: 1 takes at most one direction/],
+		] as Array<[Record<string, unknown>, RegExp]>) {
+			const { spawned, error } = await run(params);
+			assert.ok(error, JSON.stringify(params).slice(0, 80));
+			assert.match(error!.message, pattern);
+			assert.equal(spawned.length, 0);
+		}
+	});
+
+	it("directions are validated before any model panel could open (no reviewer gate needed)", async () => {
+		// A delegated role that was never confirmed would normally walk the user
+		// through the first-use panels; bad directions must fail first.
+		const { workdir, planPath } = setup();
+		setRole(workdir, { role: "reviewer", mode: "delegated-subagent", modelSelector: "inherit" });
+		await assert.rejects(
+			loadTool().execute("t1", { planPath, reviewers: 2 }, undefined, undefined, headlessCtx(workdir)),
+			/needs tailor-made directions/,
+		);
+	});
+
+	it("one reviewer takes an optional direction as its lane; none means the general lane", async () => {
+		const withDirection = await run({ directions: [DIRECTIONS[0]] });
+		assert.deepEqual(withDirection.result!.details.outputs.map((output: { lane: string }) => output.lane), ["state-transitions"]);
+		assert.match(withDirection.spawned[0]!, /Your assigned direction: Probe how the plan/);
+		assert.doesNotMatch(withDirection.spawned[0]!, /Other reviewers in this round/);
+		const general = await run({});
+		assert.deepEqual(general.result!.details.outputs.map((output: { lane: string }) => output.lane), ["general"]);
+		assert.doesNotMatch(general.spawned[0]!, /Your assigned direction/);
+	});
+
+	it("current-session mode needs the directions too and lists them in the one brief", async () => {
+		const { workdir, planPath } = setup();
+		setRole(workdir, { role: "reviewer", mode: "current-session", confirmed: true });
+		await assert.rejects(
+			loadTool().execute("t1", { planPath, reviewers: 2 }, undefined, undefined, headlessCtx(workdir)),
+			/needs tailor-made directions/,
+		);
+		const result = await loadTool().execute("t1", { planPath, reviewers: 2, directions: two() }, undefined, undefined, headlessCtx(workdir));
+		const text = result.content[0]!.text;
+		assert.match(text, /current-session/);
+		assert.match(text, /You are the only reviewer here: cover each one in turn/);
+		assert.match(text, /- state-transitions: Probe how/);
+		assert.match(text, /- blast-radius: Find the callers/);
 	});
 });

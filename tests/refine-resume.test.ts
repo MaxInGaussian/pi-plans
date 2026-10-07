@@ -206,7 +206,7 @@ describe("implementation-review round 1 fixes", () => {
 			ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } },
 		};
 		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
-		const result = await tool!.execute("t1", { role: "reviewer", planPath, reviewers: 2 }, undefined, undefined, ctx);
+		const result = await tool!.execute("t1", { role: "reviewer", planPath, reviewers: 2, directions: [{ id: "state-transitions", direction: "Probe how the plan changes persisted state and what a half-applied change leaves behind." }, { id: "blast-radius", direction: "Find the callers and modules the plan touches indirectly and whether the tasks cover them." }] }, undefined, undefined, ctx);
 		assert.match(result.content[0]?.text ?? "", /current-session/);
 		// The durable round exists WITH lanes — the pre-fix crash site.
 		const loaded = loadCheckpoint(workdir, run.run_id);
@@ -376,7 +376,7 @@ describe("plan-review reviewer-count defaults (v0.6.1 single-reviewer)", () => {
 			ui: { notify: () => {}, setStatus: () => {}, theme: { fg: (_c: string, t: string) => t } },
 		};
 		setMessagingApi({ appendEntry: () => {}, sendMessage: () => {}, sendUserMessage: async () => {} });
-		const result = await tool.execute("t1", { planPath, reviewers: 3 }, undefined, undefined, ctx);
+		const result = await tool.execute("t1", { planPath, reviewers: 3, directions: [{ id: "state-transitions", direction: "Probe how the plan changes persisted state and what a half-applied change leaves behind." }, { id: "blast-radius", direction: "Find the callers and modules the plan touches indirectly and whether the tasks cover them." }, { id: "check-strength", direction: "Test whether each verification check could pass while the behavior is still broken." }] }, undefined, undefined, ctx);
 		assert.match(result.content[0]?.text ?? "", /current-session/);
 		const loaded = loadCheckpoint(workdir, runId);
 		assert.ok(loaded.status === "ok");

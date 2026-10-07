@@ -40,7 +40,7 @@ import {
 	reusableLaneOutputs,
 	startReviewRound,
 } from "../src/workflow-state.ts";
-import { buildReviewerTask, reviewerLanes } from "../src/refine-prompts.ts";
+import { buildReviewerTask, lanesFromDirections, validateDirections, type ReviewerDirection, type ReviewerLane } from "../src/refine-prompts.ts";
 import { graphBlockForRefiner } from "../src/code-graph/prompts.ts";
 import { stripFrontmatter } from "../src/subagent.ts";
 import { agentHostOf, runAgentSession } from "../src/agent-session.ts";
@@ -57,8 +57,24 @@ const RefineParams = Type.Object({
 		Type.Integer({
 			minimum: 1,
 			maximum: 3,
-			description: "Number of independent reviewer subagents (big plans: 3 for the concurrent round).",
+			description:
+				"Number of independent reviewer subagents: plan-normal 2, plan-big / plan-huge 3, others 1. With more than one reviewer you MUST also pass `directions`.",
 		}),
+	),
+	directions: Type.Optional(
+		Type.Array(
+			Type.Object({
+				id: Type.String({ description: 'Short unique slug for this reviewer, e.g. "migration-rollback" (lowercase letters, digits, hyphens; up to 32 characters)' }),
+				direction: Type.String({
+					description:
+						"20-800 characters, written by you for THIS project and plan: the concrete modules, flows or risks this reviewer digs into, and why the planner or an executor could overlook them.",
+				}),
+			}),
+			{
+				description:
+					"One tailor-made direction per reviewer (required when reviewers > 1; exactly `reviewers` entries). Choose complementary, non-overlapping directions with the highest expected miss rate for this plan (hidden coupling and blast radius, migration/rollback and state transitions, concurrency and ordering, failure and degraded modes, security and permissions, performance cliffs, integration points, whether the verification checks really prove the claims, unstated assumptions) — not a generic checklist.",
+			},
+		),
 	),
 	context: Type.Optional(
 		Type.String({ description: "Context for the subagents: user goals, repo evidence, constraints, open questions" }),
@@ -149,7 +165,7 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 		name: "refine",
 		label: "Refine",
 		description:
-			"Run a reviewer refinement round on a PLAN_vN.md via read-only Pi subagents. Each reviewer returns findings (F-###, severity, evidence, impact, fix, disposition) AND questions (Q-1..Q-5) that only the user can settle — after the round you MUST ask every question with ask_choice (one call per question or a batched form, in the configured language, stable questionIds) and record the answers before revising the plan. Use reviewers: 3 for concurrent reviewer rounds (big-plan review). Refuses to spawn until the reviewer mode is set and, for delegated-subagent, a concrete model is confirmed: first use pops native model/effort panels in TUI (persisted to the global reviewer config) instead of an ask_choice question.",
+			"Run a reviewer refinement round on a PLAN_vN.md via read-only Pi subagents. Each reviewer returns findings (F-###, severity, evidence, impact, fix, disposition) AND questions (Q-1..Q-5) that only the user can settle — after the round you MUST ask every question with ask_choice (one call per question or a batched form, in the configured language, stable questionIds) and record the answers before revising the plan. Concurrent rounds: reviewers: 2 for plan-normal, reviewers: 3 for plan-big / plan-huge — with more than one reviewer you MUST pass `directions`, one tailor-made direction per reviewer that YOU write for this project and plan (complementary, non-overlapping, aimed at what the planner or an executor is most likely to overlook), so the reviewers dig into different aspects instead of repeating each other. Refuses to spawn until the reviewer mode is set and, for delegated-subagent, a concrete model is confirmed: first use pops native model/effort panels in TUI (persisted to the global reviewer config) instead of an ask_choice question.",
 		promptSnippet: "Run reviewer plan-refinement rounds",
 		parameters: RefineParams,
 
@@ -174,6 +190,18 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 			const { reviewer: initialRole } = resolveEffectiveReviewer(root);
 			if (initialRole.mode !== "delegated-subagent" && initialRole.mode !== "current-session") {
 				throw roleGateError("mode");
+			}
+			// Tailored directions are validated BEFORE any first-use panel (cheap
+			// checks first, so a missing argument never walks the user through
+			// panels that would then be discarded). A resume that omits them reuses
+			// the lanes stored in its round. Current-session mode needs them too:
+			// the one session covers each direction in turn.
+			const requestedCount = Math.min(3, Math.max(1, params.reviewers ?? 1));
+			let requestedDirections: ReviewerDirection[] | undefined;
+			if (params.directions !== undefined || !params.resumeRoundId) {
+				const checked = validateDirections(requestedCount, params.directions);
+				if (!checked.ok) throw new StateError(checked.error);
+				requestedDirections = checked.directions;
 			}
 			// Model/effort confirmation applies only to delegated-subagent
 			// (decision 10); current-session runs in this session with its model.
@@ -205,8 +233,16 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 			const checkpointLoad = active ? loadCheckpoint(workdir, active.run_id) : null;
 			const useCheckpoint = checkpointLoad?.status === "ok" ? checkpointLoad.checkpoint : null;
 			const roundId = params.resumeRoundId ?? `plan-reviewer-r${Date.now().toString(36)}`;
-			const roundReviewerCount = Math.min(3, Math.max(1, params.reviewers ?? 1));
-			const roundLanes = reviewerLanes(roundReviewerCount).map((lane) => ({ laneId: lane.id, lens: lane.lens ?? undefined }));
+			// Lanes come from the planner's directions; a resumed round without
+			// new directions keeps the lanes (and their direction text) it was
+			// started with, so interrupted rounds — including ones recorded with
+			// the old fixed lenses — resume untouched.
+			const storedRound = params.resumeRoundId ? useCheckpoint?.reviewRounds.find((round) => round.roundId === params.resumeRoundId) : undefined;
+			const lanes: ReviewerLane[] =
+				requestedDirections === undefined && storedRound
+					? storedRound.lanes.map((lane) => ({ id: lane.laneId, direction: lane.lens ?? null }))
+					: lanesFromDirections(requestedDirections ?? []);
+			const roundReviewerCount = lanes.length;
 			const roundSpec = {
 				roundId,
 				role: "reviewer" as const,
@@ -215,7 +251,7 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 				planPath,
 				focus: params.focus,
 				context: params.context,
-				lanes: roundLanes,
+				lanes: lanes.map((lane) => ({ laneId: lane.id, lens: lane.direction ?? undefined })),
 			};
 			if (useCheckpoint) {
 				startReviewRound(workdir, active!.run_id, roundSpec);
@@ -231,26 +267,40 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 					/* the subagents ledger still records the spawn; resume treats the lane as unfinished */
 				}
 			};
-			const pickTask = (lens: string | null): string =>
-				buildReviewerTask({ planText, planPath, lens, focus: params.focus, context: params.context });
+			const pickTask = (lane: ReviewerLane | null): string =>
+				buildReviewerTask({
+					planText,
+					planPath,
+					direction: lane?.direction ?? null,
+					otherDirections: lane
+						? lanes.filter((other) => other.id !== lane.id && other.direction).map((other) => ({ id: other.id, direction: other.direction! }))
+						: [],
+					focus: params.focus,
+					context: params.context,
+				});
 
 			const systemPrompt = loadAgentPrompt();
 			const graphEnabled = config.graph_enabled === true;
 			const subagentTools = graphEnabled ? ["read", "grep", "find", "ls", "code_graph"] : undefined;
-				// In-process sessions load no extensions: hand the reviewers a
-				// read-only code_graph tool directly when the graph is on.
-				const subagentCustomTools = graphEnabled ? [buildCodeGraphTool({ readOnly: true })] : undefined;
+			// In-process sessions load no extensions: hand the reviewers a
+			// read-only code_graph tool directly when the graph is on.
+			const subagentCustomTools = graphEnabled ? [buildCodeGraphTool({ readOnly: true })] : undefined;
 			const graphPrompt = graphBlockForRefiner(graphEnabled);
 			const model = roleConfig.mode === "current-session" ? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined) : roleConfig.model_selector ?? undefined;
 			const modelLabel = roleModelLabel(model ?? "inherit", roleConfig.mode === "current-session" ? null : roleConfig.thinking_level);
 
 			if (roleConfig.mode === "current-session") {
 				const task = pickTask(null);
+				const directed = lanes.filter((lane) => lane.direction);
+				const directionNote =
+					directed.length > 1
+						? `\n\nThe main agent assigned these directions to the reviewers of this round. You are the only reviewer here: cover each one in turn and go deep on every one of them.\n${directed.map((lane) => `- ${lane.id}: ${lane.direction}`).join("\n")}`
+						: "";
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Role mode is current-session: perform the read-only reviewer pass yourself, in this session, following this brief. Do not spawn anything. Then surface the findings and ask the Questions section with ask_choice before revising.\n\n${task}`,
+							text: `Role mode is current-session: perform the read-only reviewer pass yourself, in this session, following this brief. Do not spawn anything. Then surface the findings and ask the Questions section with ask_choice before revising.${directionNote}\n\n${task}`,
 						},
 					],
 					details: { mode: "current-session", planPath },
@@ -258,10 +308,9 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 			}
 
 			const count = roundReviewerCount;
-			const lanes = reviewerLanes(count);
 			const jobs = lanes.map((lane) => {
 				const name = `${roleConfig.name_prefix}-${active?.run_id ?? "adhoc"}-${lane.id}`;
-				const task = pickTask(lane.lens);
+				const task = pickTask(lane);
 				return { lane, name, task };
 			});
 
@@ -324,11 +373,11 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 					const persisted = reusable[job.lane.id];
 					if (persisted === undefined) continue;
 					reusedCount += 1;
-					const title = job.lane.lens ? `${job.name} — ${job.lane.lens}` : job.name;
+					const title = job.name;
 					sections.push(`### ${title} — REUSED (round ${roundId}, no re-run)\n${readReviewOutput(workdir, active!.run_id, persisted)}`);
 				}
 				for (const { job, result } of results) {
-					const title = job.lane.lens ? `${job.name} — ${job.lane.lens}` : job.name;
+					const title = job.name;
 					if (!result.ok) {
 						failures += 1;
 						sections.push(`### ${title} — FAILED\n${result.errorMessage ?? "unknown error"}`);
@@ -363,7 +412,7 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 						reviewers: count,
 						model,
 						thinkingLevel: roleConfig.thinking_level,
-						outputs: results.map(({ job, result }) => ({ name: job.name, lane: job.lane.id, lens: job.lane.lens, ok: result.ok, output: result.output, stderr: result.stderr, turns: result.turns })),
+						outputs: results.map(({ job, result }) => ({ name: job.name, lane: job.lane.id, direction: job.lane.direction, ok: result.ok, output: result.output, stderr: result.stderr, turns: result.turns })),
 					},
 				};
 			} finally {
