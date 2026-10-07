@@ -271,6 +271,7 @@ export function registerRefineTool(ext: ExtensionAPI, baseDir: string): void {
 			const execution = setupRefinementExecution(
 				ctx,
 				signal,
+				roundId,
 				runnableJobs.map((job) => ({ id: job.lane.id, label: job.lane.id })),
 				modelLabel,
 				overlayLang,
