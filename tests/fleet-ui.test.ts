@@ -266,13 +266,13 @@ describe("SubagentOverlay", () => {
 // Controller: widget + keys
 // ---------------------------------------------------------------------------
 
-function fakeHost(editorText = "") {
+function fakeHost(editorText = "", focused: unknown = null) {
 	const calls = { widgets: [] as Array<{ key: string; shown: boolean }>, customs: 0, handlers: [] as Array<(d: string) => { consume?: boolean } | undefined> };
 	const state = { editorText, renders: 0 };
 	const ui = {
 		setWidget: (key: string, content: unknown) => {
 			calls.widgets.push({ key, shown: content !== undefined });
-			if (typeof content === "function") (content as (tui: unknown, theme: unknown) => unknown)({ requestRender: () => (state.renders += 1), getFocusedComponent: () => null }, fakeTheme);
+			if (typeof content === "function") (content as (tui: unknown, theme: unknown) => unknown)({ requestRender: () => (state.renders += 1), getFocusedComponent: () => focused }, fakeTheme);
 		},
 		onTerminalInput: (handler: (d: string) => { consume?: boolean } | undefined) => {
 			calls.handlers.push(handler);
@@ -364,12 +364,28 @@ describe("FleetUiController", () => {
 		assert.equal(controller.isFocused(), false);
 	});
 
-	it("does nothing without agents and never touches ↓ when another component has focus", () => {
+	it("does nothing without agents", () => {
 		const fleet = new AgentFleet();
 		const controller = new FleetUiController(fleet);
 		const { host } = fakeHost();
 		controller.attach(host);
 		assert.equal(controller.handleKey("\x1b[B"), undefined);
+	});
+
+	it("never touches ↓ while a dialog (not the editor) has focus, but accepts any editor-like component", () => {
+		const fleet = new AgentFleet();
+		const controller = new FleetUiController(fleet);
+		const dialog = { handleInput() {}, render: () => [] };
+		const { host } = fakeHost("", dialog);
+		controller.attach(host);
+		seed(fleet, ["a"]);
+		assert.equal(controller.handleKey("\x1b[B"), undefined, "a select dialog keeps its arrow keys");
+		assert.equal(controller.isFocused(), false);
+
+		const second = new FleetUiController(fleet);
+		const editorLike = { handleInput() {}, getText: () => "" };
+		second.attach(fakeHost("", editorLike).host);
+		assert.deepEqual(second.handleKey("\x1b[B"), { consume: true }, "an editor from another module copy still counts");
 	});
 
 	it("openLatest reopens the newest agent of a role", () => {
