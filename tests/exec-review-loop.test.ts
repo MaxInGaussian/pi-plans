@@ -30,7 +30,7 @@ import { spawnSync } from "node:child_process";
 import { getRun, initState, setRunStatus, startRun } from "../src/state.ts";
 import { createCheckpoint, loadCheckpoint, mutateCheckpoint, applyExecutionApproved, applyExecutionProgress, applyPlanWritten, planIdentityOf, resolveHeadAt } from "../src/workflow-state.ts";
 
-import { loadExecutionFromCheckpoint } from "../src/exec.ts";
+import { loadExecutionFromCheckpoint, setSuggestedReviewDirections } from "../src/exec.ts";
 import { fleet } from "../src/agent-fleet.ts";
 import { fleetUi } from "../src/fleet-ui.ts";
 
@@ -1093,8 +1093,9 @@ describe("execution-review budget (v0.9.3)", () => {
 			...base,
 			ui: {
 				...ui,
-				select: async (_title: string, options: string[]): Promise<string | undefined> => {
-					onAsk?.();
+				select: async (title: string, options: string[]): Promise<string | undefined> => {
+					// Only the budget menu counts: the reviewer-count menu follows it.
+					if (/budget/i.test(title)) onAsk?.();
 					if (choice === null) return undefined;
 					return options.find((option) => option.startsWith(choice)) ?? options[0];
 				},
@@ -1127,6 +1128,105 @@ describe("execution-review budget (v0.9.3)", () => {
 		assert.equal(asks, 1, "no second ask for the same run");
 		assert.equal(getExecution(), null, "the passing round completed the run");
 		ctl.drainAll();
+		__setAuditRunnerForTests(null);
+	});
+
+	/** Menu host that answers the budget and reviewer-count menus by title. */
+	function ctxWithMenus(workdir: string, answers: { budget: string; reviewers: string | null }, asked: string[]) {
+		const base = makeCtx(workdir, "tui");
+		const ui = (base as { ui: Record<string, unknown> }).ui;
+		return {
+			...base,
+			ui: {
+				...ui,
+				select: async (title: string, options: string[]): Promise<string | undefined> => {
+					const kind = /reviewers/i.test(title) ? "reviewers" : "budget";
+					asked.push(kind);
+					const choice = kind === "budget" ? answers.budget : answers.reviewers;
+					if (choice === null) return undefined;
+					return options.find((option) => option.startsWith(choice)) ?? options[0];
+				},
+			},
+		} as typeof base;
+	}
+
+	it("asks for the reviewer count once after the budget, persists it, and splits the checks across lanes", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		await startTerminal(planPath, workdir);
+		const inputs: Array<{ lanes?: Array<{ id: string; checks: Array<{ id: string }> }> }> = [];
+		const resolvers: Array<(value: { round: number; passed: string[]; failed: string[]; undeterminable: string[]; report: string }) => void> = [];
+		__setAuditRunnerForTests(async (input) => {
+			inputs.push(input);
+			return new Promise((resolve) => resolvers.push(resolve));
+		});
+		const asked: string[] = [];
+		fleet.clear();
+		fleetUi.detach();
+		const ctx = ctxWithMenus(workdir, { budget: "3 rounds", reviewers: "2 reviewers" }, asked);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		const ex = getExecution()!;
+		assert.deepEqual(asked, ["budget", "reviewers"], "budget first, then the reviewer count");
+		assert.equal(ex.reviewers?.count, 2);
+		assert.equal(inputs.length, 1);
+		assert.deepEqual(inputs[0]!.lanes!.map((lane) => lane.id), ["correctness-vs-plan", "tests-and-evidence"], "no executor suggestion: back-up aspects");
+		assert.deepEqual(inputs[0]!.lanes!.map((lane) => lane.checks.map((check) => check.id)), [["VC-001"], ["VC-002"]], "one check per reviewer");
+		const auditors = fleet.list().filter((entry) => entry.role === "auditor");
+		assert.equal(auditors.length, 2, "one fleet bullet per reviewer");
+		assert.match(auditors[0]!.label, /Reviewer 1\/2 · correctness-vs-plan/);
+		const cp = loadCheckpoint(workdir, runId);
+		assert.ok(cp.status === "ok");
+		assert.equal(cp.checkpoint.execution?.reviewers?.count, 2, "the count is persisted");
+		resolvers.shift()!({ round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" });
+		await restoring;
+		await __awaitReviewRoundForTests();
+		assert.deepEqual(asked, ["budget", "reviewers"], "never asked twice");
+		fleetUi.detach();
+		fleet.clear();
+		__setAuditRunnerForTests(null);
+	});
+
+	it("feeds the executor's suggested directions to the reviewers", async () => {
+		const { workdir, planPath } = freshWorkdir();
+		await startTerminal(planPath, workdir);
+		const inputs: Array<{ lanes?: Array<{ id: string }> }> = [];
+		__setAuditRunnerForTests(async (input) => {
+			inputs.push(input);
+			return { round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" };
+		});
+		const asked: string[] = [];
+		const ctx = ctxWithMenus(workdir, { budget: "3 rounds", reviewers: "2 reviewers" }, asked);
+		const ex0 = getExecution()!;
+		const result = setSuggestedReviewDirections(ctx, ex0, [
+			{ id: "state-machine", direction: "Walk the run state machine in src/exec.ts for transitions the new code skips." },
+			{ id: "bad id", direction: "nope" },
+		]);
+		assert.equal(result.accepted.length, 1);
+		assert.equal(result.dropped.length, 1);
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		await restoring;
+		await __awaitReviewRoundForTests();
+		assert.deepEqual(inputs[0]!.lanes!.map((lane) => lane.id), ["state-machine", "correctness-vs-plan"]);
+		__setAuditRunnerForTests(null);
+	});
+
+	it("keeps one reviewer (no lanes) when no menu exists, and records the default without asking", async () => {
+		const { workdir, planPath, runId } = freshWorkdir();
+		const ctx = await startTerminal(planPath, workdir);
+		const inputs: Array<{ lanes?: unknown[] }> = [];
+		__setAuditRunnerForTests(async (input) => {
+			inputs.push(input);
+			return { round: 1, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" };
+		});
+		const restoring = restoreFromSession(ctx, [{ type: "custom", customType: "pi-plans-exec", data: getExecution() }]);
+		await tick();
+		await restoring;
+		await __awaitReviewRoundForTests();
+		assert.equal(inputs[0]!.lanes!.length, 0, "single-reviewer round");
+		const cp = loadCheckpoint(workdir, runId);
+		assert.ok(cp.status === "ok");
+		assert.equal(cp.checkpoint.execution?.reviewers?.count ?? 1, 1);
 		__setAuditRunnerForTests(null);
 	});
 

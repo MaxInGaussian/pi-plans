@@ -697,6 +697,29 @@ describe("review-budget persistence (v0.9.3)", () => {
 		assert.equal(completed.execution?.reviewNoProgress, undefined);
 	});
 
+	it("round-trips the reviewer settings, validates them, and drops them on stop and completion", () => {
+		const { workdir, runId } = setupRun("reviewers-roundtrip");
+		const base = executingCheckpoint(workdir, runId);
+		const reviewers = { count: 3, directions: [{ id: "auth-edge", direction: "Probe the permission checks in src/auth.ts." }] };
+		const cp = applyExecutionProgress(base, { reviewers });
+		mutateCheckpoint(workdir, runId, () => cp);
+		const loaded = loadCheckpoint(workdir, runId);
+		assert.ok(loaded.status === "ok");
+		assert.deepEqual(loaded.checkpoint.execution?.reviewers, reviewers);
+		// directions may arrive before the count is decided
+		assert.deepEqual(applyExecutionProgress(base, { reviewers: { directions: reviewers.directions } }).execution?.reviewers, { directions: reviewers.directions });
+		for (const bad of [{ count: 0 }, { count: 4 }, { count: 2.5 }, { count: 2, extra: true }, { directions: [{ id: "x" }] }, { directions: "no" }]) {
+			assert.throws(
+				() => mutateCheckpoint(workdir, runId, () => applyExecutionProgress(base, { reviewers: bad as never })),
+				/reviewers/,
+				`reviewers ${JSON.stringify(bad)} rejected`,
+			);
+		}
+		assert.equal(applyExecutionProgress(cp, { reviewers: null }).execution?.reviewers, undefined, "null clears");
+		assert.equal(applyExecutionStopped(cp, "user stop").execution?.reviewers, undefined);
+		assert.equal(applyExecutionCompleted(cp).execution?.reviewers, undefined);
+	});
+
 	it("a migration preserves the budget but resets the invalidated execution state", () => {
 		const { workdir, runId } = setupRun("budget-migration");
 		const migrated = applyMigration(applyExecutionProgress(executingCheckpoint(workdir, runId), BUDGET), {

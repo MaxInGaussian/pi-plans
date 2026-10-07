@@ -27,6 +27,7 @@ import {
 	persistTaskProgress,
 	recordExecutionTurn,
 	setDelegateDriver,
+	setSuggestedReviewDirections,
 	toggleDashboardExpanded,
 	triggerOwedReview,
 	updateStatusWidget,
@@ -34,6 +35,7 @@ import {
 	type ExecState,
 } from "./exec.ts";
 import { resolveActiveRun } from "./run-context.ts";
+import { REVIEW_DIRECTIONS_DESCRIPTION, ReviewDirectionsParams, reviewDirectionsResultText } from "./review-directions-tool.ts";
 import { recordSubagent } from "./state.ts";
 import { stripFrontmatter, type SubagentResult, type SubagentUsage } from "./subagent.ts";
 import { UpdateTaskParams, applyTaskUpdate } from "./task-tool.ts";
@@ -174,7 +176,8 @@ export function buildWorkerBrief(input: BriefInput): string {
 			: "",
 		`Report each task the moment it is done with the plans_update_task tool (taskId, status "complete" with evidence, or "skipped" with a skipReason). The tool returns at once: keep working through your remaining tasks in this same session and stop only when every assigned task is closed.`,
 		findingsText,
-		`After all tasks are terminal an independent reviewer verifies these checks:\n${checks}`,
+		`After all tasks are terminal, independent reviewers verify these checks:\n${checks}`,
+		`Before your last task update, call plans_review_directions once with 2-3 complementary, non-overlapping directions the reviewers should dig into beyond the checks (what you touched, risky seams, what you were unsure about; name real files and modules). It is optional and returns at once.`,
 		...input.repairNotes.map((note) => `Repair brief from the supervisor (a review round reopened tasks):\n${note}`),
 		input.nudge ?? "",
 	];
@@ -475,7 +478,7 @@ export class DelegateRun {
 					model: this.choice.model_selector ?? undefined,
 					thinkingLevel: this.choice.thinking_level ?? undefined,
 					tools: EXECUTOR_TOOLS,
-					customTools: [this.buildTool(worker)],
+					customTools: [this.buildTool(worker), this.buildDirectionsTool()],
 					timeoutMs: WORKER_RUN_TIMEOUT_MS,
 					signal: this.fleetRun.signalFor(worker.laneId),
 					onProgress: (event) => this.fleetRun.group.update(worker.laneId, event),
@@ -521,6 +524,26 @@ export class DelegateRun {
 				return {
 					content: [{ type: "text", text: `✓ ${outcome.message}. ${remaining.length > 0 ? `Still open for you: ${remaining.join(", ")} — continue.` : "All your assigned tasks are closed."}` }],
 					details: { taskId: params.taskId, status: params.status },
+				};
+			},
+		});
+	}
+
+	/** Lets a worker suggest the execution reviewers' directions. */
+	private buildDirectionsTool() {
+		return defineTool({
+			name: "plans_review_directions",
+			label: "Review directions",
+			description: REVIEW_DIRECTIONS_DESCRIPTION,
+			promptSnippet: "Suggest complementary directions for the execution reviewers",
+			parameters: ReviewDirectionsParams,
+			execute: async (_toolCallId, params) => {
+				const ex = getExecution();
+				if (this.disposed || ex !== this.ex) throw new Error("this execution is no longer live; stop working");
+				const { accepted, dropped } = setSuggestedReviewDirections(this.ctx, ex, params.directions);
+				return {
+					content: [{ type: "text", text: reviewDirectionsResultText(accepted.length, dropped) }],
+					details: { accepted: accepted.map((entry) => entry.id), dropped },
 				};
 			},
 		});

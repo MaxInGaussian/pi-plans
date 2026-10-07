@@ -170,6 +170,15 @@ export interface ExecutionBlocked {
  * reported round): non-high findings keep the legacy no-owed semantics. */
 export type ReviewNonHighRepairState = "available" | "granted" | "used";
 
+/** Multi-reviewer review settings of one run. */
+export interface ExecutionReviewers {
+	/** Absent until the user (or the no-UI default) decided; the executor may
+	 * suggest directions before that. */
+	count?: number;
+	/** Executor-suggested directions (id + brief); absent = back-up aspects. */
+	directions?: Array<{ id: string; direction: string }>;
+}
+
 export interface ExecutionCheckpoint {
 	approval: ExecutionApproval | null;
 	doneVcIds: string[];
@@ -189,6 +198,11 @@ export interface ExecutionCheckpoint {
 	 * chosen model/effort). Absent on checkpoints written before the choice
 	 * existed — those run in the current session. */
 	executor?: ExecutorChoice;
+	/** How many reviewers each execution-review round runs (1–3) and the
+	 * complementary directions the executor suggested for them. Absent = not
+	 * decided yet (asked right before round 1) or a pre-multi-reviewer
+	 * checkpoint, which runs one reviewer. */
+	reviewers?: ExecutionReviewers;
 	/** v0.6.1: task-tree progress (task id → status/evidence), the primary
 	 * progress record. doneVcIds stays for legacy checkpoints and the final
 	 * audit pass. */
@@ -673,7 +687,7 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 	const record = asRecord(value, label);
 	rejectExtraKeys(
 		record,
-		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "executor", "tasks", "stallRounds", "blocked", "planAmended", "audit", "reviewBudget", "reviewBudgetDefaulted", "reviewRoundsTotal", "reviewCapExtension", "reviewNoProgress", "reviewNonHighRepair", "reviewNonHighCredits"]),
+		new Set(["approval", "doneVcIds", "implStatus", "currentI", "usage", "pausedReason", "reverifyAll", "originWorktree", "delegate", "executor", "reviewers", "tasks", "stallRounds", "blocked", "planAmended", "audit", "reviewBudget", "reviewBudgetDefaulted", "reviewRoundsTotal", "reviewCapExtension", "reviewNoProgress", "reviewNonHighRepair", "reviewNonHighCredits"]),
 		label,
 	);
 	const execution: ExecutionCheckpoint = {
@@ -718,6 +732,27 @@ function asExecution(value: unknown, label: string): ExecutionCheckpoint {
 		const parsed = parseExecutorChoice(record.executor, VALID_THINKING_LEVELS);
 		if ("error" in parsed) throw new StateError(`${label}.executor: ${parsed.error}`);
 		execution.executor = parsed;
+	}
+	if (record.reviewers !== undefined && record.reviewers !== null) {
+		const rec = asRecord(record.reviewers, `${label}.reviewers`);
+		rejectExtraKeys(rec, new Set(["count", "directions"]), `${label}.reviewers`);
+		const reviewers: ExecutionReviewers = {};
+		if (rec.count !== undefined && rec.count !== null) {
+			reviewers.count = asInt(rec.count, `${label}.reviewers.count`, 1);
+			if (reviewers.count > 3) throw new CheckpointValidationError(`${label}.reviewers.count must be 1-3`);
+		}
+		if (rec.directions !== undefined && rec.directions !== null) {
+			if (!Array.isArray(rec.directions)) throw new CheckpointValidationError(`${label}.reviewers.directions must be an array`);
+			reviewers.directions = rec.directions.map((entry, i) => {
+				const item = asRecord(entry, `${label}.reviewers.directions.${i}`);
+				rejectExtraKeys(item, new Set(["id", "direction"]), `${label}.reviewers.directions.${i}`);
+				return {
+					id: asString(item.id, `${label}.reviewers.directions.${i}.id`),
+					direction: asString(item.direction, `${label}.reviewers.directions.${i}.direction`),
+				};
+			});
+		}
+		execution.reviewers = reviewers;
 	}
 	if (record.tasks !== undefined && record.tasks !== null) {
 		const tasksRecord = asRecord(record.tasks, `${label}.tasks`);
@@ -1547,6 +1582,8 @@ export interface ExecutionProgressInput {
 	delegate?: { modelSelector: string; startedAt: string } | null;
 	/** Execution choice for this run; null clears it (delete-on-null). */
 	executor?: ExecutorChoice | null;
+	/** Multi-reviewer settings; null clears them (delete-on-null). */
+	reviewers?: ExecutionReviewers | null;
 	/** v0.6.1: task-tree progress snapshot (authoritative). */
 	tasks?: Record<string, { status: string; evidence?: string; skipReason?: string }>;
 	/** v0.6.1: completion-audit bookkeeping update. v0.9: findings rides the
@@ -1593,6 +1630,8 @@ export function applyExecutionProgress(cp: WorkflowCheckpoint, progress: Executi
 	else if (progress.delegate !== undefined) execution.delegate = progress.delegate;
 	if (progress.executor === null) delete execution.executor;
 	else if (progress.executor !== undefined) execution.executor = progress.executor;
+	if (progress.reviewers === null) delete execution.reviewers;
+	else if (progress.reviewers !== undefined) execution.reviewers = progress.reviewers;
 	if (progress.tasks !== undefined) execution.tasks = progress.tasks;
 	if (progress.stallRounds !== undefined) execution.stallRounds = progress.stallRounds;
 	if (progress.blocked === null) delete execution.blocked;
@@ -1645,6 +1684,7 @@ export function applyExecutionCompleted(cp: WorkflowCheckpoint): WorkflowCheckpo
 	// v0.9.3: the review budget (and its valve state) describes a review that
 	// no longer runs — completed runs do not carry it.
 	const {
+		reviewers: _reviewers,
 		reviewBudget: _reviewBudget,
 		reviewBudgetDefaulted: _reviewBudgetDefaulted,
 		reviewRoundsTotal: _reviewRoundsTotal,
@@ -1997,6 +2037,7 @@ export function applyExecutionStopped(cp: WorkflowCheckpoint, reason: string): W
 	const {
 		delegate: _delegate,
 		executor: _executor,
+		reviewers: _reviewers,
 		blocked: _blocked,
 		reviewBudget: _reviewBudget,
 		reviewBudgetDefaulted: _reviewBudgetDefaulted,

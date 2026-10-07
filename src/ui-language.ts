@@ -262,6 +262,32 @@ export function reviewBudgetChrome(lang: UiLanguage): ReviewBudgetChrome {
 }
 
 // --------------------------------------------------------------------------
+// Execution-review reviewer-count picker chrome (src/reviewer-count.ts)
+// --------------------------------------------------------------------------
+
+export interface ReviewerCountChrome {
+	/** Select-menu title (the menu asked right before the first review round). */
+	panelTitle(pendingChecks: number): string;
+	/** Row label for a reviewer count, with each reviewer's share of the checks. */
+	option(count: number, perReviewer: string): string;
+}
+
+const REVIEWER_COUNT_CHROME: Record<UiLanguage, ReviewerCountChrome> = {
+	zh: {
+		panelTitle: (pending) => `执行评审并行评议员数量 — ${pending} 条待验证 VC 将平均分配，各评议员再沿互补方向找问题`,
+		option: (count, perReviewer) => `${count} 位评议员（每位约 ${perReviewer} 条 VC）`,
+	},
+	en: {
+		panelTitle: (pending) => `Execution reviewers — ${pending} pending check${pending === 1 ? "" : "s"} are split evenly; each reviewer also digs along its own direction`,
+		option: (count, perReviewer) => `${count} reviewer${count === 1 ? "" : "s"} (about ${perReviewer} check${perReviewer === "1" ? "" : "s"} each)`,
+	},
+};
+
+export function reviewerCountChrome(lang: UiLanguage): ReviewerCountChrome {
+	return REVIEWER_COUNT_CHROME[lang];
+}
+
+// --------------------------------------------------------------------------
 // User-authorized termination chrome (/plans-terminate)
 // --------------------------------------------------------------------------
 

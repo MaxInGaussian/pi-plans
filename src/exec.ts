@@ -118,7 +118,8 @@ import {
 	renderDashboardTreeLines,
 	type HugeProgress,
 } from "./dashboard.ts";
-import { presolvedCheckIds, runCompletionAudit, writeReviewRoundReport, type AuditOutcome, type AuditRoundResult, type ReviewFinding } from "./auditor.ts";
+import { planReviewLanes, presolvedCheckIds, runCompletionAudit, writeReviewRoundReport, type AuditLane, type AuditOutcome, type AuditRoundResult, type ReviewDirection, type ReviewFinding } from "./auditor.ts";
+import { askReviewerCount, DEFAULT_REVIEWER_COUNT, sanitizeDirections } from "./reviewer-count.ts";
 import {
 	DEFAULT_REVIEW_BUDGET,
 	LEGACY_REVIEW_MAX_ROUNDS,
@@ -139,7 +140,7 @@ import {
 	type NoProgressState,
 	type ReviewBudget,
 } from "./review-budget.ts";
-import type { ReviewFindingRecord } from "./workflow-state.ts";
+import type { ExecutionReviewers, ReviewFindingRecord } from "./workflow-state.ts";
 import { staleReloadHint as probeStaleReload } from "./staleness.ts";
 import { messaging } from "./messaging.ts";
 import { fleetUi, fleetUiHost } from "./fleet-ui.ts";
@@ -155,6 +156,10 @@ export interface ExecState {
 	 * the work. Delegated: worker sessions on another model do it
 	 * (src/exec-delegate.ts) and the main session only supervises. */
 	executor?: ExecutorChoice;
+	/** Execution-review reviewers: how many run in parallel per round (decided
+	 * right before round 1; absent = undecided, one reviewer) and the
+	 * complementary directions the executor suggested. */
+	reviewers?: ExecutionReviewers;
 	/** Verification checks (VC-###) — the audit's contract. */
 	items: CheckItem[];
 	/** Parsed plan task model (kept for re-deriving the view). */
@@ -509,6 +514,7 @@ export function loadExecutionFromCheckpoint(
 		planTasks,
 		tasks,
 		executor: cp.execution.executor,
+		reviewers: cp.execution.reviewers,
 		legacyPlan: planTasks.legacy,
 		startedAt: utcNow(),
 		usage: { inToks: cp.execution.usage.inToks, outToks: cp.execution.usage.outToks },
@@ -893,6 +899,7 @@ function persist(ctx: ExtensionContext): void {
 		planTasks: execution.planTasks,
 		tasks: execution.tasks,
 		executor: execution.executor,
+		reviewers: execution.reviewers,
 		legacyPlan: execution.legacyPlan,
 		startedAt: execution.startedAt,
 		usage: execution.usage,
@@ -1118,10 +1125,10 @@ export function recordExecutionTurn(
 }
 
 /** Test hook: replace the audit subagent with a deterministic function. */
-let auditRunnerForTests: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number; priorFindings: ReviewFinding[]; findingDispositions?: ReadonlyMap<string, string> }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null = null;
+let auditRunnerForTests: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number; priorFindings: ReviewFinding[]; findingDispositions?: ReadonlyMap<string, string>; lanes?: AuditLane[] }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null = null;
 
 export function __setAuditRunnerForTests(
-	runner: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number; priorFindings: ReviewFinding[]; findingDispositions?: ReadonlyMap<string, string> }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null,
+	runner: ((input: { planPath: string; checklist: CheckItem[]; tasks: TaskView[]; round: number; priorFindings: ReviewFinding[]; findingDispositions?: ReadonlyMap<string, string>; lanes?: AuditLane[] }) => Promise<Awaited<ReturnType<typeof runCompletionAudit>>>) | null,
 ): void {
 	auditRunnerForTests = runner;
 }
@@ -1360,6 +1367,58 @@ async function askReviewBudgetForRun(ctx: ExtensionContext, ex: ExecState): Prom
 	} finally {
 		ex.review.budgetAsking = false;
 	}
+}
+
+/** Persist the reviewer settings (count and suggested directions). */
+function persistReviewers(ctx: ExtensionContext, ex: ExecState): void {
+	withExecutionCheckpoint(ctx, (cp) => applyExecutionProgress(cp, { reviewers: ex.reviewers ?? null }));
+	persist(ctx);
+	updateStatusWidget(ctx);
+}
+
+/** Reviewers per round for this run: the decided count, or one. */
+export function reviewerCountOf(ex: ExecState): number {
+	return ex.reviewers?.count ?? DEFAULT_REVIEWER_COUNT;
+}
+
+/** No menu available: record the default count so the run never re-asks. */
+function applyDefaultReviewerCount(ctx: ExtensionContext, ex: ExecState): void {
+	if (ex.reviewers?.count !== undefined) return;
+	ex.reviewers = { ...ex.reviewers, count: DEFAULT_REVIEWER_COUNT };
+	persistReviewers(ctx, ex);
+}
+
+/**
+ * Ask how many reviewers the execution review should run, once per run, right
+ * before round 1 (every task is terminal and the pending checks are known).
+ * Shares the `budgetAsking` guard with the budget ask so a second settle
+ * cannot open a second menu while this one is open.
+ */
+async function askReviewerCountForRun(ctx: ExtensionContext, ex: ExecState, pendingChecks: number): Promise<void> {
+	if (ex.reviewers?.count !== undefined || ex.review.budgetAsking) return;
+	ex.review.budgetAsking = true;
+	try {
+		const picked = await askReviewerCount(ctx, ex.uiLanguage, pendingChecks);
+		if (execution !== ex || ex.reviewers?.count !== undefined) return;
+		ex.reviewers = { ...ex.reviewers, count: picked ?? DEFAULT_REVIEWER_COUNT };
+		persistReviewers(ctx, ex);
+	} finally {
+		ex.review.budgetAsking = false;
+	}
+}
+
+/**
+ * Record the directions the executor suggests for the reviewers (the
+ * `plans_review_directions` tool). Replaces any earlier suggestion; invalid
+ * entries are dropped and reported back to the caller.
+ */
+export function setSuggestedReviewDirections(ctx: ExtensionContext, ex: ExecState, value: unknown): { accepted: ReviewDirection[]; dropped: string[] } {
+	const { directions, dropped } = sanitizeDirections(value);
+	if (directions.length > 0) {
+		ex.reviewers = { ...ex.reviewers, directions };
+		persistReviewers(ctx, ex);
+	}
+	return { accepted: directions, dropped };
 }
 
 /** The currently-running (or self-scheduling) review chain; the sanctioned
@@ -1670,6 +1729,16 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 		}
 	}
 	if (!reviewBudgetGate(ctx, ex)) return;
+	// How many reviewers share this run's review: asked once, only when there
+	// are at least two checks to split (otherwise one reviewer is the whole
+	// round and nothing is stored, so a later round with more checks may ask).
+	if (ex.reviewers?.count === undefined && pendingChecks.length > 1) {
+		if (!reviewBudgetPanelUsable(ctx)) applyDefaultReviewerCount(ctx, ex);
+		else {
+			await askReviewerCountForRun(ctx, ex, pendingChecks.length);
+			if (execution !== ex || ex.stall.paused || ex.review.inFlight) return;
+		}
+	}
 	// Phase transition: the executor is done with its tasks; the review loop
 	// owns the run until it converges (or pauses at the cap).
 	setRunStatusForReview(ctx, "verifying");
@@ -1685,12 +1754,21 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 	ex.audit.running = true; // dashboard mirror (the v0.8 model lands with the overlay task)
 	const spawn = reviewSpawnProfile();
 	const laneId = `review-round-${round.attempt}`;
+	// Multi-reviewer round: the pending checks are split evenly and every
+	// reviewer digs along its own direction (executor-suggested, else the
+	// back-up aspects). Empty = the unchanged single-reviewer round.
+	const reviewLanes: AuditLane[] = planReviewLanes(pendingChecks, reviewerCountOf(ex), ex.reviewers?.directions, ex.audit.findings);
+	const multi = reviewLanes.length > 1;
+	const fleetLaneIds = multi ? reviewLanes.map((lane) => lane.id) : [laneId];
+	const completedLanes = new Set<string>();
 	// A UI failure must NEVER kill the round itself: the fleet list is
 	// best-effort chrome.
 	const run = openFleetGroup(ctx, {
 		role: "auditor",
 		groupId: `execution-review-${round.attempt}-${Date.now().toString(36)}`,
-		lanes: [{ id: laneId, label: `Execution review round ${round.attempt}` }],
+		lanes: multi
+			? reviewLanes.map((lane) => ({ id: lane.id, label: `Reviewer ${lane.index + 1}/${lane.total} · ${lane.id}` }))
+			: [{ id: laneId, label: `Execution review round ${round.attempt}` }],
 		modelLabel: spawn.label,
 		lang: ex.uiLanguage,
 		// pi-tui has no key bubbling: forward the dashboard toggle.
@@ -1703,7 +1781,7 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 	let result: AuditRoundResult;
 	try {
 		result = auditRunnerForTests
-			? await auditRunnerForTests({ planPath: ex.planPath, checklist: ex.items, tasks: ex.tasks, round: round.attempt, priorFindings: ex.audit.findings, findingDispositions: findingDispositionMap(ex) })
+			? await auditRunnerForTests({ planPath: ex.planPath, checklist: ex.items, tasks: ex.tasks, round: round.attempt, priorFindings: ex.audit.findings, findingDispositions: findingDispositionMap(ex), lanes: reviewLanes })
 			: await runCompletionAudit(ctx, {
 				planPath: ex.planPath,
 				checklist: ex.items,
@@ -1718,13 +1796,21 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 				timeoutMs: REVIEW_ROUND_TIMEOUT_MS,
 				signal: round.controller.signal,
 				onProgress: (event) => run.group.update(laneId, event),
+				lanes: reviewLanes,
+				onLaneProgress: (id, event) => run.group.update(id, event),
+				onLaneResult: (id, laneResult) => {
+					completedLanes.add(id);
+					run.group.complete(id, laneResult);
+				},
 			});
 	} catch (error) {
 		if (ex.review.inFlight === round) {
 			ex.review.inFlight = null;
 			ex.audit.running = false;
 		}
-		run.group.complete(laneId, { ok: false, output: "", stderr: "", turns: 0, errorMessage: String(error) });
+		for (const id of fleetLaneIds) {
+			if (!completedLanes.has(id)) run.group.complete(id, { ok: false, output: "", stderr: "", turns: 0, errorMessage: String(error) });
+		}
 		run.close();
 		if (reviewRun === run) reviewRun = null;
 		messaging().sendMessage(
@@ -1738,13 +1824,16 @@ async function startReviewRound(ctx: ExtensionContext): Promise<void> {
 	// transcript can still be read until the next round replaces it.
 	const cancelledResult = result !== null && typeof result === "object" && "cancelled" in result;
 	try {
-		run.group.complete(laneId, {
-			ok: !cancelledResult,
-			output: result && "report" in result ? result.report : "",
-			stderr: "",
-			turns: 0,
-			...(cancelledResult ? { cancelled: true as const } : {}),
-		});
+		for (const id of fleetLaneIds) {
+			if (completedLanes.has(id)) continue;
+			run.group.complete(id, {
+				ok: !cancelledResult,
+				output: result && "report" in result ? result.report : "",
+				stderr: "",
+				turns: 0,
+				...(cancelledResult ? { cancelled: true as const } : {}),
+			});
+		}
 	} catch {
 		/* cosmetic only */
 	}
@@ -3789,7 +3878,8 @@ Execution rules:
 - Close subtasks before their parent; a parent is auditable only when every child is terminal.
 - After a FAILED review round, every reopened task must be re-closed with fresh evidence — PARENTS INCLUDED. Closing a task's children does NOT close the task: a parent that still has an open child is not terminal, and the review cannot start until the whole tree is terminal.
 - NEVER wait for the review. While any task is open, the review is not running and nothing will re-close tasks for you: an open task is your work queue — close it with evidence or skip it with a skipReason.
-- When every task is terminal, the independent execution reviewer verifies the plan's verification checks (${execution.items.map((item) => item.id).join(", ")}); failed checks roll their covered tasks back automatically.
+- When every task is terminal, the independent execution reviewer(s) verify the plan's verification checks (${execution.items.map((item) => item.id).join(", ")}); failed checks roll their covered tasks back automatically.
+- Before your LAST \`plans_update_task\` call, call \`plans_review_directions\` once with 2-3 complementary, non-overlapping directions the reviewers should dig into beyond the checks (what you touched, risky seams, what you were unsure about; name real files and modules). It is optional: without it the reviewers use fixed back-up aspects.
 - Simplest implementation that fully meets the task: no speculative abstractions, configuration, or indirection; keep components modular with clearly separated concerns.
 - Architectural decisions are for the long term: no stopgaps. Remove the obsolete paths this change obsoletes.
 - Prefer established, well-maintained libraries when they reduce complexity; check the project's existing dependencies before adding a package or reimplementing common functionality.
@@ -3865,6 +3955,7 @@ export async function restoreFromSession(ctx: ExtensionContext, entries: Session
 		planTasks,
 		tasks,
 		executor: snapshot.executor,
+		reviewers: snapshot.reviewers,
 		legacyPlan: snapshot.legacyPlan,
 		startedAt: snapshot.startedAt,
 		usage: snapshot.usage ?? { inToks: 0, outToks: 0 },

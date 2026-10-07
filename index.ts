@@ -97,6 +97,7 @@ import { applyPlanWritten, loadCheckpoint, mutateCheckpoint, planIdentityOf } fr
 import { registerAskChoiceTool } from "./tools/ask-choice.ts";
 import { executeCommand, registerExecutePlanTool } from "./tools/execute-plan.ts";
 import { registerTaskStatusTool } from "./src/task-tool.ts";
+import { registerReviewDirectionsTool } from "./src/review-directions-tool.ts";
 import { flattenTaskViews, taskIsTerminal, taskProgress } from "./src/tasks.ts";
 import { hugeRunSummary, registerPlansTool } from "./tools/plans.ts";
 import { registerRefineTool } from "./tools/refine.ts";
@@ -157,6 +158,7 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	registerAnalyzeRefsTool(pi, baseDir);
 	registerExecutePlanTool(pi);
 	registerTaskStatusTool(pi);
+	registerReviewDirectionsTool(pi);
 	pi.registerShortcut("ctrl+shift+t", {
 		description: "Expand/collapse the pi-plans task dashboard",
 		handler: (ctx) => toggleDashboardExpanded(ctx),

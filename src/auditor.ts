@@ -136,6 +136,209 @@ export function auditablePendingChecks(checklist: CheckItem[], tasks: TaskView[]
 	return auditableChecks(checklist, tasks).filter((item) => !item.done);
 }
 
+// ---------------------------------------------------------------------------
+// Multi-reviewer rounds: lanes, directions, merge
+// ---------------------------------------------------------------------------
+
+/** A complementary direction one reviewer digs into beyond its VC share. */
+export interface ReviewDirection {
+	/** Short slug; becomes the fleet lane id and the report section title. */
+	id: string;
+	direction: string;
+}
+
+/** Largest number of parallel reviewers one round may use. */
+export const MAX_REVIEWERS = 3;
+
+/** Fixed aspects used when the executor suggested no (or too few) directions. */
+export const BACKUP_REVIEW_ASPECTS: readonly ReviewDirection[] = [
+	{
+		id: "correctness-vs-plan",
+		direction:
+			"Does the implementation actually do what each task and the plan's intent say? Trace the main flows through the changed code and look for wrong behavior, missed requirements, edge cases and regressions in neighbouring code.",
+	},
+	{
+		id: "tests-and-evidence",
+		direction:
+			"Do the tests and recorded evidence really prove the verification checks? Look for assertions that cannot fail, untested branches and error paths, fixtures that mask the defect, and claims in task evidence that the code does not back up.",
+	},
+	{
+		id: "integration-and-risk",
+		direction:
+			"What can the change break outside the files it touched? Check callers and consumers, configuration and compatibility, failure and degraded modes, concurrency and ordering, security and permissions, and leftover debug or half-finished code.",
+	},
+];
+
+/** Directions for `count` reviewers: valid executor suggestions first (in the
+ * order given, ids unique), topped up from the back-up aspects. One reviewer
+ * keeps today's undirected brief, so the result is empty. */
+export function resolveReviewerDirections(count: number, suggested: readonly ReviewDirection[] | undefined): ReviewDirection[] {
+	if (count <= 1) return [];
+	const chosen: ReviewDirection[] = [];
+	const used = new Set<string>();
+	for (const entry of suggested ?? []) {
+		if (chosen.length >= count) break;
+		if (!entry || used.has(entry.id)) continue;
+		used.add(entry.id);
+		chosen.push({ id: entry.id, direction: entry.direction });
+	}
+	for (const aspect of BACKUP_REVIEW_ASPECTS) {
+		if (chosen.length >= count) break;
+		if (used.has(aspect.id)) continue;
+		used.add(aspect.id);
+		chosen.push({ ...aspect });
+	}
+	return chosen;
+}
+
+/** Split `items` into `parts` balanced contiguous chunks (sizes differ by at
+ * most one, larger chunks first, order preserved). */
+export function splitEvenly<T>(items: readonly T[], parts: number): T[][] {
+	const count = Math.max(1, Math.floor(parts));
+	const base = Math.floor(items.length / count);
+	const extra = items.length % count;
+	const chunks: T[][] = [];
+	let offset = 0;
+	for (let i = 0; i < count; i++) {
+		const size = base + (i < extra ? 1 : 0);
+		chunks.push(items.slice(offset, offset + size));
+		offset += size;
+	}
+	return chunks;
+}
+
+/** One reviewer of a multi-reviewer round. */
+export interface AuditLane {
+	/** Fleet lane id (the direction id). */
+	id: string;
+	index: number;
+	total: number;
+	direction: ReviewDirection;
+	/** Directions of the other reviewers of this round. */
+	others: ReviewDirection[];
+	/** This reviewer's share of the pending checks. */
+	checks: CheckItem[];
+	/** First finding number this reviewer may use for brand-new findings;
+	 * ranges are disjoint across reviewers so merged ids never collide. */
+	findingIdStart: number;
+}
+
+/**
+ * Plan the lanes of a round: the pending checks are divided evenly, one lane per
+ * reviewer, never more lanes than checks (a reviewer with nothing to verify
+ * would only duplicate another's findings). With no pending check (the round is
+ * owed only by unresolved findings) every reviewer runs as a findings-only lane.
+ * One reviewer → no lanes (the unchanged single-reviewer path).
+ */
+export function planReviewLanes(
+	pending: CheckItem[],
+	count: number,
+	suggested: readonly ReviewDirection[] | undefined,
+	priorFindings: ReviewFinding[] = [],
+): AuditLane[] {
+	const wanted = Math.max(1, Math.min(MAX_REVIEWERS, Math.floor(count)));
+	if (wanted <= 1) return [];
+	const total = pending.length > 0 ? Math.min(wanted, pending.length) : wanted;
+	if (total <= 1) return [];
+	const directions = resolveReviewerDirections(total, suggested);
+	const shares = splitEvenly(pending, total);
+	const maxPrior = priorFindings.reduce((max, finding) => {
+		const match = /^F-(\d+)$/.exec(finding.id);
+		return match ? Math.max(max, Number(match[1])) : max;
+	}, 0);
+	const base = maxPrior === 0 ? 0 : Math.ceil(maxPrior / 100) * 100;
+	return directions.map((direction, index) => ({
+		id: direction.id,
+		index,
+		total,
+		direction,
+		others: directions.filter((_, other) => other !== index),
+		checks: shares[index] ?? [],
+		findingIdStart: base + index * 100 + 1,
+	}));
+}
+
+function findingId(n: number): string {
+	return `F-${String(n).padStart(3, "0")}`;
+}
+
+function laneBlock(lane: AuditLane): string {
+	const others = lane.others.map((entry) => `- ${entry.id}: ${entry.direction}`).join("\n");
+	return `
+
+You are reviewer ${lane.index + 1} of ${lane.total} in a parallel review round. The pending verification checks are divided evenly between the reviewers: verify only your share (listed below). Every reviewer also looks for defects and improvements beyond the checks, each along its own direction.
+
+Your direction (${lane.direction.id}): ${lane.direction.direction}
+Go deeper here than a generic review would. Do not pad the report with generic coverage of other aspects, but if you stumble on a high-severity problem outside your direction, report it briefly.
+
+The other reviewers cover different directions — do not duplicate them:
+${others}
+
+Finding ids: number brand-new findings from ${findingId(lane.findingIdStart)} upward (${findingId(lane.findingIdStart)}, ${findingId(lane.findingIdStart + 1)}, …); the other reviewers use disjoint ranges. A listed unresolved finding keeps its id.`;
+}
+
+const SEVERITY_RANK: Record<FindingSeverity, number> = { high: 3, medium: 2, low: 1, malformed: 0 };
+
+/** One finished lane, as the merge consumes it. */
+export interface LaneRun {
+	lane: AuditLane;
+	ok: boolean;
+	cancelled?: boolean;
+	output: string;
+	error?: string;
+}
+
+/**
+ * Merge the lane reports of one round into a single outcome, so everything
+ * downstream (rollback, findings, budget) sees exactly one round.
+ *  - any cancelled lane → the whole round is cancelled (nothing committed);
+ *  - every lane failed → `null` (the spawn-failed path);
+ *  - a failed lane makes only ITS checks undeterminable;
+ *  - findings reported by several lanes under one id collapse to one entry
+ *    (highest severity, task ids united).
+ */
+export function mergeLaneRuns(round: number, runs: LaneRun[], knownTaskIds?: Set<string>): AuditRoundResult {
+	if (runs.some((run) => run.cancelled)) return { cancelled: true };
+	if (runs.length > 0 && runs.every((run) => !run.ok)) return null;
+	const passed: string[] = [];
+	const failed: string[] = [];
+	const undeterminable: string[] = [];
+	const byId = new Map<string, ReviewFinding>();
+	const sections: string[] = [];
+	for (const run of runs) {
+		const heading = `## Reviewer ${run.lane.index + 1}/${run.lane.total} — ${run.lane.direction.id}${run.lane.checks.length ? ` (${run.lane.checks.map((check) => check.id).join(", ")})` : ""}`;
+		if (!run.ok) {
+			undeterminable.push(...run.lane.checks.map((check) => check.id));
+			sections.push(`${heading}\n\n(this reviewer failed to run: ${run.error ?? "unknown error"} — its checks are undeterminable)`);
+			continue;
+		}
+		const parsed = parseAuditReport(run.output, run.lane.checks.map((check) => check.id), knownTaskIds);
+		passed.push(...parsed.passed);
+		failed.push(...parsed.failed);
+		undeterminable.push(...parsed.undeterminable);
+		for (const finding of parsed.findings) {
+			const existing = byId.get(finding.id);
+			if (!existing) {
+				byId.set(finding.id, finding);
+				continue;
+			}
+			const winner = SEVERITY_RANK[finding.severity] > SEVERITY_RANK[existing.severity] ? finding : existing;
+			byId.set(finding.id, { ...winner, taskIds: [...new Set([...existing.taskIds, ...finding.taskIds])], proposedTask: winner.proposedTask ?? existing.proposedTask ?? finding.proposedTask });
+		}
+		sections.push(`${heading}\n\n${run.output.trim()}`);
+	}
+	const report = runs.length === 1 ? (runs[0]!.ok ? runs[0]!.output : sections[0]!) : sections.join("\n\n");
+	// A check with conflicting verdicts across lanes resolves to fail (cannot
+	// happen with disjoint shares; defensive for a lane naming a foreign check).
+	const failedSet = new Set(failed);
+	return applyAuditOutcome(round, {
+		passed: [...new Set(passed)].filter((id) => !failedSet.has(id)),
+		failed: [...failedSet],
+		undeterminable: [...new Set(undeterminable)].filter((id) => !failedSet.has(id) && !passed.includes(id)),
+		findings: [...byId.values()],
+	}, report);
+}
+
 /** Build the audit brief for the read-only subagent. Exported for tests. */
 export function buildAuditTask(
 	planPath: string,
@@ -147,10 +350,14 @@ export function buildAuditTask(
 	 * `deferred: <reason>` / `repair claimed — still reported` / `unresolved`),
 	 * so the reviewer sees how the executor answered the previous round. */
 	dispositions?: ReadonlyMap<string, string>,
+	/** Multi-reviewer rounds: this reviewer's share of the checks and its
+	 * assigned direction. Absent = the single reviewer judges every check. */
+	lane?: AuditLane,
 ): string {
-	const checks = auditablePendingChecks(checklist, tasks)
-		.map((check) => `- \`${check.id}\`: ${check.text}`)
-		.join("\n");
+	const checkList = lane ? lane.checks : auditablePendingChecks(checklist, tasks);
+	const checks = checkList.length > 0
+		? checkList.map((check) => `- \`${check.id}\`: ${check.text}`).join("\n")
+		: "(none — the other reviewers verify the checks; you report implementation findings only, and section 1 is the single line `- none.`)";
 	const taskList = flattenTaskViews(tasks)
 		.map((t) => `- \`${t.id}\`: ${t.title} (${t.status})`)
 		.join("\n");
@@ -161,13 +368,13 @@ ${priorFindings.map((f) => `- \`${f.id}\` — severity: ${f.severity}; tasks: ${
 			: "(none — this is the first round with findings in scope)";
 	return `Goal: verify that the implemented worktree satisfies the accepted plan's verification checks, and report implementation findings that drive the fix loop.
 
-Target plan: ${planPath} (review round ${round})
+Target plan: ${planPath} (review round ${round})${lane ? laneBlock(lane) : ""}
 
 Authority boundary: read-only analysis only. Do not edit, write, delete, commit, push, or spawn subagents.
 
 Evidence: inspect the repository with read, grep, find, ls, and targeted commands (bash is not granted — rely on the read tools) before judging each check. Tests may be referenced from their recorded evidence; do not re-run them.
 
-Checks to verify (only these; checks covering no task and checks already satisfied in an earlier round are excluded):
+Checks to verify (only these${lane ? "; the other reviewers verify the remaining checks, so emit no verdict for any check not listed here" : ""}; checks covering no task and checks already satisfied in an earlier round are excluded):
 
 ${checks}
 
@@ -287,11 +494,17 @@ export async function runCompletionAudit(
 		timeoutMs?: number;
 		signal?: AbortSignal;
 		onProgress?: (event: import("./subagent.ts").SubagentProgressEvent) => void;
+		/** Multi-reviewer round (from `planReviewLanes`): one session per lane,
+		 * run in parallel. Absent/empty = the single-reviewer path. */
+		lanes?: AuditLane[];
+		/** Progress of one lane's session (multi-reviewer rounds). */
+		onLaneProgress?: (laneId: string, event: import("./subagent.ts").SubagentProgressEvent) => void;
+		/** A lane's session finished (multi-reviewer rounds). */
+		onLaneResult?: (laneId: string, result: import("./subagent.ts").SubagentResult) => void;
 	},
 ): Promise<AuditRoundResult> {
 	const { runAgentSession, agentHostOf } = await import("./agent-session.ts");
 	const pending = auditablePendingChecks(opts.checklist, opts.tasks);
-	const task = buildAuditTask(opts.planPath, opts.checklist, opts.tasks, opts.round, opts.priorFindings ?? [], opts.findingDispositions);
 	// agents/auditor.md, not agents/reviewer.md: the reviewer prompt mandates a
 	// plan-review shape (`## Findings` / `## Questions`, F-###) and never says
 	// "verdict", so auditing under it produced reports this parser could not
@@ -300,9 +513,10 @@ export async function runCompletionAudit(
 	// fallback once swapped in a minimal prompt that produced unparsable
 	// reports and burned whole audit budgets as undeterminable.
 	const agentPrompt = fs.readFileSync(new URL("../agents/execution-reviewer.md", import.meta.url), "utf8");
-	const result = await runAgentSession({
+	const knownTaskIds = new Set(flattenTaskViews(opts.tasks).map((t) => t.id));
+	const lanes = opts.lanes ?? [];
+	const base = {
 		systemPrompt: agentPrompt,
-		task,
 		cwd: ctx.cwd,
 		host: agentHostOf(ctx),
 		model: opts.model,
@@ -310,13 +524,48 @@ export async function runCompletionAudit(
 		timeoutMs: opts.timeoutMs,
 		tools: ["read", "grep", "find", "ls"],
 		signal: opts.signal,
+	};
+
+	if (lanes.length > 1) {
+		const runs = await Promise.all(
+			lanes.map(async (lane): Promise<LaneRun> => {
+				const result = await runAgentSession({
+					...base,
+					task: buildAuditTask(opts.planPath, opts.checklist, opts.tasks, opts.round, opts.priorFindings ?? [], opts.findingDispositions, lane),
+					onProgress: (event) => opts.onLaneProgress?.(lane.id, event),
+				});
+				try {
+					opts.onLaneResult?.(lane.id, result);
+				} catch {
+					/* a display sink must not fail the round */
+				}
+				return { lane, ok: result.ok, cancelled: result.cancelled === true, output: result.output, error: result.errorMessage };
+			}),
+		);
+		const merged = mergeLaneRuns(opts.round, runs, knownTaskIds);
+		if (merged === null || "cancelled" in merged) return merged;
+		messaging().appendEntry("pi-plans-audit", {
+			planPath: opts.planPath,
+			round: opts.round,
+			reviewers: lanes.length,
+			passed: merged.passed,
+			failed: merged.failed,
+			undeterminable: merged.undeterminable,
+			highFindings: (merged.findings ?? []).filter((f) => f.severity === "high").map((f) => f.id),
+		});
+		return merged;
+	}
+
+	const result = await runAgentSession({
+		...base,
+		task: buildAuditTask(opts.planPath, opts.checklist, opts.tasks, opts.round, opts.priorFindings ?? [], opts.findingDispositions),
 		onProgress: opts.onProgress,
 	});
 	if (!result.ok) {
 		if (result.cancelled === true) return { cancelled: true };
 		return null;
 	}
-	const parsed = parseAuditReport(result.output, pending.map((item) => item.id), new Set(flattenTaskViews(opts.tasks).map((t) => t.id)));
+	const parsed = parseAuditReport(result.output, pending.map((item) => item.id), knownTaskIds);
 	messaging().appendEntry("pi-plans-audit", {
 		planPath: opts.planPath,
 		round: opts.round,
