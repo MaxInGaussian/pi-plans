@@ -92,6 +92,17 @@ describe("renderFleetLines", () => {
 });
 
 describe("AgentFleet", () => {
+	it("drops finished agents after the retention window but keeps running ones", async () => {
+		const fleet = new AgentFleet(20);
+		const finished = seed(fleet, ["old"], "reviewer", "g-old");
+		const running = seed(fleet, ["live"], "auditor", "g-live");
+		finished.complete("old", { ok: true, output: "done", stderr: "", turns: 1 });
+		assert.equal(fleet.list().length, 2, "a just-finished agent is still listed");
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		assert.deepEqual(fleet.list().map((entry) => entry.label), ["live"]);
+		void running;
+	});
+
 	it("prunes finished lanes of earlier groups when a new group registers", () => {
 		const fleet = new AgentFleet();
 		const first = seed(fleet, ["a"], "reviewer", "round-1");

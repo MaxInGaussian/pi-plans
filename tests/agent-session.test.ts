@@ -74,8 +74,10 @@ describe("runAgentSession", () => {
 
 	it("defaults to the read-only tool allowlist and forwards custom tools", async () => {
 		install((api) => api.say("ok"));
-		await runAgentSession({ ...base, customTools: [{ name: "x" }] });
+		await runAgentSession(base);
 		assert.deepEqual(lastOptions?.tools, ["read", "grep", "find", "ls"]);
+		await runAgentSession({ ...base, customTools: [{ name: "x" }] });
+		assert.deepEqual(lastOptions?.tools, ["read", "grep", "find", "ls", "x"], "custom tools are allowlisted too (the SDK enables only named tools)");
 		assert.deepEqual(lastOptions?.customTools, [{ name: "x" }]);
 	});
 

@@ -37,7 +37,7 @@ describe("levelsForModel (delegates to pi-ai)", () => {
 });
 
 describe("default sentinel", () => {
-	it("null stored level means: omit the --thinking flag", () => {
+	it("null stored level means: no explicit level", () => {
 		assert.equal(spawnThinkingFlag(null), null);
 		assert.equal(spawnThinkingFlag("high"), "high");
 		assert.equal(spawnThinkingFlag("off"), "off");
@@ -70,8 +70,8 @@ describe("labels and spawn resolution", () => {
 		});
 	});
 
-	it("the default row documents the child pi default chain, not the session level", () => {
-		assert.match(DEFAULT_LEVEL_DESCRIPTION, /child pi/);
+	it("the default row documents the delegated session's default chain, not the main session level", () => {
+		assert.match(DEFAULT_LEVEL_DESCRIPTION, /no explicit level/);
 		assert.match(DEFAULT_LEVEL_DESCRIPTION, /defaultThinkingLevel/);
 	});
 });

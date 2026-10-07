@@ -113,7 +113,7 @@ describe("effort panel rows", () => {
 	it("Default sentinel first, then pi-ai-supported levels", () => {
 		const items = effortItems(fakeModel, null);
 		assert.equal(items[0]!.value, "default");
-		assert.match(items[0]!.description, /no --thinking flag/);
+		assert.match(items[0]!.description, /no explicit level/);
 		assert.deepEqual(items.slice(1).map((item) => item.value), ["minimal", "low", "medium", "high"]);
 	});
 

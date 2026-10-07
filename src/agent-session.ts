@@ -178,7 +178,9 @@ export async function startAgentSession(options: AgentRunOptions): Promise<{ han
 	const resolved = resolveModel(options);
 	if ("error" in resolved) return { error: resolved.error };
 
-	const tools = options.tools ?? READ_ONLY_TOOLS;
+	// The SDK enables only allowlisted names, custom tools included.
+	const customNames = (options.customTools ?? []).map((tool) => String((tool as { name?: unknown }).name ?? "")).filter(Boolean);
+	const tools = [...new Set([...(options.tools ?? READ_ONLY_TOOLS), ...customNames])];
 	const sessionOptions: Record<string, unknown> = {
 		cwd: options.cwd,
 		systemPrompt: options.systemPrompt,

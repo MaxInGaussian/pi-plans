@@ -8,7 +8,7 @@
  * the stored-level resolution used by the reviewer spawn path (F-012).
  *
  * Semantics (decision 4 / F-009): `thinking_level: null` in the global
- * reviewer config means DEFAULT — the child pi gets NO --thinking flag and
+ * reviewer config means DEFAULT — the session gets NO explicit thinking level and
  * resolves its own default chain (per-model settings → defaultThinkingLevel
  * → medium, then model clamping). That is deliberately distinct from the
  * explicit "off" level.
@@ -17,7 +17,7 @@
 import { getSupportedThinkingLevels, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { GlobalRoleConfig, ThinkingLevelValue } from "./global-state.ts";
 
-/** Panel/label sentinel for `thinking_level: null` (omit --thinking). */
+/** Panel/label sentinel for `thinking_level: null` (no explicit level). */
 export const DEFAULT_LEVEL_SENTINEL = "default";
 
 /** Levels a model actually supports, via pi-ai (single source of truth). */
@@ -46,9 +46,9 @@ export function roleModelLabel(modelSelector: string, thinkingLevel: ThinkingLev
 }
 
 /** Human-facing one-liner for the default row / docs (F-009): the default
- * is the child pi's own chain, NOT the current session's level. */
+ * is the delegated session's own chain, NOT the current session's level. */
 export const DEFAULT_LEVEL_DESCRIPTION =
-	"no --thinking flag: the child pi resolves its default (per-model settings → defaultThinkingLevel → medium)";
+	"no explicit level: pi resolves its default (per-model settings → defaultThinkingLevel → medium)";
 
 /** Spawn-view of a confirmed reviewer role: concrete model + optional level. */
 export interface ResolvedReviewerSpawn {

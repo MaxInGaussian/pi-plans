@@ -322,7 +322,7 @@ export function registerExecutePlanTool(ext: ExtensionAPI): void {
 		name: "execute_plan",
 		label: "Execute Plan",
 		description:
-			"Execution handoff for an accepted plan. Asks the user for explicit approval (never auto-completed), then enters task-tree execution mode: every task's progress is reported via the plans_update_task tool (status + evidence), the task dashboard tracks the tree (Ctrl+Shift+T expands it), and an independent execution reviewer verifies the verification checks before the run completes. Legacy I-### plans parse through the compatibility mapping with an upgrade notice. When several runs with plans exist, a run-picker form selects the target run first. Only call after the user chose 'Execute this plan now' at the handoff question.",
+			"Execution handoff for an accepted plan. Asks the user for explicit approval (never auto-completed), then asks where the plan runs (the current session, or one or several delegated worker subagents on a model and effort the user picks — when delegated, the workers report progress themselves and the main session must not implement the tasks), then enters task-tree execution mode: every task's progress is reported via the plans_update_task tool (status + evidence), the task dashboard tracks the tree (Ctrl+Shift+T expands it), and an independent execution reviewer verifies the verification checks before the run completes. Legacy I-### plans parse through the compatibility mapping with an upgrade notice. When several runs with plans exist, a run-picker form selects the target run first. Only call after the user chose 'Execute this plan now' at the handoff question.",
 		promptSnippet: "Hand an accepted plan off to the tracked execution loop",
 		parameters: ExecutePlanParams,
 

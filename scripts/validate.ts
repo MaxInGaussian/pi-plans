@@ -25,6 +25,9 @@ const REQUIRED_REFERENCES = [
 	"state-and-config.md",
 ];
 const REQUIRED_AGENTS = ["reviewer.md", "execution-reviewer.md"];
+// The execution worker is the one agent that writes: it must say so and must
+// carry the progress tool that keeps the task panel live.
+const WRITE_AGENTS = ["executor.md"];
 // Root-level docs that must exist and must be entirely English (see AGENTS.md).
 const REQUIRED_ROOT_DOCS = ["AGENTS.md", "CHANGELOG.md"];
 // CJK ideographs plus full-width CJK punctuation. Ideographs alone are not
@@ -42,7 +45,13 @@ const REQUIRED_TOOL_FILES = [
 	"src/guard.ts",
 	"src/plan.ts",
 	"src/subagent.ts",
+	"src/agent-session.ts",
+	"src/agent-fleet.ts",
+	"src/fleet-ui.ts",
 	"src/exec.ts",
+	"src/exec-delegate.ts",
+	"src/exec-mode-picker.ts",
+	"src/executor-config.ts",
 	"src/code-graph/runtime.ts",
 	"src/code-graph/schema.ts",
 	"src/code-graph/store.ts",
@@ -281,6 +290,14 @@ function main(): void {
 		if (!text.includes("read-only")) fail(`${agent}: must state read-only contract`);
 	}
 
+	for (const agent of WRITE_AGENTS) {
+		const file = path.join(ROOT, "agents", agent);
+		if (!fs.existsSync(file)) fail(`missing agent ${agent}`);
+		const text = fs.readFileSync(file, "utf8");
+		if (!/tools:[^\n]*\bedit\b[^\n]*\bwrite\b/.test(text)) fail(`${agent}: must declare its write tools`);
+		if (!/tools:[^\n]*plans_update_task/.test(text)) fail(`${agent}: must declare the plans_update_task progress tool`);
+	}
+
 	for (const tool of REQUIRED_TOOL_FILES) {
 		if (!fs.existsSync(path.join(ROOT, tool))) fail(`missing ${tool}`);
 	}
@@ -304,7 +321,7 @@ function main(): void {
 	validatePackageMetadata();
 	validatePackageArtifact();
 	console.log(
-		`validated ${EXPECTED_SKILLS.size} skills, ${REQUIRED_REFERENCES.length} references, ${REQUIRED_AGENTS.length} agents, ${REQUIRED_TOOL_FILES.length} tools, ${REQUIRED_ROOT_DOCS.length} docs, readme ${README_CHECKS.length} checks`,
+		`validated ${EXPECTED_SKILLS.size} skills, ${REQUIRED_REFERENCES.length} references, ${REQUIRED_AGENTS.length + WRITE_AGENTS.length} agents, ${REQUIRED_TOOL_FILES.length} tools, ${REQUIRED_ROOT_DOCS.length} docs, readme ${README_CHECKS.length} checks`,
 	);
 }
 

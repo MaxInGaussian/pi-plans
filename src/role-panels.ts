@@ -250,7 +250,7 @@ export const REVIEWER_TITLES: PickTitles = {
 	levelTitle: "Reviewer Thinking Level",
 	levelSubtitle: "Applies to spawned reviewer subagents only",
 	modelMenu: "Reviewer model? (type Other… to enter an exact provider/model string)",
-	levelMenu: "Reviewer thinking level? (first row = default: no --thinking flag)",
+	levelMenu: "Reviewer thinking level? (first row = default: no explicit level)",
 };
 
 export interface EffortItem {

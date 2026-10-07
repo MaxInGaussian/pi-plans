@@ -76,7 +76,7 @@ const MANDATED_HEADINGS = [
 	"Interface overview",
 	"Requirements & compatibility",
 	"VCC compact",
-	"Visible Refiner overlay",
+	"Delegated subagents",
 	"The execution rules",
 	"Skills",
 	"Installation details",
