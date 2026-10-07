@@ -26,6 +26,7 @@ import {
 	filterGoalWaitMessages,
 	filterPlanningResumeMessages,
 	getExecution,
+	isDelegatedExecution,
 	handleExecutionBeforeCompact,
 	handleExecutionCompact,
 	handleExecutionCompactFailed,
@@ -358,6 +359,14 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 	// is enabled and an execution is active. Reminders are best-effort notifies.
 	pi.on("tool_call", async (event, ctx) => {
 		if (!getExecution()) return;
+		// A delegated run is implemented by worker sessions: the supervising
+		// main session must not edit files underneath them.
+		if (isDelegatedExecution() && (event.toolName === "edit" || event.toolName === "write")) {
+			return {
+				block: true,
+				reason: "pi-plans: this plan is executing on delegated workers; the supervising session must not edit files. Use /plans-stop to stop the run; press Down with an empty editor to watch the workers.",
+			};
+		}
 		const stateRoot = resolveStateRootOrNull(ctx.cwd);
 		if (!stateRoot) return;
 		let graphEnabled = false;

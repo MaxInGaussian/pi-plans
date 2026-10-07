@@ -267,7 +267,7 @@ export interface RefEntry {
 }
 
 export interface SubagentEntry {
-	role: "reviewer" | "criticizer" | "ref-analyst";
+	role: "reviewer" | "criticizer" | "ref-analyst" | "executor";
 	name: string;
 	model?: string | null;
 	/** Thinking level actually passed to the child ("--thinking"); null or

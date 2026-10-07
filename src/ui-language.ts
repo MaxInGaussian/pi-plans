@@ -167,6 +167,60 @@ export function fleetChrome(lang: UiLanguage): FleetChrome {
 	return FLEET_CHROME[lang];
 }
 
+// ---------------------------------------------------------------------------
+// Execution-mode chooser chrome (src/exec-mode-picker.ts)
+// ---------------------------------------------------------------------------
+
+export interface ExecModeChrome {
+	title: string;
+	/** `{model}` is replaced with the current session's model label. */
+	currentSession: string;
+	oneWorker: string;
+	severalWorkers: string;
+	lastUsed: string;
+	/** `{max}` is replaced with the worker cap. */
+	countTitle: string;
+	/** Titles of the reused model/effort picker. */
+	levelTitle: string;
+	levelSubtitle: string;
+	modelMenu: string;
+	levelMenu: string;
+	unavailable: string;
+}
+
+const EXEC_MODE_CHROME: Record<UiLanguage, ExecModeChrome> = {
+	zh: {
+		title: "在哪里执行这份计划？",
+		currentSession: "当前会话 — 使用同一模型（{model}）",
+		oneWorker: "一个委派子代理 — 另选模型与推理强度",
+		severalWorkers: "多个委派子代理 — 每个 wave 的任务并行执行",
+		lastUsed: "（上次选择）",
+		countTitle: "委派几个子代理？（2–{max}）",
+		levelTitle: "执行子代理的推理强度",
+		levelSubtitle: "仅作用于委派的执行子代理",
+		modelMenu: "执行子代理的模型？（选择 Other… 可输入精确的 provider/model）",
+		levelMenu: "执行子代理的推理强度？（第一项为默认：不传 --thinking）",
+		unavailable: "没有可用的模型选择器，改在当前会话中执行。",
+	},
+	en: {
+		title: "Where should this plan run?",
+		currentSession: "Current session — same model ({model})",
+		oneWorker: "One delegated subagent — pick a different model and effort",
+		severalWorkers: "Several delegated subagents — each wave's tasks run in parallel",
+		lastUsed: " (last used)",
+		countTitle: "How many delegated subagents? (2–{max})",
+		levelTitle: "Executor Thinking Level",
+		levelSubtitle: "Applies to delegated execution subagents only",
+		modelMenu: "Executor model? (type Other… to enter an exact provider/model string)",
+		levelMenu: "Executor thinking level? (first row = default: no --thinking flag)",
+		unavailable: "No model picker is available here; running in the current session instead.",
+	},
+};
+
+export function execModeChrome(lang: UiLanguage): ExecModeChrome {
+	return EXEC_MODE_CHROME[lang];
+}
+
 // --------------------------------------------------------------------------
 // Execution-review budget picker chrome (src/review-budget.ts)
 // --------------------------------------------------------------------------
