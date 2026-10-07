@@ -259,7 +259,7 @@ describe("delegated execution: live progress without ending the worker", () => {
 		await waitFor(() => options.length === 1, "the worker session");
 		assert.deepEqual(options[0]!.model, { provider: "fake", id: "worker" });
 		assert.equal(options[0]!.thinkingLevel, "high");
-		assert.deepEqual(options[0]!.tools, ["read", "grep", "find", "ls", "edit", "write", "bash"]);
+		assert.deepEqual(options[0]!.tools, ["read", "grep", "find", "ls", "edit", "write", "bash", "plans_update_task"]);
 		assert.equal((options[0]!.customTools as Array<{ name: string }>)[0]!.name, "plans_update_task");
 		assert.match(String(options[0]!.systemPrompt), /execution worker in the pi-plans workflow/);
 	});

@@ -199,7 +199,7 @@ const EXEC_MODE_CHROME: Record<UiLanguage, ExecModeChrome> = {
 		levelTitle: "执行子代理的推理强度",
 		levelSubtitle: "仅作用于委派的执行子代理",
 		modelMenu: "执行子代理的模型？（选择 Other… 可输入精确的 provider/model）",
-		levelMenu: "执行子代理的推理强度？（第一项为默认：不传 --thinking）",
+		levelMenu: "执行子代理的推理强度？（第一项为默认：不指定强度）",
 		unavailable: "没有可用的模型选择器，改在当前会话中执行。",
 	},
 	en: {
@@ -212,7 +212,7 @@ const EXEC_MODE_CHROME: Record<UiLanguage, ExecModeChrome> = {
 		levelTitle: "Executor Thinking Level",
 		levelSubtitle: "Applies to delegated execution subagents only",
 		modelMenu: "Executor model? (type Other… to enter an exact provider/model string)",
-		levelMenu: "Executor thinking level? (first row = default: no --thinking flag)",
+		levelMenu: "Executor thinking level? (first row = default: no explicit level)",
 		unavailable: "No model picker is available here; running in the current session instead.",
 	},
 };

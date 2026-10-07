@@ -288,9 +288,9 @@ async function changeReviewerRole(
 		typeof ctx.modelRegistry?.find === "function"
 			? ((ctx.modelRegistry.find(selector.split("/")[0]!, selector.split("/")[1]!) as never) ?? null)
 			: null;
-	const items = found ? effortItems(found, role.thinking_level) : [{ value: DEFAULT_LEVEL_SENTINEL, label: DEFAULT_LEVEL_SENTINEL, description: "no --thinking flag" }];
+	const items = found ? effortItems(found, role.thinking_level) : [{ value: DEFAULT_LEVEL_SENTINEL, label: DEFAULT_LEVEL_SENTINEL, description: "no explicit level" }];
 	const levelLabels = items.map((item) => `${item.label} — ${item.description}`);
-	const levelPicked = await ctx.ui.select("Reviewer thinking level? (first row = default: no --thinking flag)", levelLabels);
+	const levelPicked = await ctx.ui.select("Reviewer thinking level? (first row = default: no explicit level)", levelLabels);
 	const levelValue = levelPicked === undefined ? DEFAULT_LEVEL_SENTINEL : items[levelLabels.indexOf(levelPicked)]?.value ?? DEFAULT_LEVEL_SENTINEL;
 	try {
 		const applied = setRole(ctx.cwd, {

@@ -124,11 +124,26 @@ export class FleetGroup {
 	}
 }
 
+/** How long a finished agent stays in the list before it is dropped. */
+export const FINISHED_RETAIN_MS = 10 * 60 * 1000;
+
 export class AgentFleet {
 	private readonly entries = new Map<string, FleetEntry>();
 	private readonly listeners = new Set<Listener>();
+	private readonly retainMs: number;
 
+	constructor(retainMs: number = FINISHED_RETAIN_MS) {
+		this.retainMs = retainMs;
+	}
+
+	/** Live agents plus recently finished ones; older finished agents are dropped. */
 	list(): FleetEntry[] {
+		const now = Date.now();
+		for (const [id, entry] of [...this.entries]) {
+			if (isTerminal(entry) && !entry.idle && entry.finishedAt !== undefined && now - entry.finishedAt > this.retainMs) {
+				this.entries.delete(id);
+			}
+		}
 		return [...this.entries.values()];
 	}
 

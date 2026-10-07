@@ -107,7 +107,7 @@ const PlansParams = Type.Object({
 	thinkingLevel: Type.Optional(
 		StringEnum(["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
 			description:
-				"set-role: reviewer subagent thinking level in the GLOBAL config; 'default' (null) omits --thinking so the child pi resolves its own default chain; changing modelSelector without this resets the level",
+				"set-role: reviewer subagent thinking level in the GLOBAL config; 'default' (null) sets no explicit level so the delegated session resolves its own default chain; changing modelSelector without this resets the level",
 		}),
 	),
 	confirmed: Type.Optional(
