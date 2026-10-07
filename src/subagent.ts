@@ -1,13 +1,9 @@
 /**
- * Minimal read-only subagent runner: spawns a `pi --mode json -p --no-session`
- * subprocess with a delegated system prompt and restricted tools, mirrors the
- * official subagent example's invocation and JSON event parsing.
+ * Shared types and event normalization for delegated agent sessions
+ * (reviewers, reference analysts, execution workers). The in-process runner
+ * lives in `src/agent-session.ts`; this module only holds the protocol the
+ * UI reducers consume.
  */
-
-import { spawn } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 
 export type SubagentTranscriptEntryType = "assistant-text" | "thinking" | "tool-call" | "tool-result";
 
@@ -34,23 +30,25 @@ export interface SubagentOptions {
 	cwd: string;
 	/** Exact "provider/model" selector; omit to inherit the dispatching session's model. */
 	model?: string;
-	/** Explicit thinking level for the child (e.g. "high", "off"). Omit for
-	 * the default chain (per-model settings → defaultThinkingLevel → medium);
+	/** Explicit thinking level for the session (e.g. "high", "off"). Omit for
+	 * the default chain (per-model settings -> defaultThinkingLevel -> medium);
 	 * "default" as a value is NOT valid here — resolve null via
 	 * src/thinking-levels.ts before calling. */
 	thinkingLevel?: string;
-	/** Tool allowlist for the child process. Defaults to read-only tools. */
+	/** Tool allowlist for the session. Defaults to read-only tools. */
 	tools?: string[];
 	signal?: AbortSignal;
 	timeoutMs?: number;
 	/** Optional normalized progress sink. Exceptions from the sink are ignored. */
 	onProgress?: (event: SubagentProgressEvent) => void;
-	/**
-	 * Child env marker: "refiner" (default — read-only reviewer/ref-analyst
-	 * children; sets PI_PLANS_REFINER=1, which the code-graph gates treat as
-	 * read-only) or "none".
-	 */
-	envMarker?: "refiner" | "none";
+}
+
+export interface SubagentUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
 }
 
 export interface SubagentResult {
@@ -60,6 +58,7 @@ export interface SubagentResult {
 	errorMessage?: string;
 	stderr: string;
 	turns: number;
+	usage?: SubagentUsage;
 	cancelled?: boolean;
 	timedOut?: boolean;
 }
@@ -72,21 +71,7 @@ export function stripFrontmatter(text: string): string {
 	return text.slice(end + 5).trimStart();
 }
 
-export function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-	return { command: "pi", args };
-}
-
-interface MessageLike {
+export interface MessageLike {
 	role: string;
 	content?: unknown;
 	model?: string;
@@ -130,7 +115,7 @@ function formatValue(value: unknown): string {
 	}
 }
 
-function messageText(message: MessageLike | undefined, kind: "text" | "thinking" = "text"): string {
+export function messageText(message: MessageLike | undefined, kind: "text" | "thinking" = "text"): string {
 	if (!Array.isArray(message?.content)) return typeof message?.content === "string" && kind === "text" ? message.content : "";
 	return message.content
 		.filter((part) => part && typeof part === "object" && (part as { type?: unknown }).type === kind)
@@ -141,7 +126,7 @@ function messageText(message: MessageLike | undefined, kind: "text" | "thinking"
 		.join("\n");
 }
 
-function finalOutput(messages: MessageLike[]): string {
+export function finalOutput(messages: MessageLike[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
 		if (message.role === "assistant") {
@@ -282,196 +267,4 @@ export function normalizeSubagentEvent(value: unknown): SubagentProgressEvent[] 
 	}
 
 	return [];
-}
-
-function emitProgress(options: SubagentOptions, event: SubagentProgressEvent): void {
-	try {
-		options.onProgress?.(event);
-	} catch {
-		// A display sink must not be able to fail the child runner.
-	}
-}
-
-const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
-
-/**
- * Build the child process env for a subagent run: refiner children carry
- * PI_PLANS_REFINER=1, and marker keys never leak across kinds.
- */
-export function subagentChildEnv(
-	options: Pick<SubagentOptions, "envMarker">,
-	parentEnv: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv {
-	const childEnv: NodeJS.ProcessEnv = { ...parentEnv };
-	if ((options.envMarker ?? "refiner") === "refiner") {
-		childEnv.PI_PLANS_REFINER = "1";
-	} else {
-		delete childEnv.PI_PLANS_REFINER;
-	}
-	delete childEnv.PI_PLANS_EXECUTOR;
-	delete childEnv.PI_PLANS_RUN_ID;
-	return childEnv;
-}
-
-export async function runPiSubagent(options: SubagentOptions): Promise<SubagentResult> {
-	const tools = options.tools ?? ["read", "grep", "find", "ls"];
-	let tmpDir = "";
-	const messages: MessageLike[] = [];
-	let stderr = "";
-	let termination: "abort" | "timeout" | null = null;
-	// I-010: aggregate usage from message_end assistant messages so the
-	// benchmark can meter parent + subagent cost (F-001/C-F001).
-	const usageTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-	let sawUsage = false;
-	const accumulateUsage = (message: MessageLike | undefined): void => {
-		const usage = (message as { usage?: Record<string, unknown> } | undefined)?.usage;
-		if (!usage || typeof usage !== "object") return;
-		const num = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
-		usageTotals.input += num(usage.input);
-		usageTotals.output += num(usage.output);
-		usageTotals.cacheRead += num(usage.cacheRead);
-		usageTotals.cacheWrite += num(usage.cacheWrite);
-		const cost = usage.cost as { total?: unknown } | undefined;
-		usageTotals.cost += num(cost?.total);
-		sawUsage = true;
-	};
-
-	try {
-		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-subagent-"));
-		const promptFile = path.join(tmpDir, "system-prompt.md");
-		fs.writeFileSync(promptFile, options.systemPrompt, { encoding: "utf8", mode: 0o600 });
-
-		const args: string[] = ["--mode", "json", "-p", "--no-session", "--tools", tools.join(",")];
-		if (options.model) args.push("--model", options.model);
-		if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
-		args.push("--append-system-prompt", promptFile);
-		args.push(`Task: ${options.task}`);
-
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: options.cwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: subagentChildEnv(options),
-			});
-			let buffer = "";
-			let closed = false;
-			let settled = false;
-			let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-			let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-
-			const onAbort = () => {
-				if (termination === null) termination = "abort";
-				killProc();
-			};
-
-			const cleanup = () => {
-				if (timeoutTimer) clearTimeout(timeoutTimer);
-				if (forceKillTimer) clearTimeout(forceKillTimer);
-				options.signal?.removeEventListener("abort", onAbort);
-			};
-
-			const finish = (code: number) => {
-				if (settled) return;
-				settled = true;
-				closed = true;
-				cleanup();
-				emitProgress(options, { type: "process", phase: "exited", code });
-				resolve(code);
-			};
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: RawSubagentEvent;
-				try {
-					event = JSON.parse(line) as RawSubagentEvent;
-				} catch {
-					return;
-				}
-				const progress = normalizeSubagentEvent(event);
-				for (const progressEvent of progress) emitProgress(options, progressEvent);
-				if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-					messages.push(event.message);
-				}
-				if (event.type === "message_end") accumulateUsage(event.message);
-			};
-
-			const killProc = () => {
-				if (settled || termination === null) return;
-				if (!proc.killed) proc.kill("SIGTERM");
-				if (!forceKillTimer) {
-					forceKillTimer = setTimeout(() => {
-						try {
-							if (!closed) proc.kill("SIGKILL");
-						} catch {
-							// The process already exited.
-						}
-					}, 5000);
-				}
-			};
-
-			emitProgress(options, { type: "process", phase: "started" });
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() ?? "";
-				for (const line of lines) processLine(line);
-			});
-			proc.stderr.on("data", (data) => {
-				const text = data.toString();
-				stderr += text;
-				emitProgress(options, { type: "stderr", text });
-			});
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				finish(code ?? 0);
-			});
-			proc.on("error", (error) => {
-				stderr += error instanceof Error ? error.message : String(error);
-				finish(1);
-			});
-
-			timeoutTimer = setTimeout(() => {
-				if (termination === null) termination = "timeout";
-				killProc();
-			}, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-			if (options.signal) {
-				if (options.signal.aborted) onAbort();
-				else options.signal.addEventListener("abort", onAbort, { once: true });
-			}
-		});
-
-		const turns = messages.filter((message) => message.role === "assistant").length;
-		const output = finalOutput(messages);
-		const usage = sawUsage ? usageTotals : undefined;
-		if (termination === "abort") {
-			return { ok: false, output, stderr, turns, usage, cancelled: true, errorMessage: "Subagent was aborted" };
-		}
-		if (termination === "timeout") {
-			return { ok: false, output, stderr, turns, usage, timedOut: true, errorMessage: "Subagent timed out" };
-		}
-		if (exitCode !== 0) {
-			return { ok: false, output, stderr, turns, usage, errorMessage: `pi exited with code ${exitCode}` };
-		}
-		if (!output) {
-			return { ok: false, output: "", stderr, turns, usage, errorMessage: "subagent produced no final output" };
-		}
-		return {
-			ok: true,
-			output,
-			model: [...messages].reverse().find((message) => message.role === "assistant" && message.model)?.model,
-			stderr,
-			turns,
-			usage,
-		};
-	} finally {
-		if (tmpDir) {
-			try {
-				fs.rmSync(tmpDir, { recursive: true, force: true });
-			} catch {
-				/* best effort */
-			}
-		}
-	}
 }

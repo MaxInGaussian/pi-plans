@@ -3,7 +3,7 @@
  *
  * Workspace `language.tag` (`.git/pi-plans/config.json`) selects the chrome
  * strings for every user-visible surface: the batch form (src/ask-form.ts)
- * and the refine/refs overlay footer (src/refine-ui.ts).
+ * and the delegated-agent list and overlay (src/fleet-ui.ts).
  *
  * Mapping follows RFC 4647 primary-subtag fallback (zh-Hant-CN → zh-Hant →
  * zh), so every `zh*` tag renders the existing Simplified strings verbatim.
@@ -95,37 +95,76 @@ export function formChrome(lang: UiLanguage): FormChrome {
 }
 
 // ---------------------------------------------------------------------------
-// Refine overlay footer chrome (src/refine-ui.ts)
+// Delegated-agent list + overlay chrome (src/fleet-ui.ts)
 // ---------------------------------------------------------------------------
 
-export interface RefineChrome {
+export interface FleetChrome {
+	title: string;
+	/** Hint under the list while the list does not hold focus. */
+	browseHint: string;
+	/** Hint under the list while it holds focus. */
+	listHint: string;
+	running: string;
+	done: string;
+	queued: string;
+	idle: string;
+	tools: string;
+	/** `{n}` is replaced with the number of hidden rows. */
+	more: string;
 	close: string;
 	scroll: string;
 	page: string;
-	switchLane: string;
-	/** Auditor overlay only (v0.8): the shortcut that reopens the in-flight round. */
+	switchAgent: string;
+	stop: string;
+	stopArmed: string;
+	/** Execution-review overlay only: the shortcut that reopens the round. */
 	reopen: string;
+	noAgents: string;
 }
 
-const REFINE_CHROME: Record<UiLanguage, RefineChrome> = {
+const FLEET_CHROME: Record<UiLanguage, FleetChrome> = {
 	zh: {
+		title: "子代理",
+		browseHint: "↓ 浏览子代理",
+		listHint: "↑/↓ 选择 · Enter 查看 · Esc 返回",
+		running: "运行中",
+		done: "已完成",
+		queued: "排队中",
+		idle: "空闲",
+		tools: "次工具调用",
+		more: "还有 {n} 项",
 		close: "Esc 关闭",
 		scroll: "↑/↓ 滚动",
 		page: "PgUp/PgDn 翻页",
-		switchLane: "Tab & Shift + Tab 切换 lane",
+		switchAgent: "Tab & Shift + Tab 切换子代理",
+		stop: "x 停止",
+		stopArmed: "再按 x 确认停止",
 		reopen: "Ctrl+Shift+R 重开评审面板",
+		noAgents: "没有活动的子代理",
 	},
 	en: {
+		title: "Subagents",
+		browseHint: "↓ browse subagents",
+		listHint: "↑/↓ select · Enter view · Esc back",
+		running: "running",
+		done: "done",
+		queued: "queued",
+		idle: "idle",
+		tools: "tool calls",
+		more: "+{n} more",
 		close: "Esc close",
 		scroll: "↑/↓ scroll",
 		page: "PgUp/PgDn page",
-		switchLane: "Tab & Shift + Tab switch lane",
+		switchAgent: "Tab & Shift + Tab switch agent",
+		stop: "x stop",
+		stopArmed: "press x again to stop",
 		reopen: "Ctrl+Shift+R reopen review overlay",
+		noAgents: "No active subagents",
 	},
 };
 
-export function refineChrome(lang: UiLanguage): RefineChrome {
-	return REFINE_CHROME[lang];
+export function fleetChrome(lang: UiLanguage): FleetChrome {
+	return FLEET_CHROME[lang];
 }
 
 // --------------------------------------------------------------------------

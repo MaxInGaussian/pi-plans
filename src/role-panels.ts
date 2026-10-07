@@ -158,7 +158,7 @@ function isRuleLine(line: string): boolean {
  * pi's `DynamicBorder` — used by ModelSelectorComponent, ThinkingSelector and
  * our EffortPanelComponent — renders only a horizontal line, so the first-use
  * gate panels had top/bottom borders but no sides, while the reviewer panel
- * (refine-ui.ts) already drew a complete box. This wrapper makes the gate
+ * (the agent overlay) already drew a complete box. This wrapper makes the gate
  * panels consistent with the rest of pi-plans.
  *
  * The inner component's own rule lines are stripped, so the total line count is

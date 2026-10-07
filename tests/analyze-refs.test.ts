@@ -8,6 +8,9 @@ import * as url from "node:url";
 import { after, before, describe, it } from "node:test";
 import { registerAnalyzeRefsTool } from "../tools/analyze-refs.ts";
 import { initState, setRole, setLanguage, startRun, readActive } from "../src/state.ts";
+import { fleet } from "../src/agent-fleet.ts";
+import { fleetUi } from "../src/fleet-ui.ts";
+import { fakeModelRegistry, installFakeAgents } from "./fake-agent-session.ts";
 
 const ROOT = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
 
@@ -36,29 +39,6 @@ function mkWorkdir(name: string): string {
 	return dir;
 }
 
-function fakePiScript(body: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plans-fake-pi-"));
-	const script = path.join(dir, "fake-pi.mjs");
-	fs.writeFileSync(
-		script,
-		[
-			'const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");',
-			'emit({ type: "turn_start" });',
-			`async function main() { ${body} }`,
-			"await main();",
-		].join("\n"),
-	);
-	return script;
-}
-
-function withFakePi(scriptPath: string): () => void {
-	const previousScript = process.argv[1];
-	process.argv[1] = scriptPath;
-	return () => {
-		process.argv[1] = previousScript;
-	};
-}
-
 interface CapturedTool {
 	execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: unknown, ctx: unknown) => Promise<{ content: Array<{ type: string; text: string }>; details: any }>;
 }
@@ -76,22 +56,26 @@ function loadTool(): CapturedTool {
 }
 
 function headlessCtx(workdir: string): unknown {
-	return { cwd: workdir };
+	return { cwd: workdir, modelRegistry: fakeModelRegistry };
 }
 
-/** TUI-mode ctx whose fake ui.custom invokes the overlay factory and captures renders. */
-function tuiCtx(workdir: string, captured: string[][]): unknown {
+/** TUI-mode ctx whose fake ui captures the fleet widget factory. */
+function tuiCtx(workdir: string, widgets: Array<(width: number) => string[]>): unknown {
 	const theme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
 	return {
 		cwd: workdir,
 		mode: "tui",
 		hasUI: true,
+		modelRegistry: fakeModelRegistry,
 		ui: {
-			custom: async (factory: unknown) => {
-				const component = (factory as (...a: unknown[]) => { render(w: number): string[] })(undefined, theme, {}, () => {});
-				captured.push(component.render(120));
-				return undefined;
+			setWidget: (_key: string, content: unknown) => {
+				if (typeof content !== "function") return;
+				const component = (content as (tui: unknown, theme: unknown) => { render(w: number): string[] })({ requestRender() {} }, theme);
+				widgets.push((width) => component.render(width));
 			},
+			onTerminalInput: () => () => undefined,
+			getEditorText: () => "",
+			custom: async () => undefined,
 			setStatus: () => {},
 			notify: () => {},
 		},
@@ -137,11 +121,7 @@ function subagentLines(workdir: string): Array<any> {
 		setRole(workdir, { role: "reviewer", mode: "current-session", modelSelector: "fake/model", confirmed: true });
 		const refDir = path.join(workdir, "refs", "solo");
 		fs.mkdirSync(refDir, { recursive: true });
-		const restore = withFakePi(
-			fakePiScript(
-				`emit({ type: "message_end", message: { role: "assistant", model: "fake/model", content: [{ type: "text", text: "OK" }] } });`,
-			),
-		);
+		const restore = installFakeAgents(() => "OK");
 		const tool = loadTool();
 		try {
 			const result = await tool.execute("c1", { refs: [{ id: "ref-1", localPath: refDir }] }, undefined, undefined, headlessCtx(workdir));
@@ -166,47 +146,40 @@ function subagentLines(workdir: string): Array<any> {
 	});
 });
 
-describe("analyze_refs overlay chrome language (issue #3)", () => {
-	it("refs overlay footer follows the chrome language (D-010)", async () => {
+describe("analyze_refs subagent list chrome language (issue #3)", () => {
+	it("the subagent list follows the chrome language (D-010)", async () => {
 		const refDir = path.join(tmpRoot, "overlay-lang-ref");
 		fs.mkdirSync(refDir, { recursive: true });
-		const restore = withFakePi(
-			fakePiScript(
-				`emit({ type: "message_end", message: { role: "assistant", model: "fake/model", content: [{ type: "text", text: "OK" }] } });`,
-			),
-		);
+		const restore = installFakeAgents(() => "OK");
 		const tool = loadTool();
 		try {
 			for (const [tag, expected] of [
-				["zh-Hans", "Esc 关闭"],
-				["en", "Esc close"],
+				["zh-Hans", "↓ 浏览子代理"],
+				["en", "↓ browse subagents"],
 			] as const) {
+				fleetUi.detach();
+				fleet.clear();
 				const workdir = mkWorkdir(`overlay-lang-${tag}`);
 				initState(workdir);
 				setRole(workdir, { role: "reviewer", mode: "delegated-subagent", modelSelector: "fake/model", confirmed: true });
 				setLanguage(workdir, tag, "user");
-				const captured: string[][] = [];
-				await tool.execute(
-					"c1",
-					{ refs: [{ id: "ref-1", localPath: refDir }] },
-					undefined,
-					undefined,
-					tuiCtx(workdir, captured),
-				);
-				assert.equal(captured.length, 1, "refs overlay must render through ctx.ui.custom");
-				assert.ok(
-					captured[0]!.some((line) => line.includes(expected)),
-					`expected "${expected}" in refs overlay footer for tag ${tag}`,
-				);
+				const widgets: Array<(width: number) => string[]> = [];
+				await tool.execute("c1", { refs: [{ id: "ref-1", localPath: refDir }] }, undefined, undefined, tuiCtx(workdir, widgets));
+				assert.equal(widgets.length, 1, "the list must register one widget");
+				const lines = widgets[0]!(120);
+				assert.ok(lines.some((line) => line.includes(expected)), `expected "${expected}" in the list for tag ${tag}: ${JSON.stringify(lines)}`);
+				assert.ok(lines.some((line) => line.includes("ref-1")), "one bullet per reference");
 			}
 		} finally {
 			restore();
+			fleetUi.detach();
+			fleet.clear();
 		}
 	});
 });
 
 describe("analyze_refs fanout", () => {
-	it("spawns one lane per ref in batches of at most 3, records spawns, and returns sections", async () => {
+	it("spawns one lane per ref (at most 3 at once), records spawns, and returns sections", async () => {
 		const workdir = mkWorkdir("fanout");
 		initState(workdir);
 		setRole(workdir, { role: "reviewer", mode: "delegated-subagent", modelSelector: "fake/model", confirmed: true });
@@ -219,12 +192,7 @@ describe("analyze_refs fanout", () => {
 			return { id: `ref-${n}`, localPath: dir, title: `Ref ${n}`, url: "https://example.com", kind: "project" };
 		});
 
-		const restore = withFakePi(
-			fakePiScript(
-				`const task = process.argv.filter((arg) => arg.startsWith("Task: ")).pop() ?? "";\n` +
-					`emit({ type: "message_end", message: { role: "assistant", model: "fake/model", content: [{ type: "text", text: "ANALYSIS from " + process.cwd().split("/").pop() + "\\n" + task }] } });`,
-			),
-		);
+		const restore = installFakeAgents(({ cwd, prompt }) => `ANALYSIS from ${path.basename(cwd)}\n${prompt}`);
 		const tool = loadTool();
 		try {
 			const result = await tool.execute("c1", { refs, context: "pi-plans repo" }, undefined, undefined, headlessCtx(workdir));
@@ -237,7 +205,7 @@ describe("analyze_refs fanout", () => {
 			assert.ok(text.includes("Target repo context: pi-plans repo"), "brief must carry the target repo context");
 			assert.ok(text.includes("## Evidence Gaps"), "brief must carry the seven-section contract");
 			assert.match(text, /Persist: paste each reference's analysis into REF_ANALYSIS\.md/);
-			assert.equal(result.details.batches, 2, "five refs must run as two batches");
+			assert.equal(result.details.batches, 2, "five refs at a concurrency of three");
 			assert.equal(result.details.role, "ref-analyst");
 
 			const spawns = subagentLines(workdir);
@@ -266,11 +234,7 @@ describe("analyze_refs fanout", () => {
 			{ id: "ref-2", localPath: good },
 		];
 
-		const restore = withFakePi(
-			fakePiScript(
-				`emit({ type: "message_end", message: { role: "assistant", model: "fake/model", content: [{ type: "text", text: "OK analysis" }] } });`,
-			),
-		);
+		const restore = installFakeAgents(() => "OK analysis");
 		const tool = loadTool();
 		try {
 			const result = await tool.execute("c1", { refs }, undefined, undefined, headlessCtx(workdir));
@@ -301,13 +265,36 @@ describe("analyze_refs fanout", () => {
 		);
 	});
 
-	it("pins the per-batch overlay lifecycle (open before spawn, close in finally, cap 3)", () => {
-		const source = fs.readFileSync(path.join(ROOT, "tools", "analyze-refs.ts"), "utf8");
-		assert.equal((source.match(/new RefineOverlayController\(\s*"refs"/g) ?? []).length, 1, "controller must be constructed per batch inside the loop");
-		assert.match(source, /overlay\?\.open\(refineOverlayContext\(ctx\), modelLabel\)/);
-		assert.match(source, /await overlay\?\.close\(\);/);
-		assert.match(source, /const BATCH_SIZE = 3;/);
-		assert.ok(source.indexOf("overlay?.open(") < source.indexOf("await overlay?.close();"), "open must precede close");
+	it("queues references beyond the concurrency cap as queued bullets", async () => {
+		const workdir = mkWorkdir("fanout-queue");
+		initState(workdir);
+		setRole(workdir, { role: "reviewer", mode: "delegated-subagent", modelSelector: "fake/model", confirmed: true });
+		const refs = [1, 2, 3, 4, 5].map((n) => {
+			const dir = path.join(workdir, "refs", `queue-${n}`);
+			fs.mkdirSync(dir, { recursive: true });
+			return { id: `ref-${n}`, localPath: dir };
+		});
+		let inFlight = 0;
+		let peak = 0;
+		const statusesAtPeak: string[][] = [];
+		const restore = installFakeAgents(async () => {
+			inFlight += 1;
+			peak = Math.max(peak, inFlight);
+			if (inFlight === 3) statusesAtPeak.push(fleet.list().map((entry) => entry.lane.status));
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			inFlight -= 1;
+			return "ok";
+		});
+		const tool = loadTool();
+		try {
+			fleet.clear();
+			await tool.execute("c1", { refs }, undefined, undefined, headlessCtx(workdir));
+			assert.equal(peak, 3, "never more than three lanes at once");
+			assert.ok(statusesAtPeak[0]!.includes("queued"), "lanes beyond the cap stay queued in the fleet");
+		} finally {
+			restore();
+			fleet.clear();
+		}
 	});
 
 	it("skips recording without an active run (adhoc) and still succeeds", async () => {
@@ -317,11 +304,7 @@ describe("analyze_refs fanout", () => {
 		const refDir = path.join(workdir, "refs", "solo");
 		fs.mkdirSync(refDir, { recursive: true });
 
-		const restore = withFakePi(
-			fakePiScript(
-				`emit({ type: "message_end", message: { role: "assistant", model: "fake/model", content: [{ type: "text", text: "adhoc analysis" }] } });`,
-			),
-		);
+		const restore = installFakeAgents(() => "adhoc analysis");
 		const tool = loadTool();
 		try {
 			const result = await tool.execute("c1", { refs: [{ id: "ref-1", localPath: refDir }] }, undefined, undefined, headlessCtx(workdir));

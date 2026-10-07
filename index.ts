@@ -67,6 +67,8 @@ import { planningWriteBlockReason } from "./src/guard.ts";
 import { lintPlanIntoNotices } from "./src/state.ts";
 import { registerQueryInterviewHooks } from "./src/query-hook.ts";
 import { registerCodeGraphTool } from "./tools/code-graph.ts";
+import { fleet } from "./src/agent-fleet.ts";
+import { fleetUi } from "./src/fleet-ui.ts";
 import { registerGraphAwareFileTools } from "./tools/graph-aware-file-tools.ts";
 import {
 	initGraphCommand,
@@ -180,6 +182,9 @@ export default function piPlansExtension(pi: ExtensionAPI): void {
 		});
 		pi.on("session_shutdown", () => {
 			stopGraphWatcher(process.cwd());
+			// Drop the subagent list and its key hook with the session.
+			fleetUi.detach();
+			fleet.clear();
 		});
 	} catch {
 		/* hosts without session events simply run watchers until unload */
