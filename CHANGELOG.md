@@ -4,6 +4,8 @@
 
 ### Added
 
+- **Token usage on every subagent row.** Each bullet in the subagent list (and the overlay status row) now shows the agent's cumulative input and output tokens and how full its context window is, beside the tool-call count, for example `12 tool calls · ↑12k ↓1.2k · 34% ctx`. The numbers appear once the agent finishes its first model turn.
+
 - **Multi-reviewer execution review.** Right before round 1 (when at least two checks are pending) a menu asks for 1, 2, or 3 parallel execution reviewers; the choice is stored in the run checkpoint (`execution.reviewers`) and reused by later rounds, and a session with no UI keeps one reviewer. The pending checks are split evenly across the reviewers and each one also looks for defects and improvements along its own direction, suggested by the executor through the new optional `plans_review_directions` tool (also given to delegated workers) with three fixed back-up aspects filling any gap. Each reviewer numbers new findings from a disjoint `F-###` range, and the lane reports merge into a single outcome, so a multi-reviewer round is still one budgeted round; a failed reviewer makes only its own checks undeterminable and aborting any reviewer cancels the round. The fleet list shows one bullet per reviewer.
 
 ## [0.9.0] - 2026-10-07

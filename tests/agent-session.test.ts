@@ -53,6 +53,30 @@ describe("runAgentSession", () => {
 		assert.match(lastSession?.prompts[0] ?? "", /^Task: do it/);
 	});
 
+	it("reports cumulative tokens and the context fill after every assistant message", async () => {
+		__setSessionFactoryForTests(async () => {
+			const session = new FakeSession(async (api) => {
+				api.say("first", { usage: { input: 10, output: 5 } });
+				api.say("final", { usage: { input: 20, output: 7 } });
+			}) as FakeSession & { getContextUsage: () => { percent: number } };
+			session.getContextUsage = () => ({ percent: 41.5 });
+			return { session };
+		});
+		const usage: Array<{ input: number; output: number; contextPercent?: number }> = [];
+		await runAgentSession({
+			systemPrompt: "s",
+			task: "t",
+			cwd: "/tmp",
+			onProgress: (event) => {
+				if (event.type === "usage") usage.push({ input: event.input, output: event.output, contextPercent: event.contextPercent });
+			},
+		});
+		assert.deepEqual(usage, [
+			{ input: 10, output: 5, contextPercent: 41.5 },
+			{ input: 30, output: 12, contextPercent: 41.5 },
+		]);
+	});
+
 	it("omits usage when the session reports none", async () => {
 		install((api) => api.say("final"));
 		const result = await runAgentSession(base);

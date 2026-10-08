@@ -152,7 +152,7 @@ export function renderFleetLines(view: FleetListView): string[] {
 		const bullet = isSelected ? theme.fg("accent", "▸") : theme.fg(color, "•");
 		const label = isSelected ? theme.fg("accent", theme.bold(entry.label)) : theme.bold(entry.label);
 		const phase = entry.lane.status === "running" && !entry.idle && entry.lane.phase ? theme.fg("muted", ` · ${entry.lane.phase}`) : "";
-		const tools = entry.toolCalls > 0 ? ` · ${entry.toolCalls} ${chrome.tools}` : "";
+		const tools = `${entry.toolCalls > 0 ? ` · ${entry.toolCalls} ${chrome.tools}` : ""}${usageText(entry)}`;
 		const worked = workedMs(entry, now);
 		const elapsed = worked > 0 || entry.workingSince !== undefined ? ` · ${formatElapsed(worked)}` : "";
 		const note = entry.note ? ` · ${entry.note}` : "";
@@ -161,6 +161,21 @@ export function renderFleetLines(view: FleetListView): string[] {
 	if (visibleRows < entries.length) lines.push(theme.fg("dim", `  ${chrome.more.replace("{n}", String(entries.length - visibleRows))}`));
 	lines.push(theme.fg("dim", selected === null ? chrome.browseHint : chrome.listHint));
 	return lines.map((line) => fitLine(line, width));
+}
+
+/** Compact token count: 842, 12.3k, 1.2M. */
+export function formatTokens(count: number): string {
+	if (count < 1000) return String(Math.max(0, Math.round(count)));
+	if (count < 1_000_000) return `${(count / 1000).toFixed(count < 10_000 ? 1 : 0).replace(/\.0$/, "")}k`;
+	return `${(count / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+/** ` · ↑12k ↓1.2k · 34% ctx` for a row, or "" while the agent has reported no usage. */
+export function usageText(entry: Pick<FleetEntry, "inputTokens" | "outputTokens" | "contextPercent">): string {
+	const parts: string[] = [];
+	if (entry.inputTokens > 0 || entry.outputTokens > 0) parts.push(`↑${formatTokens(entry.inputTokens)} ↓${formatTokens(entry.outputTokens)}`);
+	if (entry.contextPercent !== undefined) parts.push(`${Math.round(entry.contextPercent)}% ctx`);
+	return parts.length > 0 ? ` · ${parts.join(" · ")}` : "";
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +395,7 @@ export class SubagentOverlay implements Component {
 			const scrollCount = hiddenAbove || hiddenBelow ? ` ↑${hiddenAbove} ↓${hiddenBelow}` : "";
 			const status = theme.fg(entryColor(entry), entryStatus(entry, this.lang));
 			const phase = lane.phase && !entry.idle ? theme.fg("muted", ` · ${lane.phase}`) : "";
-			const tools = entry.toolCalls > 0 ? ` · ${entry.toolCalls} ${chrome.tools}` : "";
+			const tools = `${entry.toolCalls > 0 ? ` · ${entry.toolCalls} ${chrome.tools}` : ""}${usageText(entry)}`;
 			const note = entry.note ? ` · ${entry.note}` : "";
 			lines.push(renderRow(theme, `${status}${phase}${theme.fg("dim", `${tools}${note}${scrollCount}`)}`, innerWidth));
 			const visible = transcriptLines.slice(lane.scrollOffset, lane.scrollOffset + viewportHeight);

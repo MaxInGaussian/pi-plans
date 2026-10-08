@@ -66,6 +66,8 @@ export interface SessionLike {
 	dispose(): void;
 	readonly messages: unknown[];
 	readonly isStreaming?: boolean;
+	/** Estimated context fill (the SDK session provides it). */
+	getContextUsage?(): { percent: number | null } | undefined;
 }
 
 type SessionFactory = (options: Record<string, unknown>) => Promise<{ session: SessionLike }>;
@@ -218,12 +220,26 @@ export async function startAgentSession(options: AgentRunOptions): Promise<{ han
 		usage.cost += next.cost;
 	};
 
+	/** Report cumulative tokens and the context fill so the fleet row can show them. */
+	const emitUsage = (): void => {
+		if (!usage) return;
+		let contextPercent: number | undefined;
+		try {
+			const percent = session.getContextUsage?.()?.percent;
+			if (typeof percent === "number" && Number.isFinite(percent)) contextPercent = percent;
+		} catch {
+			/* the estimate is cosmetic */
+		}
+		emit(options, { type: "usage", input: usage.input, output: usage.output, ...(contextPercent !== undefined ? { contextPercent } : {}) });
+	};
+
 	const unsubscribe = session.subscribe((event) => {
 		for (const progress of normalizeSubagentEvent(event)) emit(options, progress);
 		const typed = event as { type?: string; message?: MessageLike };
 		if (typed.type === "message_end" && typed.message?.role === "assistant") {
 			turns += 1;
 			addUsage(typed.message);
+			emitUsage();
 		}
 	});
 

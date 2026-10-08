@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it, mock } from "node:test";
 import { AgentFleet } from "../src/agent-fleet.ts";
-import { FleetUiController, SubagentOverlay, formatElapsed, renderFleetLines, FLEET_WIDGET_KEY } from "../src/fleet-ui.ts";
+import { FleetUiController, SubagentOverlay, formatElapsed, formatTokens, renderFleetLines, usageText, FLEET_WIDGET_KEY } from "../src/fleet-ui.ts";
 import { visibleWidth } from "../src/refine-ui-helpers.ts";
 import { __clearPiTuiForTests, __setPiTuiForTests } from "../src/terminal-keys.ts";
 
@@ -56,6 +56,31 @@ describe("renderFleetLines", () => {
 		assert.match(row!, /worker-1 idle/);
 		assert.match(row!, /1 tool calls/);
 		assert.match(row!, /1\/3 tasks/);
+	});
+
+	it("shows input/output tokens and the context percentage beside the tool count", () => {
+		const fleet = new AgentFleet();
+		const group = seed(fleet, ["worker-1"], "executor");
+		group.update("worker-1", { type: "transcript", phase: "start", entryType: "tool-call", key: "tool:c1", text: "{}", update: "replace", streaming: true, toolName: "edit" });
+		group.update("worker-1", { type: "usage", input: 12_345, output: 1_234, contextPercent: 33.6 });
+		const [, row] = renderFleetLines({ entries: fleet.list(), selected: null, now: Date.now(), lang: "en", theme: fakeTheme, width: 160 });
+		assert.match(row!, /1 tool calls · ↑12k ↓1\.2k · 34% ctx/);
+	});
+
+	it("omits the usage segment until the agent reports tokens", () => {
+		const fleet = new AgentFleet();
+		seed(fleet, ["a"]);
+		const [, row] = renderFleetLines({ entries: fleet.list(), selected: null, now: Date.now(), lang: "en", theme: fakeTheme, width: 120 });
+		assert.doesNotMatch(row!, /↑|ctx/);
+	});
+
+	it("formats token counts compactly", () => {
+		assert.equal(formatTokens(842), "842");
+		assert.equal(formatTokens(1234), "1.2k");
+		assert.equal(formatTokens(12_345), "12k");
+		assert.equal(formatTokens(1_250_000), "1.3M");
+		assert.equal(usageText({ inputTokens: 0, outputTokens: 0 }), "");
+		assert.equal(usageText({ inputTokens: 0, outputTokens: 0, contextPercent: 5 }), " · 5% ctx");
 	});
 
 	it("never exceeds the width, even with ANSI, CJK labels and tiny widths", () => {

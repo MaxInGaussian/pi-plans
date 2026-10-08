@@ -22,7 +22,9 @@ export type SubagentProgressEvent =
 			toolName?: string;
 			isError?: boolean;
 	  }
-	| { type: "stderr"; text: string };
+	| { type: "stderr"; text: string }
+	/** Cumulative token usage of the session so far (display only). */
+	| { type: "usage"; input: number; output: number; contextPercent?: number };
 
 export interface SubagentOptions {
 	systemPrompt: string;

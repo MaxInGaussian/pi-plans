@@ -32,6 +32,11 @@ export interface FleetEntry {
 	/** Short free-form suffix for the list row (for example "2/3 tasks"). */
 	note: string;
 	toolCalls: number;
+	/** Cumulative input and output tokens of the agent's session. */
+	inputTokens: number;
+	outputTokens: number;
+	/** Share of the model's context window in use (0-100); absent until known. */
+	contextPercent?: number;
 	/** Stops just this agent; absent when the spawner cannot stop one lane. */
 	abort?: () => void;
 }
@@ -102,6 +107,13 @@ export class FleetGroup {
 		beginWork(entry);
 		if (event.type === "transcript" && event.entryType === "tool-call" && event.phase === "start" && event.key.startsWith("tool:")) {
 			entry.toolCalls += 1;
+		}
+		if (event.type === "usage") {
+			entry.inputTokens = event.input;
+			entry.outputTokens = event.output;
+			if (event.contextPercent !== undefined) entry.contextPercent = event.contextPercent;
+			this.fleet.notify();
+			return;
 		}
 		applyRefineProgress(entry.lane, event);
 		this.fleet.notify();
@@ -211,6 +223,8 @@ export class AgentFleet {
 				idle: false,
 				note: "",
 				toolCalls: 0,
+				inputTokens: 0,
+				outputTokens: 0,
 				abort: lane.abort,
 			});
 		}
