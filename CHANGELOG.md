@@ -42,6 +42,8 @@
 
 ### Fixed
 
+- **The `plan-huge` skill loads on Pi again.** Its `description` held an unquoted `: `, which is invalid YAML, so Pi reported "Nested mappings are not allowed in compact mappings" and skipped the skill (issue #7). The description is now quoted, `npm run validate` rejects unquoted frontmatter values containing `: ` or ` #`, and a test parses every skill and agent definition with Pi's own frontmatter parser.
+
 - **Pre-plan compaction aborted the running turn before every compaction.** Creating a run (`plans start-run`) triggered the pre-plan VCC compaction through the host's manual compaction path, whose first step is `await abort()` — so every compaction was preceded by an aborted assistant message (`This operation was aborted`), sibling tool calls of the same batch died with `Operation aborted`, and the user saw an error they never caused. The compaction now travels as a `turn_end` **compaction boundary draft** (the host appends it and refreshes the finalized context), so nothing is aborted at all. Diagnosed from three real session logs: all 14 compactions were `reason: "manual"`, every one immediately preceded by the aborted-turn record.
 
 - **A compaction could end without continuing the run.** The resume had been attached to the host's `onComplete`/`onError` callbacks with a one-shot latch that closed *before* the send, so a single failed send stranded the session until the user typed something (2 of 12 observed compactions ended with no resume message and no assistant turn). Continuation is no longer needed for the pre-plan path (the turn is never interrupted), and every path that really does displace a live turn now resumes from a terminal compaction event with the latch closing only after a successful send.

@@ -73,7 +73,14 @@ function parseFrontmatter(text: string, file: string): Map<string, string> {
 		if (!line.trim()) continue;
 		const sep = line.indexOf(":");
 		if (sep < 0) fail(`${file}: invalid frontmatter line ${line!}`);
-		data.set(line.slice(0, sep).trim(), line.slice(sep + 1).trim());
+		const key = line.slice(0, sep).trim();
+		let value = line.slice(sep + 1).trim();
+		const quoted = /^(["']).*\1$/.test(value);
+		// A plain YAML scalar cannot hold ": " (it opens a nested mapping) or " #"
+		// (it starts a comment); Pi rejects such a file outright (issue #7).
+		if (!quoted && /: | #/.test(value)) fail(`${file}: frontmatter value of ${key} contains ": " or " #"; wrap it in double quotes`);
+		if (quoted) value = value.slice(1, -1);
+		data.set(key, value);
 	}
 	return data;
 }
