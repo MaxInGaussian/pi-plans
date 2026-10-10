@@ -42,7 +42,7 @@
 
 ### Fixed
 
-- **The `plan-huge` skill loads on Pi again.** Its `description` held an unquoted `: `, which is invalid YAML, so Pi reported "Nested mappings are not allowed in compact mappings" and skipped the skill (issue #7). The description is now quoted, `npm run validate` rejects unquoted frontmatter values containing `: ` or ` #`, and a test parses every skill and agent definition with Pi's own frontmatter parser.
+- **The `plan-huge` skill loads on Pi again.** Its `description` held an unquoted `: `, which is invalid YAML, so Pi reported "Nested mappings are not allowed in compact mappings" and skipped the skill (issue #7). The description is reworded so it stays a plain YAML scalar, `npm run validate` rejects unquoted frontmatter values containing `: ` or ` #`, and a test parses every skill and agent definition with Pi's own frontmatter parser.
 
 - **Pre-plan compaction aborted the running turn before every compaction.** Creating a run (`plans start-run`) triggered the pre-plan VCC compaction through the host's manual compaction path, whose first step is `await abort()` — so every compaction was preceded by an aborted assistant message (`This operation was aborted`), sibling tool calls of the same batch died with `Operation aborted`, and the user saw an error they never caused. The compaction now travels as a `turn_end` **compaction boundary draft** (the host appends it and refreshes the finalized context), so nothing is aborted at all. Diagnosed from three real session logs: all 14 compactions were `reason: "manual"`, every one immediately preceded by the aborted-turn record.
 

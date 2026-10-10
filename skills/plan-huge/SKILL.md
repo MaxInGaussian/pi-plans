@@ -1,6 +1,6 @@
 ---
 name: plan-huge
-description: "Create a huge Pi plan for multi-version product builds. Use when the effort is bigger than plan-big: an abstract overall plan (mission per version, architecture, file map, user experience, final objective), then one plan-big-style plan per product version (2 to 10 versions), each planned, reviewed, executed, and execution-reviewed before the next version is planned; exclude direct implementation-only, factual/explanation, trivial command-only, or explicit no-plan requests."
+description: Create a huge Pi plan for multi-version product builds. Use when the effort is bigger than plan-big — an abstract overall plan (mission per version, architecture, file map, user experience, final objective), then one plan-big-style plan per product version (2 to 10 versions), each planned, reviewed, executed, and execution-reviewed before the next version is planned; exclude direct implementation-only, factual/explanation, trivial command-only, or explicit no-plan requests.
 ---
 
 # Plan Huge
