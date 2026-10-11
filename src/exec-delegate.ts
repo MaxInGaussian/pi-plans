@@ -146,6 +146,27 @@ export interface BriefInput {
 	nudge?: string;
 }
 
+/** Unresolved review findings as a brief section (empty when there are none). */
+function unresolvedFindingsText(findings: ReadonlyArray<{ id: string; severity: string; taskIds: string[]; note: string }>): string {
+	if (findings.length === 0) return "";
+	return `Unresolved review findings you must address (stable ids; the reviewer reuses them until the problem is gone):\n${findings
+		.map((finding) => `- ${finding.id} (${finding.severity})${finding.taskIds.length ? ` [${finding.taskIds.join(", ")}]` : ""}: ${finding.note}`)
+		.join("\n")}`;
+}
+
+/** Brief for a review round that reopened no task: nothing is left to close,
+ * so the workers fix the reported problems in the worktree and the review
+ * reruns when they finish (the same instruction the main session gets). */
+export function buildRepairOnlyBrief(ex: ExecState, workerLabel: string, workerCount: number, repairNotes: string[]): string {
+	const parts = [
+		`[PI-PLANS EXECUTION — worker ${workerLabel} of ${workerCount}]`,
+		`An execution review round of the accepted plan at ${ex.planPath} reported problems, but no task was reopened: every task is already closed, so plans_update_task has nothing to close. Fix the reported problems directly in the worktree; the review reruns by itself when you finish.`,
+		unresolvedFindingsText(ex.audit?.findings ?? []),
+		...repairNotes.map((note) => `Repair brief from the supervisor (a review round reported problems):\n${note}`),
+	];
+	return parts.filter(Boolean).join("\n\n");
+}
+
 export function buildWorkerBrief(input: BriefInput): string {
 	const { ex, units } = input;
 	const wave = Math.min(...units.map((unit) => unit.task.wave));
@@ -160,11 +181,7 @@ export function buildWorkerBrief(input: BriefInput): string {
 	// workers would otherwise see reopened tasks without knowing why.
 	const assigned = new Set(units.flatMap((unit) => unit.ids));
 	const findings = (ex.audit?.findings ?? []).filter((finding) => finding.taskIds.length === 0 || finding.taskIds.some((id) => assigned.has(id)));
-	const findingsText = findings.length > 0
-		? `Unresolved review findings you must address (stable ids; the reviewer reuses them until the problem is gone):\n${findings
-				.map((finding) => `- ${finding.id} (${finding.severity})${finding.taskIds.length ? ` [${finding.taskIds.join(", ")}]` : ""}: ${finding.note}`)
-				.join("\n")}`
-		: "";
+	const findingsText = unresolvedFindingsText(findings);
 	const checks = ex.items.map((item) => `- ${item.id}: ${item.text.length > 220 ? `${item.text.slice(0, 217)}...` : item.text}`).join("\n");
 	const parts = [
 		`[PI-PLANS EXECUTION — worker ${input.workerLabel} of ${input.workerCount}]`,
@@ -187,6 +204,14 @@ export function buildWorkerBrief(input: BriefInput): string {
 // ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
+
+/** A review round's repair brief and the reopened tasks it still has to reach. */
+interface RepairNote {
+	content: string;
+	/** Tasks open when the brief arrived that no launch has carried it to yet. */
+	open: Set<string>;
+	delivered: boolean;
+}
 
 interface Worker {
 	index: number;
@@ -223,7 +248,7 @@ export class DelegateRun {
 	private readonly fleetRun: FleetRun;
 	private readonly systemPrompt: string;
 	private readonly owners = new Map<string, number>();
-	private repairNotes: string[] = [];
+	private repairNotes: RepairNote[] = [];
 	disposed = false;
 	private driving = false;
 	private again = false;
@@ -277,7 +302,8 @@ export class DelegateRun {
 	}
 
 	addRepair(content: string): void {
-		this.repairNotes.push(content);
+		const open = flattenTaskViews(this.ex.tasks).filter((task) => !taskIsTerminal(task)).map((task) => task.id);
+		this.repairNotes.push({ content, open: new Set(open), delivered: false });
 		void this.drive();
 	}
 
@@ -314,6 +340,9 @@ export class DelegateRun {
 		const open = ex.tasks.filter((task) => !taskIsTerminal(task));
 		if (open.length === 0) {
 			if (this.workers.some((worker) => worker.running)) return;
+			// A review round that reopened nothing still has to reach a worker:
+			// finishing straight to the next round would re-review unchanged work.
+			if (this.launchRepairOnly()) return;
 			await this.finishToReview(ex);
 			return;
 		}
@@ -358,15 +387,36 @@ export class DelegateRun {
 			workerCount: this.workers.length,
 			units,
 			otherOpenIds,
-			repairNotes: this.takeRepairNotes(),
+			repairNotes: this.takeRepairNotes(worker.assigned),
 			nudge,
 		}));
 	}
 
-	private takeRepairNotes(): string[] {
-		const notes = this.repairNotes;
+	/** The pending briefs that cover any of `ids`. A brief stays queued until
+	 * every task it reopened has been launched, so each owning worker gets it,
+	 * not only the first one launched. */
+	private takeRepairNotes(ids: ReadonlySet<string>): string[] {
+		const taken: string[] = [];
+		for (const note of this.repairNotes) {
+			if (![...ids].some((id) => note.open.has(id))) continue;
+			taken.push(note.content);
+			note.delivered = true;
+			for (const id of ids) note.open.delete(id);
+		}
+		this.repairNotes = this.repairNotes.filter((note) => !note.delivered || note.open.size > 0);
+		return taken;
+	}
+
+	/** Run the undelivered briefs on one idle worker when the round left no
+	 * open task. Returns whether a worker was started. */
+	private launchRepairOnly(): boolean {
+		const pending = this.repairNotes.filter((note) => !note.delivered);
+		if (pending.length === 0) return false;
+		const worker = this.workers.find((candidate) => !candidate.running);
+		if (!worker) return false;
 		this.repairNotes = [];
-		return notes;
+		this.runBrief(worker, buildRepairOnlyBrief(this.ex, worker.label, this.workers.length, pending.map((note) => note.content)));
+		return true;
 	}
 
 	private runBrief(worker: Worker, brief: string): void {
@@ -611,8 +661,16 @@ const driver: DelegateDriver = {
 		current.start();
 	},
 	repair(ctx, ex, content) {
-		if (!current || current.disposed || current.ex !== ex) driver.resume(ctx, ex);
-		current?.addRepair(content);
+		if (current && !current.disposed && current.ex === ex) {
+			current.ctx = ctx;
+		} else {
+			// Queue the brief before the first drive: a started run launches the
+			// reopened tasks at once and would otherwise do so without it.
+			current?.dispose("stopped");
+			if (!ex.executor || ex.executor.mode !== "delegated") return;
+			current = new DelegateRun(ctx, ex);
+		}
+		current.addRepair(content);
 	},
 	dispose(outcome) {
 		current?.dispose(outcome);

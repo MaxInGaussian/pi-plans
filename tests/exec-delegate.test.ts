@@ -328,6 +328,62 @@ describe("delegated execution: review repairs and stalls", () => {
 		assert.doesNotMatch(repairBrief!, /\[delegated run\]/, "the workers get the brief without the supervisor note");
 	});
 
+	it("gives every worker that owns a reopened task the repair brief", async () => {
+		const byWorker: string[][] = [[], []];
+		installWorkers(async ({ brief, tool, session }) => {
+			byWorker[session]!.push(brief);
+			for (const id of ["Task-1", "Task-2", "Task-3"]) {
+				if (statuses()[id] === "pending" && assignedIds(brief).includes(id)) await tool({ taskId: id, status: "complete", evidence: `${id} evidence` });
+			}
+		});
+		let round = 0;
+		__setAuditRunnerForTests(async () => {
+			round += 1;
+			return round === 1
+				? { round, passed: [], failed: ["VC-001", "VC-002"], undeterminable: [], report: "both checks failed" }
+				: { round, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" };
+		});
+		await begin(2);
+		await waitFor(() => getExecution() === null, "the repaired run to complete", 8000);
+		for (const [index, briefs] of byWorker.entries()) {
+			const owner = briefs.filter((brief) => assignedIds(brief).some((id) => id === "Task-1" || id === "Task-2"));
+			assert.ok(
+				owner.some((brief) => brief.includes("Repair brief from the supervisor")),
+				`worker ${index + 1} received the repair brief for its reopened task`,
+			);
+		}
+	});
+
+	it("hands a round that reopened nothing to a worker before the next review round", async () => {
+		const prompts: string[] = [];
+		installWorkers(async ({ brief, tool }) => {
+			prompts.push(brief);
+			for (const id of ["Task-1", "Task-2", "Task-3", "Task-4"]) {
+				if (statuses()[id] === "pending" && brief.includes(id)) await tool({ taskId: id, status: "complete", evidence: `${id} evidence` });
+			}
+		});
+		const promptsAtRound: number[] = [];
+		const stillReported = { id: "F-001", severity: "high", taskIds: [], note: "retry budget is unbounded", evidence: "src/lib", raw: "- `F-001` raw", proposedTask: "bound the retry budget" };
+		let round = 0;
+		__setAuditRunnerForTests(async () => {
+			round += 1;
+			promptsAtRound.push(prompts.length);
+			return round <= 2
+				? { round, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: `round ${round}`, findings: [stillReported] }
+				: { round, passed: ["VC-001", "VC-002"], failed: [], undeterminable: [], report: "all pass" };
+		});
+		await begin(1);
+		await waitFor(() => getExecution() === null, "the run to complete", 8000);
+		assert.equal(round, 3);
+		// Round 1 appends `fix F-001`, the worker closes it, round 2 reports the
+		// finding again: no task reopens, so the repair must still reach a worker.
+		assert.ok(promptsAtRound[2]! > promptsAtRound[1]!, "a worker ran between round 2 and round 3");
+		const repairOnly = prompts.at(-1)!;
+		assert.match(repairOnly, /Repair brief from the supervisor/);
+		assert.match(repairOnly, /F-001/);
+		assert.match(repairOnly, /no task was reopened/i);
+	});
+
 	it("re-prompts a worker that ends with tasks still open, then pauses at the stall cap", async () => {
 		const { sessions } = installWorkers(async () => undefined);
 		await begin(1);
